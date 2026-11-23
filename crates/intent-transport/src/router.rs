@@ -4007,6 +4007,15 @@ async fn agent_methods(
             let result = api.agent_retry(ws, agent_id).await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.retrySetup" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_retry_setup(ws, agent_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.wakeOrCreate" => {
             if let Some(message) = std::iter::once(params)
                 .chain(params.get("create").and_then(Value::as_object))

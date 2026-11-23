@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use intent_core::node_link::{
     CheckoutOwner, SetupCommand, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
@@ -43,8 +43,8 @@ pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The output kept on the machine (and resent once after a reconnect).
 const OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
-/// The output a failure notice quotes.
-const NOTICE_TAIL_BYTES: usize = 4 * 1024;
+/// The output a failure notice and a retry's result quote.
+pub(super) const NOTICE_TAIL_BYTES: usize = 4 * 1024;
 
 /// How long the run waits for the terminal's output to end after the
 /// script's process group is reaped.
@@ -134,24 +134,41 @@ impl SetupStatus {
     }
 
     /// A setup that was running when it was stopped or the machine
-    /// restarted, recorded at the next launch.
+    /// restarted, recorded at the next launch (or, for a retry, at the
+    /// agent's stop).
     pub(super) fn interrupted(self) -> Self {
         Self::failed(
             self.started_at,
             codes::INTERRUPTED,
-            "the setup script was stopped before it finished and does not run again",
+            "the setup script was stopped before it finished",
         )
     }
 
     /// A kept checkout with no recorded setup (one from a machine without
     /// setup, or from before it recorded `pending`): the script never ran
-    /// there and does not run now.
+    /// there and does not run on its own now.
     pub(super) fn never_ran() -> Self {
         Self::failed(
             None,
             codes::INTERRUPTED,
-            "this checkout was kept from a launch that did not run the setup script; it does not run again",
+            "this checkout was kept from a launch that did not run the setup script",
         )
+    }
+
+    /// A setup script that has started.
+    pub(super) fn running(started_at: String) -> Self {
+        Self {
+            state: Recorded::Running,
+            exit_code: None,
+            error: None,
+            started_at: Some(started_at),
+            finished_at: None,
+        }
+    }
+
+    /// A setup run that could not start (`node-setup-failed`).
+    pub(super) fn could_not_start(detail: &str) -> Self {
+        Self::failed(None, codes::FAILED, detail)
     }
 
     /// The `setupFinished` state; `None` while running.
@@ -176,6 +193,9 @@ impl SetupStatus {
         let mut value = json!({ "state": state });
         if let Some(code) = self.exit_code {
             value["exitCode"] = json!(code);
+        }
+        if let Some(error) = &self.error {
+            value["error"] = json!(error);
         }
         if let Some(at) = &self.started_at {
             value["startedAt"] = json!(at);
@@ -391,6 +411,120 @@ impl SetupOutput {
     }
 }
 
+/// A running agent's checkout setup as its workspace API shows it: the
+/// `setupStatus` overlay, live across a retry (node-link.md § Setup
+/// retry), and the retry under way, if any.
+pub(super) struct SetupView {
+    overlay: watch::Sender<Option<Value>>,
+    /// The retry under way; `Err` once the agent is stopping, so no retry
+    /// starts after its stop took the last one.
+    retry: Mutex<Result<Option<RetryRun>, Closed>>,
+    /// The newest retry's output, for its result.
+    last_output: Mutex<Option<Arc<SetupOutput>>>,
+}
+
+/// A setup retry under way.
+pub(super) struct RetryRun {
+    pub started_at: String,
+    pub output: Arc<SetupOutput>,
+    /// Kills the script; taken by the agent's stop.
+    pub stop: Option<oneshot::Sender<()>>,
+    /// `true` once the run's result is recorded and journaled.
+    pub done: watch::Receiver<bool>,
+}
+
+impl Default for SetupView {
+    fn default() -> Self {
+        Self {
+            overlay: watch::channel(None).0,
+            retry: Mutex::new(Ok(None)),
+            last_output: Mutex::new(None),
+        }
+    }
+}
+
+impl SetupView {
+    /// The `setupStatus` the agent's `workspace.details` shows.
+    pub(super) fn overlay(&self) -> Option<Value> {
+        self.overlay.borrow().clone()
+    }
+
+    pub(super) fn set_overlay(&self, overlay: Option<Value>) {
+        self.overlay.send_replace(overlay);
+    }
+
+    /// Show `status`, keeping what the launch found beside it
+    /// (`unsentSubmodules`).
+    pub(super) fn show(&self, status: &SetupStatus) {
+        self.overlay.send_modify(|overlay| {
+            let mut next = status.overlay();
+            if let (Some(Value::Object(old)), Value::Object(new)) = (overlay.as_ref(), &mut next) {
+                if let Some(paths) = old.get("unsentSubmodules") {
+                    new.insert("unsentSubmodules".to_owned(), paths.clone());
+                }
+            }
+            *overlay = Some(next);
+        });
+    }
+
+    /// Follow the overlay.
+    pub(super) fn subscribe(&self) -> watch::Receiver<Option<Value>> {
+        self.overlay.subscribe()
+    }
+
+    /// The retry under way: its `startedAt`, or `None`.
+    pub(super) fn running_retry(&self) -> Option<String> {
+        lock(&self.retry)
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .filter(|run| !*run.done.borrow())
+            .map(|run| run.started_at.clone())
+    }
+
+    /// Record `run` as the retry under way; `Err(Closed)` once the agent
+    /// is stopping.
+    pub(super) fn begin_retry(&self, run: RetryRun) -> Result<(), Closed> {
+        let mut retry = lock(&self.retry);
+        let slot = retry.as_mut().map_err(|closed| *closed)?;
+        *lock(&self.last_output) = Some(run.output.clone());
+        *slot = Some(run);
+        Ok(())
+    }
+
+    /// The agent is stopping: take the retry under way, to stop it, and
+    /// refuse any later one.
+    pub(super) fn close(&self) -> Option<RetryRun> {
+        std::mem::replace(&mut *lock(&self.retry), Err(Closed)).unwrap_or_default()
+    }
+
+    /// The output a retry's result quotes: the newest retry's last
+    /// [`NOTICE_TAIL_BYTES`].
+    pub(super) fn retry_tail(&self) -> Option<String> {
+        let output = lock(&self.last_output).clone()?;
+        let (tail, _) = output.tail();
+        let mut cut = tail.len().saturating_sub(NOTICE_TAIL_BYTES);
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        Some(tail[cut..].to_owned())
+    }
+
+    /// The output of a retry under way, to resend after a reconnect.
+    pub(super) fn retry_output(&self) -> Option<Arc<SetupOutput>> {
+        lock(&self.retry)
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .filter(|run| !*run.done.borrow())
+            .map(|run| run.output.clone())
+    }
+}
+
+/// The agent is stopping: no setup retry starts.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Closed;
+
 /// What one setup run needs.
 pub(super) struct SetupRun<'a> {
     pub command: &'a SetupCommand,
@@ -400,6 +534,9 @@ pub(super) struct SetupRun<'a> {
     /// The machine-local stand-in for head's main checkout.
     pub main_checkout: &'a Path,
     pub pins: &'a [SubmodulePin],
+    /// A retry in a kept checkout: the earlier runs' excludes stay, since
+    /// their files are still there.
+    pub retry: bool,
 }
 
 /// How a setup run ended.
@@ -420,8 +557,11 @@ pub(super) async fn run(
 ) -> Ran {
     let dir = agent_dir(run.worktree);
     let excludes = excludes_dir(run.worktree);
-    // A fresh run's excludes replace any earlier run's.
-    let _ = std::fs::remove_dir_all(&excludes);
+    // A fresh checkout's excludes replace any earlier run's; a retry adds
+    // to them.
+    if !run.retry {
+        let _ = std::fs::remove_dir_all(&excludes);
+    }
     let before = untracked(run.worktree, run.pins).await;
     match serde_json::to_vec(&before) {
         Ok(body) => {
@@ -587,8 +727,15 @@ pub(super) fn unsent_notice(paths: &[String]) -> Option<String> {
     ))
 }
 
-/// The first turn's notice for a setup that did not complete.
-pub(super) fn failed_notice(status: &SetupStatus, worktree: &Path, tail: &str) -> Option<String> {
+/// The first turn's notice for a setup that did not complete; with
+/// `can_retry` (a link with the setup retry) it names
+/// `ws.workspace.retrySetup()`.
+pub(super) fn failed_notice(
+    status: &SetupStatus,
+    worktree: &Path,
+    tail: &str,
+    can_retry: bool,
+) -> Option<String> {
     if status.state != Recorded::Failed {
         return None;
     }
@@ -598,7 +745,7 @@ pub(super) fn failed_notice(status: &SetupStatus, worktree: &Path, tail: &str) -
             "the setup script timed out and was killed".to_owned()
         }
         (None, Some(error)) if error.starts_with(codes::INTERRUPTED) => {
-            "the setup script was stopped before it finished and did not run again".to_owned()
+            "the setup script was stopped before it finished".to_owned()
         }
         (None, error) => format!(
             "the setup script could not run ({})",
@@ -616,11 +763,16 @@ pub(super) fn failed_notice(status: &SetupStatus, worktree: &Path, tail: &str) -
     } else {
         format!(" Its last output:\n```\n{last}\n```\n")
     };
+    let next = if can_retry {
+        "Once you have fixed the cause, run it again in this checkout with \
+         ws.workspace.retrySetup(); if you cannot fix it, tell the user setup needs attention."
+    } else {
+        "Tell the user setup needs attention."
+    };
     Some(format!(
         "[System: workspace setup failed — {outcome}. It ran on this machine before you started; \
          its output is in {}.{quoted} The checkout may be missing tooling the script installs: \
-         read that output before diagnosing missing files, and tell the user setup needs \
-         attention.]",
+         read that output before diagnosing missing files. {next}]",
         log.display()
     ))
 }
@@ -673,7 +825,8 @@ async fn untracked(worktree: &Path, pins: &[SubmodulePin]) -> Vec<(Option<usize>
 
 /// Write each repository's excludes: the paths `after` lists that `before`
 /// did not, after the machine user's global excludes (the file replaces
-/// git's global excludes file for the push).
+/// git's global excludes file for the push). A file an earlier run of the
+/// same checkout wrote is kept, and the new paths are added to it.
 fn write_excludes(
     worktree: &Path,
     dir: &Path,
@@ -695,16 +848,27 @@ fn write_excludes(
         if new.is_empty() {
             continue;
         }
-        let mut body = global.clone();
+        let file = intent_git::node_git::exclude_file(dir, repo);
+        let mut body = match std::fs::read_to_string(&file) {
+            Ok(kept) => kept,
+            Err(_) => {
+                let mut body = global.clone();
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str("# Created by the workspace setup script on this machine\n");
+                body
+            }
+        };
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
-        body.push_str("# Created by the workspace setup script on this machine\n");
         for line in new {
-            body.push_str(&line);
-            body.push('\n');
+            if !body.lines().any(|kept| kept == line) {
+                body.push_str(&line);
+                body.push('\n');
+            }
         }
-        let file = intent_git::node_git::exclude_file(dir, repo);
         let written = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, body));
         if let Err(error) = written {
             tracing::warn!(%error, "node: could not record the setup files' excludes");
@@ -861,6 +1025,32 @@ mod tests {
         .unwrap();
         assert!(body.lines().any(|line| line == "/node_modules/"), "{body}");
         assert!(!body.contains("before.txt"), "{body}");
+    }
+
+    /// A retry adds its files to the excludes an earlier run of the same
+    /// checkout wrote: the earlier run's files are still there and must
+    /// stay out of `wip`.
+    #[test]
+    fn a_retrys_excludes_keep_the_earlier_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let work = repo(root.path());
+        let dir = excludes_dir(&work);
+        write_excludes(&work, &dir, &[], vec![(None, vec!["first-run".to_owned()])]);
+        let before = vec![(None, vec!["first-run".to_owned(), "agent-file".to_owned()])];
+        let after = vec![(
+            None,
+            vec![
+                "first-run".to_owned(),
+                "agent-file".to_owned(),
+                "second-run".to_owned(),
+            ],
+        )];
+        write_excludes(&work, &dir, &before, after);
+        let body = std::fs::read_to_string(intent_git::node_git::exclude_file(&dir, None)).unwrap();
+        assert!(body.lines().any(|line| line == "/first-run"), "{body}");
+        assert!(body.lines().any(|line| line == "/second-run"), "{body}");
+        assert!(!body.lines().any(|line| line == "/agent-file"), "{body}");
+        assert_eq!(body.matches("# Created by").count(), 1, "{body}");
     }
 
     #[test]

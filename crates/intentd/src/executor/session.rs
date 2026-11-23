@@ -14,7 +14,7 @@ use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
     MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, CHECKOUT_FILES_PROTOCOL,
     FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, HOMES_PROTOCOL, NODE_LINK_PROTOCOLS,
-    ONE_SHOT_PROTOCOL, SKILLS_PROTOCOL,
+    ONE_SHOT_PROTOCOL, SETUP_RETRY_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -399,6 +399,17 @@ pub(super) async fn serve_link(
                             error,
                         }))
                         .await;
+                });
+            }
+            // Runs a running agent's setup again in its kept checkout
+            // (nodeProtocol 21); answered once the run has started.
+            LinkEvent::Frame(LinkFrame::SetupRetry(retry)) if protocol >= SETUP_RETRY_PROTOCOL => {
+                let link = link.clone();
+                let runner = runner.clone();
+                // caller-binding: allow — answers one setup retry on its link
+                tokio::spawn(async move {
+                    let reply = runner.setup_retry(retry).await;
+                    let _ = link.send(&LinkFrame::SetupRetryReply(reply)).await;
                 });
             }
             // Reads a piece of an agent's checkout for another agent's pull

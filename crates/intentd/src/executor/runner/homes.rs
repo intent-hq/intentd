@@ -799,6 +799,7 @@ impl Runner {
                 tmp,
                 main_checkout: &main_checkout,
                 pins,
+                retry: false,
             },
             output,
             started_at,

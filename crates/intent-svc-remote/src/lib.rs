@@ -75,6 +75,7 @@ mod methods;
 pub mod order;
 mod quick_action;
 mod rpc;
+mod setup_retry;
 mod terminals;
 mod view {
     pub(crate) use intent_node_connections::view::*;

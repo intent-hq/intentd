@@ -1809,6 +1809,25 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { MachineSecretAnswer::Offline })
     }
 
+    /// Ask remote agent `agent_id`'s machine (the agent placed with `view`)
+    /// to run its setup script again in its kept checkout (`setupRetry`,
+    /// nodeProtocol 21) and wait for the answer: the run's status, `running`
+    /// with `startedAt`. The caller has checked the agent's own state.
+    ///
+    /// # Errors
+    ///
+    /// `machine-update-required` below nodeProtocol 21, the machine's
+    /// refusal, `machine-unreachable`; `setup-retry-not-remote` by default.
+    fn retry_setup<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        view: &'a RemotePlacementView,
+    ) -> BoxFuture<'a, Result<intent_core::remote_launch::RemoteSetupStatus>> {
+        let _ = (svc, agent_id, view);
+        Box::pin(async { Err(crate::remote_machine_ops::setup_retry_not_remote()) })
+    }
+
     /// The executor link to `agent_id`'s machine for its machine runs,
     /// connecting on demand.
     ///

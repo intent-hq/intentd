@@ -34,6 +34,7 @@ pub(crate) const PRELUDE: &str = r"
         setAgentName: (name) => host({ method: 'workspace.setAgentName', args: { name } }),
         archive: () => host({ method: 'workspace.archive' }),
         unarchive: () => host({ method: 'workspace.unarchive' }),
+        retrySetup: () => host({ method: 'workspace.retrySetup' }),
         proposeSibling: (params) =>
             host({ method: 'workspace.proposeSibling', args: params || {} }),
         applyProposal: (proposalId, options) =>
@@ -77,6 +78,7 @@ pub(crate) async fn dispatch(
         "setAgentName" => set_agent_name(api, caller_agent_id, args).await,
         "archive" => archive(api, ws, caller_agent_id).await,
         "unarchive" => unarchive(api, ws).await,
+        "retrySetup" => retry_setup(api, ws, caller_agent_id).await,
         "proposeSibling" => propose_sibling(api, ws, caller_agent_id, args).await,
         "applyProposal" => apply_proposal(api, ws, caller_agent_id, args).await,
         "context" => {
@@ -1104,6 +1106,33 @@ async fn set_status_image(
         "statusImageAssetId": saved.asset_id,
         "url": saved.url,
     }))
+}
+
+/// `ws.workspace.retrySetup()`: the calling remote agent's failed setup runs
+/// again in its checkout. Here (on the backend) the answer is the started
+/// run, `{ state: "running", startedAt }`; a remote agent's machine then
+/// waits for the result. A refusal reads `<code>: <message>`.
+async fn retry_setup(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+) -> Result<Value, String> {
+    let agent_id = caller_agent_id.cloned().ok_or_else(|| {
+        "ws.workspace.retrySetup is for an agent's own setup; no calling agent".to_string()
+    })?;
+    let answer =
+        api.agent_retry_setup(ws.clone(), agent_id)
+            .await
+            .map_err(|error| match &error {
+                Error::RemoteMachine(failure) => {
+                    match failure.data.get("code").and_then(Value::as_str) {
+                        Some(code) => format!("{code}: {}", failure.message),
+                        None => failure.message.clone(),
+                    }
+                }
+                _ => map_err(error),
+            })?;
+    Ok(answer.get("setup").cloned().unwrap_or(answer))
 }
 
 async fn set_agent_name(

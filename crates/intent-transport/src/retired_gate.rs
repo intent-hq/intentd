@@ -46,6 +46,7 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "agent.restore",
     "agent.retire",
     "agent.retry",
+    "agent.retrySetup",
     "agent.sendQueuedMessageNow",
     "agent.sendQueuedMessagesNow",
     "agent.sendToTask",

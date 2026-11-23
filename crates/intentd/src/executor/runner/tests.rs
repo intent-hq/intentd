@@ -3141,6 +3141,178 @@ async fn node_runner_stop_during_setup_kills_it_and_records_it_interrupted() {
     h.runner.stop(&AgentId::from("a1"));
 }
 
+/// A `setupRetry` for `id` with `script`.
+fn setup_retry(id: &str, script: &str) -> intent_core::node_link::SetupRetry {
+    intent_core::node_link::SetupRetry {
+        request_id: intent_core::node_link::LinkId::new_v4(),
+        agent_id: AgentId::from(id),
+        setup: intent_core::node_link::SetupCommand {
+            script: script.into(),
+            branch_name: "feat/x".into(),
+            source_branch: "main".into(),
+            timeout_secs: None,
+        },
+    }
+}
+
+/// Wait until `id` has journaled `count` `setupFinished` records; all of them.
+async fn wait_setups(runner: &Runner, id: &str, count: usize) -> Vec<JournalRecord> {
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let all = records(runner).await;
+        if all.iter().filter(|r| setup_finished(id)(r)).count() >= count {
+            return all;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id} never finished setup {count} times: {all:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The last `setupFinished` of `id`: state, exit code, error.
+fn last_finished(
+    all: &[JournalRecord],
+    id: &str,
+) -> (
+    intent_core::node_link::SetupState,
+    Option<i32>,
+    Option<String>,
+) {
+    match &all
+        .iter()
+        .rev()
+        .find(|r| setup_finished(id)(r))
+        .unwrap()
+        .body
+    {
+        JournalBody::SetupFinished {
+            state,
+            exit_code,
+            error,
+            ..
+        } => (*state, *exit_code, error.clone()),
+        _ => unreachable!(),
+    }
+}
+
+/// Setup retry (node-link.md § Setup retry): a running agent whose setup
+/// failed runs the retry's script again in the same kept checkout, with
+/// `setupStarted` / `setupFinished` journaled while it runs; the agent's
+/// turns go on. Once setup has completed, and for an agent that does not
+/// run here, the retry is refused with its code.
+#[tokio::test]
+async fn node_runner_retries_a_failed_setup_in_the_same_checkout() {
+    use intent_core::node_link::{setup_retry_codes, SetupRetryOutcome, SetupState};
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\n[ -f fixed ] || exit 3\necho fixed-now\n";
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    let all = records(&h.runner).await;
+    assert_eq!(finished(&all, "a1"), (SetupState::Failed, Some(3), None));
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    std::fs::write(worktree.join("fixed"), "").unwrap();
+
+    let reply = h.runner.setup_retry(setup_retry("a1", script)).await;
+    assert_eq!(reply.outcome, SetupRetryOutcome::Started, "{reply:?}");
+    assert!(reply.started_at.is_some(), "{reply:?}");
+    let all = wait_setups(&h.runner, "a1", 2).await;
+    assert_eq!(
+        last_finished(&all, "a1"),
+        (SetupState::Completed, Some(0), None)
+    );
+    assert_eq!(all.iter().filter(|r| setup_started("a1")(r)).count(), 2);
+    let start = all.iter().position(started("a1")).unwrap();
+    let again = all.iter().rposition(setup_started("a1")).unwrap();
+    assert!(
+        start < again,
+        "the retry runs while the agent does: {all:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("setup-runs.txt")).unwrap(),
+        "ran\nran\n",
+        "the same checkout"
+    );
+
+    // The agent still works, and its setup no longer needs a retry.
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    let done = h.runner.setup_retry(setup_retry("a1", script)).await;
+    assert_eq!(done.outcome, SetupRetryOutcome::Refused);
+    assert!(
+        done.error
+            .as_deref()
+            .unwrap()
+            .starts_with(setup_retry_codes::NOT_FAILED),
+        "{done:?}"
+    );
+    let unknown = h.runner.setup_retry(setup_retry("nobody", script)).await;
+    assert!(
+        unknown
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with(setup_retry_codes::NOT_RUNNING),
+        "{unknown:?}"
+    );
+    h.runner.stop(&AgentId::from("a1"));
+}
+
+/// A retry while one runs joins it (no second run); a stop during a retry
+/// kills the script's process group and journals `setupFinished` `failed`
+/// with `node-setup-interrupted` before the agent's exit.
+#[tokio::test]
+async fn node_runner_a_stop_during_a_setup_retry_records_it_interrupted() {
+    use intent_core::node_link::{SetupRetryOutcome, SetupState};
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\n[ -f slow ] || exit 3\nsleep 60 &\necho $! > child.pid\nwait\n";
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    std::fs::write(worktree.join("slow"), "").unwrap();
+    let first = h.runner.setup_retry(setup_retry("a1", script)).await;
+    assert_eq!(first.outcome, SetupRetryOutcome::Started, "{first:?}");
+    let joined = h.runner.setup_retry(setup_retry("a1", script)).await;
+    assert_eq!(joined.outcome, SetupRetryOutcome::Started, "{joined:?}");
+    assert_eq!(joined.started_at, first.started_at, "the same run");
+    let pid_file = worktree.join("child.pid");
+    let deadline = tokio::time::Instant::now() + wait();
+    let child: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retry never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    h.runner.stop(&AgentId::from("a1"));
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let (state, code, error) = last_finished(&all, "a1");
+    assert_eq!((state, code), (SetupState::Failed, None));
+    assert!(error.unwrap().starts_with("node-setup-interrupted: "));
+    let interrupted = all.iter().rposition(setup_finished("a1")).unwrap();
+    let exit = all.iter().position(exited("a1")).unwrap();
+    assert!(interrupted < exit, "{all:#?}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("setup-runs.txt")).unwrap(),
+        "ran\nran\n",
+        "one retry run"
+    );
+    assert_gone(child).await;
+}
+
 /// A stop while the machine makes a fresh checkout, before its setup
 /// starts, leaves a partial checkout. The next launch removes it, makes a
 /// fresh one and runs the setup script, instead of recording it

@@ -1256,6 +1256,15 @@ impl RemoteLaunchPort for RemoteLaunch {
         })
     }
 
+    fn retry_setup<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        view: &'a RemotePlacementView,
+    ) -> BoxFuture<'a, Result<RemoteSetupStatus>> {
+        Box::pin(crate::setup_retry::retry(svc, agent_id, view))
+    }
+
     fn machine_script_link<'a>(
         &'a self,
         svc: &'a Services,
