@@ -10627,8 +10627,17 @@ async fn worst_case_agent_list_row(
     // fill it to its cap through its own writer, with 4-byte characters (the
     // widest printable UTF-8): 1,000 characters serialize to ≈ 4,000 B.
     let goal = "\u{1F3AF}".repeat(intent_core::conversation_goal::MAX_CHARS);
+    // Its attribution at its caps: a principal id and both profile names
+    // at `SET_BY_NAME_CAP_BYTES` of `"`, the widest name a snapshot can hold
+    // once serialized (2 B per byte; control characters are stripped).
+    let name = "\"".repeat(intent_core::conversation_goal::SET_BY_NAME_CAP_BYTES);
+    let set_by = intent_core::conversation_goal::GoalSetBy {
+        principal_id: intent_core::PrincipalId::new().0,
+        display_name: Some(name.clone()),
+        login: Some(name),
+    };
     svc.store()
-        .set_agent_goal(ws, &s.id, None, Some(&goal))
+        .set_agent_goal(ws, &s.id, None, Some(&goal), Some(&set_by))
         .await
         .expect("goal");
     svc.store()

@@ -1045,6 +1045,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         effective_permission_policy: None,
         permission_policy: None,
         goal: None,
+        goal_set_by: None,
         metadata: AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,

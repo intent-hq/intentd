@@ -693,6 +693,39 @@ async fn state_writers(store: &Store, tenant: &str) {
     assert!(not_found(
         &store.set_agent_permission_policy(&w, &missing, None).await
     ));
+    // Conversation goal and its attribution: one compare-and-set write,
+    // read back on both projections, then cleared together.
+    let goal = format!("goal-{tenant}");
+    let set_by = intent_core::conversation_goal::GoalSetBy {
+        principal_id: format!("principal-{tenant}"),
+        display_name: Some(format!("Name {tenant}")),
+        login: None,
+    };
+    assert!(store
+        .set_agent_goal(&w, &a, None, Some(&goal), Some(&set_by))
+        .await
+        .unwrap());
+    assert!(!store
+        .set_agent_goal(&w, &a, None, Some("lost race"), None)
+        .await
+        .unwrap());
+    let summary = store.get_agent_session_summary(&a).await.unwrap();
+    assert_eq!(summary.goal.as_deref(), Some(goal.as_str()));
+    assert_eq!(summary.goal_set_by.as_ref(), Some(&set_by));
+    let full = store.get_agent_session_without_messages(&a).await.unwrap();
+    assert_eq!(full.goal_set_by.as_ref(), Some(&set_by));
+    assert!(store
+        .set_agent_goal(&w, &a, Some(&goal), None, None)
+        .await
+        .unwrap());
+    let summary = store.get_agent_session_summary(&a).await.unwrap();
+    assert_eq!(summary.goal, None);
+    assert_eq!(summary.goal_set_by, None);
+    assert!(not_found(
+        &store
+            .set_agent_goal(&w, &missing, None, Some("x"), None)
+            .await
+    ));
 
     let breakdown: PromptBreakdown = serde_json::from_value(json!({
         "harnessVersion": "1.0", "recordedAt": tenant, "systemPromptChars": 3,

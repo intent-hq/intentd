@@ -3876,6 +3876,10 @@ pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
 /// goal at the cap adds ≈ 1,010 B). A goal built from control characters
 /// (escaped as 6-byte `\u00XX`) could exceed this; that is not realistic
 /// input, and `agent.list` pages still stop at their 480,000-byte budget.
+/// Its `goalSetBy` attribution (a principal id plus two profile names, each
+/// capped at [`crate::conversation_goal::SET_BY_NAME_CAP_BYTES`], control
+/// characters stripped) adds at most ≈ 600 B and is included in the measured
+/// worst case.
 pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 11 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array
@@ -4040,6 +4044,7 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "permissionPolicy",
     "effectivePermissionPolicy",
     "goal",
+    "goalSetBy",
     "harnessVersion",
     "nodeId",
     "nodeName",
@@ -4797,6 +4802,12 @@ pub struct AgentSession {
     /// revert it. Rendered into every outbound turn prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// Who wrote [`Self::goal`] (PROTOCOL §5.5 "Conversation goal" →
+    /// "Attribution"); `None` when no goal is set, when the writer was not a
+    /// known principal, or for a goal written before the field existed.
+    /// Written only together with `goal` by the same narrow goal writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_set_by: Option<crate::conversation_goal::GoalSetBy>,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -4871,6 +4882,7 @@ impl Default for AgentSession {
             pinned: false,
             permission_policy: None,
             goal: None,
+            goal_set_by: None,
             harness_version: CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: String::new(),
@@ -5436,6 +5448,10 @@ pub struct AgentLite {
     /// this key's presence (PROTOCOL §5.5 "Conversation goal").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// Who wrote [`Self::goal`]; mirrors [`AgentSession::goal_set_by`].
+    /// Omitted when absent (PROTOCOL §5.5 "Conversation goal" → "Attribution").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_set_by: Option<crate::conversation_goal::GoalSetBy>,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -5590,6 +5606,7 @@ impl AgentLite {
             permission_policy: session.permission_policy,
             effective_permission_policy: None,
             goal: session.goal,
+            goal_set_by: session.goal_set_by,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             node_id: remote

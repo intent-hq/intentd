@@ -7405,6 +7405,7 @@ impl Services {
             pinned: false,
             permission_policy: None,
             goal: None,
+            goal_set_by: None,
             harness_version: harness_version.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),

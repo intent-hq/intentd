@@ -8,7 +8,7 @@
 
 use serde_json::{json, Value};
 
-use crate::{Error, Result};
+use crate::{Error, Principal, Result};
 
 /// The command token. Case-sensitive.
 pub const COMMAND: &str = "/goal";
@@ -32,6 +32,57 @@ pub const NO_GOAL_NOTICE: &str = "No goal set. Send /goal followed by what done 
 
 /// Notice text for a removed goal.
 pub const REMOVED_NOTICE: &str = "Goal removed.";
+
+/// Longest stored `goalSetBy.displayName` / `goalSetBy.login` snapshot, in
+/// bytes (cut back to a character boundary). Profile fields are not capped
+/// at the source, and the attribution rides every `agent.list` row, so the
+/// snapshot is bounded to keep the row inside
+/// [`crate::AGENT_LIST_ROW_BUDGET_BYTES`]. Real logins and display names are
+/// far shorter.
+pub const SET_BY_NAME_CAP_BYTES: usize = 128;
+
+/// Who wrote the current goal (PROTOCOL §5.5 "Conversation goal" →
+/// "Attribution"): the writer's principal id plus a `displayName` / `login`
+/// snapshot of its profile at write time. Stored as JSON in
+/// `agent_session.goal_set_by` and served as `goalSetBy`. Both name keys are
+/// always serialized (`null` when the profile had none).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalSetBy {
+    pub principal_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub login: Option<String>,
+}
+
+impl GoalSetBy {
+    /// The attribution snapshot of `principal`'s current profile, each name
+    /// stripped of control characters and capped at [`SET_BY_NAME_CAP_BYTES`].
+    #[must_use]
+    pub fn snapshot(principal: &Principal) -> Self {
+        Self {
+            principal_id: principal.id.0.clone(),
+            display_name: principal.display_name.as_deref().map(cap_name),
+            login: principal.login.as_deref().map(cap_name),
+        }
+    }
+}
+
+/// `name` without control characters (JSON escapes each as a 6-byte
+/// `\u00XX`, so they would inflate the served row), cut to at most
+/// [`SET_BY_NAME_CAP_BYTES`] bytes on a character boundary.
+fn cap_name(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    if name.len() <= SET_BY_NAME_CAP_BYTES {
+        return name;
+    }
+    let mut end = SET_BY_NAME_CAP_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
 
 /// A documented conversation-goal refusal (`-32602`, nothing changed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use intent_core::conversation_goal::{GoalError, MAX_CHARS, NO_GOAL_NOTICE};
 use intent_core::events::{AGENT_MESSAGE, AGENT_UPDATED};
-use intent_core::{AgentId, Error, Event, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    with_caller, AgentId, Caller, Error, Event, Principal, PrincipalId, WorkspaceApi, WorkspaceId,
+};
 use serde_json::{json, Value};
 
 use super::tests::{create_agent, setup_with_bus, workspace};
@@ -153,7 +155,7 @@ async fn set_goal_follows_the_action_table_without_touching_activity() {
             .await;
             assert_eq!(
                 updates(&events),
-                vec![json!({ "agentId": id.0, "goal": goal })]
+                vec![json!({ "agentId": id.0, "goal": goal, "goalSetBy": null })]
             );
             assert_eq!(message_ids(&events), vec![notice_id.to_string()]);
         } else {
@@ -225,30 +227,32 @@ async fn the_store_writer_is_compare_and_set() {
     let id = create_agent(&svc, &ws, "Goal").await;
     assert!(svc
         .store
-        .set_agent_goal(&ws, &id, None, Some("a"))
+        .set_agent_goal(&ws, &id, None, Some("a"), None)
         .await
         .unwrap());
     // A writer that observed "no goal" lost the race and must not write.
     assert!(!svc
         .store
-        .set_agent_goal(&ws, &id, None, Some("b"))
+        .set_agent_goal(&ws, &id, None, Some("b"), None)
         .await
         .unwrap());
     // Writing the stored value is a no-op.
     assert!(!svc
         .store
-        .set_agent_goal(&ws, &id, Some("a"), Some("a"))
+        .set_agent_goal(&ws, &id, Some("a"), Some("a"), None)
         .await
         .unwrap());
     assert!(svc
         .store
-        .set_agent_goal(&ws, &id, Some("a"), None)
+        .set_agent_goal(&ws, &id, Some("a"), None, None)
         .await
         .unwrap());
     assert_eq!(stored_goal(&svc, &id).await, None);
     let other = WorkspaceId::new();
     assert!(matches!(
-        svc.store.set_agent_goal(&other, &id, None, Some("x")).await,
+        svc.store
+            .set_agent_goal(&other, &id, None, Some("x"), None)
+            .await,
         Err(Error::NotFound(_))
     ));
 }
@@ -340,7 +344,7 @@ async fn goal_command_sets_shows_and_never_delivers() {
         let events = drain(&mut sub).await;
         assert_eq!(message_ids(&events), vec![notice_id.clone()]);
         let expected_updates = if matches!(action, "set" | "updated") {
-            vec![json!({ "agentId": id.0, "goal": goal })]
+            vec![json!({ "agentId": id.0, "goal": goal, "goalSetBy": null })]
         } else {
             Vec::new()
         };
@@ -642,4 +646,231 @@ async fn goal_notices_never_steal_a_concurrent_appends_seq() {
     let seqs: Vec<i64> = rows.iter().map(|m| m.seq).collect();
     let expected: Vec<i64> = (0..i64::try_from(rows.len()).unwrap()).collect();
     assert_eq!(seqs, expected, "unique, gap-free seq");
+}
+
+/// A collaborator principal with a profile, added to `ws`.
+async fn member(svc: &Services, ws: &WorkspaceId, login: &str, display: &str) -> PrincipalId {
+    let id = PrincipalId::new();
+    svc.store
+        .upsert_principal(&Principal {
+            id: id.clone(),
+            identity: None,
+            github_user_id: None,
+            login: Some(login.into()),
+            display_name: Some(display.into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: intent_core::now_iso(),
+            updated_at: intent_core::now_iso(),
+        })
+        .await
+        .unwrap();
+    svc.store
+        .add_workspace_member(ws, &id, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    id
+}
+
+fn as_principal(id: &PrincipalId) -> Caller {
+    Caller::Wire {
+        principal_id: id.clone(),
+        host_role: intent_core::HostRole::Guest,
+    }
+}
+
+fn set_by_json(id: &PrincipalId, login: &str, display: &str) -> Value {
+    json!({ "principalId": id.0, "displayName": display, "login": login })
+}
+
+/// The `goalSetBy` served on `agent.get` (`AgentLite`) and the
+/// `agent.getSession` session form, which must agree.
+async fn served_set_by(svc: &Services, ws: &WorkspaceId, id: &AgentId) -> Option<Value> {
+    let lite = serde_json::to_value(
+        svc.agent_get_op(id.clone(), Some(ws.clone()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let session =
+        serde_json::to_value(svc.agent_get_session_op(id.clone()).await.unwrap()).unwrap();
+    assert_eq!(lite.get("goalSetBy"), session.get("goalSetBy"));
+    lite.get("goalSetBy").cloned()
+}
+
+/// Attribution (§5.5 "Conversation goal" → "Attribution"): every write
+/// records its writer; a later writer replaces it; `unchanged` / `shown`
+/// keep it; it survives retire / restore; a clear removes it with the goal;
+/// and `agent:updated` carries it (`null` on remove).
+#[intent_test_macros::daemon_test]
+async fn goal_set_by_follows_the_last_writer() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    let alice = member(&svc, &ws, "alice", "Alice A").await;
+    let bob = member(&svc, &ws, "bob", "Bob B").await;
+    let alice_json = set_by_json(&alice, "alice", "Alice A");
+    let bob_json = set_by_json(&bob, "bob", "Bob B");
+    let mut sub = subscribe(&bus);
+
+    let set = with_caller(
+        as_principal(&alice),
+        svc.agent_set_goal_op(Some(ws.clone()), id.clone(), Some("Ship it".into())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(set["action"], "set");
+    assert_eq!(set["goalSetBy"], alice_json);
+    assert_eq!(
+        served_set_by(&svc, &ws, &id).await,
+        Some(alice_json.clone())
+    );
+
+    // Bob repeats the same text: `unchanged` keeps Alice; his `/goal` shows
+    // it with her attribution.
+    let same = with_caller(
+        as_principal(&bob),
+        svc.agent_set_goal_op(None, id.clone(), Some("Ship it".into())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(same["action"], "unchanged");
+    assert_eq!(same["goalSetBy"], alice_json);
+    let shown = with_caller(
+        as_principal(&bob),
+        svc.agent_goal_command_op(None, id.clone(), String::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shown["command"]["action"], "shown");
+    assert_eq!(shown["command"]["goalSetBy"], alice_json);
+    assert_eq!(
+        served_set_by(&svc, &ws, &id).await,
+        Some(alice_json.clone())
+    );
+
+    // Bob replaces it with a `/goal` command: now Bob.
+    let updated = with_caller(
+        as_principal(&bob),
+        svc.agent_goal_command_op(None, id.clone(), "Ship it twice".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated["command"]["action"], "updated");
+    assert_eq!(updated["command"]["goalSetBy"], bob_json);
+    assert_eq!(served_set_by(&svc, &ws, &id).await, Some(bob_json.clone()));
+
+    // Retire / restore keeps it with the goal.
+    svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .unwrap();
+    svc.agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_goal(&svc, &id).await.as_deref(),
+        Some("Ship it twice")
+    );
+    assert_eq!(served_set_by(&svc, &ws, &id).await, Some(bob_json.clone()));
+
+    // Alice clears it: the attribution goes with the goal.
+    let cleared = with_caller(
+        as_principal(&alice),
+        svc.agent_set_goal_op(None, id.clone(), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared["action"], "cleared");
+    assert!(cleared.get("goalSetBy").is_none(), "{cleared}");
+    assert_eq!(served_set_by(&svc, &ws, &id).await, None);
+
+    let goal_updates: Vec<Value> = updates(&drain(&mut sub).await)
+        .into_iter()
+        .filter(|u| u.get("goal").is_some())
+        .collect();
+    assert_eq!(
+        goal_updates,
+        vec![
+            json!({ "agentId": id.0, "goal": "Ship it", "goalSetBy": alice_json }),
+            json!({ "agentId": id.0, "goal": "Ship it twice", "goalSetBy": bob_json }),
+            json!({ "agentId": id.0, "goal": null, "goalSetBy": null }),
+        ]
+    );
+}
+
+/// A write with no resolvable principal (a daemon caller, or a wire
+/// principal with no stored profile) stores no attribution and replaces a
+/// previous writer's; `agent:updated` then carries `goalSetBy: null`.
+#[intent_test_macros::daemon_test]
+async fn goal_write_without_a_principal_stores_no_attribution() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    let alice = member(&svc, &ws, "alice", "Alice A").await;
+    with_caller(
+        as_principal(&alice),
+        svc.agent_set_goal_op(None, id.clone(), Some("First".into())),
+    )
+    .await
+    .unwrap();
+    let mut sub = subscribe(&bus);
+
+    let result = with_caller(
+        Caller::Daemon,
+        svc.agent_set_goal_op(None, id.clone(), Some("Second".into())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["action"], "updated");
+    assert!(result.get("goalSetBy").is_none(), "{result}");
+    assert_eq!(served_set_by(&svc, &ws, &id).await, None);
+    let command = with_caller(
+        Caller::Daemon,
+        svc.agent_goal_command_op(None, id.clone(), "Third".into()),
+    )
+    .await
+    .unwrap();
+    assert!(command["command"].get("goalSetBy").is_none(), "{command}");
+
+    let goal_updates: Vec<Value> = updates(&drain(&mut sub).await)
+        .into_iter()
+        .filter(|u| u.get("goal").is_some())
+        .collect();
+    assert_eq!(
+        goal_updates,
+        vec![
+            json!({ "agentId": id.0, "goal": "Second", "goalSetBy": null }),
+            json!({ "agentId": id.0, "goal": "Third", "goalSetBy": null }),
+        ]
+    );
+}
+
+/// The attribution is a store column written with the goal: it survives
+/// reopening the database, and full-row session writes never revert it.
+#[intent_test_macros::daemon_test]
+async fn goal_set_by_survives_reopen_and_full_row_writes() {
+    let (tmp, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Goal").await;
+    let alice = member(&svc, &ws, "alice", "Alice A").await;
+    let mut stale = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    with_caller(
+        as_principal(&alice),
+        svc.agent_set_goal_op(None, id.clone(), Some("Persist me".into())),
+    )
+    .await
+    .unwrap();
+    stale.name = "Renamed".into();
+    svc.store.update_agent_session(&ws, &stale).await.unwrap();
+    drop(svc);
+    let store = intent_store::Store::open(&tmp.path).await.unwrap();
+    let session = store.get_agent_session_summary(&id).await.unwrap();
+    assert_eq!(
+        session
+            .goal_set_by
+            .as_ref()
+            .map(|s| serde_json::to_value(s).unwrap()),
+        Some(set_by_json(&alice, "alice", "Alice A"))
+    );
 }

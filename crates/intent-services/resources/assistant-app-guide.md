@@ -1303,7 +1303,8 @@ without these goal controls sends **/goal** to the agent as an ordinary message,
 promise that **/goal** avoids starting a turn unless the user's app shows the goal
 controls. While a goal is set, the agent is reminded of it on every turn, and newer
 instructions from the user still take precedence. A goal is up to 1,000 characters, cannot carry attachments, survives
-restarts and is shared across devices. Agents cannot set a goal. Older versions may
+restarts and is shared across devices. Agents cannot set a goal. In a shared workspace the
+goal strip or chip also shows who set the goal. Older versions may
 differ: a backend without goal support delivers **/goal** to the agent as an ordinary
 message.
 

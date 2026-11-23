@@ -11525,6 +11525,7 @@ mod wsapi4_bindings_tests {
             effective_permission_policy: None,
             permission_policy: None,
             goal: None,
+            goal_set_by: None,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
@@ -15313,6 +15314,7 @@ mod workspace_apply_proposal_tests {
             effective_permission_policy: None,
             permission_policy: None,
             goal: None,
+            goal_set_by: None,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
