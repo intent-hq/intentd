@@ -36,7 +36,10 @@ async fn reply_becomes(
         }
     })
     .await;
-    assert!(reached.is_ok(), "the reply never contained {want:?}: {last}");
+    assert!(
+        reached.is_ok(),
+        "the reply never contained {want:?}: {last}"
+    );
     last
 }
 
@@ -45,7 +48,11 @@ async fn delta(events: &mut common::TlsWs, text: &str) {
     timeout(wait(), async {
         loop {
             let d = event(events, "chat:stream:delta").await;
-            if d["data"]["content"].as_str().unwrap_or_default().contains(text) {
+            if d["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(text)
+            {
                 return;
             }
         }
