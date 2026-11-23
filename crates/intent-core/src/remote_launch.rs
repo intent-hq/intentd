@@ -491,6 +491,8 @@ pub mod setup_retry {
     pub const NOT_FAILED: &str = "setup-retry-not-failed";
     /// It works in another agent's checkout or in a home.
     pub const SHARED_CHECKOUT: &str = "setup-retry-shared-checkout";
+    /// The workspace has no setup script now.
+    pub const NO_SCRIPT: &str = "setup-retry-no-script";
     /// A user's call while the agent runs a turn.
     pub const AGENT_BUSY: &str = "agent-busy";
     /// The agent does not run on its machine now.

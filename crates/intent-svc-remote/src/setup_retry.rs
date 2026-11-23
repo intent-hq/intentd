@@ -22,7 +22,7 @@ fn refusal(code: &str, message: impl Into<String>) -> Error {
 fn not_running() -> Error {
     refusal(
         setup_retry::AGENT_NOT_RUNNING,
-        "The agent is not running on its machine; start it (send it a message), then retry setup.",
+        "The agent is not running on its machine; send it a message, then retry setup once that turn ends.",
     )
 }
 
@@ -42,7 +42,7 @@ fn machine_refusal(error: &str) -> Error {
     match code {
         setup_retry_codes::NOT_RUNNING => refusal(
             setup_retry::AGENT_NOT_RUNNING,
-            format!("The agent is not running on its machine ({detail}); start it (send it a message), then retry setup."),
+            format!("The agent is not running on its machine ({detail}); send it a message, then retry setup once that turn ends."),
         ),
         setup_retry_codes::SHARED => refusal(
             setup_retry::SHARED_CHECKOUT,
@@ -92,7 +92,7 @@ pub(crate) async fn retry(
         .await?
         .ok_or_else(|| {
             refusal(
-                setup_retry::NOT_FAILED,
+                setup_retry::NO_SCRIPT,
                 "The workspace has no setup script now, so there is nothing to run.",
             )
         })?;

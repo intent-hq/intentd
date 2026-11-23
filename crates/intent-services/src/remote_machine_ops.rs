@@ -110,13 +110,21 @@ impl Services {
             )));
         }
         let view = RemotePlacementView::from_metadata(session.metadata.as_ref())
-            .filter(|view| view.setup.is_some())
             .ok_or_else(setup_retry_not_remote)?;
-        if view.shared_checkout_of.is_some() || view.home_checkout.is_some() {
+        if view.shared_checkout_of.is_some() {
             return Err(setup_retry_refusal(
                 setup_retry::SHARED_CHECKOUT,
-                "This agent works in another agent's checkout or the workspace home; retry setup on the agent that owns the checkout.",
+                "This agent works in another agent's checkout; retry setup on the agent that owns it.",
             ));
+        }
+        if view.home_checkout.is_some() {
+            return Err(setup_retry_refusal(
+                setup_retry::SHARED_CHECKOUT,
+                "This agent works in the workspace home, whose setup is the home's; it cannot be retried here.",
+            ));
+        }
+        if view.setup.is_none() {
+            return Err(setup_retry_not_remote());
         }
         let state = view.setup.as_ref().map(|setup| setup.state);
         if !matches!(
