@@ -48,6 +48,7 @@ mod home_exec;
 mod home_move;
 mod home_roots;
 mod home_stops;
+mod interrupt;
 mod homes;
 mod machine_order;
 mod node_invite;
