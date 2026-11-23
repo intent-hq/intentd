@@ -26,7 +26,7 @@ pub(crate) mod credential_tests;
 
 /// Secret-store account the device flow persists the token under — the first
 /// slot of the existing resolution chain (`intent_sourcecontrol::token`).
-pub(crate) const SECRET_ACCOUNT: &str = "sourceControl.github.token";
+pub(crate) const SECRET_ACCOUNT: &str = intent_sourcecontrol::token::SECRET_ACCOUNT;
 
 /// Env override for the GitHub login host the device flow talks to — the
 /// spawned-daemon test seam (e2e points it at a local mock).

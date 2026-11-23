@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 /// Secrets-store account/key for the GitHub token (`sourceControl.github.token`).
-/// Shared with [`crate::device_flow`], which writes/deletes this exact entry.
-pub(crate) const SECRET_ACCOUNT: &str = "sourceControl.github.token";
+/// Shared with [`crate::device_flow`], which writes/deletes this exact entry,
+/// and with the daemon's settings catalog, which saves it.
+pub const SECRET_ACCOUNT: &str = "sourceControl.github.token";
 /// Bounded wait for a secrets-store read before treating the entry as absent.
 /// A stalled backing store (e.g. a wedged filesystem) would otherwise block
 /// the caller indefinitely. Mirrors the read budget used by

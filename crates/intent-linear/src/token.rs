@@ -19,8 +19,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-/// Secrets-store account/key for the Linear API key (`linear.token`).
-const SECRET_ACCOUNT: &str = "linear.token";
+/// Secrets-store account/key, and settings path, of the Linear API key.
+pub const SECRET_ACCOUNT: &str = "linear.token";
 /// Bounded wait for a secrets-store read before treating the entry as absent.
 /// A stalled backing store (e.g. a wedged filesystem) would otherwise block
 /// the caller indefinitely. Mirrors the read budget used by
