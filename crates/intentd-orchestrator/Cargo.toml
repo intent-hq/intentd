@@ -1,0 +1,47 @@
+[package]
+name = "intentd-orchestrator"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "The multi-tenant Postgres orchestrator: one process serving several tenants, each under its own lease and self-fence; never shipped"
+# Not released or packaged: no release-plz entry, no cargo-dist artifact.
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+# The binary needs `--features postgres`. Off by default, so workspace builds
+# (`make check`, `make test`) never unify intent-store's Postgres backend into
+# the other crates; only the `store-postgres` CI job turns it on.
+[[bin]]
+name = "intentd-orchestrator"
+path = "src/main.rs"
+required-features = ["postgres"]
+
+[features]
+postgres = ["intent-store/postgres"]
+
+[dependencies]
+intent-app = { workspace = true }
+intent-core = { workspace = true }
+intent-services = { workspace = true }
+intent-store = { workspace = true }
+sha2 = "0.11"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+intent-store = { workspace = true, features = ["test-support"] }
+intentd-test-support = { path = "../intentd-test-support" }
+# The Postgres tests lock a lease row to stop renewals. No feature of its
+# own: `postgres` turns sqlx's Postgres driver on through intent-store.
+sqlx = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -13,7 +13,7 @@ holds if nothing below a feature reaches up into it:
   domain reaches the service through its traits, so neither depends on
   intent-services, a feature crate or intent-app.
 - Every other edge into an `intent-svc-*` crate or intent-app must be listed in
-  ALLOWED below: intent-app composes every feature, intentd depends on
+  ALLOWED below: intent-app composes every feature, intentd and intentd-orchestrator (the two binaries) depend on
   intent-app, and feature-to-feature edges are the ones in the split plan
   (agents -> providers, scm, runtime; transfer -> agents).
 
@@ -54,6 +54,9 @@ BELOW_SERVICES = ("intent-node-connections", "intent-node-link")
 ALLOWED = {
     (APP, FEATURE_PREFIX + "*"),
     ("intentd", APP),
+    # The multi-tenant orchestrator binary: a second composition root, one
+    # `intent_app::compose` per tenant.
+    ("intentd-orchestrator", APP),
     ("intent-svc-agents", "intent-svc-providers"),
     ("intent-svc-agents", "intent-svc-scm"),
     ("intent-svc-agents", "intent-svc-runtime"),
