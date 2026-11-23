@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.280] - 2026-11-23
+
+### 🚀 Features
+
+- *(cloud)* Report each provider's disk setting in cloudMachines.list ([#3710](https://github.com/intent-hq/intentd/pull/3710))
+
+### 🐛 Bug Fixes
+
+- *(store)* Number Postgres row_seq from a per-tenant counter ([#3642](https://github.com/intent-hq/intentd/pull/3642))
+- *(quota-failover)* The backup sees the user's message after a first-turn failover ([#3708](https://github.com/intent-hq/intentd/pull/3708))
+- Run remote setup after a launch stopped mid-checkout ([#3700](https://github.com/intent-hq/intentd/pull/3700))
+- *(secrets)* Route every secret reader through the tenant's SecretStore ([#3705](https://github.com/intent-hq/intentd/pull/3705))
+
+### 🔧 Refactor
+
+- *(settings)* Name the Sentry organization known path by its constant ([#3704](https://github.com/intent-hq/intentd/pull/3704))
+- *(node-connections)* Hand the domain a MachineConnection handle, not RemoteNode ([#3713](https://github.com/intent-hq/intentd/pull/3713))
+
+
 ## [0.11.279] - 2026-11-23
 
 ### 🚀 Features
