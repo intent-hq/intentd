@@ -46,7 +46,7 @@ struct Permit {
 
 #[derive(Clone)]
 pub struct Mutation {
-    _permit: Arc<Permit>,
+    permit: Arc<Permit>,
 }
 
 tokio::task_local! {
@@ -83,7 +83,7 @@ where
     let mut permits: Vec<Arc<Permit>> = ADMITTED
         .try_with(|admitted| admitted.borrow().iter().filter_map(Weak::upgrade).collect())
         .unwrap_or_default();
-    permits.extend(held.map(|mutation| mutation._permit));
+    permits.extend(held.map(|mutation| mutation.permit));
     let admitted = permits.iter().map(Arc::downgrade).collect();
     let ingress = intent_core::browser_message::current_ingress();
     let task = intent_core::caller::spawn_with_current_caller(async move {
@@ -142,7 +142,7 @@ impl WorkspaceMutations {
             .ok()
             .flatten()
         {
-            return Ok(Mutation { _permit: permit });
+            return Ok(Mutation { permit });
         }
         let entry = self.entry(id);
         let permit = entry
@@ -159,7 +159,7 @@ impl WorkspaceMutations {
             held.retain(|entry| entry.strong_count() > 0);
             held.push(Arc::downgrade(&permit));
         });
-        Ok(Mutation { _permit: permit })
+        Ok(Mutation { permit })
     }
 
     pub(crate) async fn delete(&self, id: &WorkspaceId) -> Deletion {
