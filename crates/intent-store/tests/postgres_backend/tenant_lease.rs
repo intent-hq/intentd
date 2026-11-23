@@ -401,6 +401,143 @@ async fn the_heartbeat_renews_and_reports_a_lost_lease() {
     assert!(matches!(*heartbeat.state().borrow(), LeaseState::Lost(_)));
 }
 
+/// The lease row's expiry has passed by the database clock.
+async fn lease_expired(admin: &PgPool, tenant: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT expires_at <= clock_timestamp() FROM tenant_lease WHERE tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_one(admin)
+    .await
+    .expect("read lease expiry")
+}
+
+/// The lease row's expiry, in epoch milliseconds.
+async fn lease_expiry_ms(admin: &PgPool, tenant: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM tenant_lease \
+         WHERE tenant_id = $1",
+    )
+    .bind(tenant)
+    .fetch_one(admin)
+    .await
+    .expect("read lease expiry")
+}
+
+#[tokio::test]
+async fn a_released_lease_is_claimed_at_once_with_the_next_epoch() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-release";
+    let (old, first) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    old.set_setting("userRules", "\"a\"").await.unwrap();
+
+    // Not while the claim still serves the tenant: its fence has not fired.
+    assert!(matches!(
+        old.release_tenant_lease(first.epoch).await,
+        Err(Error::InvalidParams(_))
+    ));
+    // Not a claim this process does not hold.
+    assert_not_owner(
+        old.release_tenant_lease(first.epoch + 1).await,
+        "a release at another epoch",
+    );
+    assert!(!lease_expired(&db.admin, tenant).await);
+
+    let fence = old.tenant_fence().expect("claimed");
+    fence.fire("stopping");
+    assert!(old.release_tenant_lease(first.epoch).await.unwrap());
+    assert!(lease_expired(&db.admin, tenant).await);
+    // The row still names the old claim until someone claims.
+    assert_eq!(
+        owner_rows(&db.admin, tenant).await,
+        (
+            Some(("proc-a".to_owned(), 1)),
+            (Some("proc-a".to_owned()), 1)
+        )
+    );
+
+    // Long before the 60 s TTL: another process claims at once, epoch + 1.
+    let (new, second) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .expect("a released lease is free at once");
+    assert_eq!(second.epoch, first.epoch + 1);
+    assert_eq!(
+        new.get_setting("userRules").await.unwrap().as_deref(),
+        Some("\"a\"")
+    );
+    new.set_setting("userRules", "\"b\"").await.unwrap();
+    assert_not_owner(
+        old.set_setting("userRules", "\"stale\"").await,
+        "the released owner's write",
+    );
+}
+
+#[tokio::test]
+async fn a_release_by_a_process_that_lost_the_lease_changes_nothing() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-release-lost";
+    let (old, first) = open_owned(&db.app, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    wait_for_expiry(&db.admin, tenant).await;
+    let (_new, second) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .unwrap();
+    let rows = owner_rows(&db.admin, tenant).await;
+    let expiry = lease_expiry_ms(&db.admin, tenant).await;
+    let before = tenant_rows(&db.admin, tenant).await;
+
+    old.tenant_fence().expect("claimed").fire("stopping");
+    assert!(
+        !old.release_tenant_lease(first.epoch).await.unwrap(),
+        "the lease is proc-b's now"
+    );
+    assert_eq!(owner_rows(&db.admin, tenant).await, rows);
+    assert_eq!(lease_expiry_ms(&db.admin, tenant).await, expiry);
+    assert_eq!(tenant_rows(&db.admin, tenant).await, before);
+    assert!(!lease_expired(&db.admin, tenant).await);
+    // So proc-b's lease still holds against a third claimant.
+    assert_not_owner(
+        open_owned(&db.app, tenant, "proc-c", LONG_TTL).await,
+        "a claim after a stale release",
+    );
+    assert_eq!(second.epoch, first.epoch + 1);
+}
+
+#[tokio::test]
+async fn the_heartbeat_releases_its_lease_after_the_fence_fired() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-release-heartbeat";
+    let (store, lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    let heartbeat = LeaseHeartbeat::spawn(
+        store.clone(),
+        &lease,
+        LONG_TTL,
+        postgres::LEASE_RENEW_INTERVAL,
+    );
+    assert!(matches!(
+        heartbeat.release().await,
+        Err(Error::InvalidParams(_))
+    ));
+    heartbeat.fence().fire("stopping");
+    assert!(heartbeat.release().await.unwrap());
+    assert!(lease_expired(&db.admin, tenant).await);
+    let (_next, next) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .expect("claimed at once");
+    assert_eq!(next.epoch, lease.epoch + 1);
+}
+
 #[tokio::test]
 async fn sqlite_stores_have_no_tenant_lease() {
     let (store, _dir) = sqlite_store().await;
@@ -410,6 +547,10 @@ async fn sqlite_stores_have_no_tenant_lease() {
     ));
     assert!(matches!(
         store.renew_tenant_lease(LONG_TTL).await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        store.release_tenant_lease(1).await,
         Err(Error::InvalidParams(_))
     ));
     // Writes need no claim on SQLite.

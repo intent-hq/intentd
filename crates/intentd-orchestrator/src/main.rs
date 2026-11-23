@@ -11,6 +11,9 @@
 //! Once [`DEFAULT_TENANT`] is served, its clients connect over the local
 //! socket and the WSS listener with `intentd`'s auth (see
 //! `intentd_orchestrator::listen` for the environment variables).
+//! On Ctrl-C or SIGTERM each tenant whose work stopped cleanly releases its
+//! lease, so a restart or standby takes it over at once instead of waiting
+//! out the TTL.
 
 use std::process::ExitCode;
 
@@ -22,6 +25,13 @@ use intentd_orchestrator::{
 
 /// Connections the shared pool keeps; each tenant writes through it.
 const POOL_CONNECTIONS: u32 = 16;
+
+/// Why [`stop_all`] fires every tenant's fence.
+const STOPPING: &str = "the orchestrator is stopping";
+
+/// How long one tenant's lease release may take on shutdown; past it the
+/// lease lapses after its TTL instead.
+const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -78,6 +88,10 @@ async fn run(url: String) -> Result<ExitCode, String> {
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
+    // Listen before any tenant opens: a signal during startup is then a
+    // clean stop once the tenants are up, not the default kill.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let pool = intent_store::postgres::connect(&url, POOL_CONNECTIONS)
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -130,7 +144,7 @@ async fn run(url: String) -> Result<ExitCode, String> {
         }
         tokio::select! {
             Some(tenant) = stopped.recv() => served.retain(|served| served.tenant() != tenant),
-            () = shutdown_signal() => {
+            () = &mut shutdown => {
                 tracing::info!("stopping every tenant");
                 return Ok(stop_all(&mut served, &mut stopped).await);
             }
@@ -186,45 +200,95 @@ fn on_stopped(
 }
 
 /// Ctrl-C, or SIGTERM on Unix (systemd, `docker stop`, Kubernetes): either
-/// stops every tenant before the process exits.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(term) => term,
-            Err(error) => {
-                tracing::warn!(%error, "SIGTERM cannot be handled; only Ctrl-C stops the tenants");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+/// stops every tenant before the process exits. On Unix both handlers are
+/// installed when this is called, not when the future is first polled.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let interrupt = signal(SignalKind::interrupt());
+    let term = signal(SignalKind::terminate());
+    async move {
+        match (interrupt, term) {
+            (Ok(mut interrupt), Ok(mut term)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = term.recv() => {}
+                }
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            (Ok(mut interrupt), Err(error)) => {
+                tracing::warn!(%error, "SIGTERM cannot be handled; only Ctrl-C stops the tenants");
+                interrupt.recv().await;
+            }
+            (Err(error), Ok(mut term)) => {
+                tracing::warn!(%error, "Ctrl-C cannot be handled; only SIGTERM stops the tenants");
+                term.recv().await;
+            }
+            (Err(error), Err(_)) => {
+                tracing::warn!(%error, "no stop signal can be handled");
+                std::future::pending::<()>().await;
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Ctrl-C: stops every tenant before the process exits.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Fire every tenant's fence and wait until every one stopped; an overrun
-/// exits from its watcher as soon as it is reported. The exit code.
+/// exits from its watcher as soon as it is reported, before any release.
+/// A tenant whose fence this call fired releases its lease once its work
+/// stopped; one already fenced (lease lost, a write met another owner)
+/// keeps it until the TTL. The exit code.
 async fn stop_all(
     served: &mut Vec<ServedTenant>,
     stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> ExitCode {
-    for tenant in served.iter() {
-        tenant.fence().fire("the orchestrator is stopping");
-    }
+    let ours: Vec<String> = served
+        .iter()
+        .filter(|tenant| tenant.fence().fire(STOPPING))
+        .map(|tenant| tenant.tenant().to_owned())
+        .collect();
     while !served.is_empty() {
         let Some(tenant) = stopped.recv().await else {
             break;
         };
-        served.retain(|served| served.tenant() != tenant);
+        let Some(at) = served.iter().position(|served| served.tenant() == tenant) else {
+            continue;
+        };
+        let done = served.swap_remove(at);
+        if ours.contains(&tenant) {
+            release(&done).await;
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// Release a cleanly stopped tenant's lease, within [`RELEASE_BUDGET`]; a
+/// failure only leaves the lease to lapse after its TTL.
+async fn release(tenant: &ServedTenant) {
+    let name = tenant.tenant();
+    match tokio::time::timeout(RELEASE_BUDGET, tenant.heartbeat().release()).await {
+        Ok(Ok(true)) => tracing::info!(tenant = name, "released the tenant lease"),
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                tenant = name,
+                "the tenant lease was no longer ours; nothing released"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(tenant = name, %error, "could not release the tenant lease");
+        }
+        Err(_) => tracing::warn!(
+            tenant = name,
+            budget_ms = RELEASE_BUDGET.as_millis(),
+            "releasing the tenant lease timed out; it lapses after its TTL"
+        ),
+    }
 }
 
 /// The orchestrator-mode proof the Postgres opener takes: this binary runs
