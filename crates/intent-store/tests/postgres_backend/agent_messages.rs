@@ -182,6 +182,26 @@ fn noise_png_base64(width: u32, height: u32) -> String {
     base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 
+// A turn that ended before any output leaves an empty `[]` row: not an
+// answer on either backend; a later real answer is.
+message_test!(empty_assistant_row_is_not_an_answer, |store, _tenant| {
+    let c1 = agent("c1");
+    store
+        .append_agent_message(&c1, "user", &text("q"), "2026-02-01T00:00:00Z")
+        .await
+        .unwrap();
+    store
+        .append_agent_message(&c1, "assistant", &json!([]), "2026-02-01T00:00:01Z")
+        .await
+        .unwrap();
+    assert!(!store.agent_has_assistant_message(&c1).await.unwrap());
+    store
+        .append_agent_message(&c1, "assistant", &text("a"), "2026-02-01T00:00:02Z")
+        .await
+        .unwrap();
+    assert!(store.agent_has_assistant_message(&c1).await.unwrap());
+});
+
 message_test!(messages_append_read_and_page, |store, tenant| {
     let a1 = agent("a1");
     assert_eq!(store.count_agent_messages(&a1).await.unwrap(), 0);
