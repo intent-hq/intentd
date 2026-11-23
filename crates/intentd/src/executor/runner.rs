@@ -2005,6 +2005,9 @@ impl Runner {
                 if settled.stopped {
                     Err(None)
                 } else {
+                    if agent.checkout_of.is_none() && agent.home.is_none() {
+                        setup::clear_pending(&cwd);
+                    }
                     let forge_notice = self.forge_notice(&agent);
                     let notice = super::checkout::first_turn_notice(
                         agent.new_machine.as_deref(),
@@ -2259,7 +2262,9 @@ impl Runner {
     /// setup `pending`, so a stop or restart before the script starts does
     /// not leave a kept checkout whose setup never runs. A kept checkout
     /// still `pending` is such a launch's partial checkout, where no agent
-    /// ran: it is removed, to be made fresh.
+    /// ran (every own launch drops `pending` before its agent starts, and
+    /// no sharer takes a `pending` checkout): it is removed, to be made
+    /// fresh.
     async fn pend_setup(&self, agent: &Agent) {
         let worktree = match self.inner.checkouts.worktree(&agent.id) {
             Ok(worktree) => worktree,
@@ -2269,7 +2274,7 @@ impl Runner {
             }
         };
         if self.inner.checkouts.existing(&agent.id).is_some() {
-            if !setup::read_status(&worktree).is_some_and(|s| s.state == setup::Recorded::Pending) {
+            if !setup::is_pending(&worktree) {
                 return;
             }
             self.inner.checkouts.discard_checkout(&agent.id).await;
@@ -2295,9 +2300,7 @@ impl Runner {
         stop: &mut oneshot::Receiver<()>,
     ) -> Settled {
         let own = agent.checkout_of.is_none() && agent.home.is_none();
-        let fresh = fresh
-            || (own
-                && setup::read_status(cwd).is_some_and(|s| s.state == setup::Recorded::Pending));
+        let fresh = fresh || (own && setup::is_pending(cwd));
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
                 Some(status) if status.state == setup::Recorded::Running => {
@@ -3009,7 +3012,9 @@ impl Runner {
             state.sweeping.contains(owner) || state.finalizing.contains_key(owner)
         };
         match self.inner.checkouts.existing(owner) {
-            Some(worktree) if !removing => Ok(Prepared {
+            // A checkout still `pending` is a partial one its owner's next
+            // launch replaces.
+            Some(worktree) if !removing && !setup::is_pending(&worktree) => Ok(Prepared {
                 worktree,
                 tmp: self.inner.checkouts.agent_tmp(agent_id)?,
                 unrestored: Vec::new(),

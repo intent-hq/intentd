@@ -81,6 +81,23 @@ async fn a_sharing_launch_without_the_owners_checkout_fails() {
     assert!(h.runner.running().is_empty());
 }
 
+/// An owner's partial checkout, still `pending` after a stop mid-checkout,
+/// is not ready to share: a sharing launch fails as without one, so the
+/// owner's next launch can replace it with no agent working there.
+#[tokio::test]
+async fn a_sharing_launch_refuses_the_owners_partial_checkout() {
+    let Some(h) = harness(2, &[]) else { return };
+    stop_mid_checkout(&h, "o1", "true\n").await;
+    h.runner.launch(sharing("c1", "o1")).await;
+    let all = wait_for(&h.runner, "exit", exited("c1")).await;
+    let error = exit_error(find(&all, exited("c1"))).unwrap();
+    assert!(
+        error.contains("the checkout of agent o1 is not on this machine"),
+        "{error}"
+    );
+    assert!(!all.iter().any(started("c1")), "{all:#?}");
+}
+
 /// A sharing agent's final stop pushes the owner's refs and leaves the
 /// owner's checkout; the owner's final stop stops the agents sharing it
 /// first, then removes the checkout.
