@@ -115,7 +115,10 @@ async fn run(url: String) -> Result<ExitCode, String> {
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
     for tenant in &tenants {
-        let mut opening = std::pin::pin!(serve_tenant(
+        // Boxed so the grace below takes ownership: a timed-out open (and
+        // the heartbeat it may already run) is dropped right there, not
+        // kept renewing while stop_all waits for the other tenants.
+        let mut opening = Box::pin(serve_tenant(
             pool.clone(),
             tenant,
             &data_dir,
@@ -127,7 +130,8 @@ async fn run(url: String) -> Result<ExitCode, String> {
             opened = &mut opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
             () = &mut shutdown => {
                 tracing::info!(tenant, "stopping every tenant during startup");
-                match tokio::time::timeout(OPEN_GRACE, opening).await {
+                let graced = tokio::time::timeout(OPEN_GRACE, opening).await;
+                match graced {
                     Ok(Ok(mut opened)) => {
                         watch(&mut opened, &stopped_tx);
                         served.push(opened);
