@@ -511,6 +511,64 @@ async fn a_release_by_a_process_that_lost_the_lease_changes_nothing() {
 }
 
 #[tokio::test]
+async fn a_release_after_expiry_keeps_the_earlier_expiry() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-release-expired";
+    let (old, first) = open_owned(&db.app, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    wait_for_expiry(&db.admin, tenant).await;
+    let expiry = lease_expiry_ms(&db.admin, tenant).await;
+    old.tenant_fence().expect("claimed").fire("stopping");
+    // Still this claim's lease (no one claimed): released, but never moved
+    // later than it already lapsed.
+    assert!(old.release_tenant_lease(first.epoch).await.unwrap());
+    assert_eq!(lease_expiry_ms(&db.admin, tenant).await, expiry);
+    let (_new, second) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .unwrap();
+    assert_eq!(second.epoch, first.epoch + 1);
+}
+
+/// A write that passed the fence before it fired is still open: the
+/// release waits for it to end, so it cannot land under the next owner.
+#[tokio::test]
+async fn a_release_waits_for_a_write_that_passed_the_fence() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-release-settle";
+    let (old, first) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    // The write takes the writer slot, then queues on the held row lock.
+    let holder = hold_writer_lock(&db.admin, tenant).await;
+    let writer = old.clone();
+    let write = tokio::spawn(async move { writer.set_setting("userRules", "\"late\"").await });
+    wait_for_lock_waiters(&db, 1).await;
+
+    old.tenant_fence().expect("claimed").fire("stopping");
+    let store = old.clone();
+    let mut pending = tokio::spawn(async move { store.release_tenant_lease(first.epoch).await });
+    // timing-guard: bounded window in which the release must stay blocked behind the open write
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut pending).await;
+    assert!(early.is_err(), "released while a write was still open");
+    assert!(!lease_expired(&db.admin, tenant).await);
+
+    holder.rollback().await.expect("release the writer lock");
+    // The queued write sees the fired fence once it holds the lock.
+    assert_not_owner(write.await.unwrap(), "the write behind the fence");
+    let released = tokio::time::timeout(test_timeout(Duration::from_secs(30)), pending)
+        .await
+        .expect("the release finishes once the write ended")
+        .unwrap();
+    assert!(released.unwrap());
+    assert!(lease_expired(&db.admin, tenant).await);
+}
+
+#[tokio::test]
 async fn the_heartbeat_releases_its_lease_after_the_fence_fired() {
     let Some(db) = test_db(false).await else {
         return;
