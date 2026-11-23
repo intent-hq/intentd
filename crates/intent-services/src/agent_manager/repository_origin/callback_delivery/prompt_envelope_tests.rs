@@ -1150,6 +1150,7 @@ async fn prompt_envelope_conversation_goal_block_order() {
                 &h.row.id,
                 None,
                 Some("Ship it.\nAll green."),
+                None,
             )
             .await
             .unwrap();

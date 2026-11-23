@@ -49,7 +49,7 @@ pub(crate) const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, 
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted, pinned, permission_policy, goal";
+    harness_features, retired_at, notifications_muted, pinned, permission_policy, goal, goal_set_by";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, \
     stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy, goal";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy, goal, goal_set_by";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -1062,6 +1062,30 @@ pub(crate) fn json_col_from_db(
     .transpose()
 }
 
+/// Encode the conversation goal attribution (0200) as its JSON TEXT form,
+/// `None` staying NULL.
+pub(crate) fn goal_set_by_to_db(
+    set_by: Option<&intent_core::conversation_goal::GoalSetBy>,
+) -> Result<Option<String>> {
+    set_by
+        .map(|v| {
+            serde_json::to_string(v)
+                .map_err(|e| Error::Internal(format!("encode goal_set_by failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the conversation goal attribution column.
+pub(crate) fn goal_set_by_from_db(
+    raw: Option<String>,
+) -> Result<Option<intent_core::conversation_goal::GoalSetBy>> {
+    raw.map(|s| {
+        serde_json::from_str(&s)
+            .map_err(|e| Error::Internal(format!("decode session column goal_set_by failed: {e}")))
+    })
+    .transpose()
+}
+
 /// Encode the `effort_levels` string array as its JSON TEXT form, `None`
 /// staying NULL. `serde_json` string-array encoding is deterministic, so the
 /// encoded form doubles as the change-detection comparand in
@@ -1084,7 +1108,7 @@ pub(crate) fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<St
     .transpose()
 }
 
-/// Bind the full 44-column `agent_session` insert value list onto `query`, in
+/// Bind the full 45-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1135,7 +1159,8 @@ fn bind_session_insert<'q>(
         .bind(i64::from(s.notifications_muted))
         .bind(i64::from(s.pinned))
         .bind(&s.permission_policy)
-        .bind(&s.goal))
+        .bind(&s.goal)
+        .bind(goal_set_by_to_db(s.goal_set_by.as_ref())?))
 }
 
 /// Per-session boolean user preferences. Each is written only by its narrow
@@ -2088,9 +2113,10 @@ impl Store {
         dispatch!(self, backend => backend.set_agent_permission_policy(workspace_id, id, policy).await)
     }
 
-    /// Compare-and-set the session's conversation goal (0199) — the store
-    /// side of `/goal` and `agent.setGoal` (PROTOCOL §5.5 "Conversation
-    /// goal"). Writes `goal` (`None` clears it) only while the stored value
+    /// Compare-and-set the session's conversation goal (0199) and its
+    /// attribution (0200) — the store side of `/goal` and `agent.setGoal`
+    /// (PROTOCOL §5.5 "Conversation goal"). Writes `goal` (`None` clears it)
+    /// and `goal_set_by` (`set_by`, NULL when `None`) in one statement only while the stored value
     /// still equals `expected` and differs from `goal`, so two concurrent
     /// writers can never both report the action they computed from the same
     /// old value. Returns `true` when the row changed; `false` when the
@@ -2109,8 +2135,10 @@ impl Store {
         id: &AgentId,
         expected: Option<&str>,
         goal: Option<&str>,
+        set_by: Option<&intent_core::conversation_goal::GoalSetBy>,
     ) -> Result<bool> {
-        dispatch!(self, backend => backend.set_agent_goal(workspace_id, id, expected, goal).await)
+        let set_by = goal_set_by_to_db(set_by)?;
+        dispatch!(self, backend => backend.set_agent_goal(workspace_id, id, expected, goal, set_by.as_deref()).await)
     }
 
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
@@ -2836,7 +2864,7 @@ impl crate::SqliteStore {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
@@ -2904,7 +2932,7 @@ impl crate::SqliteStore {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(
                 sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())),
@@ -4255,7 +4283,8 @@ impl crate::SqliteStore {
         // such a patch can never revert the user's mute. `pinned` (0180) is
         // the same kind of user toggle and is excluded on the same grounds,
         // as are `permission_policy` (0190) and the conversation `goal`
-        // (0199, written only by `Store::set_agent_goal`).
+        // (0199) with its `goal_set_by` (0200), written only by
+        // `Store::set_agent_goal`.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -4460,12 +4489,14 @@ impl crate::SqliteStore {
         id: &AgentId,
         expected: Option<&str>,
         goal: Option<&str>,
+        set_by: Option<&str>,
     ) -> Result<bool> {
         let rows = sqlx::query(
-            "UPDATE agent_session SET goal=? \
+            "UPDATE agent_session SET goal=?, goal_set_by=? \
              WHERE id=? AND workspace_id=? AND goal IS ? AND goal IS NOT ?",
         )
         .bind(goal)
+        .bind(set_by)
         .bind(&id.0)
         .bind(&workspace_id.0)
         .bind(expected)
@@ -6055,6 +6086,7 @@ fn map_session_row_with_heavy_cols(
         pinned: col::<i64>(row, "pinned")? != 0,
         permission_policy: col(row, "permission_policy")?,
         goal: col(row, "goal")?,
+        goal_set_by: goal_set_by_from_db(col(row, "goal_set_by")?)?,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,

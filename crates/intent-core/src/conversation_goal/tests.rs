@@ -147,3 +147,34 @@ fn goal_errors_carry_the_documented_message_and_data() {
     assert_eq!(err.code(), -32602);
     assert_eq!(err.to_string(), TOO_LONG_ERROR);
 }
+
+#[test]
+fn set_by_snapshot_caps_names_on_a_char_boundary_and_serializes_nulls() {
+    use super::{GoalSetBy, SET_BY_NAME_CAP_BYTES};
+    let mut principal = crate::Principal {
+        id: crate::PrincipalId("p-1".into()),
+        identity: None,
+        github_user_id: None,
+        login: None,
+        display_name: Some(format!("a{}", "\u{1F3AF}".repeat(SET_BY_NAME_CAP_BYTES))),
+        avatar_url: None,
+        is_primary: false,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let snapshot = GoalSetBy::snapshot(&principal);
+    let display = snapshot.display_name.as_deref().unwrap();
+    assert!(display.len() <= SET_BY_NAME_CAP_BYTES);
+    assert_eq!(display.len(), 1 + (SET_BY_NAME_CAP_BYTES - 1) / 4 * 4);
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap()["login"],
+        serde_json::Value::Null
+    );
+
+    principal.display_name = Some("Ada".into());
+    principal.login = Some("ada".into());
+    assert_eq!(
+        serde_json::to_value(GoalSetBy::snapshot(&principal)).unwrap(),
+        serde_json::json!({ "principalId": "p-1", "displayName": "Ada", "login": "ada" })
+    );
+}

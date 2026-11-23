@@ -4,12 +4,14 @@
 //! Both share one write path: validate, compare-and-set the stored goal
 //! through the narrow store writer (never advancing `updatedAt`), persist one
 //! transcript-only `goal_command` notice row outside any turn, and emit
-//! `agent:updated { agentId, goal }` when the stored goal changed. Nothing
+//! `agent:updated { agentId, goal, goalSetBy }` when the stored goal changed.
+//! Every write records its writer's principal as the goal's attribution
+//! (`goalSetBy`, "Attribution"), in the same atomic write as the goal. Nothing
 //! here wakes the agent, touches its queue, attention, unread or turn state,
 //! or revives an archived workspace. The per-turn prompt block is rendered
 //! by the harness in the turn envelope ([`Services::agent_conversation_goal`]).
 
-use intent_core::conversation_goal::{self, GoalAction, GoalError};
+use intent_core::conversation_goal::{self, GoalAction, GoalError, GoalSetBy};
 use intent_core::events::AGENT_UPDATED;
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use serde_json::{json, Value};
@@ -19,6 +21,9 @@ use crate::Services;
 /// Bound on compare-and-set retries when concurrent goal writers keep
 /// winning the race; each retry re-reads the stored goal.
 const MAX_GOAL_WRITE_ATTEMPTS: usize = 8;
+
+/// The stored goal and its attribution, as read before a write.
+type StoredGoal = (Option<String>, Option<GoalSetBy>);
 
 /// `NotFound` from a session lookup or write is the contract's
 /// `agent not found` (the agent is unknown or was deleted mid-call).
@@ -41,7 +46,7 @@ impl Services {
         &self,
         workspace_id: Option<&WorkspaceId>,
         agent_id: &AgentId,
-    ) -> Result<(WorkspaceId, Option<String>)> {
+    ) -> Result<(WorkspaceId, StoredGoal)> {
         if matches!(
             intent_core::caller::current_caller(),
             Some(intent_core::caller::Caller::Agent { .. })
@@ -79,28 +84,66 @@ impl Services {
         if workspace.retired_at.is_some() {
             return Err(crate::retire::retired_error(&session.workspace_id));
         }
-        Ok((session.workspace_id.clone(), session.goal.clone()))
+        Ok((
+            session.workspace_id.clone(),
+            (session.goal.clone(), session.goal_set_by.clone()),
+        ))
     }
 
-    /// Move the stored goal to `next`, starting from the observed `current`.
-    /// Returns the action and the goal after it. A compare-and-set lost to a
+    /// The attribution a goal write by the current caller records: the bound
+    /// wire principal (owner or collaborator, in every workspace) with a
+    /// snapshot of its profile. `None` for an agent, daemon or absent caller,
+    /// or a principal the store cannot resolve: such a write stores no
+    /// attribution.
+    async fn goal_writer(&self) -> Option<GoalSetBy> {
+        let principal_id = crate::principal_ops::attributed_caller_id()?;
+        match self.store.get_principal(&principal_id).await {
+            Ok(principal) => Some(GoalSetBy::snapshot(&principal)),
+            Err(e) => {
+                tracing::warn!(
+                    principal_id = %principal_id.0,
+                    error = %e,
+                    "conversation goal writer could not be resolved; storing no attribution"
+                );
+                None
+            }
+        }
+    }
+
+    /// Move the stored goal to `next`, starting from the observed `current`
+    /// goal and attribution. Returns the action and the goal and attribution
+    /// after it: a write stores the current caller's attribution with a set
+    /// or replaced goal and removes it with a cleared one; a non-writing
+    /// action keeps the stored attribution. A compare-and-set lost to a
     /// concurrent writer re-reads and recomputes, so the action always
     /// describes the write that actually landed.
     async fn write_goal(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-        mut current: Option<String>,
+        (mut current, mut current_set_by): StoredGoal,
         next: Option<String>,
-    ) -> Result<(GoalAction, Option<String>)> {
+    ) -> Result<(GoalAction, Option<String>, Option<GoalSetBy>)> {
+        let mut writer: Option<Option<GoalSetBy>> = None;
         for _ in 0..MAX_GOAL_WRITE_ATTEMPTS {
             let action = conversation_goal::write_action(current.as_deref(), next.as_deref());
             if !action.writes() {
-                return Ok((action, current));
+                return Ok((action, current, current_set_by));
             }
+            let set_by = match (&next, &writer) {
+                (None, _) => None,
+                (Some(_), Some(writer)) => writer.clone(),
+                (Some(_), None) => writer.insert(self.goal_writer().await).clone(),
+            };
             if self
                 .store
-                .set_agent_goal(workspace_id, agent_id, current.as_deref(), next.as_deref())
+                .set_agent_goal(
+                    workspace_id,
+                    agent_id,
+                    current.as_deref(),
+                    next.as_deref(),
+                    set_by.as_ref(),
+                )
                 .await
                 .map_err(agent_not_found)?
             {
@@ -109,10 +152,10 @@ impl Services {
                     workspace_id,
                     agent_id,
                     AGENT_UPDATED,
-                    json!({ "agentId": agent_id.0, "goal": next }),
+                    json!({ "agentId": agent_id.0, "goal": next, "goalSetBy": set_by }),
                 )
                 .await;
-                return Ok((action, next));
+                return Ok((action, next, set_by));
             }
             let stored = self
                 .store
@@ -120,6 +163,7 @@ impl Services {
                 .await
                 .map_err(agent_not_found)?;
             current.clone_from(&stored.goal);
+            current_set_by.clone_from(&stored.goal_set_by);
         }
         Err(Error::Internal(
             "the conversation goal kept changing concurrently; try again".to_string(),
@@ -201,10 +245,13 @@ impl Services {
     ) -> Result<Value> {
         let next = conversation_goal::normalize(goal.as_deref())?;
         let (workspace_id, current) = self.goal_target(workspace_id.as_ref(), &agent_id).await?;
-        let (action, goal) = self
+        let (action, goal, set_by) = self
             .write_goal(&workspace_id, &agent_id, current, next)
             .await?;
         let mut result = json!({ "action": action.as_str(), "goal": goal });
+        if let Some(set_by) = set_by {
+            result["goalSetBy"] = json!(set_by);
+        }
         if action.writes() {
             if let Some(id) = self
                 .notice_after_write(&workspace_id, &agent_id, action, goal.as_deref())
@@ -226,8 +273,8 @@ impl Services {
     ) -> Result<Value> {
         let next = conversation_goal::normalize(Some(&statement))?;
         let (workspace_id, current) = self.goal_target(workspace_id.as_ref(), &agent_id).await?;
-        let (action, goal) = match next {
-            None => (GoalAction::Shown, current),
+        let (action, goal, set_by) = match next {
+            None => (GoalAction::Shown, current.0, current.1),
             Some(next) => {
                 self.write_goal(&workspace_id, &agent_id, current, Some(next))
                     .await?
@@ -245,6 +292,9 @@ impl Services {
             )
         };
         let mut command = json!({ "name": "goal", "action": action.as_str(), "goal": goal });
+        if let Some(set_by) = set_by {
+            command["goalSetBy"] = json!(set_by);
+        }
         if let Some(id) = notice_id {
             command["noticeMessageId"] = json!(id);
         }

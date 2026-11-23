@@ -1322,6 +1322,10 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   provider) keeps its model / effort on legacy model-prefix or last-turn
 ///   evidence for the provider, else the selection is cleared so the target's defaults apply
 ///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
+///   The conversation `goal` and its `goal_set_by` attribution ride as-is:
+///   the attribution's source-daemon `principalId` matches no target member,
+///   so clients fall back to its `displayName` / `login` snapshot (PROTOCOL
+///   §5.5 "Conversation goal" → "Attribution").
 /// - **sandbox** (older archives only): never read — the table no longer
 ///   exists, so its rows file is skipped. The retired `agent_session`
 ///   sandbox link columns (`sandbox_id` / `sandbox_path` / `sandbox_branch`)

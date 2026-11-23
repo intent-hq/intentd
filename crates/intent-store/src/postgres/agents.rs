@@ -142,6 +142,7 @@ pub(super) fn map_session(row: &PgRow, heavy: bool) -> Result<AgentSession> {
         pinned: col::<i64>(row, "pinned")? != 0,
         permission_policy: col(row, "permission_policy")?,
         goal: col(row, "goal")?,
+        goal_set_by: crate::agent_repo::goal_set_by_from_db(col(row, "goal_set_by")?)?,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -402,7 +403,7 @@ fn statuses(list: &[AgentStatus]) -> Result<Vec<String>> {
     list.iter().map(enum_to_db).collect()
 }
 
-/// Bind the 41 [`SESSION_COLUMNS`] values as `$2..$42`.
+/// Bind the 42 [`SESSION_COLUMNS`] values as `$2..$43`.
 fn bind_session<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     s: &'q AgentSession,
@@ -449,7 +450,10 @@ fn bind_session<'q>(
         .bind(i64::from(s.notifications_muted))
         .bind(i64::from(s.pinned))
         .bind(&s.permission_policy)
-        .bind(&s.goal))
+        .bind(&s.goal)
+        .bind(crate::agent_repo::goal_set_by_to_db(
+            s.goal_set_by.as_ref(),
+        )?))
 }
 
 fn decode_totals(raw: Option<String>) -> Option<TokenUsageTotals> {
@@ -560,7 +564,7 @@ impl PgStore {
             "INSERT INTO agent_session (tenant_id, {SESSION_COLUMNS}) VALUES ($1, \
              $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
              $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, \
-             $36, $37, $38, $39, $40, $41, $42)"
+             $36, $37, $38, $39, $40, $41, $42, $43)"
         );
         Ok(bind_session(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(self.tenant()),
@@ -1900,16 +1904,17 @@ impl PgStore {
         id: &AgentId,
         expected: Option<&str>,
         goal: Option<&str>,
+        set_by: Option<&str>,
     ) -> Result<bool> {
         let tx = self.begin_write().await?;
         self.guarded_write(
             tx,
-            "UPDATE agent_session SET goal = $4 \
+            "UPDATE agent_session SET goal = $4, goal_set_by = $6 \
              WHERE tenant_id = $1 AND id = $2 AND workspace_id = $3 \
              AND goal IS NOT DISTINCT FROM $5 AND goal IS DISTINCT FROM $4",
             workspace_id,
             id,
-            &[goal, expected],
+            &[goal, expected, set_by],
         )
         .await
     }
