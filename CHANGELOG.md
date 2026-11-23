@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.277] - 2026-11-23
+
+### 🐛 Bug Fixes
+
+- *(cloud)* Restart a resumed E2B tunnel that never joins its relay ([#3679](https://github.com/intent-hq/intentd/pull/3679))
+
+
 ## [0.11.276] - 2026-11-23
 
 ### 🚀 Features
