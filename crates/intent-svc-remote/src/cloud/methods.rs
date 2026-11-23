@@ -875,7 +875,7 @@ async fn rename(feature: &RemoteFeature, svc: &Services, id: &str, old: &str, ne
                     crate::methods::publish_machine(
                         svc,
                         &renamed,
-                        live.as_ref().map(crate::RemoteNode::view),
+                        live.as_ref().map(|node| node.view()),
                     )
                     .await;
                 }
@@ -936,7 +936,7 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
         .iter()
         .map(|row| {
             let live = feature.running_node(&row.id);
-            crate::methods::machine_json(row, live.as_ref().map(crate::RemoteNode::view))
+            crate::methods::machine_json(row, live.as_ref().map(|node| node.view()))
         })
         .collect();
     Ok(json!({
@@ -1240,7 +1240,7 @@ async fn paused(feature: &RemoteFeature, svc: &Services, row: &ExposedMachine) -
     let paused = super::lifecycle::pause(svc, feature, &*client, &row.id).await?;
     let live = feature.running_node(&paused.id);
     Ok(json!({
-        "machine": crate::methods::machine_json(&paused, live.as_ref().map(crate::RemoteNode::view)),
+        "machine": crate::methods::machine_json(&paused, live.as_ref().map(|node| node.view())),
     }))
 }
 
