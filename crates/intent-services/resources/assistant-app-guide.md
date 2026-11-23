@@ -745,8 +745,8 @@ shows its plain name (no **(connected backend)**). An orchestrator's row shows a
 intentd is older than the app's shows an orange dot after its name. Hovering the name
 shows one plain-text tooltip with the row's details: **Host only: sends agents to runners**,
 the outdated version, agent load, **OS** and providers. On the host on screen it also lists
-**Hosts with access** (hosts that may run agents on it), and its **…** menu has **Revoke access
-for <host>** for each; there is no separate Hosts with access section. A saved host stays
+**Runner for** (hosts that may run agents on it), and its **…** menu has **Revoke access
+for <host>** for each; there is no separate Hosts with access section (older versions may differ). A saved host stays
 under Hosts even when it also runs agents for the current host. **Add host** under Hosts opens
 setup with the host choices (paste a link, enter details, **Install a host**); **Add runner**
 under Runners offers **Install a runner** and, when cloud runners can be added, the cloud
