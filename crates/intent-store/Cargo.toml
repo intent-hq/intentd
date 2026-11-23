@@ -31,7 +31,15 @@ test-support = []
 # includes it.
 # TLS: PlanetScale Neki only accepts TLS connections (rustls + ring, like the
 # rest of the workspace; webpki roots, so no system certificate store).
-postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
+# Tenant secrets (`postgres::TenantSecretStore`): XChaCha20-Poly1305 values,
+# keys zeroized on drop, and `block_in_place` for the synchronous secret trait.
+postgres = [
+    "sqlx/postgres",
+    "sqlx/tls-rustls-ring-webpki",
+    "dep:chacha20poly1305",
+    "dep:zeroize",
+    "tokio/rt-multi-thread",
+]
 
 [dependencies]
 intent-core = { workspace = true }
@@ -49,6 +57,8 @@ flate2 = "1.1.9"
 futures-util = "0.3"
 async-stream = "0.3"
 sha2 = "0.10"
+chacha20poly1305 = { version = "0.10", optional = true }
+zeroize = { version = "1.9", optional = true }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["fs"] }

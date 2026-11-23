@@ -60,6 +60,7 @@ pub use lease::{
     LEASE_TTL,
 };
 pub use neki_topology::{neki_topology_gap, NekiTopologyGap};
+pub use secrets::{SecretKeyring, TenantSecretStore, SECRET_KEY_LEN};
 
 mod agent_messages;
 mod agents;
@@ -90,6 +91,7 @@ mod read_seam;
 mod repositories;
 mod script_monitors;
 mod scripts;
+mod secrets;
 mod settings;
 mod tenant_registry;
 mod usage_metrics;

@@ -95,6 +95,28 @@ async fn round_trip(pool: PgPool) -> Result<(), String> {
     if seen != (Some("\"a\"".into()), Some("\"b\"".into())) {
         return Err(format!("tenants not isolated on Neki: {seen:?}"));
     }
+    // Tenant secrets: the row lands on the tenant's shard next to its
+    // `tenant_writer` row, which every secret write locks.
+    let keys = std::sync::Arc::new(
+        postgres::SecretKeyring::new("neki", &[0x5a; 32]).map_err(|e| e.to_string())?,
+    );
+    let mut stores = Vec::new();
+    for (store, value) in [(&a, "secret-a"), (&b, "secret-b")] {
+        let secrets =
+            postgres::TenantSecretStore::new(store, keys.clone()).map_err(|e| e.to_string())?;
+        secrets
+            .store("acct", value)
+            .await
+            .map_err(|e| e.to_string())?;
+        stores.push((secrets, value));
+    }
+    // Re-read both after both wrote, so neither write reached the other.
+    for (secrets, value) in &stores {
+        let seen = secrets.load("acct").await.map_err(|e| e.to_string())?;
+        if seen.as_deref() != Some(*value) {
+            return Err(format!("tenant secret not isolated on Neki: {seen:?}"));
+        }
+    }
     if a.daemon_id().await.map_err(|e| e.to_string())?
         == b.daemon_id().await.map_err(|e| e.to_string())?
     {
@@ -562,7 +584,8 @@ where
     dropped.map_err(|e| format!("drop the run's schema: {e}"))
 }
 
-#[tokio::test]
+// Multi-thread: the round trip opens tenant secret stores, which need it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migrations_and_tenant_round_trip_run_on_neki() {
     let Some(url) = neki_url("INTENT_STORE_NEKI_URL") else {
         return;
@@ -570,6 +593,21 @@ async fn migrations_and_tenant_round_trip_run_on_neki() {
     in_fresh_schema(&url, 2, false, round_trip)
         .await
         .expect("migrations and tenant round trip on Neki");
+}
+
+/// The round trip, tenant secrets included, in the sharded schema: in the
+/// topology-bound schema `migrate_bound` binds `tenant_secrets` with the
+/// other tenant tables, and in single-shard mode a secret write, which
+/// locks the tenant's `tenant_writer` row and writes its `tenant_secrets`
+/// row in one transaction, fails if the two are on different shards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_round_trip_with_secrets_runs_on_sharded_neki() {
+    let Some(url) = neki_url("INTENT_STORE_NEKI_SHARDED_URL") else {
+        return;
+    };
+    in_sharded_schema(&url, 2, true, round_trip)
+        .await
+        .expect("tenant round trip with secrets on sharded Neki");
 }
 
 /// Audit finding 1: eight processes increment one tenant's counter at once.
