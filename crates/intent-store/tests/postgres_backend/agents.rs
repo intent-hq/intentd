@@ -719,7 +719,8 @@ async fn state_writers(store: &Store, tenant: &str) {
         .await
         .unwrap());
     let summary = store.get_agent_session_summary(&a).await.unwrap();
-    assert_eq!((summary.goal, summary.goal_set_by), (None, None));
+    assert_eq!(summary.goal, None);
+    assert_eq!(summary.goal_set_by, None);
     assert!(not_found(
         &store
             .set_agent_goal(&w, &missing, None, Some("x"), None)
