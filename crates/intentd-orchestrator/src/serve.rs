@@ -153,18 +153,30 @@ impl ServedTenant {
     ///
     /// # Errors
     /// As [`crate::listen::start_client_listeners`].
+    ///
+    /// The listeners stop (and unbind) once the tenant's fence fires, so
+    /// clients stop reaching a process that no longer serves the tenant.
     #[cfg(unix)]
     pub async fn listen(
         &self,
         config: &crate::listen::ListenConfig,
     ) -> std::result::Result<crate::listen::ClientListeners, String> {
-        crate::listen::start_client_listeners(
+        let listeners = crate::listen::start_client_listeners(
             config,
             &self.services,
             &self.bus,
             self.runtime.connections(),
         )
-        .await
+        .await?;
+        let fence = self.fence.clone();
+        let stop = listeners.stopper();
+        let tenant = self.tenant.clone();
+        tokio::spawn(async move {
+            fence.fenced().await;
+            stop.stop().await;
+            tracing::info!(tenant, "the tenant is fenced: its client listeners stopped");
+        });
+        Ok(listeners)
     }
 
     /// The tenant's running work.

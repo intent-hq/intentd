@@ -13,8 +13,11 @@
 //!   `intentd serve --insecure` does: for local development only.
 //!
 //! Every accepted connection joins the tenant's
-//! [`ClientConnections`], so the tenant's self-fence closes it, and a
-//! connection accepted after the fence is closed at once.
+//! [`ClientConnections`], so the tenant's self-fence closes it; once the
+//! set is closed the listeners refuse new connections before serving them
+//! (WSS `503`, the socket drops them unread). Requests already running when
+//! the fence fires are not cancelled: the tenant's store fence refuses
+//! their writes (`NotOwner`), as for every other piece of the tenant's work.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -60,9 +63,6 @@ pub struct ListenConfig {
     pub ws_port: u16,
     pub tls_dir: PathBuf,
     pub insecure: bool,
-    /// The cap on outstanding slow-path RPCs across both listeners
-    /// (`server.maxOutstandingRpcs`); 0 is unlimited.
-    pub max_outstanding_rpcs: u32,
 }
 
 impl ListenConfig {
@@ -71,11 +71,7 @@ impl ListenConfig {
     ///
     /// # Errors
     /// When a set variable is not a valid value.
-    pub fn from_env(
-        var: impl Fn(&str) -> Option<String>,
-        data_dir: &Path,
-        max_outstanding_rpcs: u32,
-    ) -> Result<Self, String> {
+    pub fn from_env(var: impl Fn(&str) -> Option<String>, data_dir: &Path) -> Result<Self, String> {
         let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
         let socket_path = set(SOCKET_ENV).map_or_else(
             || data_dir.join("orchestrator.sock"),
@@ -105,7 +101,6 @@ impl ListenConfig {
             ws_port,
             tls_dir,
             insecure,
-            max_outstanding_rpcs,
         })
     }
 }
@@ -139,6 +134,10 @@ impl ConnectionSet for TenantConnections {
         let id = self.0.register(close)?;
         let connections = self.0.clone();
         Some(ConnectionGuard::new(move || connections.remove(id)))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 }
 
@@ -188,11 +187,33 @@ impl ServerPairingInfo for Pairing {
 /// The running client listeners. They serve until [`Self::stop`] or the
 /// end of the process; the tenant's fence closes their connections.
 pub struct ClientListeners {
-    ws: WsApiServer,
+    stop: ListenersStop,
     ws_port: u16,
     socket_path: PathBuf,
-    stop_socket: Option<tokio::sync::oneshot::Sender<()>>,
     socket: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+/// Stops both listeners; cheap to clone.
+#[derive(Clone)]
+pub struct ListenersStop {
+    ws: WsApiServer,
+    stop_socket: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl ListenersStop {
+    /// Stop accepting on both listeners and close their connections.
+    /// Idempotent.
+    pub async fn stop(&self) {
+        self.ws.stop().await;
+        let stop = self
+            .stop_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(stop) = stop {
+            let _ = stop.send(());
+        }
+    }
 }
 
 impl ClientListeners {
@@ -211,15 +232,19 @@ impl ClientListeners {
     /// The pinned SHA-256 certificate fingerprint; `None` when insecure.
     #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
-        self.ws.fingerprint()
+        self.stop.ws.fingerprint()
     }
 
-    /// Stop both listeners and close their connections.
+    /// A handle that stops both listeners.
+    #[must_use]
+    pub fn stopper(&self) -> ListenersStop {
+        self.stop.clone()
+    }
+
+    /// Stop both listeners, close their connections, and wait until the
+    /// local socket is gone.
     pub async fn stop(mut self) {
-        self.ws.stop().await;
-        if let Some(stop) = self.stop_socket.take() {
-            let _ = stop.send(());
-        }
+        self.stop.stop().await;
         let _ = (&mut self.socket).await;
     }
 }
@@ -238,7 +263,12 @@ pub async fn start_client_listeners(
 ) -> Result<ClientListeners, String> {
     let hook = ConnectionHook::new(Arc::new(TenantConnections(connections.clone())));
     let reverse = Arc::new(PrimaryReverseRegistry::new());
-    let limiter = RpcLimiter::new(config.max_outstanding_rpcs);
+    // The tenant's `server.maxOutstandingRpcs` (its own config.toml), across
+    // both listeners, as `intentd` caps its own.
+    let limiter = RpcLimiter::new(services.settings_registry().map_or(
+        intent_core::config::DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+        |registry| registry.snapshot().effective.server.max_outstanding_rpcs,
+    ));
     let api_services = Arc::new(services.clone());
     if let Err(error) = api_services.initialize_repository_wire().await {
         tracing::debug!(%error, "native repository context remains unavailable");
@@ -338,10 +368,12 @@ pub async fn start_client_listeners(
         "serving the default tenant's clients"
     );
     Ok(ClientListeners {
-        ws,
+        stop: ListenersStop {
+            ws,
+            stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
+        },
         ws_port,
         socket_path,
-        stop_socket: Some(stop_socket),
         socket,
     })
 }
