@@ -1840,6 +1840,20 @@ impl ForgeFetchModule {
 }
 
 impl LaunchCommand {
+    /// Fit [`Self::session_meta`] to the link `protocol` the launch goes out
+    /// on (dropped below [`SESSION_META_PROTOCOL`]) and say whether the
+    /// provider session then holds the agent's instructions as its system
+    /// prompt, so the first prompt needs no copy of them.
+    pub fn fit_session_meta(&mut self, protocol: u32) -> bool {
+        if protocol < SESSION_META_PROTOCOL {
+            self.session_meta = None;
+        }
+        self.session_meta
+            .as_ref()
+            .and_then(|meta| meta.new.as_ref())
+            .is_some_and(|meta| meta.contains_key("systemPrompt"))
+    }
+
     /// Whether [`Self::forge_fetch_modules`] may be used: empty, or with
     /// [`Self::forge_fetch`], each entry with a safe relative path and a
     /// safe key no other entry has, and a GitHub URL that is neither the root's

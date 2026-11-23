@@ -368,9 +368,11 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
 /// A remote agent's launch carries the provider session `_meta` a local
 /// session gets, for `session/new` and `session/load`. Claude Code: its
 /// instructions as the system prompt and `Task` denied on both, so its
-/// runtime reports the instructions as delivered. Codex: the thread title on
-/// `session/new` only, and the instructions still ride the first prompt. A
-/// link before nodeProtocol 21 gets none.
+/// runtime reports the instructions as delivered. `load` rides only after a
+/// disk resume, so the frame holds one copy of the prompt. Codex: the thread
+/// title on `session/new` only, and the instructions still ride the first
+/// prompt. A link before nodeProtocol 21 gets none. Each launch records
+/// where the instructions went, for a run reattached after a restart.
 #[tokio::test]
 async fn a_launch_carries_the_local_session_meta_from_protocol_21() {
     let (f, mut link, _machine) = fixture().await;
@@ -405,6 +407,19 @@ async fn a_launch_carries_the_local_session_meta_from_protocol_21() {
             })
             .await;
         assert_eq!(launch.provider, provider);
+        let recorded = store
+            .get_agent_session_summary(&agent)
+            .await
+            .unwrap()
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("remoteSessionPrompt").cloned());
+        let expected = provider == "claude-code" && !older;
+        assert_eq!(
+            recorded,
+            Some(serde_json::json!(if expected { "true" } else { "false" })),
+            "{provider} older={older}"
+        );
         if older {
             assert_eq!(launch.session_meta, None);
             assert!(!runtime.session_has_system_prompt());
@@ -419,19 +434,19 @@ async fn a_launch_carries_the_local_session_meta_from_protocol_21() {
             assert!(!runtime.session_has_system_prompt());
             continue;
         }
-        for opened in [meta.new.expect("new"), meta.load.expect("load")] {
-            assert_eq!(
-                opened["systemPrompt"], "REMOTE-INSTRUCTIONS-MARKER",
-                "{opened:?}"
-            );
-            assert!(
-                opened["claudeCode"]["options"]["disallowedTools"]
-                    .as_array()
-                    .is_some_and(|tools| tools.iter().any(|tool| tool == "Task")),
-                "{opened:?}"
-            );
-            assert!(!opened.contains_key("sessionTitle"), "{opened:?}");
-        }
+        let opened = meta.new.expect("new");
+        assert_eq!(
+            opened["systemPrompt"], "REMOTE-INSTRUCTIONS-MARKER",
+            "{opened:?}"
+        );
+        assert!(
+            opened["claudeCode"]["options"]["disallowedTools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "Task")),
+            "{opened:?}"
+        );
+        assert!(!opened.contains_key("sessionTitle"), "{opened:?}");
+        assert_eq!(meta.load, None, "no disk resume: no session/load");
         assert!(runtime.session_has_system_prompt());
     }
     f.node.shutdown();

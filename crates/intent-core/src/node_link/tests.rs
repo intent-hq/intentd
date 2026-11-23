@@ -2754,3 +2754,40 @@ fn exit_reasons_need_protocol_20_and_are_stripped_for_older_links() {
     assert!(plain.for_protocol(HOMES_PROTOCOL).is_none());
     assert_eq!(plain.min_protocol(), HOMES_PROTOCOL);
 }
+
+/// A launch keeps its provider session `_meta` only on a link of
+/// [`SESSION_META_PROTOCOL`] or later, and the session holds the
+/// instructions only when `new` carries `systemPrompt`.
+#[test]
+fn a_launch_fits_its_session_meta_to_the_link() {
+    let object = |value: Value| match value {
+        Value::Object(map) => map,
+        _ => unreachable!(),
+    };
+    let with = |new: Option<Value>| {
+        let mut command = labelled_launch(LaunchLabels::default());
+        command.session_meta = Some(Box::new(LaunchSessionMeta {
+            new: new.map(object),
+            load: None,
+        }));
+        command
+    };
+    let prompt = || Some(serde_json::json!({ "systemPrompt": "INSTRUCTIONS" }));
+
+    let mut current = with(prompt());
+    assert!(current.fit_session_meta(SESSION_META_PROTOCOL));
+    assert!(current.session_meta.is_some());
+
+    let mut older = with(prompt());
+    assert!(!older.fit_session_meta(SESSION_META_PROTOCOL - 1));
+    assert_eq!(older.session_meta, None);
+    let encoded = String::from_utf8(LinkFrame::Launch(older).encode().unwrap()).unwrap();
+    assert!(!encoded.contains("sessionMeta"), "{encoded}");
+
+    let mut titled = with(Some(serde_json::json!({ "sessionTitle": "Named" })));
+    assert!(!titled.fit_session_meta(SESSION_META_PROTOCOL));
+    assert!(titled.session_meta.is_some());
+
+    let mut none = labelled_launch(LaunchLabels::default());
+    assert!(!none.fit_session_meta(SESSION_META_PROTOCOL));
+}
