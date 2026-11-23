@@ -66,13 +66,26 @@ pub(crate) async fn resolve_source_control(
     if let Some(sc) = injected {
         return Ok(sc);
     }
-    // The identity reads' loopback-only API seam, so an e2e daemon's forge
-    // reads reach its mock and never api.github.com.
-    let mut settings = SourceControlSettings::default();
-    settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(None);
-    SourceControlRegistry::from_settings(&settings, secrets)
+    default_forge_registry(None, secrets)
         .await
         .map_err(map_sc_err)
+}
+
+/// The only place the daemon builds its forge client from default settings:
+/// it applies the API-base seam ([`crate::invite_ops::resolve_api_base_uri`]:
+/// `override_uri`, else `$INTENTD_GITHUB_API_BASE_URI`, loopback-or-https
+/// only), so a test daemon's forge reads reach its mock and never
+/// api.github.com with a fake token (intentd#3712). Returns the raw forge
+/// error so callers can tell `NotConfigured` apart.
+/// `default_forge_settings_lint` rejects any other default-settings or
+/// registry build.
+pub(crate) async fn default_forge_registry(
+    override_uri: Option<&str>,
+    secrets: &intent_core::SharedSecretStore,
+) -> std::result::Result<Arc<dyn SourceControl>, intent_sourcecontrol::Error> {
+    let mut settings = SourceControlSettings::default();
+    settings.github.api_base_url = crate::invite_ops::resolve_api_base_uri(override_uri);
+    SourceControlRegistry::from_settings(&settings, secrets).await
 }
 
 /// The workspace's forge repository ([`Workspace::repo`]) for its active

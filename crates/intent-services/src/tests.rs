@@ -18498,6 +18498,29 @@ pub(crate) mod pr {
         assert_eq!(err.code(), -32603);
     }
 
+    /// `sourceControl.getUser` for GitHub builds its forge client through the
+    /// shared default-registry resolver, so the API-base seam applies: a test
+    /// daemon's fake token reaches its mock, never api.github.com (before the
+    /// fix this read built `SourceControlSettings::default()` directly and
+    /// got "Bad credentials" from the real API).
+    #[intent_test_macros::daemon_test]
+    async fn source_control_get_user_github_honors_the_api_base_override() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_fake")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo"), "g1").await;
+        let svc = Services::new_isolated(store)
+            .with_secret_store(mem)
+            .with_github_api_base_uri(base);
+        let v = svc
+            .source_control_get_user("github".into(), None)
+            .await
+            .expect("getUser reads the mock");
+        assert_eq!(v["user"]["login"], "octocat", "{v}");
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_identity_proof_create_against_a_dead_host_is_unreachable() {
         let (_t, svc) = github_svc().await;
