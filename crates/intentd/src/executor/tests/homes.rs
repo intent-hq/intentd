@@ -135,7 +135,7 @@ async fn a_machine_that_may_not_hold_homes_reports_it_and_refuses_home_open() {
     let mut dialed = dial_link(&node.endpoint, leasing(1, Some(Vec::new())))
         .await
         .unwrap();
-    assert!(dialed.welcome.protocol >= HOMES_PROTOCOL);
+    intentd_test_support::assert_link_supports(dialed.welcome.protocol, HOMES_PROTOCOL);
     assert_eq!(dialed.welcome.capabilities.homes, Some(false));
     replay_complete(&mut dialed).await;
     dialed.link.send(&open(&home("h1"))).await.unwrap();
@@ -1178,7 +1178,7 @@ async fn a_home_run_runs_in_the_home_checkout_and_reports_its_exit() {
     let mut dialed = dial_link(&node.endpoint, session_hello(1, "s1", Vec::new()))
         .await
         .unwrap();
-    assert!(dialed.link.protocol() >= HOMES_PROTOCOL);
+    intentd_test_support::assert_link_supports(dialed.link.protocol(), HOMES_PROTOCOL);
     replay_complete(&mut dialed).await;
     opened_home(&mut dialed, &h1).await;
     let checkout = std::fs::canonicalize(worktree(dir.path(), &h1)).unwrap();
