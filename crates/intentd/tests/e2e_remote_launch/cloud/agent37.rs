@@ -427,6 +427,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         listed["providerKinds"],
         json!(["e2b", "northflank", "agent37", "vercel"])
     );
+    assert_eq!(listed["diskSettings"], disk_settings(), "{listed}");
 
     let saved = ok(
         &mut rpc_ws,

@@ -249,20 +249,57 @@ fn northflank_params(params: &Value) -> Result<NorthflankParams> {
     })
 }
 
-/// `diskGiB` for an entry of provider `kind`: a Northflank volume is
-/// 6-500 GiB, an Agent37 disk 4-100 GiB, and E2B takes none.
+/// The `diskGiB` limits of entries of provider `kind` (min, max, default):
+/// a Northflank volume is 6-500 GiB, an Agent37 disk 4-100 GiB; E2B and
+/// Vercel take none.
+fn disk_limits(kind: &str) -> Option<(u32, u32, u32)> {
+    match kind {
+        CLOUD_PROVIDER_NORTHFLANK => Some((MIN_DISK_GIB, 500, config::DEFAULT_DISK_GIB)),
+        CLOUD_PROVIDER_AGENT37 => Some((4, 100, config::DEFAULT_AGENT37_DISK_GIB)),
+        _ => None,
+    }
+}
+
+/// `cloudMachines.list` `diskSettings`: a `CloudDiskSetting` per kind that
+/// takes `diskGiB`.
+fn disk_settings() -> Value {
+    let mut settings = serde_json::Map::new();
+    for kind in CLOUD_PROVIDER_KINDS {
+        let Some((min, max, default)) = disk_limits(kind) else {
+            continue;
+        };
+        let mut setting = json!({ "minGiB": min, "maxGiB": max, "defaultGiB": default });
+        if kind == CLOUD_PROVIDER_AGENT37 {
+            let caps = |vm: bool| -> serde_json::Map<String, Value> {
+                CloudMachineSize::AGENT37
+                    .into_iter()
+                    .filter_map(|size| {
+                        Some((size.id().to_owned(), json!(size.agent37_max_disk_gib(vm)?)))
+                    })
+                    .collect()
+            };
+            setting["sizeMaxGiB"] = json!({ "default": caps(false), "vm": caps(true) });
+        }
+        settings.insert(kind.to_owned(), setting);
+    }
+    Value::Object(settings)
+}
+
+/// `diskGiB` for an entry of provider `kind`, within its [`disk_limits`].
 fn disk_param(params: &Value, kind: &str) -> Result<Option<u32>> {
     if params.get("diskGiB").is_none_or(Value::is_null) {
         return Ok(None);
     }
-    match kind {
-        CLOUD_PROVIDER_NORTHFLANK => range_param(params, "diskGiB", MIN_DISK_GIB, 500).map_err(|_| {
-            Error::InvalidParams(format!(
-                "diskGiB must be an integer {MIN_DISK_GIB}-500: a Northflank volume is at least {MIN_DISK_GIB} GiB"
+    match (kind, disk_limits(kind)) {
+        (CLOUD_PROVIDER_NORTHFLANK, Some((min, max, _))) => {
+            range_param(params, "diskGiB", min, max).map_err(|_| {
+                Error::InvalidParams(format!(
+                "diskGiB must be an integer {min}-{max}: a Northflank volume is at least {min} GiB"
             ))
-        }),
-        CLOUD_PROVIDER_AGENT37 => range_param(params, "diskGiB", 4, 100),
-        _ => Err(Error::InvalidParams(format!(
+            })
+        }
+        (_, Some((min, max, _))) => range_param(params, "diskGiB", min, max),
+        (_, None) => Err(Error::InvalidParams(format!(
             "diskGiB is a Northflank or Agent37 setting; a{} {} entry has none",
             if kind == CLOUD_PROVIDER_E2B { "n" } else { "" },
             intent_core::machines::cloud_provider_name(kind)
@@ -943,6 +980,7 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
         "providers": providers,
         "machines": machines,
         "providerKinds": CLOUD_PROVIDER_KINDS,
+        "diskSettings": disk_settings(),
     }))
 }
 
