@@ -49,6 +49,7 @@ mod home_move;
 mod home_roots;
 mod home_stops;
 mod homes;
+mod interrupt;
 mod machine_order;
 mod node_invite;
 mod orchestrator;
