@@ -743,10 +743,14 @@ adds the host to the window's host rail when the rail is on, shows it, and opens
 **Settings → Machines**. This computer's row reads **This computer**, and the host on screen
 shows its plain name (no **(connected backend)**). An orchestrator's row shows a hub icon after its name instead of a subtitle. A row whose
 intentd is older than the app's shows an orange dot after its name. Hovering the name
-shows one tooltip with the row's details: **Host only: sends agents to runners**, the
-outdated version, agent load, operating system and providers. A saved host stays under Hosts even
-when it also runs agents for the current host. **Set up a new machine** becomes **Set up a
-host or runner**, with **Install a host** and **Install a runner**.
+shows one plain-text tooltip with the row's details: **Host only: sends agents to runners**,
+the outdated version, agent load, **OS** and providers. On the host on screen it also lists
+**Hosts with access** (hosts that may run agents on it), and its **…** menu has **Revoke access
+for <host>** for each; there is no separate Hosts with access section. A saved host stays
+under Hosts even when it also runs agents for the current host. **Add host** under Hosts opens
+setup with the host choices (paste a link, enter details, **Install a host**); **Add runner**
+under Runners offers **Install a runner** and, when cloud runners can be added, the cloud
+providers.
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{MachineName,MachineOrderPlainRow}.svelte; packages/cloudlands-fe/src/features/remote-machines/{machine-order,start-on}.ts. -->
 <!-- Labs (SSH machine setup, desktop app only): describe only when the user asks about
 installing over SSH, and say it is Labs (turn on **SSH machine setup** in
@@ -1006,7 +1010,7 @@ say it is experimental and being removed, and suggest `@intent-hq/web` instead.
   another public tunnel.
 - If `intentd` is already running on the same machine when `intent-web` starts, it
   appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
-  other machines in **Settings → Machines → Add machine** with the host, port and token
+  other machines in **Settings → Machines → Add host** (older versions: **Add machine**) with the host, port and token
   from `intentd pair` on that machine, then check the fingerprint and choose
   **Confirm & connect**. With no machine yet, the browser shows **Add your first
   machine**.
