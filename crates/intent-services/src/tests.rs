@@ -20836,6 +20836,41 @@ pub(crate) mod pr {
         assert_eq!(forge.seen_get_pr.lock().unwrap().as_slice(), [42]);
     }
 
+    /// A created-PR retry waiting out a quota pause never holds daemon
+    /// shutdown: only each finite fetch and write is a drained store task.
+    #[tokio::test]
+    async fn store_writer_shutdown_does_not_wait_for_a_pending_created_pr_retry() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let forge = Arc::new(StubForge::default());
+        let svc = svc.with_source_control(forge.clone());
+        assert!(svc
+            .sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(600), false));
+        svc.spawn_link_created_prs(
+            &ws.id,
+            vec![(intent_sourcecontrol::RepoRef::new("o", "r"), 42)],
+        );
+        // The first attempt runs and defers; the retry then waits.
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
+        while svc.created_pr_retries.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no retry pending");
+            // timing-guard: poll interval until the claim is recorded
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            svc.shutdown_store_writers(),
+        )
+        .await
+        .expect("shutdown waited for the created-PR retry");
+        assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+    }
+
     /// A root without a detected GitHub repo is skipped before any forge call.
     #[tokio::test]
     async fn root_refresh_skips_without_detected_repo() {

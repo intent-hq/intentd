@@ -6735,31 +6735,19 @@ impl Services {
         }
         let services = self.clone();
         let workspace_id = workspace_id.clone();
-        let release = {
-            let pending = self.created_pr_retries.clone();
-            let workspace_id = workspace_id.clone();
-            let claimed = claimed.clone();
-            move || {
-                let mut pending = pending.lock().unwrap();
-                for (repo, n) in claimed {
-                    pending.remove(&(workspace_id.clone(), repo, n));
-                }
-            }
-        };
-        let spawned = self.store_tasks.spawn_draining(intent_core::with_caller(
-            intent_core::Caller::Daemon,
-            async move {
-                intent_sourcecontrol::traffic::with_caller(
-                    intent_sourcecontrol::traffic::Caller::GitRootRefresh,
-                    services.link_created_prs_with_retry(&workspace_id, claimed),
-                )
+        let pending = self.created_pr_retries.clone();
+        // The retry loop sleeps between attempts, so it is not a drained
+        // store task (shutdown would wait out every pause); each finite
+        // attempt is, and the loop stops once the store writers close.
+        intent_core::spawn_daemon(async move {
+            services
+                .link_created_prs_with_retry(&workspace_id, claimed.clone())
                 .await;
-                release();
-            },
-        ));
-        if spawned.is_none() {
-            tracing::debug!("PR refresh writers are shutting down; created PR not linked");
-        }
+            let mut pending = pending.lock().unwrap();
+            for (repo, n) in claimed {
+                pending.remove(&(workspace_id.clone(), repo, n));
+            }
+        });
     }
 
     async fn link_created_prs_with_retry(
@@ -6768,9 +6756,22 @@ impl Services {
         mut pending: Vec<(intent_sourcecontrol::RepoRef, u64)>,
     ) {
         for attempt in 1..=CREATED_PR_RETRY_ATTEMPTS {
-            pending = match self.link_created_prs(workspace_id, &pending).await {
-                Ok(deferred) => deferred,
-                Err(error) => {
+            let services = self.clone();
+            let attempt_workspace = workspace_id.clone();
+            let batch = pending.clone();
+            let Some(handle) = self.store_tasks.spawn_draining(intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                intent_sourcecontrol::traffic::with_caller(
+                    intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                    async move { services.link_created_prs(&attempt_workspace, &batch).await },
+                ),
+            )) else {
+                tracing::debug!("PR refresh writers are shutting down; created PR not linked");
+                return;
+            };
+            pending = match handle.await {
+                Ok(Ok(deferred)) => deferred,
+                Ok(Err(error)) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
                         %error,
@@ -6778,6 +6779,7 @@ impl Services {
                     );
                     return;
                 }
+                Err(_) => return,
             };
             if pending.is_empty() {
                 return;
@@ -6788,7 +6790,10 @@ impl Services {
                     .paused_remaining()
                     .unwrap_or_default()
                     .max(CREATED_PR_RETRY_DELAY);
-                tokio::time::sleep(wait).await;
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = self.store_tasks.closed() => return,
+                }
             }
         }
         tracing::warn!(
