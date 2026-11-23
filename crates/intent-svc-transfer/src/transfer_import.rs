@@ -1322,10 +1322,12 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   provider) keeps its model / effort on legacy model-prefix or last-turn
 ///   evidence for the provider, else the selection is cleared so the target's defaults apply
 ///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
-///   The conversation `goal` and its `goal_set_by` attribution ride as-is:
-///   the attribution's source-daemon `principalId` matches no target member,
-///   so clients fall back to its `displayName` / `login` snapshot (PROTOCOL
-///   §5.5 "Conversation goal" → "Attribution").
+///   The conversation `goal` rides as-is, but its `goal_set_by` attribution
+///   is nulled: its `principalId` names a source-daemon principal that could
+///   collide with (or be forged to match) a target member, the same reason
+///   the principal columns above are nulled, and an undecodable archive
+///   value must not reach the target (PROTOCOL §5.5 "Conversation goal" →
+///   "Attribution": no resolvable writer stores no attribution).
 /// - **sandbox** (older archives only): never read — the table no longer
 ///   exists, so its rows file is skipped. The retired `agent_session`
 ///   sandbox link columns (`sandbox_id` / `sandbox_path` / `sandbox_branch`)
@@ -1430,6 +1432,9 @@ fn transform_rows(
                     map.insert("acp_session_id".into(), serde_json::Value::Null);
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
+                    if map.contains_key("goal_set_by") {
+                        map.insert("goal_set_by".into(), serde_json::Value::Null);
+                    }
                     for retired in ["sandbox_id", "sandbox_path", "sandbox_branch"] {
                         map.remove(retired);
                     }
@@ -1728,6 +1733,33 @@ mod tests {
         let row = &find(&outcome, "workspace")[0];
         assert!(row.get("owner_principal_id").is_none());
         assert!(row.get("legacy_author_principal_id").is_none());
+    }
+
+    /// The goal attribution names a source-daemon principal that could match
+    /// a target member, so the import keeps the goal and nulls `goal_set_by`;
+    /// archives predating the column import untouched.
+    #[test]
+    fn transform_keeps_goal_and_nulls_goal_set_by() {
+        let set_by = serde_json::json!({"principalId":"principal-target-member","displayName":"Forged","login":null});
+        let outcome = transform_one(
+            "agent_session",
+            serde_json::json!({
+                "id": "agent-import",
+                "status": "idle",
+                "goal": "ship it",
+                "goal_set_by": set_by.to_string(),
+            }),
+        );
+        let row = &find(&outcome, "agent_session")[0];
+        assert_eq!(row["goal"], "ship it");
+        assert_eq!(row["goal_set_by"], serde_json::Value::Null);
+
+        let outcome = transform_one(
+            "agent_session",
+            serde_json::json!({ "id": "agent-import", "status": "idle" }),
+        );
+        let row = &find(&outcome, "agent_session")[0];
+        assert!(row.get("goal_set_by").is_none());
     }
 
     #[test]

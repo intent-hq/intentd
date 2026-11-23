@@ -1076,14 +1076,20 @@ pub(crate) fn goal_set_by_to_db(
 }
 
 /// Decode the conversation goal attribution column.
+///
+/// The attribution is display-only and can arrive from a transfer archive, so
+/// a value that does not decode (wrong shape, or a future field rename) reads
+/// as no attribution instead of failing the whole session read.
 pub(crate) fn goal_set_by_from_db(
     raw: Option<String>,
-) -> Result<Option<intent_core::conversation_goal::GoalSetBy>> {
-    raw.map(|s| {
-        serde_json::from_str(&s)
-            .map_err(|e| Error::Internal(format!("decode session column goal_set_by failed: {e}")))
+) -> Option<intent_core::conversation_goal::GoalSetBy> {
+    raw.and_then(|s| match serde_json::from_str(&s) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "ignoring undecodable session column goal_set_by");
+            None
+        }
     })
-    .transpose()
 }
 
 /// Encode the `effort_levels` string array as its JSON TEXT form, `None`
@@ -6086,7 +6092,7 @@ fn map_session_row_with_heavy_cols(
         pinned: col::<i64>(row, "pinned")? != 0,
         permission_policy: col(row, "permission_policy")?,
         goal: col(row, "goal")?,
-        goal_set_by: goal_set_by_from_db(col(row, "goal_set_by")?)?,
+        goal_set_by: goal_set_by_from_db(col(row, "goal_set_by")?),
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -22359,5 +22365,61 @@ mod tests {
             best = best.min(t.elapsed().as_secs_f64());
         }
         println!("fts-only floor: best {best:.3}s");
+    }
+
+    /// A `goal_set_by` value that does not decode (for example one carried
+    /// in by a transfer archive) reads as no attribution: the session itself
+    /// stays readable on every projection.
+    #[tokio::test]
+    async fn undecodable_goal_set_by_reads_as_none() {
+        let tmp = TempDb::new("goal-set-by-decode");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = intent_core::now_iso();
+        let ws = intent_core::WorkspaceId("ws-goal-set-by".to_string());
+        store
+            .insert_workspace(&intent_core::Workspace {
+                id: ws.clone(),
+                title: "Test".to_string(),
+                branch: "main".to_string(),
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("insert workspace");
+        let agent = AgentId(format!("agent-{}", uuid::Uuid::new_v4()));
+        store
+            .insert_agent_session(&AgentSession {
+                id: agent.clone(),
+                workspace_id: ws.clone(),
+                name: "Owner".to_string(),
+                status: intent_core::AgentStatus::Idle,
+                created_at: ts.clone(),
+                updated_at: ts,
+                ..Default::default()
+            })
+            .await
+            .expect("insert session");
+        for bad in ["{}", r#"{"principal":"renamed"}"#, "not json"] {
+            sqlx::query("UPDATE agent_session SET goal='g', goal_set_by=? WHERE id=?")
+                .bind(bad)
+                .bind(&agent.0)
+                .execute(store.write_pool())
+                .await
+                .expect("plant goal_set_by");
+            let summary = store
+                .get_agent_session_summary(&agent)
+                .await
+                .expect("summary");
+            assert_eq!(summary.goal.as_deref(), Some("g"), "{bad}");
+            assert_eq!(summary.goal_set_by, None, "{bad}");
+            let full = store
+                .get_agent_session_without_messages(&agent)
+                .await
+                .expect("full row");
+            assert_eq!(full.goal_set_by, None, "{bad}");
+            let listed = store.list_agent_session_summaries(&ws).await.expect("list");
+            assert_eq!(listed.len(), 1, "{bad}");
+        }
     }
 }

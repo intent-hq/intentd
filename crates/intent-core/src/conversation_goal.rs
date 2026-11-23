@@ -58,7 +58,7 @@ pub struct GoalSetBy {
 
 impl GoalSetBy {
     /// The attribution snapshot of `principal`'s current profile, each name
-    /// capped at [`SET_BY_NAME_CAP_BYTES`].
+    /// stripped of control characters and capped at [`SET_BY_NAME_CAP_BYTES`].
     #[must_use]
     pub fn snapshot(principal: &Principal) -> Self {
         Self {
@@ -69,11 +69,13 @@ impl GoalSetBy {
     }
 }
 
-/// `name` cut to at most [`SET_BY_NAME_CAP_BYTES`] bytes on a character
-/// boundary.
+/// `name` without control characters (JSON escapes each as a 6-byte
+/// `\u00XX`, so they would inflate the served row), cut to at most
+/// [`SET_BY_NAME_CAP_BYTES`] bytes on a character boundary.
 fn cap_name(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
     if name.len() <= SET_BY_NAME_CAP_BYTES {
-        return name.to_string();
+        return name;
     }
     let mut end = SET_BY_NAME_CAP_BYTES;
     while !name.is_char_boundary(end) {

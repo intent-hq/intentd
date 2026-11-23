@@ -3877,8 +3877,9 @@ pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
 /// (escaped as 6-byte `\u00XX`) could exceed this; that is not realistic
 /// input, and `agent.list` pages still stop at their 480,000-byte budget.
 /// Its `goalSetBy` attribution (a principal id plus two profile names, each
-/// capped at [`crate::conversation_goal::SET_BY_NAME_CAP_BYTES`]) adds at
-/// most ≈ 340 B and is included in the measured worst case.
+/// capped at [`crate::conversation_goal::SET_BY_NAME_CAP_BYTES`], control
+/// characters stripped) adds at most ≈ 600 B and is included in the measured
+/// worst case.
 pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 11 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array

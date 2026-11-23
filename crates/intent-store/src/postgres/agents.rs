@@ -142,7 +142,7 @@ pub(super) fn map_session(row: &PgRow, heavy: bool) -> Result<AgentSession> {
         pinned: col::<i64>(row, "pinned")? != 0,
         permission_policy: col(row, "permission_policy")?,
         goal: col(row, "goal")?,
-        goal_set_by: crate::agent_repo::goal_set_by_from_db(col(row, "goal_set_by")?)?,
+        goal_set_by: crate::agent_repo::goal_set_by_from_db(col(row, "goal_set_by")?),
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
