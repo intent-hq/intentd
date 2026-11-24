@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.288] - 2026-11-24
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* Serve system.status on the client listeners ([#3736](https://github.com/intent-hq/intentd/pull/3736))
+- *(orchestrator)* Wait out a live tenant lease at start instead of exiting ([#3737](https://github.com/intent-hq/intentd/pull/3737))
+- *(agent)* A new message after a failed turn carries the failed one ([#3739](https://github.com/intent-hq/intentd/pull/3739))
+- Interrupt and preempt cancel on the live runtime's session ([#3738](https://github.com/intent-hq/intentd/pull/3738))
+
+### 🧪 Testing
+
+- Make node-test-agent directives whole-prompt @ commands ([#3735](https://github.com/intent-hq/intentd/pull/3735))
+
+
 ## [0.11.287] - 2026-11-24
 
 ### 🐛 Bug Fixes
