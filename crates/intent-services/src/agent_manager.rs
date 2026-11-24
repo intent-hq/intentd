@@ -8692,14 +8692,14 @@ impl AgentManager {
         options: &TurnOptions,
         mut claim: TurnSlotClaim,
     ) {
-        // A cancelled failure path must not overwrite the `Error` it persists.
-        claim.persist_idle = false;
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
         if self.is_shutting_down() || !self.owns_admission(agent_id, claim.admission()) {
             claim.hand_off();
             return;
         }
+        // A cancelled failure path must not overwrite the `Error` it persists.
+        claim.persist_idle = false;
         handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
         self.release_in_flight_slot(agent_id);
         claim.hand_off();
@@ -8711,8 +8711,9 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         entries: Vec<QueuedMessage>,
         draining: DrainingGuard,
-        admission: TurnAdmission,
+        claim: &mut TurnSlotClaim,
     ) -> FlushPrep {
+        let admission = claim.admission();
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
         if self.is_shutting_down() {
@@ -8728,7 +8729,8 @@ impl AgentManager {
         }
         // Flush preparation can requeue entries and persist Error on append
         // failure. Order all of those effects before retirement detaches.
-        prepare_flush_turn(self, agent_id, workspace_id, entries, draining).await
+        prepare_flush_turn_claimed(self, agent_id, workspace_id, entries, draining, Some(claim))
+            .await
     }
 
     /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
@@ -10057,7 +10059,7 @@ impl AgentManager {
         // STAB-52 gate holds for `agent.retry`. Under the archived-workspace
         // exemption only a user-origin entry may drain; the normal path
         // claims first, then pops the queue head (or a flush batch).
-        let claim;
+        let mut claim;
         let dequeued = if redrive_error_park {
             let Some((popped, claimed)) = self
                 .try_begin_recovery_redrive(&agent_id, &workspace_id)
@@ -10096,7 +10098,7 @@ impl AgentManager {
                         &workspace_id,
                         batch,
                         draining,
-                        claim.admission(),
+                        &mut claim,
                     )
                     .await
                 {
@@ -10564,7 +10566,7 @@ impl AgentManager {
                 file_blocks: interrupt.prepend_file_blocks,
             },
         );
-        let Some(claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+        let Some(mut claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             self.services.requeue_front_batch(&agent_id, entries);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
@@ -10575,13 +10577,7 @@ impl AgentManager {
         self.services
             .commit_provisional_queue_delivery(&agent_id, &entries);
         match self
-            .prepare_admitted_flush_turn(
-                &agent_id,
-                &workspace_id,
-                entries,
-                draining,
-                claim.admission(),
-            )
+            .prepare_admitted_flush_turn(&agent_id, &workspace_id, entries, draining, &mut claim)
             .await
         {
             FlushPrep::Turn {
@@ -17583,8 +17579,22 @@ async fn prepare_flush_turn(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
+    entries: Vec<QueuedMessage>,
+    draining: DrainingGuard,
+) -> FlushPrep {
+    prepare_flush_turn_claimed(mgr, agent_id, workspace_id, entries, draining, None).await
+}
+
+/// [`prepare_flush_turn`] for a caller still holding an unhanded claim: an
+/// append failure persists `Error`, so the claim's drop-release must not
+/// overwrite it with `RuntimeIdle` if the caller is cancelled afterwards.
+async fn prepare_flush_turn_claimed(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
     mut entries: Vec<QueuedMessage>,
     draining: DrainingGuard,
+    claim: Option<&mut TurnSlotClaim>,
 ) -> FlushPrep {
     // Durable shrink now; the ONE shrunk `agent:queue:updated` is published
     // only after every row below is persisted (§6.5 drain ordering).
@@ -17665,6 +17675,9 @@ async fn prepare_flush_turn(
             ..turn_options_for_entry(&failed, stale)
         };
         mgr.services.requeue_front_batch(agent_id, tail);
+        if let Some(claim) = claim {
+            claim.persist_idle = false;
+        }
         let vanished =
             handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options)
                 .await;

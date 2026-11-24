@@ -11572,7 +11572,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
     let id = AgentId::from("retire-cleanup");
     seed_agent(&mgr, &ws, &id).await;
     seed_top_level_peer(&mgr, &id).await;
-    let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let mut cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let flush = if matches!(cleanup, RetiredCleanup::Flush) {
         mgr.services.enqueue_message(
             &id,
@@ -11623,7 +11623,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         RetiredCleanup::Flush => {
             let (entry, draining) = flush.unwrap();
             let prep = mgr
-                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, cancelled.admission())
+                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, &mut cancelled)
                 .await;
             assert!(matches!(prep, super::FlushPrep::Parked));
             cancelled.release(false).await;
@@ -29919,7 +29919,7 @@ async fn shutdown_admission_requeues_flush_popped_before_closure() {
     let ws = WorkspaceId::from("ws-shutdown-flush-popped");
     let id = AgentId::from("shutdown-flush-popped");
     seed_agent(&mgr, &ws, &id).await;
-    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap().hand_off();
+    let mut claim = mgr.try_begin_turn(&id, &ws).await.unwrap();
     mgr.services.enqueue_message_with_id(
         &id,
         Some("popped-before-shutdown".into()),
@@ -29935,10 +29935,11 @@ async fn shutdown_admission_requeues_flush_popped_before_closure() {
     let (entry, draining) = mgr.services.dequeue_message_draining(&id).unwrap();
     mgr.begin_shutdown();
     assert!(matches!(
-        mgr.prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, admission)
+        mgr.prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, &mut claim)
             .await,
         super::FlushPrep::Parked
     ));
+    claim.hand_off();
     // An unrelated queue mutation must not durably overwrite the popped entry.
     mgr.services.persist_queue_snapshot(&id).await;
     mgr.shutdown().await;
@@ -30142,7 +30143,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     let ws = WorkspaceId::from("ws-shutdown-batch-failure");
     let id = AgentId::from("shutdown-batch-failure");
     seed_agent(&mgr, &ws, &id).await;
-    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap().hand_off();
+    let mut claim = mgr.try_begin_turn(&id, &ws).await.unwrap();
     for n in 0..3 {
         mgr.services.enqueue_message_with_id(
             &id,
@@ -30169,12 +30170,14 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     let worker_id = id.clone();
     let worker_ws = ws.clone();
     let preparation = tokio::spawn(async move {
-        matches!(
+        let parked = matches!(
             worker_mgr
-                .prepare_admitted_flush_turn(&worker_id, &worker_ws, entries, draining, admission)
+                .prepare_admitted_flush_turn(&worker_id, &worker_ws, entries, draining, &mut claim)
                 .await,
             super::FlushPrep::Parked
-        )
+        );
+        claim.hand_off();
+        parked
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -30303,11 +30306,10 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
                     .await
                     .is_err());
             } else {
-                let admission = worker_mgr
+                let mut claim = worker_mgr
                     .try_begin_turn(&worker_id, &worker_ws)
                     .await
-                    .unwrap()
-                    .hand_off();
+                    .unwrap();
                 let (entry, guard) = worker_mgr
                     .services
                     .dequeue_message_draining(&worker_id)
@@ -30320,11 +30322,12 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
                             &worker_ws,
                             vec![entry],
                             guard,
-                            admission
+                            &mut claim
                         )
                         .await,
                     super::FlushPrep::Parked
                 ));
+                claim.hand_off();
             }
         });
         timeout(
