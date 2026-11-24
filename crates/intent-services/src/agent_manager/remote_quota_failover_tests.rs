@@ -987,14 +987,18 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
     // Review of intentd#2957: the next message continues on the backup
     // (home's earlier output no longer skips the backoff).
     send_as_user(&mgr, &id, &ws, "carry on").await;
-    // The backup also takes the undelivered "back home" message, so it runs
-    // two turns.
-    backup_again.finish.add_permits(2);
-    backup_again.wait_prompts(2).await;
+    // The undelivered "back home" message rides the same turn, first.
+    backup_again.finish.add_permits(1);
+    backup_again.wait_prompts(1).await;
     wait_idle(&mgr, &id).await;
     assert_eq!(port.asked.load(Ordering::SeqCst), 4, "home is not retried");
-    let delivered = format!("{:?}", backup_again.prompts.lock().unwrap());
-    assert!(delivered.contains("carry on"), "{delivered}");
+    assert_eq!(backup_again.prompts.lock().unwrap().len(), 1, "one turn");
+    let delivered = prompt_text(&backup_again, 0);
+    let carry_on = delivered.find("carry on").expect("the new message is sent");
+    assert!(
+        delivered.find("back home").is_some_and(|at| at < carry_on),
+        "{delivered}"
+    );
     let session = mgr
         .services
         .store

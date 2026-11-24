@@ -9363,7 +9363,12 @@ impl AgentManager {
         // `agent.retry` does, so the batch flush delivers both in order in
         // one turn. A direct turn would run this message alone, and a
         // provider session that never saw the failed one would lack it.
-        if session.status == AgentStatus::Error && self.services.has_ready_failed_turn(&agent_id) {
+        // While the failing worker still holds the slot, the parked
+        // recovery send below applies instead: a retry would abort it.
+        if session.status == AgentStatus::Error
+            && !self.is_busy(&agent_id)
+            && self.services.has_ready_failed_turn(&agent_id)
+        {
             let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
