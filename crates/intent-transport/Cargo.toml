@@ -1,6 +1,6 @@
 [package]
 name = "intent-transport"
-version = "0.11.287"
+version = "0.11.288"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
