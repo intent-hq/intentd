@@ -194,7 +194,10 @@ impl ServerPairingInfo for Pairing {
 struct StatusControl {
     services: Services,
     host: HostEnvironment,
-    ws: Arc<OnceLock<WsApiServer>>,
+    /// Weak: the listener owns this control, so a strong reference would
+    /// keep a stopped listener (and the tenant's `Services`) alive. The
+    /// strong one is [`ListenersStop`]'s.
+    ws: Arc<OnceLock<std::sync::Weak<WsApiServer>>>,
     /// The WSS port once bound; for the synchronous [`SystemControl::status`].
     port: Arc<OnceLock<u16>>,
     started: std::time::Instant,
@@ -219,10 +222,13 @@ const USAGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How many [`USAGE_INTERVAL`]s apart the host's addresses are re-read.
 const ROUTES_EVERY: u32 = 10;
 
-/// Keep `sample` fresh until `stop` ran: CPU and memory every
+/// Keep `sample` fresh until the listeners stop (or are dropped): CPU and memory every
 /// [`USAGE_INTERVAL`], the addresses every [`ROUTES_EVERY`] of them, off the
 /// runtime's worker threads. Without `sysinfo` on this host, usage reads 0.
-async fn sample_usage(sample: Arc<std::sync::Mutex<UsageSample>>, stop: ListenersStop) {
+async fn sample_usage(
+    sample: Arc<std::sync::Mutex<UsageSample>>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) {
     let process = sysinfo::System::new()
         .ok()
         .zip(sysinfo::get_current_pid().ok());
@@ -233,7 +239,8 @@ async fn sample_usage(sample: Arc<std::sync::Mutex<UsageSample>>, stop: Listener
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            () = stop.stopped() => return,
+            // Stopped, or every handle to the listeners dropped.
+            _ = stopped.wait_for(|stopped| *stopped) => return,
         }
         let routes = ticks.is_multiple_of(ROUTES_EVERY);
         ticks = ticks.wrapping_add(1);
@@ -281,7 +288,8 @@ async fn sample_usage(sample: Arc<std::sync::Mutex<UsageSample>>, stop: Listener
 impl StatusControl {
     fn snapshot(&self, port: Option<u16>) -> SystemStatus {
         use intent_app::remote::RemoteServicesExt as _;
-        let ws = self.ws.get();
+        let ws = self.ws.get().and_then(std::sync::Weak::upgrade);
+        let ws = ws.as_deref();
         let tcp = port.is_some();
         // Agents run only on other machines; a local manager, if any, is
         // counted as `intentd` counts its own.
@@ -367,7 +375,8 @@ impl SystemControl for StatusControl {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SystemStatus> + Send + '_>> {
         Box::pin(async move {
-            let port = match self.ws.get() {
+            let ws = self.ws.get().and_then(std::sync::Weak::upgrade);
+            let port = match ws {
                 Some(ws) => ws.bound_port().await,
                 None => None,
             };
@@ -418,6 +427,8 @@ pub struct ClientListeners {
 #[derive(Clone)]
 pub struct ListenersStop {
     ws: WsApiServer,
+    /// What the status control reaches weakly; dropped with the last clone.
+    _status_ws: Arc<WsApiServer>,
     stop_socket: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     stopped: Arc<tokio::sync::watch::Sender<bool>>,
 }
@@ -519,11 +530,12 @@ pub async fn start_client_listeners(
         .await
         .map_err(|e| format!("host environment: {e}"))?;
     let port_slot = Arc::new(OnceLock::new());
+    let status_ws_slot = Arc::new(OnceLock::new());
     let sample = Arc::new(std::sync::Mutex::new(UsageSample::default()));
     let control: Arc<dyn SystemControl> = Arc::new(StatusControl {
         services: services.clone(),
         host: host.clone(),
-        ws: ws_slot.clone(),
+        ws: status_ws_slot.clone(),
         port: port_slot.clone(),
         started: std::time::Instant::now(),
         sample: sample.clone(),
@@ -576,6 +588,8 @@ pub async fn start_client_listeners(
         .await
         .map_err(|e| format!("WSS listener on port {}: {e}", config.ws_port))?;
     let _ = ws_slot.set(ws.clone());
+    let status_ws = Arc::new(ws.clone());
+    let _ = status_ws_slot.set(Arc::downgrade(&status_ws));
     let _ = port_slot.set(ws_port);
 
     let socket_path = config.socket_path.clone();
@@ -615,10 +629,11 @@ pub async fn start_client_listeners(
     );
     let stop = ListenersStop {
         ws,
+        _status_ws: status_ws,
         stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
         stopped: Arc::new(tokio::sync::watch::channel(false).0),
     };
-    tokio::spawn(sample_usage(sample, stop.clone()));
+    tokio::spawn(sample_usage(sample, stop.stopped.subscribe()));
     Ok(ClientListeners {
         stop,
         ws_port,
