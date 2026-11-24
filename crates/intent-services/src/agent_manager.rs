@@ -3419,6 +3419,9 @@ pub struct AgentManager {
     /// Fails the next status read of a send's failed-turn redrive.
     #[cfg(test)]
     redrive_store_fault: std::sync::atomic::AtomicBool,
+    /// Fails the next turn start's `Active` write.
+    #[cfg(test)]
+    active_write_fault: std::sync::atomic::AtomicBool,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3571,6 +3574,8 @@ impl AgentManager {
             retry_pause: Mutex::new(None),
             #[cfg(test)]
             redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            active_write_fault: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -8248,6 +8253,7 @@ impl AgentManager {
                         auto_unarchive,
                         fence,
                         origin,
+                        claim.admission(),
                     )
                 })
                 .await
@@ -8305,6 +8311,7 @@ impl AgentManager {
                         true,
                         fence,
                         TurnOrigin::Delivery,
+                        popped.1.admission(),
                     )
                 })
                 .await
@@ -8470,6 +8477,7 @@ impl AgentManager {
         auto_unarchive: bool,
         archive_fence: Option<crate::ArchiveFenceGuard>,
         origin: TurnOrigin,
+        admission: TurnAdmission,
     ) -> bool {
         #[cfg(test)]
         {
@@ -8585,16 +8593,28 @@ impl AgentManager {
                 }
             }
             self.services.agent_activity_begin(workspace_id).await;
+            #[cfg(test)]
+            let faulted = self
+                .active_write_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let faulted = false;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
-            self.persist_status_with_stop_reason(
-                agent_id,
-                workspace_id,
-                AgentStatus::Active,
-                true,
-                Some(None),
-                true,
-            )
-            .await;
+            let recorded = !faulted
+                && self
+                    .persist_status_with_stop_reason(
+                        agent_id,
+                        workspace_id,
+                        AgentStatus::Active,
+                        true,
+                        Some(None),
+                        true,
+                    )
+                    .await;
+            if !recorded {
+                self.services
+                    .mark_unrecorded_turn_start(agent_id, admission);
+            }
         }
         true
     }
@@ -8613,6 +8633,14 @@ impl AgentManager {
 
     fn owns_admission(&self, agent_id: &AgentId, admission: TurnAdmission) -> bool {
         self.turn_admissions.lock().unwrap().get(agent_id) == Some(&admission)
+    }
+
+    /// Whether the turn holding the slot started without recording `Active`,
+    /// so a persisted `Error` predates it. Call under the turn-start gate.
+    fn holds_unrecorded_turn_start(&self, agent_id: &AgentId) -> bool {
+        self.services
+            .unrecorded_turn_start(agent_id)
+            .is_some_and(|admission| self.owns_admission(agent_id, admission))
     }
 
     /// Pre-spawn exits belong to the admitted request, not whichever turn
@@ -8776,6 +8804,7 @@ impl AgentManager {
             }
             self.settled_turns.lock().unwrap().remove(agent_id);
             self.turn_admissions.lock().unwrap().remove(agent_id);
+            self.services.clear_unrecorded_turn_start(agent_id);
             if busy.is_empty() {
                 *self.idle_since.lock().unwrap() = Some(Instant::now());
             }
@@ -9070,6 +9099,7 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status");
             return;
         }
+        self.services.clear_unrecorded_turn_start(agent_id);
         let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
             return;
         };
@@ -9123,7 +9153,7 @@ impl AgentManager {
         is_active: bool,
         stop_reason: Option<Option<String>>,
         turn_boundary: bool,
-    ) {
+    ) -> bool {
         let ts = now_iso();
         // Clone stop_reason for event emission (we need it after the store call moves it).
         let stop_reason_for_event = stop_reason.clone();
@@ -9134,10 +9164,11 @@ impl AgentManager {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status + stop_reason");
-            return;
+            return false;
         }
+        self.services.clear_unrecorded_turn_start(agent_id);
         let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
-            return;
+            return true;
         };
         // Build the event data. When stop_reason is Some(_) — i.e. the call sets or
         // clears the persisted value — include "stopReason" in the event: the string
@@ -9186,6 +9217,7 @@ impl AgentManager {
             self.services
                 .schedule_last_activity_event(workspace_id.clone());
         }
+        true
     }
 
     /// Release per-agent ownership while retaining the task's persistence tail.
@@ -11558,10 +11590,12 @@ impl AgentManager {
 
         // The check above ran unlocked: a send's redrive or another retry
         // may have lifted the park and started a turn since. Every turn
-        // start persists `Active` under the turn-start gate, so `Error`
-        // re-read under it means no turn started since the failure and any
-        // worker still holding the slot is the failed one. Only then does
-        // this retry own the restart and tear down.
+        // start persists `Active` under the turn-start gate, or, when that
+        // write fails, records its admission as unrecorded. So `Error`
+        // re-read under it, with no unrecorded start holding the slot, means
+        // no turn started since the failure and any worker still holding
+        // the slot is the failed one. Only then does this retry own the
+        // restart and tear down.
         let owned = {
             let gate = self.turn_start_gates.for_agent(&agent_id);
             let _starting = gate.lock().await;
@@ -11571,7 +11605,8 @@ impl AgentManager {
                 .get_agent_session_summary(&agent_id)
                 .await?;
             Self::check_retry_not_retired(&agent_id, &session)?;
-            if session.status == AgentStatus::Error {
+            if session.status == AgentStatus::Error && !self.holds_unrecorded_turn_start(&agent_id)
+            {
                 Some(self.lift_failed_park(&agent_id, &session).await?)
             } else {
                 None
@@ -18731,7 +18766,10 @@ pub(crate) async fn persist_terminal_error_status_via_services(
         )
         .await
     {
-        Ok(()) => true,
+        Ok(()) => {
+            services.clear_unrecorded_turn_start(agent_id);
+            true
+        }
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
             false
