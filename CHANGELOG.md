@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.290] - 2026-11-24
+
+### 🚀 Features
+
+- *(secrets)* Persist secret request resolutions ([#3741](https://github.com/intent-hq/intentd/pull/3741))
+
+### 🐛 Bug Fixes
+
+- *(agent)* Try again no longer cancels a turn a new message started ([#3747](https://github.com/intent-hq/intentd/pull/3747))
+- *(agent-manager)* Release a dropped turn slot claim ([#3742](https://github.com/intent-hq/intentd/pull/3742))
+- *(services)* Point isolated test services at a dead GitHub API base ([#3743](https://github.com/intent-hq/intentd/pull/3743))
+
+
 ## [0.11.289] - 2026-11-24
 
 ### 🐛 Bug Fixes
