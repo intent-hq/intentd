@@ -66,36 +66,89 @@ pub const CLAIM_WAIT_ENV: &str = "INTENTD_ORCHESTRATOR_CLAIM_WAIT_SECS";
 /// restart right after a crash outlasts the dead instance's lease.
 pub const DEFAULT_CLAIM_WAIT: Duration = Duration::from_secs(60);
 
-/// How long after the lease's expiry a waiting start claims again, so the
-/// expiry has passed by the database clock too.
-pub const CLAIM_RETRY_MARGIN: Duration = Duration::from_millis(500);
+/// The longest accepted [`CLAIM_WAIT_ENV`]: a day.
+pub const MAX_CLAIM_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often a waiting start re-reads the lease, so a lease released early
+/// (a clean stop of its holder) is claimed at once, not at its old expiry.
+pub const CLAIM_POLL: Duration = Duration::from_secs(1);
 
 /// The claim wait from [`CLAIM_WAIT_ENV`]'s value: `None` (unset or blank)
 /// is [`DEFAULT_CLAIM_WAIT`].
 ///
 /// # Errors
-/// When a set value is not a whole number of seconds.
+/// When a set value is not a whole number of seconds up to
+/// [`MAX_CLAIM_WAIT`].
 pub fn claim_wait_from_env(raw: Option<&str>) -> Result<Duration, String> {
-    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
-        None => Ok(DEFAULT_CLAIM_WAIT),
-        Some(raw) => raw
-            .parse()
-            .map(Duration::from_secs)
-            .map_err(|_| format!("{CLAIM_WAIT_ENV}: {raw:?} is not a number of seconds")),
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(DEFAULT_CLAIM_WAIT);
+    };
+    let wait = raw
+        .parse()
+        .map(Duration::from_secs)
+        .map_err(|_| format!("{CLAIM_WAIT_ENV}: {raw:?} is not a number of seconds"))?;
+    if wait > MAX_CLAIM_WAIT {
+        return Err(format!(
+            "{CLAIM_WAIT_ENV}: {raw} s is more than {} s",
+            MAX_CLAIM_WAIT.as_secs()
+        ));
+    }
+    Ok(wait)
+}
+
+/// The next step of a start that a live lease refused, from what the lease
+/// has left (`expires_in`, by the database clock) and what is `left` of the
+/// claim wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimStep {
+    /// The lease lapsed (or was released): claim again now.
+    Claim,
+    /// Re-read the lease after this long: at most [`CLAIM_POLL`], never past
+    /// the lease's expiry or the end of the wait.
+    Wait(Duration),
+    /// Give up: the wait is spent, or the expiry is unknown.
+    GiveUp,
+}
+
+/// See [`ClaimStep`].
+#[must_use]
+pub fn next_claim_step(expires_in: Option<Duration>, left: Duration) -> ClaimStep {
+    match expires_in {
+        None => ClaimStep::GiveUp,
+        Some(expires_in) if expires_in.is_zero() => ClaimStep::Claim,
+        Some(_) if left.is_zero() => ClaimStep::GiveUp,
+        Some(expires_in) => ClaimStep::Wait(expires_in.min(CLAIM_POLL).min(left)),
     }
 }
 
-/// How long a start refused by a live lease waits before it claims again:
-/// until the lease expires (`expires_in`, by the database clock) plus
-/// [`CLAIM_RETRY_MARGIN`], at most what is `left` of its claim wait. `None`
-/// gives up: the wait is spent, or the expiry is unknown.
-#[must_use]
-pub fn next_claim_wait(expires_in: Option<Duration>, left: Duration) -> Option<Duration> {
-    let expires_in = expires_in?;
-    if left.is_zero() {
-        return None;
+/// Wait until a refused tenant's lease lapses or is released, re-reading
+/// it with `read` (what the lease has left, by the database clock) at most
+/// every [`CLAIM_POLL`] ([`next_claim_step`]): `true` to claim again,
+/// `false` to give up. Every read and sleep is bounded by `until`, so a slow
+/// database cannot stretch the wait past it; a read that fails or does not
+/// finish by `until` gives up.
+pub async fn wait_for_lease<F, Fut, E>(mut read: F, until: tokio::time::Instant) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Duration>, E>>,
+    E: std::fmt::Display,
+{
+    loop {
+        let expires_in = match tokio::time::timeout_at(until, read()).await {
+            Ok(Ok(expires_in)) => expires_in,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "could not read the tenant lease");
+                return false;
+            }
+            Err(_) => return false,
+        };
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        match next_claim_step(expires_in, left) {
+            ClaimStep::Claim => return true,
+            ClaimStep::GiveUp => return false,
+            ClaimStep::Wait(wait) => tokio::time::sleep(wait).await,
+        }
     }
-    Some((expires_in + CLAIM_RETRY_MARGIN).min(left))
 }
 
 /// The exit code when a tenant's self-fence overran: its work may still run
@@ -347,29 +400,74 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(claim_wait_from_env(Some("0")).unwrap(), Duration::ZERO);
-        for bad in ["-1", "1.5", "soon"] {
+        assert_eq!(
+            claim_wait_from_env(Some(&MAX_CLAIM_WAIT.as_secs().to_string())).unwrap(),
+            MAX_CLAIM_WAIT
+        );
+        for bad in ["-1", "1.5", "soon", "86401", "18446744073709551615"] {
             assert!(claim_wait_from_env(Some(bad)).is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn a_refused_start_waits_until_the_lease_lapses_within_its_bound() {
+    fn a_refused_start_polls_the_lease_until_it_lapses_within_its_bound() {
         let secs = Duration::from_secs;
-        // Until the expiry plus the margin, while the bound allows.
+        // A live lease: re-read it at the poll interval, or sooner when it
+        // lapses or the wait ends first.
         assert_eq!(
-            next_claim_wait(Some(secs(20)), secs(60)),
-            Some(secs(20) + CLAIM_RETRY_MARGIN)
+            next_claim_step(Some(secs(20)), secs(60)),
+            ClaimStep::Wait(CLAIM_POLL)
         );
-        // An already lapsed lease: only the margin.
+        let soon = Duration::from_millis(300);
+        assert_eq!(next_claim_step(Some(soon), secs(60)), ClaimStep::Wait(soon));
+        assert_eq!(next_claim_step(Some(secs(20)), soon), ClaimStep::Wait(soon));
+        // Lapsed or released: claim now, even at the end of the wait.
         assert_eq!(
-            next_claim_wait(Some(Duration::ZERO), secs(60)),
-            Some(CLAIM_RETRY_MARGIN)
+            next_claim_step(Some(Duration::ZERO), secs(60)),
+            ClaimStep::Claim
         );
-        // Capped at what is left, for one last claim at the bound.
-        assert_eq!(next_claim_wait(Some(secs(30)), secs(3)), Some(secs(3)));
-        // Gives up once the bound is spent, or when the expiry is unknown.
-        assert_eq!(next_claim_wait(Some(secs(30)), Duration::ZERO), None);
-        assert_eq!(next_claim_wait(None, secs(60)), None);
+        assert_eq!(
+            next_claim_step(Some(Duration::ZERO), Duration::ZERO),
+            ClaimStep::Claim
+        );
+        // Gives up once the wait is spent, or when the expiry is unknown.
+        assert_eq!(
+            next_claim_step(Some(secs(30)), Duration::ZERO),
+            ClaimStep::GiveUp
+        );
+        assert_eq!(next_claim_step(None, secs(60)), ClaimStep::GiveUp);
+    }
+
+    /// A slow lease read cannot stretch the wait: the read is charged
+    /// against the deadline, and one still running at the deadline gives up.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_lease_read_cannot_extend_the_claim_wait() {
+        let secs = Duration::from_secs;
+        let until = tokio::time::Instant::now() + secs(3);
+        let live = || async {
+            tokio::time::sleep(secs(2)).await;
+            Ok::<_, String>(Some(secs(30)))
+        };
+        assert!(!wait_for_lease(live, until).await);
+        assert!(
+            tokio::time::Instant::now() <= until,
+            "gave up past the deadline"
+        );
+
+        // A lease that lapses while waiting is claimed.
+        let start = tokio::time::Instant::now();
+        let lapses_at = start + secs(2);
+        let read = || async move {
+            Ok::<_, String>(Some(
+                lapses_at.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+        };
+        assert!(wait_for_lease(read, start + secs(60)).await);
+        assert!(tokio::time::Instant::now() >= lapses_at);
+
+        // A failed read gives up.
+        let failed = || async { Err::<Option<Duration>, _>("down".to_owned()) };
+        assert!(!wait_for_lease(failed, start + secs(60)).await);
     }
 
     #[test]

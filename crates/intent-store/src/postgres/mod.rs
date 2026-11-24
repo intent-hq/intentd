@@ -56,8 +56,8 @@ pub use sqlx::postgres::PgPool;
 
 pub(crate) use agents::PreparedPgMonitorMessage;
 pub use lease::{
-    LeaseHeartbeat, LeaseState, TenantClaim, TenantLease, LEASE_FENCE_MARGIN, LEASE_RENEW_INTERVAL,
-    LEASE_TTL,
+    LeaseHeartbeat, LeaseHeld, LeaseState, OwnedOpen, TenantClaim, TenantLease, LEASE_FENCE_MARGIN,
+    LEASE_RENEW_INTERVAL, LEASE_TTL,
 };
 pub use neki_topology::{neki_topology_gap, NekiTopologyGap};
 pub use secrets::{SecretKeyring, TenantSecretStore, SECRET_KEY_LEN};

@@ -51,11 +51,11 @@ async fn lease(pool: &PgPool, tenant: &str) -> Option<(String, i64, bool)> {
     .expect("read tenant_lease")
 }
 
-/// Start the orchestrator binary serving `tenant` as `instance`, its output
+/// Start the orchestrator binary serving `tenants` as `instance`, its output
 /// in `log`.
 fn start(
     url: &str,
-    tenant: &str,
+    tenants: &str,
     instance: &str,
     dir: &Path,
     log: &Path,
@@ -65,7 +65,7 @@ fn start(
     let mut command = Command::new(env!("CARGO_BIN_EXE_intentd-orchestrator"));
     command
         .env("INTENTD_POSTGRES_URL", url)
-        .env("INTENTD_POSTGRES_TENANTS", tenant)
+        .env("INTENTD_POSTGRES_TENANTS", tenants)
         .env("INTENTD_ORCHESTRATOR_INSTANCE", instance)
         .env("INTENTD_DATA_DIR", dir)
         .env("RUST_LOG", "info")
@@ -140,6 +140,7 @@ async fn hold(pool: &PgPool, tenant: &str, instance: &str) -> (Store, LeaseHeart
     (store, heartbeat, claim.epoch)
 }
 
+#[track_caller]
 fn sigterm(child: &GuardedChild) {
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
@@ -252,4 +253,79 @@ async fn sigterm_while_waiting_exits_0_and_leaves_the_lease() {
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(exited.code(), Some(0), "{text}");
     assert_eq!(lease(&pool, &tenant).await, Some((a, epoch, false)));
+}
+
+/// A holder that stops cleanly and releases its lease while a start waits
+/// for it: the start claims within about a poll, not at the old expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_released_while_waiting_is_claimed_at_once() {
+    let Some(url) = url() else { return };
+    let pool = postgres::connect(&url, 4).await.expect("connect");
+    postgres::migrate(&pool).await.expect("migrate");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let (tenant, a, b) = names(&run);
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, heartbeat, epoch) = hold(&pool, &tenant, &a).await;
+
+    let log = dir.path().join("b.log");
+    let mut waiter = start(&url, &tenant, &b, dir.path(), &log, &[]);
+    waiting(&log).await;
+    // The holder's lease as it stood, so the claim can be ordered against it.
+    let held_until: i64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM tenant_lease \
+         WHERE tenant_id = $1",
+    )
+    .bind(&tenant)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    heartbeat.fence().fire("the holder stops");
+    assert!(heartbeat.release().await.expect("release"), "released");
+    assert_eq!(claimed_by(&pool, &tenant, &b).await, epoch + 1);
+    // Claimed before the released lease would have expired (database clock).
+    let claimed_at: i64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM renewed_at) * 1000)::bigint FROM tenant_lease \
+         WHERE tenant_id = $1",
+    )
+    .bind(&tenant)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        claimed_at < held_until,
+        "claimed at {claimed_at} ms, not before the old expiry {held_until} ms"
+    );
+    sigterm(&waiter);
+    let exited = waiter.wait_with_timeout(wait()).unwrap().unwrap();
+    assert_eq!(exited.code(), Some(0), "{exited:?}");
+}
+
+/// SIGTERM while one tenant is served and the next waits for its lease:
+/// the served tenant is stopped and released, the waited one left alone,
+/// and the process exits 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_while_waiting_releases_the_tenants_already_served() {
+    let Some(url) = url() else { return };
+    let pool = postgres::connect(&url, 4).await.expect("connect");
+    postgres::migrate(&pool).await.expect("migrate");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let (held, a, b) = names(&run);
+    let free = format!("free-{run}");
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, _heartbeat, epoch) = hold(&pool, &held, &a).await;
+
+    let log = dir.path().join("b.log");
+    let mut waiter = start(&url, &format!("{free},{held}"), &b, dir.path(), &log, &[]);
+    let served_epoch = claimed_by(&pool, &free, &b).await;
+    waiting(&log).await;
+    sigterm(&waiter);
+    let exited = waiter.wait_with_timeout(wait()).unwrap().unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(exited.code(), Some(0), "{text}");
+    assert_eq!(
+        lease(&pool, &free).await,
+        Some((b, served_epoch, true)),
+        "{text}"
+    );
+    assert_eq!(lease(&pool, &held).await, Some((a, epoch, false)));
 }

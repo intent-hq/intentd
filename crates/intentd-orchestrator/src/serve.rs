@@ -11,8 +11,8 @@ use intent_core::{Error, Result};
 use intent_services::retention::TenantSweepTiming;
 use intent_services::{EventBus, Services, SettingsRegistry};
 use intent_store::postgres::{
-    LeaseHeartbeat, PgPool, PostgresOptions, SecretKeyring, TenantId, LEASE_RENEW_INTERVAL,
-    LEASE_TTL,
+    LeaseHeartbeat, LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId,
+    LEASE_RENEW_INTERVAL, LEASE_TTL,
 };
 use intent_store::{OrchestratorOnly, Store};
 use intent_transport::PrimaryReverseRegistry;
@@ -110,6 +110,71 @@ pub async fn serve_tenant_with(
     keyring: Arc<SecretKeyring>,
     orchestrator: OrchestratorOnly,
 ) -> Result<ServedTenant> {
+    match try_serve_tenant_with(
+        pool,
+        tenant,
+        data_dir,
+        instance,
+        timing,
+        sweeps,
+        keyring,
+        orchestrator,
+    )
+    .await?
+    {
+        Serving::Served(served) => Ok(*served),
+        Serving::Held(held) => Err(held.into_error()),
+    }
+}
+
+/// What [`try_serve_tenant`] found.
+pub enum Serving {
+    /// This process serves the tenant (boxed: it is large).
+    Served(Box<ServedTenant>),
+    /// Another instance holds a live lease on the tenant: nothing was
+    /// claimed, written or started.
+    Held(LeaseHeld),
+}
+
+/// [`serve_tenant`], with another instance's live lease as
+/// [`Serving::Held`] instead of `Error::NotOwner`, so a caller can tell
+/// that refusal from a failure after the claim.
+///
+/// # Errors
+/// As [`serve_tenant`], except a live lease.
+pub async fn try_serve_tenant(
+    pool: PgPool,
+    tenant: &str,
+    data_dir: &Path,
+    instance: &str,
+    timing: LeaseTiming,
+    keyring: Arc<SecretKeyring>,
+    orchestrator: OrchestratorOnly,
+) -> Result<Serving> {
+    try_serve_tenant_with(
+        pool,
+        tenant,
+        data_dir,
+        instance,
+        timing,
+        TenantSweepTiming::default(),
+        keyring,
+        orchestrator,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn try_serve_tenant_with(
+    pool: PgPool,
+    tenant: &str,
+    data_dir: &Path,
+    instance: &str,
+    timing: LeaseTiming,
+    sweeps: TenantSweepTiming,
+    keyring: Arc<SecretKeyring>,
+    orchestrator: OrchestratorOnly,
+) -> Result<Serving> {
     let id = TenantId::new(tenant)?;
     // The tenant's secret store blocks on the multi-thread runtime; refuse
     // any other before the lease is claimed, so nothing is set up.
@@ -127,7 +192,7 @@ pub async fn serve_tenant_with(
     // claim, so a failure claims nothing.
     install_receive_hooks(data_dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: node git receive hooks: {e}")))?;
-    let (store, lease) = Store::open_postgres_owned(
+    let (store, lease) = match Store::try_open_postgres_owned(
         pool,
         id,
         PostgresOptions::default(),
@@ -135,7 +200,11 @@ pub async fn serve_tenant_with(
         timing.ttl,
         orchestrator,
     )
-    .await?;
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(held) => return Ok(Serving::Held(held)),
+    };
     let heartbeat = LeaseHeartbeat::spawn(store.clone(), &lease, timing.ttl, timing.interval);
     let fence = heartbeat.fence();
     let dir = crate::tenant_dir(data_dir, tenant);
@@ -158,7 +227,7 @@ pub async fn serve_tenant_with(
     )
     .await;
     tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
-    Ok(ServedTenant {
+    Ok(Serving::Served(Box::new(ServedTenant {
         tenant: tenant.to_owned(),
         dir,
         services,
@@ -169,7 +238,7 @@ pub async fn serve_tenant_with(
         fence,
         heartbeat,
         report: Some(runner.spawn()),
-    })
+    })))
 }
 
 /// Install head's git receive hooks under `data_dir`, once per process

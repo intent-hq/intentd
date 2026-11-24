@@ -175,6 +175,29 @@ async fn a_refused_process_reads_how_long_the_lease_has_left() {
         .await
         .unwrap();
     let before = tenant_rows(&db.admin, tenant).await;
+    // The typed startup open reports the live lease, claiming nothing.
+    match Store::try_open_postgres_owned(
+        db.app.clone(),
+        TenantId::new(tenant).unwrap(),
+        options(),
+        "proc-b",
+        LONG_TTL,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap()
+    {
+        Err(held) => {
+            assert_eq!(
+                (held.tenant.as_str(), held.owner.as_str()),
+                (tenant, "proc-a")
+            );
+            let message = held.into_error().to_string();
+            assert!(message.contains("until"), "{message}");
+        }
+        Ok(_) => panic!("claimed an owned tenant"),
+    }
+    assert_eq!(tenant_rows(&db.admin, tenant).await, before);
     let left = expires_in().await.unwrap().expect("a claimed tenant");
     assert!(
         left > Duration::ZERO && left <= LONG_TTL,

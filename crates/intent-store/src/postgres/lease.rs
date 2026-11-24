@@ -105,6 +105,36 @@ pub enum TenantClaim {
     },
 }
 
+/// Another instance holds a live lease on a tenant, so a startup open
+/// ([`Store::try_open_postgres_owned`](crate::Store::try_open_postgres_owned))
+/// claimed and wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseHeld {
+    /// The tenant id.
+    pub tenant: String,
+    /// The instance that holds the lease.
+    pub owner: String,
+    /// When the lease lapses unless renewed, by the database clock.
+    pub expires_at: OffsetDateTime,
+}
+
+impl LeaseHeld {
+    /// The `Error::NotOwner` [`Store::open_postgres_owned`](crate::Store::open_postgres_owned)
+    /// answers for it, naming the owner and the expiry.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        Error::NotOwner(format!(
+            "tenant {} is owned by instance {} until {} (database clock); this process can \
+             claim it only after that lease expires",
+            self.tenant, self.owner, self.expires_at
+        ))
+    }
+}
+
+/// What a startup open found: the tenant opened and claimed, or
+/// [`LeaseHeld`] (nothing was claimed or written).
+pub type OwnedOpen = std::result::Result<(crate::Store, TenantLease), LeaseHeld>;
+
 /// This process's claim on one tenant, shared by every store of the tenant
 /// in the process (`tenant_registry`). `None` until a claim succeeds.
 #[derive(Clone, Default)]
@@ -589,6 +619,26 @@ impl crate::Store {
         _orchestrator: crate::OrchestratorOnly,
     ) -> Result<(Self, TenantLease)> {
         let key = super::tenant_registry::tenant_key(&pool, &tenant);
+        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl)
+            .await?
+            .map_err(LeaseHeld::into_error)
+    }
+
+    /// [`Self::open_postgres_owned`], with another instance's live lease as
+    /// an inner `Err(LeaseHeld)` instead of an error, so a caller can tell that
+    /// refusal (nothing claimed or written) from any later failure.
+    ///
+    /// # Errors
+    /// As [`Self::open_postgres_owned`], except a live lease.
+    pub async fn try_open_postgres_owned(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        instance: &str,
+        ttl: Duration,
+        _orchestrator: crate::OrchestratorOnly,
+    ) -> Result<OwnedOpen> {
+        let key = super::tenant_registry::tenant_key(&pool, &tenant);
         Self::open_owned_keyed(pool, tenant, options, key, instance, ttl).await
     }
 
@@ -612,7 +662,9 @@ impl crate::Store {
             "{}@process:{process}",
             super::tenant_registry::tenant_key(&pool, &tenant)
         );
-        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl).await
+        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl)
+            .await?
+            .map_err(LeaseHeld::into_error)
     }
 
     async fn open_owned_keyed(
@@ -622,26 +674,26 @@ impl crate::Store {
         key: String,
         instance: &str,
         ttl: Duration,
-    ) -> Result<(Self, TenantLease)> {
+    ) -> Result<OwnedOpen> {
         let store = PgStore::for_key(pool, tenant, options, key);
         super::check_schema(&store.pool).await?;
         let lease = match store.claim_lease(instance, ttl).await? {
             TenantClaim::TenantOwned(lease) => lease,
             TenantClaim::AlreadyOwned { owner, expires_at } => {
-                return Err(Error::NotOwner(format!(
-                    "tenant {} is owned by instance {owner} until {expires_at} (database \
-                     clock); this process can claim it only after that lease expires",
-                    store.tenant()
-                )));
+                return Ok(Err(LeaseHeld {
+                    tenant: store.tenant().to_owned(),
+                    owner,
+                    expires_at,
+                }));
             }
         };
         store.provision().await?;
-        Ok((
+        Ok(Ok((
             Self {
                 backend: crate::Backend::Postgres(store),
             },
             lease,
-        ))
+        )))
     }
 }
 
