@@ -27,6 +27,10 @@ pub(crate) type Runtime<'a> = dyn AgentRuntime<
 pub(super) struct RuntimeHandle {
     pub(super) runtime: Arc<Runtime<'static>>,
     pub(super) local: Option<Arc<LocalAgentRuntime>>,
+    /// The session this runtime's turns prompt on, bound when a turn's
+    /// session is started on it. A cancel targets it, whatever the runtime
+    /// kind and whatever the store holds.
+    session_id: Mutex<Option<String>>,
 }
 
 impl RuntimeHandle {
@@ -38,6 +42,7 @@ impl RuntimeHandle {
         Self {
             runtime: local.clone(),
             local: Some(local),
+            session_id: Mutex::new(None),
         }
     }
 
@@ -46,7 +51,18 @@ impl RuntimeHandle {
         Self {
             runtime,
             local: None,
+            session_id: Mutex::new(None),
         }
+    }
+
+    /// Record the session a turn on this runtime prompts on.
+    pub(super) fn bind_session(&self, session_id: &str) {
+        *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+    }
+
+    /// The session [`AgentRuntime::cancel`] targets; `None` until one is bound.
+    pub(super) fn session_id(&self) -> Option<String> {
+        self.session_id.lock().unwrap().clone()
     }
 
     pub(super) fn connection(&self) -> Option<Arc<Connection>> {

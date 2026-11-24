@@ -17,6 +17,8 @@ struct FakeRuntime {
     updates: mpsc::UnboundedSender<IncomingNotification>,
     alive: AtomicBool,
     cancels: AtomicUsize,
+    /// The session each cancel targeted.
+    cancelled: Mutex<Vec<String>>,
     stops: AtomicUsize,
     responses: AtomicUsize,
     /// Prompts still to reject with a provider quota error, before output.
@@ -45,6 +47,7 @@ impl FakeRuntime {
             updates,
             alive: AtomicBool::new(true),
             cancels: AtomicUsize::new(0),
+            cancelled: Mutex::new(Vec::new()),
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
             quota_failures: AtomicUsize::new(0),
@@ -176,10 +179,11 @@ impl AgentRuntime for FakeRuntime {
 
     fn cancel<'a>(
         &'a self,
-        _session_id: &'a str,
+        session_id: &'a str,
     ) -> BoxFuture<'a, std::result::Result<(), AcpError>> {
         Box::pin(async move {
             self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.cancelled.lock().unwrap().push(session_id.to_owned());
             Ok(())
         })
     }
@@ -403,6 +407,127 @@ async fn fake_runtime_interrupt_permissions_and_stop_need_no_local_handle() {
     assert!(!mgr.stop(&id).await);
     assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
     assert!(!fake.is_alive());
+}
+
+/// The cancel goes to the session bound on the live runtime handle, not to
+/// the `acpSessionId` the store holds.
+#[tokio::test]
+async fn an_interrupt_cancels_the_live_turns_session_not_the_stored_one() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-fake-bound");
+    let id = AgentId::from("fake-bound");
+    let fake = install_fake(&mgr, &id, &ws).await;
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "cancel this".into(),
+        None,
+        super::super::TurnOptions::default(),
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    mgr.bind_live_session_for_test(&id, "live-session");
+
+    assert!(mgr.interrupt(&id).await);
+    assert_eq!(
+        *fake.cancelled.lock().unwrap(),
+        ["live-session"],
+        "the cancel targets the handle's session, not the stored one"
+    );
+    assert!(
+        mgr.contains(&id),
+        "keep-alive interrupt retains the runtime"
+    );
+    assert!(fake.is_alive());
+    mgr.stop(&id).await;
+}
+
+/// A live runtime whose agent stores no `acpSessionId` (a remote agent) is
+/// still cancellable: an interrupt keeps it alive, and an interrupt-priority
+/// send preempts its turn instead of queueing behind it.
+#[tokio::test]
+async fn a_live_runtime_with_no_stored_session_is_interrupted_and_preempted() {
+    let ws = WorkspaceId::from("ws-remote-cancel");
+    let id = AgentId::from("agent-remote-cancel");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    // A provider without the kill-on-interrupt quirk, so the runtime is kept.
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    session.provider = Some("claude-code".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    let send = |text: &str| {
+        mgr.send_message(
+            id.clone(),
+            ws.clone(),
+            text.into(),
+            None,
+            super::super::TurnOptions::default(),
+        )
+    };
+    send("first").await.unwrap();
+    fake.wait_prompts(1).await;
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_summary(&id)
+        .await
+        .unwrap();
+    assert_eq!(stored.acp_session_id, None, "no session id is stored");
+
+    assert!(mgr.interrupt(&id).await);
+    let remote_session = format!("remote:{id}");
+    assert_eq!(
+        fake.cancelled.lock().unwrap().as_slice(),
+        std::slice::from_ref(&remote_session)
+    );
+    assert!(
+        mgr.contains(&id),
+        "keep-alive interrupt retains the runtime"
+    );
+    assert!(fake.is_alive());
+    wait_idle(&mgr, &id).await;
+
+    send("second").await.unwrap();
+    fake.wait_prompts(2).await;
+    let preempting = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "now".into(),
+            None,
+            super::super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preempting["queued"], false,
+        "the interrupt send preempts the turn: {preempting}"
+    );
+    assert_eq!(
+        *fake.cancelled.lock().unwrap(),
+        [remote_session.clone(), remote_session]
+    );
+    fake.wait_prompts(3).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    mgr.stop(&id).await;
 }
 
 #[tokio::test]
