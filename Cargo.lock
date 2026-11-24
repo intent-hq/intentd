@@ -2903,6 +2903,7 @@ dependencies = [
  "futures-util",
  "intent-app",
  "intent-core",
+ "intent-git",
  "intent-services",
  "intent-store",
  "intent-transport",

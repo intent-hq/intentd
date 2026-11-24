@@ -8,6 +8,8 @@
 //! (`intentd`) keeps refusing Postgres.
 //!
 //! Per tenant, [`serve::serve_tenant`] runs, in order:
+//! 0. head's git receive hooks, once per process, so machines' pushes into
+//!    this head are accepted (`intentd` installs them at its start);
 //! 1. `Store::open_postgres_owned`: the schema gate, then the tenant's lease
 //!    claim, then provisioning, before anything else writes;
 //! 2. `LeaseHeartbeat::spawn`: renews the lease and fires the claim's fence
