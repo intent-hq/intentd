@@ -10992,9 +10992,9 @@ enum CancelledFrontDoor {
     /// Every queue kick of an idle agent (`agent.queueMessage`, a child
     /// report, a hook dispatch) — intent-hq/intent#9985.
     QueueDrain,
-    /// `agent.sendQueuedMessageNow`, which claims on the caller's future.
+    /// `agent.sendQueuedMessageNow`.
     SendQueuedMessageNow,
-    /// `agent.sendQueuedMessagesNow`, which claims on the caller's future.
+    /// `agent.sendQueuedMessagesNow`.
     SendQueuedMessagesNow,
     /// Any other holder of a bare [`super::TurnSlotClaim`].
     BareClaim,
@@ -11004,10 +11004,7 @@ impl CancelledFrontDoor {
     /// Whether the claim-to-spawn step runs detached from the caller, so the
     /// claimed message itself still runs after the cancellation.
     fn detached(self) -> bool {
-        matches!(
-            self,
-            Self::SendMessage | Self::WakeDelivery | Self::QueueDrain
-        )
+        !matches!(self, Self::BareClaim)
     }
 }
 
@@ -11201,6 +11198,120 @@ async fn wake_delivery_cancelled_after_slot_claim_still_runs_the_turn() {
 #[tokio::test]
 async fn queue_drain_cancelled_after_slot_claim_still_runs_the_turn() {
     cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::QueueDrain).await;
+}
+
+/// intentd#3742 review: a batch "send now" whose caller is cancelled while
+/// an append fails must still finish the failure handling: the session parks
+/// in `Error` with the batch requeued, instead of `Active` with no turn, slot
+/// or worker. `before_error` cancels before the handler's first read; the
+/// other case cancels once `Error` is durable.
+async fn send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(
+    before_error: bool,
+) {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-send-now-append-failure");
+    let id = AgentId::from("send-now-append-failure");
+    seed_agent(&mgr, &ws, &id).await;
+    let ids = ["send-now-fail-0", "send-now-fail-1"];
+    for entry in ids {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(entry.into()),
+            format!("{entry} content"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+    }
+    sqlx::query("CREATE TRIGGER fail_send_now_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    let caller = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move {
+            mgr.send_queued_messages_now(id, ws, ids.iter().map(|m| (*m).to_string()).collect())
+                .await
+        }
+    });
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("the batch claimed the slot and reached its first append");
+    assert!(mgr.is_busy(&id));
+    if before_error {
+        caller.abort();
+        pause.resume.notify_one();
+    } else {
+        pause.resume.notify_one();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap()
+                    != AgentStatus::Error
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("the append failure persists Error");
+        caller.abort();
+    }
+    let _ = caller.await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the failed batch releases its slot");
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error,
+        "before_error={before_error}: the failed batch parks for agent.retry"
+    );
+    assert_eq!(
+        mgr.services
+            .queue_snapshot(&id)
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        ids,
+        "before_error={before_error}: the failed batch is requeued in order"
+    );
+}
+
+#[tokio::test]
+async fn send_queued_messages_now_cancelled_after_slot_claim_before_error_parks_error() {
+    send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(true).await;
+}
+
+#[tokio::test]
+async fn send_queued_messages_now_cancelled_after_slot_claim_after_error_keeps_error() {
+    send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(false).await;
 }
 
 /// The slot claim is a drop guard, so no entry point can strand the slot by

@@ -10276,7 +10276,29 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
-        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let this = Arc::clone(self);
+        crate::workspace_mutations::run_detached(
+            &self.services.turn_start_tasks,
+            Some(mutation),
+            Box::pin(async move {
+                this.send_queued_message_now_detached(agent_id, workspace_id, message_id, session)
+                    .await
+            }),
+        )
+        .await
+    }
+
+    /// The pop-to-spawn half of [`Self::send_queued_message_now`]. Detached
+    /// like `send_message`: a cancelled caller must not lose the popped
+    /// entry or interrupt its failure handling halfway.
+    async fn send_queued_message_now_detached(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        session: AgentSession,
+    ) -> Result<Value> {
         // Ownership (multiplayer, intentd#2068): resolved before the pop,
         // checked inside the pop's critical section against the entry found
         // there — a guest force-sends only what its `agent.getQueue` shows it.
@@ -10530,7 +10552,28 @@ impl AgentManager {
             .await?;
         let session = self.services.require_agent_session(&agent_id).await?;
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
-        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let this = Arc::clone(self);
+        crate::workspace_mutations::run_detached(
+            &self.services.turn_start_tasks,
+            Some(mutation),
+            Box::pin(async move {
+                this.send_queued_messages_now_detached(agent_id, workspace_id, message_ids, session)
+                    .await
+            }),
+        )
+        .await
+    }
+
+    /// The pop-to-spawn half of [`Self::send_queued_messages_now`], detached
+    /// for the same reason as [`Self::send_queued_message_now_detached`].
+    async fn send_queued_messages_now_detached(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_ids: Vec<String>,
+        session: AgentSession,
+    ) -> Result<Value> {
         let gate = self.services.queue_entry_gate(&agent_id, false).await?;
         self.services.park_queue_mutation_gate(gate.as_ref()).await;
         let quarantined = self.services.session_poisoned(&session);
