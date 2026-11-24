@@ -45,6 +45,7 @@ fn git_command() -> Command {
     command
 }
 
+#[track_caller]
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = git_command()
         .arg("-C")
