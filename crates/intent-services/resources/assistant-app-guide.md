@@ -2067,8 +2067,15 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
-Workspace file links open a file panel. Markdown files open in a read-only preview
-that renders Mermaid diagrams. For files in the main workspace checkout, relative image paths such as
+Workspace file links open a file panel. HTML files (`.html` and `.htm`) open in a
+read-only preview with their inline styles and embedded images and fonts. The
+preview blocks scripts and external resources. Turn off **HTML preview** in the
+panel menu to view or edit the source. Links to a specific line open the source
+directly. Files that exceed the preview limits open in source view. Older
+versions may differ.
+
+Markdown files open in a read-only preview that renders Mermaid diagrams.
+For files in the main workspace checkout, relative image paths such as
 `charts/chart.png` resolve from the Markdown file's folder and cannot reach
 outside the workspace; files from other registered repositories do not resolve them.
 Use the diagram's **View source** action to inspect
