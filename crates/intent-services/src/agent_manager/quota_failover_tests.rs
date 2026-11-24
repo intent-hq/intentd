@@ -2900,3 +2900,156 @@ async fn a_stale_rename_does_not_restore_a_cleared_return_state() {
     assert!(notices(&fx.messages().await, "provider_returned").is_empty());
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }
+
+// A first turn that fails with no output for a reason other than quota (a
+// runner that does not start, a transport error): whatever the retry, the
+// provider must still receive the user's message, exactly once.
+
+const FIRST_MESSAGE: &str = "default secret requests to on";
+
+/// How the first turn fails before any output.
+#[derive(Clone, Copy)]
+enum FirstTurnFailure {
+    /// The provider rejects the prompt.
+    Prompt,
+    /// The provider session never opens.
+    SessionStart,
+}
+
+async fn failed_first_turn(failure: FirstTurnFailure, extra: Value) -> Fixture {
+    let error = json!({"code": -32603, "message": "Internal error: the runner went away"});
+    let mut behavior = match failure {
+        FirstTurnFailure::Prompt => json!({
+            "promptRpcError": error,
+            "promptRpcErrorAttempts": 1,
+        }),
+        FirstTurnFailure::SessionStart => json!({
+            "sessionNewRpcError": error,
+            "sessionNewRpcErrorAttempts": 3,
+        }),
+    };
+    behavior["response"] = json!("answered");
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        behavior[key] = value.clone();
+    }
+    let fx = Fixture::new(behavior).await;
+    fx.send(FIRST_MESSAGE).await;
+    assert_eq!(fx.row().await.status, AgentStatus::Error);
+    assert!(
+        !fx.prompts().iter().any(|p| p.contains("answered")),
+        "the first turn produced nothing"
+    );
+    fx
+}
+
+/// The prompt texts after the first turn's failed attempts.
+fn retry_prompts(fx: &Fixture, failure: FirstTurnFailure) -> Vec<String> {
+    let prompts = fx.prompts();
+    let skip = match failure {
+        FirstTurnFailure::Prompt => 1,
+        FirstTurnFailure::SessionStart => 0,
+    };
+    assert!(prompts.len() > skip, "{prompts:#?}");
+    prompts[skip..].to_vec()
+}
+
+async fn assert_try_again_resends_the_message(failure: FirstTurnFailure) {
+    let fx = failed_first_turn(failure, json!({})).await;
+
+    let result = fx
+        .mgr
+        .agent_retry(fx.agent.clone(), fx.ws.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["redriven"], json!(true), "{result}");
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    let prompts = retry_prompts(&fx, failure);
+    assert_eq!(prompts.len(), 1, "{prompts:#?}");
+    assert_eq!(
+        prompts[0].matches(FIRST_MESSAGE).count(),
+        1,
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].trim_end().ends_with(FIRST_MESSAGE),
+        "{}",
+        prompts[0]
+    );
+    assert_eq!(user_rows(&fx.messages().await, FIRST_MESSAGE).len(), 1);
+    assert_eq!(fx.row().await.status, AgentStatus::RuntimeIdle);
+}
+
+async fn assert_a_new_message_carries_the_failed_one(failure: FirstTurnFailure) {
+    let fx = failed_first_turn(failure, json!({})).await;
+
+    fx.send("try again?").await;
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    let sent = retry_prompts(&fx, failure).join("\n---\n");
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    let original = sent.find(FIRST_MESSAGE).unwrap();
+    let new = sent.find("try again?").expect("the new message is sent");
+    assert!(original < new, "{sent}");
+    assert_eq!(user_rows(&fx.messages().await, FIRST_MESSAGE).len(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn try_again_after_a_failed_first_prompt_resends_the_message() {
+    assert_try_again_resends_the_message(FirstTurnFailure::Prompt).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn try_again_after_a_first_turn_whose_session_never_opened_resends_the_message() {
+    assert_try_again_resends_the_message(FirstTurnFailure::SessionStart).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_new_message_after_a_failed_first_prompt_carries_the_failed_one() {
+    assert_a_new_message_carries_the_failed_one(FirstTurnFailure::Prompt).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_new_message_after_a_first_turn_whose_session_never_opened_carries_the_failed_one() {
+    assert_a_new_message_carries_the_failed_one(FirstTurnFailure::SessionStart).await;
+}
+
+/// The observed sequence: the first turn fails, "Try again" hangs with no
+/// output and the user stops it, then sends a new message. The provider
+/// still sees the original message ahead of the new one.
+#[intent_test_macros::daemon_test]
+async fn a_new_message_after_a_stopped_silent_retry_carries_the_failed_one() {
+    let fx = failed_first_turn(
+        FirstTurnFailure::Prompt,
+        json!({"parkIfPromptEndsWith": FIRST_MESSAGE}),
+    )
+    .await;
+    fx.mgr
+        .agent_retry(fx.agent.clone(), fx.ws.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while fx.prompts().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("the retry reaches the provider");
+    fx.mgr.stop(&fx.agent).await;
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    fx.send("try again?").await;
+
+    let prompts = fx.prompts();
+    let last = prompts.last().unwrap();
+    assert!(last.contains("try again?"), "{prompts:#?}");
+    assert_eq!(last.matches(FIRST_MESSAGE).count(), 1, "{last}");
+    assert!(
+        last.find(FIRST_MESSAGE).unwrap() < last.find("try again?").unwrap(),
+        "{last}"
+    );
+}

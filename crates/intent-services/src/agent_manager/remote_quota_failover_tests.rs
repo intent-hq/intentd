@@ -1581,3 +1581,114 @@ async fn a_remote_failover_replays_the_earlier_conversation_to_the_backup() {
     assert!(sent.contains("kumquat"), "history replayed: {sent}");
     assert!(sent.trim_end().ends_with("what was the word?"), "{sent}");
 }
+
+const FIRST_MESSAGE: &str = "default secret requests to on";
+
+/// The first turn of a remote agent fails with no output: its Default runs
+/// out of quota and the backup cannot start on the machine
+/// (`remote-failover-unavailable`). `then` are the launches after that.
+async fn remote_failed_first_turn(
+    name: &str,
+    then: Vec<Launch>,
+) -> (TempDb, Arc<AgentManager>, WorkspaceId, AgentId) {
+    let ws = WorkspaceId::from(format!("ws-{name}"));
+    let id = AgentId::from(format!("agent-{name}"));
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let mut launches = vec![
+        Launch::Runs(primary),
+        Launch::Fails("the machine's limit on awake memory is reached"),
+    ];
+    launches.extend(then);
+    let port = ScriptedRemote::new(launches);
+    let (tmp, mgr, _backup) = remote_agent_with_backup(port, &id, &ws).await;
+    send(&mgr, &id, &ws, FIRST_MESSAGE).await;
+    wait_idle(&mgr, &id).await;
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    (tmp, mgr, ws, id)
+}
+
+/// Every prompt text `run` received, joined.
+fn all_prompts(run: &FakeRuntime) -> String {
+    let count = run.prompts.lock().unwrap().len();
+    (0..count)
+        .map(|n| prompt_text(run, n))
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+#[intent_test_macros::daemon_test]
+async fn try_again_after_a_failed_remote_first_turn_resends_the_message() {
+    let retry = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("remote-first-turn-retry", vec![Launch::Runs(retry.clone())])
+            .await;
+
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    retry.wait_prompts(1).await;
+    retry.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let sent = all_prompts(&retry);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    assert!(sent.trim_end().ends_with(FIRST_MESSAGE), "{sent}");
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_new_message_after_a_failed_remote_first_turn_carries_the_failed_one() {
+    let next = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("remote-first-turn-new", vec![Launch::Runs(next.clone())]).await;
+
+    send(&mgr, &id, &ws, "try again?").await;
+    next.wait_prompts(1).await;
+    next.finish.add_permits(2);
+    wait_idle(&mgr, &id).await;
+
+    let sent = all_prompts(&next);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    let new = sent.find("try again?").expect("the new message is sent");
+    assert!(sent.find(FIRST_MESSAGE).unwrap() < new, "{sent}");
+}
+
+/// The observed sequence: the first turn fails, "Try again" runs with no
+/// output until the user stops it, and the next message fails over to the
+/// backup, which starts this time. The backup's fresh session still gets
+/// the original message ahead of the new one.
+#[intent_test_macros::daemon_test]
+async fn a_backup_after_a_stopped_silent_retry_gets_the_failed_first_message() {
+    let silent = FakeRuntime::new();
+    let primary_again = FakeRuntime::new();
+    primary_again.quota_failures.store(1, Ordering::SeqCst);
+    let backup = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+        "remote-first-turn-stopped",
+        vec![
+            Launch::Runs(silent.clone()),
+            Launch::Runs(primary_again.clone()),
+            Launch::Runs(backup.clone()),
+        ],
+    )
+    .await;
+
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    silent.wait_prompts(1).await;
+    mgr.stop(&id).await;
+    wait_idle(&mgr, &id).await;
+
+    send(&mgr, &id, &ws, "try again?").await;
+    backup.wait_prompts(1).await;
+    backup.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let sent = prompt_text(&backup, 0);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    let new = sent.find("try again?").expect("the new message is sent");
+    assert!(sent.find(FIRST_MESSAGE).unwrap() < new, "{sent}");
+}

@@ -6387,7 +6387,9 @@ impl AgentManager {
             .iter()
             .flatten()
             .flat_map(|entry| {
-                std::iter::once(entry.id.clone()).chain(
+                // A failed turn's requeued entry names its directly persisted
+                // user row among its submission ids.
+                entry.submission_ids().into_iter().chain(
                     entry
                         .recovery_sources
                         .iter()
@@ -6889,9 +6891,10 @@ impl AgentManager {
             .filter(|source| group_source_ids.contains(source))
             .collect();
         let first_flushed = flushed_ids.and_then(|ids| {
-            messages
-                .iter()
-                .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
+            messages.iter().position(|message| {
+                queue_source(message).is_some_and(|id| ids.contains(&id))
+                    || (message.role == "user" && ids.contains(&message.id))
+            })
         });
         // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
         // already persisted assistant/tool rows after the current user row,
@@ -9353,6 +9356,34 @@ impl AgentManager {
             self.clone()
                 .try_drain_queue(agent_id.clone(), workspace_id.clone())
                 .await;
+            return Ok(result);
+        }
+        // A fresh send into an `Error` session whose failed turn's message
+        // still waits in the queue: queue this one behind it and redrive as
+        // `agent.retry` does, so the batch flush delivers both in order in
+        // one turn. A direct turn would run this message alone, and a
+        // provider session that never saw the failed one would lack it.
+        if session.status == AgentStatus::Error && self.services.has_ready_failed_turn(&agent_id) {
+            let (queued, position) = self.services.enqueue_submission(
+                &agent_id,
+                Some(message_id.clone()),
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                options.origin,
+            )?;
+            let mut result = json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            queued.attach_correlation(&mut result);
+            self.services.publish_queue_updated(&agent_id).await;
+            self.agent_retry(agent_id, workspace_id).await?;
             return Ok(result);
         }
         #[cfg(test)]
