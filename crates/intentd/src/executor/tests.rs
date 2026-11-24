@@ -915,7 +915,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
         .send(&LinkFrame::Prompt {
             agent_id: AgentId::from("a0"),
             turn_id: "t1".into(),
-            prompt: vec![serde_json::json!({ "type": "text", "text": "many" })],
+            prompt: vec![serde_json::json!({ "type": "text", "text": "@many" })],
         })
         .await
         .unwrap();

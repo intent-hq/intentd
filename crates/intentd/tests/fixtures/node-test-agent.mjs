@@ -32,11 +32,16 @@
 //
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
-// whole process tree. A prompt whose text contains "block" parks until
-// session/cancel (1.5 s after it when it also contains "slow-cancel"); "slow" waits 300 ms; "many" streams 200 extra chunks;
-// The prompt "exit" (exactly) answers and then exits with code 0, leaving its `sleep` child
-// running; "spawn-exit" starts another `sleep` in its own process group,
-// writes its pid to `late-helper.pid`, answers and exits at once; every turn
+// whole process tree. Directives are a whole one-line user message (the last
+// prompt block) "@<name> [label]", never words inside a prompt (a stopped
+// "@block" redelivered with the next message is two lines and runs as an
+// ordinary turn):
+// "@block" parks until session/cancel, "@block-slow-cancel" likewise but
+// answers the cancel 1.5 s later, "@slow" waits 300 ms, "@many" streams 200
+// extra chunks, and "@spawn-exit" starts another `sleep` in its own process
+// group, writes its pid to `late-helper.pid`, answers and exits at once. An
+// unknown "@<name>" fails the turn. The prompt "exit" (exactly) answers and
+// then exits with code 0, leaving its `sleep` child running; every turn
 // first streams one agent_message_chunk "echo: <text>". A prompt
 // "wsapi <code>" instead runs <code> through the session's workspace MCP
 // server (the `--connect` address of its `workspace-mcp` entry in
@@ -283,8 +288,8 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     }
     case 'session/prompt': {
       const text = promptText(msg.params);
-      // A specialist's role reminder leads its prompts: only echo-raw and
-      // wsapi/wsapi-tool read the command after it.
+      // A specialist's role reminder leads its prompts: echo-raw,
+      // wsapi/wsapi-tool and the @ directives read the command after it.
       const command = text.replace(/^\[Role Reminder: [\s\S]*?\]\n\n/, '');
       const earlier = currentSession ? readHistory(currentSession) ?? [] : [];
       if (currentSession) fs.writeFileSync(sessionFile(currentSession), JSON.stringify([...earlier, text]));
@@ -495,7 +500,15 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         });
         return send({ id: msg.id, error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } } });
       }
-      if (text.includes('many')) {
+      // The user's message is the last block: a first turn's notices and
+      // skills catalog are blocks before it.
+      const message = promptText({ prompt: (msg.params?.prompt ?? []).slice(-1) })
+        .replace(/^\[Role Reminder: [\s\S]*?\]\n\n/, '');
+      const directive = message.match(/^@([a-z-]+)(?: [^\n]*)?$/)?.[1];
+      if (directive && !['block', 'block-slow-cancel', 'slow', 'many', 'spawn-exit'].includes(directive)) {
+        return send({ id: msg.id, error: { code: -32602, message: `unknown directive @${directive}` } });
+      }
+      if (directive === 'many') {
         for (let i = 0; i < 200; i++) {
           send({
             method: 'session/update',
@@ -506,7 +519,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           });
         }
       }
-      if (text.includes('spawn-exit')) {
+      if (directive === 'spawn-exit') {
         const late = spawn('sleep', ['300'], { stdio: 'ignore', detached: true });
         fs.writeFileSync('late-helper.pid', String(late.pid));
         send({ id: msg.id, result: { stopReason: 'end_turn' } });
@@ -519,11 +532,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         setTimeout(() => process.exit(0), 50);
         return;
       }
-      if (text.includes('block')) {
-        parked.push({ id: msg.id, delayMs: text.includes('slow-cancel') ? 1500 : 0 });
+      if (directive === 'block' || directive === 'block-slow-cancel') {
+        parked.push({ id: msg.id, delayMs: directive === 'block-slow-cancel' ? 1500 : 0 });
         return;
       }
-      if (text.includes('slow')) await new Promise((resolve) => setTimeout(resolve, 300));
+      if (directive === 'slow') await new Promise((resolve) => setTimeout(resolve, 300));
       return send({ id: msg.id, result: { stopReason: 'end_turn' } });
     }
     default:

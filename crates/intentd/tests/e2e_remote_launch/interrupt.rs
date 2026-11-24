@@ -156,9 +156,9 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
 
     // 1. An interrupt-priority message cuts a running turn and starts at once.
     // The provider ends the cancelled turn only after a while, as real ones do.
-    send(&mut rpc_ws, agent, 100, "first block slow-cancel", None).await;
+    send(&mut rpc_ws, agent, 100, "@block-slow-cancel first", None).await;
     let mut id = 200;
-    delta(&mut events, "echo: first block slow-cancel").await;
+    delta(&mut events, "echo: @block-slow-cancel first").await;
     let sent = send(&mut rpc_ws, agent, 300, "second", Some("interrupt")).await;
     assert_eq!(sent["queued"], false, "the interrupt is not queued: {sent}");
     reply_becomes(&mut rpc_ws, agent, &mut id, "echo: second").await;
@@ -166,8 +166,8 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
     assert_eq!(end["data"]["stopReason"], "interrupted", "{end}");
 
     // 2. Stop ends a running turn.
-    send(&mut rpc_ws, agent, 400, "third block", None).await;
-    delta(&mut events, "echo: third block").await;
+    send(&mut rpc_ws, agent, 400, "@block third", None).await;
+    delta(&mut events, "echo: @block third").await;
     ok(
         &mut rpc_ws,
         500,
@@ -193,8 +193,8 @@ async fn interrupt_and_stop_reach_a_remote_agent_mid_turn() {
     // 3. Stop while the interrupting message still waits on the machine for
     // the cancelled turn to end: that message never runs as its own turn.
     // (A stop before any output redelivers it with the next message.)
-    send(&mut rpc_ws, agent, 700, "fifth block slow-cancel", None).await;
-    delta(&mut events, "echo: fifth block slow-cancel").await;
+    send(&mut rpc_ws, agent, 700, "@block-slow-cancel fifth", None).await;
+    delta(&mut events, "echo: @block-slow-cancel fifth").await;
     send(&mut rpc_ws, agent, 800, "sixth", Some("interrupt")).await;
     // timing-guard: lets the interrupting prompt reach the machine, where it waits out the 1.5 s cancel (no event marks its arrival)
     tokio::time::sleep(Duration::from_millis(500)).await;
