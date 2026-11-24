@@ -4487,6 +4487,16 @@ pub const PROPOSAL_OUTCOME_APPLIED: &str = "applied";
 /// See [`PROPOSAL_OUTCOME_APPLIED`].
 pub const PROPOSAL_OUTCOME_DISMISSED: &str = "dismissed";
 
+/// Metadata key under which answered secret requests are persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.56): a
+/// `requestId -> "provided" | "declined"` map written when the user answers
+/// a card. Holds outcomes only, never a value. Lets every client settle the
+/// card across reloads and daemon restarts without finding the notice row.
+/// Bounded: the writer evicts the oldest entries past its retention cap. No
+/// schema migration — the map rides the existing free-form `metadata`
+/// column. Read back by [`AgentSession::secret_request_resolutions`].
+pub const SECRET_REQUEST_RESOLUTIONS_KEY: &str = "secretRequestResolutions";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -5013,6 +5023,28 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
+    /// The answered secret requests persisted under
+    /// [`SECRET_REQUEST_RESOLUTIONS_KEY`]: a
+    /// `requestId -> "provided" | "declined"` map. Entries with an empty id
+    /// or any other outcome are skipped, so seeded metadata cannot read as
+    /// authoritative. Absent key or a non-object value reads as empty.
+    pub fn secret_request_resolutions(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(SECRET_REQUEST_RESOLUTIONS_KEY))
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, outcome)| {
+                        !id.is_empty() && matches!(outcome.as_str(), Some("provided" | "declined"))
+                    })
+                    .map(|(id, outcome)| (id.clone(), outcome.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The created-workspace ids persisted under
     /// [`PROPOSAL_CREATED_WORKSPACES_KEY`] in the session's free-form
     /// `metadata`: a `proposalId -> workspaceId` map. Entries with an empty
@@ -5169,6 +5201,12 @@ pub struct AgentMetadata {
     /// created workspace from an applied card with it. Omitted when empty.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub proposal_created_workspaces: serde_json::Map<String, serde_json::Value>,
+    /// Answered secret requests (PROTOCOL §5.56): a
+    /// `requestId -> "provided" | "declined"` map, mirroring
+    /// [`AgentSession::secret_request_resolutions`]. Clients settle secret
+    /// cards from it. Detail-only. Omitted when empty.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub secret_request_resolutions: serde_json::Map<String, serde_json::Value>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -5521,6 +5559,7 @@ impl AgentLite {
         let pending_proposals = session.pending_proposals();
         let proposal_resolutions = session.proposal_resolutions();
         let proposal_created_workspaces = session.proposal_created_workspaces();
+        let secret_request_resolutions = session.secret_request_resolutions();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
@@ -5545,6 +5584,7 @@ impl AgentLite {
             pending_proposals,
             proposal_resolutions,
             proposal_created_workspaces,
+            secret_request_resolutions,
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
@@ -5647,7 +5687,8 @@ impl AgentLite {
     /// that only the open-agent (detail) UI reads — `harnessFeatures`,
     /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`, the
     /// placed agent's `leaseId`, `metadata.pendingProposals`,
-    /// `metadata.proposalResolutions`, `metadata.proposalCreatedWorkspaces` — so an
+    /// `metadata.proposalResolutions`, `metadata.proposalCreatedWorkspaces`,
+    /// `metadata.secretRequestResolutions` — so an
     /// `agent.list` row carries only what list contexts render. Every one of
     /// these is presence-detected on the wire (`skip_serializing_if`), so a
     /// stripped row simply omits the key (absent, never `null`). `agent.list`
@@ -5677,6 +5718,7 @@ impl AgentLite {
         self.metadata.pending_proposals.clear();
         self.metadata.proposal_resolutions.clear();
         self.metadata.proposal_created_workspaces.clear();
+        self.metadata.secret_request_resolutions.clear();
     }
 
     /// List-path preview capping (list-payload cost contract, extending

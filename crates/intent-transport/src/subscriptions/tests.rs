@@ -3396,7 +3396,11 @@ mod agent_delta_list_projection {
         "fileBlocks",
         "stats",
     ];
-    const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+    const DETAIL_ONLY_METADATA_KEYS: &[&str] = &[
+        "pendingProposals",
+        "proposalResolutions",
+        "secretRequestResolutions",
+    ];
 
     /// `agent_get` serves the FULL `agent.get` detail row: every detail-only
     /// field populated and every render-preview string far over
@@ -3427,6 +3431,7 @@ mod agent_delta_list_projection {
             "pendingQuestionsMessageId": "msg-p",
             "pendingProposals": [{ "proposalId": "prop-1", "messageId": "msg-1" }],
             "proposalResolutions": { "prop-0": "applied" },
+            "secretRequestResolutions": { "sec-0": "declined" },
             "lastSeenMessageId": "msg-seen",
             "isInitialAgent": true,
             "sponsorAgentId": "agent-sponsor",

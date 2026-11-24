@@ -4164,10 +4164,21 @@ mod workspace_needs_attention {
         assert_eq!(
             listing.answered,
             vec![(
-                request_id,
+                request_id.clone(),
                 "KEY".to_string(),
                 crate::secret_requests::Outcome::Declined
             )]
+        );
+        let resolved = svc
+            .store
+            .get_agent_session_summary(&session.id)
+            .await
+            .unwrap()
+            .secret_request_resolutions();
+        assert_eq!(
+            serde_json::Value::Object(resolved),
+            json!({ request_id.clone(): "declined" }),
+            "dismissing records the decline durably"
         );
         svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id)
             .await
