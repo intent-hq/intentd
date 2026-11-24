@@ -527,6 +527,12 @@ mod tests {
         }
     }
 
+    /// The default claim wait outlasts a crashed instance's lease twice over.
+    #[test]
+    fn the_default_claim_wait_is_two_lease_ttls() {
+        assert_eq!(crate::DEFAULT_CLAIM_WAIT, LEASE_TTL * 2);
+    }
+
     /// A tenant's resolvers never fall back to host-wide credentials (env
     /// vars, the host `gh` login).
     #[tokio::test]

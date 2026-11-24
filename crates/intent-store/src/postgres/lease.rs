@@ -219,6 +219,12 @@ const LEASE_LOCK_SQL: &str = "SELECT owner_instance, epoch, \
      (extract(epoch FROM expires_at) * 1000)::bigint, expires_at <= clock_timestamp() \
      FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE";
 
+/// How long the tenant's ($1) lease has left by the database clock, in ms;
+/// 0 once it expired.
+const LEASE_EXPIRES_IN_SQL: &str = "SELECT GREATEST(0, \
+     (extract(epoch FROM expires_at - clock_timestamp()) * 1000)::bigint) \
+     FROM tenant_lease WHERE tenant_id = $1";
+
 /// Takes the lease ($1 tenant, $2 instance, $3 epoch, $4 TTL in ms).
 const LEASE_TAKE_SQL: &str = "INSERT INTO tenant_lease \
      (tenant_id, owner_instance, epoch, expires_at, renewed_at) \
@@ -335,6 +341,19 @@ impl PgStore {
             expires_at: timestamp(expires_ms)?,
             renew_by: started + ttl,
         }))
+    }
+
+    /// See [`Store::postgres_lease_expires_in`](crate::Store::postgres_lease_expires_in).
+    /// One read of the lease row, outside the writer lock.
+    pub(crate) async fn lease_expires_in(&self) -> Result<Option<Duration>> {
+        let mut tx = self.begin().await?;
+        let ms: Option<i64> = sqlx::query_scalar(LEASE_EXPIRES_IN_SQL)
+            .bind(self.tenant())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(ms.map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(0))))
     }
 
     /// See [`Store::renew_tenant_lease`](crate::Store::renew_tenant_lease).
@@ -530,6 +549,26 @@ impl crate::Store {
             crate::Backend::Postgres(store) => store.release_lease(epoch).await,
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
+    }
+
+    /// How long the current lease on Postgres tenant `tenant` has left, by
+    /// the database clock: zero once it expired (a claim may then succeed),
+    /// `None` when the tenant was never claimed. It reads the lease row
+    /// only, claiming and writing nothing, so a process refused with
+    /// `Error::NotOwner` by [`Self::open_postgres_owned`] can wait that long
+    /// before it claims again.
+    ///
+    /// # Errors
+    /// `Error::StoreBusy` when no pool connection comes free;
+    /// `Error::Internal` when the statement fails.
+    pub async fn postgres_lease_expires_in(
+        pool: PgPool,
+        tenant: TenantId,
+    ) -> Result<Option<Duration>> {
+        let key = super::tenant_registry::tenant_key(&pool, &tenant);
+        PgStore::for_key(pool, tenant, PostgresOptions::default(), key)
+            .lease_expires_in()
+            .await
     }
 
     /// The orchestrator's startup open: [`Self::open_postgres`] that claims

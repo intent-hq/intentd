@@ -158,6 +158,44 @@ async fn the_first_claim_owns_the_tenant_at_epoch_one() {
     assert!(store.daemon_id().await.is_ok());
 }
 
+/// A refused process reads how long the owner's lease has left (database
+/// clock), without claiming or writing: `None` before any claim, at most
+/// the TTL while it is live, zero once it lapsed.
+#[tokio::test]
+async fn a_refused_process_reads_how_long_the_lease_has_left() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-expires-in";
+    let expires_in =
+        || Store::postgres_lease_expires_in(db.app.clone(), TenantId::new(tenant).unwrap());
+    assert_eq!(expires_in().await.unwrap(), None);
+
+    let (_owner, _) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    let before = tenant_rows(&db.admin, tenant).await;
+    let left = expires_in().await.unwrap().expect("a claimed tenant");
+    assert!(
+        left > Duration::ZERO && left <= LONG_TTL,
+        "{left:?} left of a {LONG_TTL:?} lease"
+    );
+    assert_eq!(tenant_rows(&db.admin, tenant).await, before);
+
+    let short = "lease-expires-in-short";
+    let (_lapsed, _) = open_owned(&db.app, short, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    // timing-guard: outlive the short lease
+    tokio::time::sleep(SHORT_TTL * 2).await;
+    assert_eq!(
+        Store::postgres_lease_expires_in(db.app.clone(), TenantId::new(short).unwrap())
+            .await
+            .unwrap(),
+        Some(Duration::ZERO)
+    );
+}
+
 #[tokio::test]
 async fn a_second_claim_fails_names_the_owner_and_changes_no_row() {
     let Some(db) = test_db(false).await else {

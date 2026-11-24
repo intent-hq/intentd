@@ -31,6 +31,7 @@
 //! with tenant-sticky routing.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use intent_core::tenant_fence::SelfFenceReport;
 
@@ -55,6 +56,47 @@ pub const DEFAULT_TENANT: &str = "default";
 /// The instance id this process claims its leases as; a fresh one per
 /// start when unset.
 pub const INSTANCE_ENV: &str = "INTENTD_ORCHESTRATOR_INSTANCE";
+
+/// How long, in seconds, a start may wait for another instance's lease on a
+/// tenant to lapse before it gives up (exit 1); [`DEFAULT_CLAIM_WAIT`] when
+/// unset, `0` to give up at once.
+pub const CLAIM_WAIT_ENV: &str = "INTENTD_ORCHESTRATOR_CLAIM_WAIT_SECS";
+
+/// The default [`CLAIM_WAIT_ENV`]: two lease TTLs (30 s each), so a
+/// restart right after a crash outlasts the dead instance's lease.
+pub const DEFAULT_CLAIM_WAIT: Duration = Duration::from_secs(60);
+
+/// How long after the lease's expiry a waiting start claims again, so the
+/// expiry has passed by the database clock too.
+pub const CLAIM_RETRY_MARGIN: Duration = Duration::from_millis(500);
+
+/// The claim wait from [`CLAIM_WAIT_ENV`]'s value: `None` (unset or blank)
+/// is [`DEFAULT_CLAIM_WAIT`].
+///
+/// # Errors
+/// When a set value is not a whole number of seconds.
+pub fn claim_wait_from_env(raw: Option<&str>) -> Result<Duration, String> {
+    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        None => Ok(DEFAULT_CLAIM_WAIT),
+        Some(raw) => raw
+            .parse()
+            .map(Duration::from_secs)
+            .map_err(|_| format!("{CLAIM_WAIT_ENV}: {raw:?} is not a number of seconds")),
+    }
+}
+
+/// How long a start refused by a live lease waits before it claims again:
+/// until the lease expires (`expires_in`, by the database clock) plus
+/// [`CLAIM_RETRY_MARGIN`], at most what is `left` of its claim wait. `None`
+/// gives up: the wait is spent, or the expiry is unknown.
+#[must_use]
+pub fn next_claim_wait(expires_in: Option<Duration>, left: Duration) -> Option<Duration> {
+    let expires_in = expires_in?;
+    if left.is_zero() {
+        return None;
+    }
+    Some((expires_in + CLAIM_RETRY_MARGIN).min(left))
+}
 
 /// The exit code when a tenant's self-fence overran: its work may still run
 /// after its lease is gone, and only stopping the process stops it.
@@ -294,6 +336,40 @@ mod tests {
             let _ = seen_tx.send(is_fatal(&report));
         });
         assert_eq!(seen.recv().await, Some(true));
+    }
+
+    #[test]
+    fn the_claim_wait_defaults_to_two_lease_ttls_and_takes_whole_seconds() {
+        assert_eq!(claim_wait_from_env(None).unwrap(), DEFAULT_CLAIM_WAIT);
+        assert_eq!(claim_wait_from_env(Some(" ")).unwrap(), DEFAULT_CLAIM_WAIT);
+        assert_eq!(
+            claim_wait_from_env(Some(" 5 ")).unwrap(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(claim_wait_from_env(Some("0")).unwrap(), Duration::ZERO);
+        for bad in ["-1", "1.5", "soon"] {
+            assert!(claim_wait_from_env(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_refused_start_waits_until_the_lease_lapses_within_its_bound() {
+        let secs = Duration::from_secs;
+        // Until the expiry plus the margin, while the bound allows.
+        assert_eq!(
+            next_claim_wait(Some(secs(20)), secs(60)),
+            Some(secs(20) + CLAIM_RETRY_MARGIN)
+        );
+        // An already lapsed lease: only the margin.
+        assert_eq!(
+            next_claim_wait(Some(Duration::ZERO), secs(60)),
+            Some(CLAIM_RETRY_MARGIN)
+        );
+        // Capped at what is left, for one last claim at the bound.
+        assert_eq!(next_claim_wait(Some(secs(30)), secs(3)), Some(secs(3)));
+        // Gives up once the bound is spent, or when the expiry is unknown.
+        assert_eq!(next_claim_wait(Some(secs(30)), Duration::ZERO), None);
+        assert_eq!(next_claim_wait(None, secs(60)), None);
     }
 
     #[test]
