@@ -9672,13 +9672,14 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
-    // An `acpSessionId` is required for the keep-alive interrupt (otherwise
-    // `interrupt` falls back to the hard `stop` kill path).
+    // A session bound on the live handle is required for the keep-alive
+    // interrupt (otherwise `interrupt` falls back to the hard `stop` kill path).
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int");
     // Claim the in-flight slot so the interrupt exercises the busy turn path.
     assert!(mgr.try_begin(&id, &ws).await);
 
@@ -9761,6 +9762,7 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
         .set_acp_session_id(&ws, &id, "acp-int")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int");
     assert!(mgr.try_begin(&id, &ws).await);
 
     // Queue a ready-to-send message via agent_queue_message_op (mirroring
@@ -9930,6 +9932,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
         .set_acp_session_id(&ws, &id, "acp-wedged")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-wedged");
     // Claim the in-flight slot: the incident agent was mid-turn.
     assert!(mgr.try_begin(&id, &ws).await);
 
@@ -10026,6 +10029,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .set_acp_session_id(&ws, &id, "acp-int-send")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-send");
     // Claim the in-flight slot and register the live-turn slot so the send
     // sees a busy (mid-turn) agent past `session/prompt` — without the live
     // slot the busy agent is still in its startup window and the preemption
@@ -10114,6 +10118,7 @@ async fn interrupt_kills_child_for_provider_with_kill_quirk() {
         .set_acp_session_id(&ws, &id, "acp-int-quirk")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-quirk");
     assert!(mgr.try_begin(&id, &ws).await);
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -10174,6 +10179,7 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
         .set_acp_session_id(&ws, &id, "acp-int-attr")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-attr");
     assert!(mgr.try_begin(&id, &ws).await);
     // Mid-stream turn: the live-turn slot holds a streamed block, so the
     // preemption flushes a NON-empty interrupted row.
@@ -10275,6 +10281,7 @@ async fn deliver_interrupt_send(
         .set_acp_session_id(&ws, &id, "acp-preempt-note")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-preempt-note");
     if busy {
         assert!(mgr.try_begin(&id, &ws).await);
         let blocks =
@@ -10511,12 +10518,13 @@ async fn interrupt_flushes_partial_live_turn_as_interrupted_assistant_row() {
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-flush"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
-    // An `acpSessionId` keeps the interrupt on the keep-alive path.
+    // A session bound on the live handle keeps the interrupt on the keep-alive path.
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-flush")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-flush");
     assert!(mgr.try_begin(&id, &ws).await);
     // Simulate a mid-stream turn: the live-turn slot holds coalesced blocks.
     let blocks = vec![json!({ "type": "text", "id": "msg-int-flush:0", "text": "partial…" })];
@@ -10573,6 +10581,7 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
         .set_acp_session_id(&ws, &id, "acp-int-empty")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-empty");
     assert!(mgr.try_begin(&id, &ws).await);
     // The turn started (slot open, message id minted) but nothing streamed yet.
     mgr.services.set_live_turn(&id, "msg-int-empty", Vec::new());
@@ -10645,6 +10654,7 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
         .set_acp_session_id(&ws, &id, "acp-int-done")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-done");
     assert!(mgr.try_begin(&id, &ws).await);
     let blocks = vec![json!({ "type": "text", "id": "msg-int-done:0", "text": "All done." })];
     mgr.services
@@ -10755,6 +10765,7 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
         .set_acp_session_id(&ws, &id, "acp-int-susp")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-susp");
     assert!(mgr.try_begin(&id, &ws).await);
     let blocks = vec![json!({ "type": "text", "id": "msg-int-susp:0", "text": "partial…" })];
     mgr.services
@@ -11771,6 +11782,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
         .set_acp_session_id(&ws, &id, "acp-stop-redeliver")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-stop-redeliver");
     assert!(mgr.try_begin(&id, &ws).await);
     // The in-flight turn's user message (text + image attachment) is already
     // persisted; the live-turn slot is open with ZERO streamed blocks.
@@ -11903,6 +11915,7 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
         .set_acp_session_id(&ws, &id, "acp-stop-progress")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-stop-progress");
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.services
         .store
@@ -12485,6 +12498,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .set_acp_session_id(&ws, &id, "acp-sqmn-busy")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-sqmn-busy");
     let queued = mgr
         .services
         .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None, None)
@@ -12859,6 +12873,7 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
         .set_acp_session_id(&ws, &id, "acp-int-zero")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-zero");
     assert!(mgr.try_begin(&id, &ws).await);
     // The in-flight turn's user message is already persisted, and its live-turn
     // slot is open with ZERO streamed assistant blocks.
@@ -13050,6 +13065,7 @@ async fn preemption_by_agent_sender_without_name_omits_name_field() {
         .set_acp_session_id(&ws, &id, "acp-int-noname")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-noname");
     assert!(mgr.try_begin(&id, &ws).await);
     let blocks = vec![json!({ "type": "text", "id": "msg-int-noname:0", "text": "partial…" })];
     mgr.services.set_live_turn(&id, "msg-int-noname", blocks);
@@ -13140,6 +13156,7 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .set_acp_session_id(&ws, &id, "acp-int-noidle")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-noidle");
     // Claim the in-flight slot and register the live-turn slot so the send
     // preempts a busy (mid-turn) agent past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
@@ -13296,6 +13313,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .set_acp_session_id(&ws, &id, "acp-int-dup")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-int-dup");
     // Claim the in-flight slot and register the live-turn slot so the first
     // delivery preempts a busy turn past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
@@ -14113,13 +14131,14 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
     set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
-    // An `acpSessionId` is required for the keep-alive interrupt (otherwise
-    // `interrupt` falls back to the hard `stop` kill path).
+    // A session bound on the live handle is required for the keep-alive
+    // interrupt (otherwise `interrupt` falls back to the hard `stop` kill path).
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-archive")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-archive");
     // Simulate a mid-turn worker: claim the in-flight slot AND register a
     // JoinHandle in the workers map (the interrupt must abort it).
     assert!(mgr.try_begin(&id, &ws).await);
@@ -14221,6 +14240,9 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     }
     let _caller_agent = track_mock_agent(&mgr, &caller, false);
     let _other_agent = track_mock_agent(&mgr, &other, false);
+    for id in [&caller, &other] {
+        mgr.bind_live_session_for_test(id, &format!("acp-{}", id.as_str()));
+    }
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let archived =
@@ -19040,6 +19062,7 @@ async fn keep_alive_interrupt_arms_stale_cancel_mark() {
         .set_acp_session_id(&ws, &id, "acp-stale-cancel-arm")
         .await
         .unwrap();
+    mgr.bind_live_session_for_test(&id, "acp-stale-cancel-arm");
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.services
         .set_live_turn(&id, "msg-stale-cancel-arm", Vec::new());
@@ -25626,6 +25649,7 @@ mod harness_wake_tests {
             .set_acp_session_id(&ws, &id, "acp-wake")
             .await
             .unwrap();
+        mgr.bind_live_session_for_test(&id, "acp-wake");
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
         note_tx.send(chunk_note("partial wake output")).unwrap();

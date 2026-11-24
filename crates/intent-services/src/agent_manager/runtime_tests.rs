@@ -409,8 +409,8 @@ async fn fake_runtime_interrupt_permissions_and_stop_need_no_local_handle() {
     assert!(!fake.is_alive());
 }
 
-/// The cancel goes to the session the live runtime's turn prompts on, not
-/// to whatever `acpSessionId` the store holds.
+/// The cancel goes to the session bound on the live runtime handle, not to
+/// the `acpSessionId` the store holds.
 #[tokio::test]
 async fn an_interrupt_cancels_the_live_turns_session_not_the_stored_one() {
     let script = mock_agent_script();
@@ -430,19 +430,18 @@ async fn an_interrupt_cancels_the_live_turns_session_not_the_stored_one() {
     .await
     .unwrap();
     fake.wait_prompts(1).await;
-    mgr.services
-        .store
-        .set_acp_session_id(&ws, &id, "stale-stored-session")
-        .await
-        .unwrap();
+    mgr.bind_live_session_for_test(&id, "live-session");
 
     assert!(mgr.interrupt(&id).await);
     assert_eq!(
         *fake.cancelled.lock().unwrap(),
-        ["fake-resumed-session"],
-        "the cancel targets the session the turn runs on"
+        ["live-session"],
+        "the cancel targets the handle's session, not the stored one"
     );
-    assert!(mgr.contains(&id), "keep-alive interrupt retains the runtime");
+    assert!(
+        mgr.contains(&id),
+        "keep-alive interrupt retains the runtime"
+    );
     assert!(fake.is_alive());
     mgr.stop(&id).await;
 }
@@ -460,19 +459,29 @@ async fn a_live_runtime_with_no_stored_session_is_interrupted_and_preempted() {
         asked: AtomicUsize::new(0),
     });
     let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
-    let send = |text: &str, interrupt_priority: bool| {
+    // A provider without the kill-on-interrupt quirk, so the runtime is kept.
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    session.provider = Some("claude-code".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    let send = |text: &str| {
         mgr.send_message(
             id.clone(),
             ws.clone(),
             text.into(),
             None,
-            super::super::TurnOptions {
-                interrupt_priority,
-                ..super::super::TurnOptions::default()
-            },
+            super::super::TurnOptions::default(),
         )
     };
-    send("first", false).await.unwrap();
+    send("first").await.unwrap();
     fake.wait_prompts(1).await;
     let stored = mgr
         .services
@@ -484,17 +493,32 @@ async fn a_live_runtime_with_no_stored_session_is_interrupted_and_preempted() {
 
     assert!(mgr.interrupt(&id).await);
     let remote_session = format!("remote:{id}");
-    assert_eq!(*fake.cancelled.lock().unwrap(), [remote_session.clone()]);
-    assert!(mgr.contains(&id), "keep-alive interrupt retains the runtime");
+    assert_eq!(
+        fake.cancelled.lock().unwrap().as_slice(),
+        std::slice::from_ref(&remote_session)
+    );
+    assert!(
+        mgr.contains(&id),
+        "keep-alive interrupt retains the runtime"
+    );
     assert!(fake.is_alive());
     wait_idle(&mgr, &id).await;
 
-    send("second", false).await.unwrap();
+    send("second").await.unwrap();
     fake.wait_prompts(2).await;
-    let preempting = send("now", true).await.unwrap();
-    assert_ne!(
-        preempting["queued"], true,
-        "the interrupt-priority send preempts the turn: {preempting}"
+    let preempting = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "now".into(),
+            None,
+            super::super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preempting["queued"], false,
+        "the interrupt send preempts the turn: {preempting}"
     );
     assert_eq!(
         *fake.cancelled.lock().unwrap(),

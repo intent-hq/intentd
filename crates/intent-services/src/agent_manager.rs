@@ -4849,9 +4849,9 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        self.start_session_owned(agent_id, cwd, provider)
-            .await
-            .map(|started| started.session_id)
+        let started = self.start_session_owned(agent_id, cwd, provider).await?;
+        self.bind_started(agent_id, &started);
+        Ok(started.session_id)
     }
 
     async fn start_session_owned(
@@ -12356,8 +12356,13 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<StartedSession> {
-        let started =
-            boxed_await(|| self.ensure_started_unbound(agent_id, workspace_id)).await?;
+        let started = boxed_await(|| self.ensure_started_unbound(agent_id, workspace_id)).await?;
+        self.bind_started(agent_id, &started);
+        Ok(started)
+    }
+
+    /// Bind `started`'s session on the handle whose runtime started it.
+    fn bind_started(&self, agent_id: &AgentId, started: &StartedSession) {
         if let Some(handle) = self.handles.lock().unwrap().get(agent_id) {
             if std::ptr::addr_eq(
                 Arc::as_ptr(&handle.execution.runtime),
@@ -12366,7 +12371,19 @@ impl AgentManager {
                 handle.execution.bind_session(&started.session_id);
             }
         }
-        Ok(started)
+    }
+
+    /// Test seam: bind `session_id` on the installed handle, as a started
+    /// turn's session is bound by [`Self::ensure_started_owned`].
+    #[cfg(test)]
+    fn bind_live_session_for_test(&self, agent_id: &AgentId, session_id: &str) {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .expect("a live handle to bind the session on")
+            .execution
+            .bind_session(session_id);
     }
 
     /// The live cancel target of `agent_id`; see [`LiveCancel`].
@@ -23280,6 +23297,7 @@ mod startup_preempt_tests {
             "worker still owns the busy slot until its end_turn"
         );
         let _ends = install_fake_handle(&mgr, &agent_id, None);
+        mgr.bind_live_session_for_test(&agent_id, "acp-live");
         // The turn was live when the eligibility check ran, then completed:
         // the worker's normal turn end cleared the unpinned slot.
         mgr.services.set_live_turn(&agent_id, "msg-done", vec![]);
@@ -23338,6 +23356,7 @@ mod startup_preempt_tests {
         seed_mock_session(&mgr, &agent_id, "acp-live").await;
         assert!(mgr.try_begin(&agent_id, &ws).await);
         let _ends = install_fake_handle(&mgr, &agent_id, None);
+        mgr.bind_live_session_for_test(&agent_id, "acp-live");
         assert!(mgr.services.live_turn(&agent_id).is_none());
 
         let outcome = mgr
