@@ -9495,16 +9495,19 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
-        // A fresh send while a failed turn's message still waits in the
-        // queue: queue this one behind it and lift the Error park, so the
-        // batch flush delivers both in order in one turn. A direct turn would
-        // run this message first, and a provider session that never saw the
-        // failed one would lack it. This holds after `agent.retry` lifted the
-        // park but before its drain started too (the session is then no
-        // longer `Error`; `redrive_failed_turn` only drains). While the
-        // failing worker still holds the slot, the parked recovery send
-        // below applies instead.
-        if !self.is_busy(&agent_id) && self.services.has_ready_failed_turn(&agent_id) {
+        // A fresh send into an `Error` session whose failed turn's message
+        // still waits in the queue: queue this one behind it and lift the
+        // Error park, so the batch flush delivers both in order in one turn.
+        // A direct turn would run this message first, and a provider session
+        // that never saw the failed one would lack it. `Pending` is the same
+        // moment after `agent.retry` lifted the park but before its drain
+        // started; `redrive_failed_turn` then only drains. A stopped or idle
+        // session keeps the direct send. While the failing worker still holds
+        // the slot, the parked recovery send below applies instead.
+        if matches!(session.status, AgentStatus::Error | AgentStatus::Pending)
+            && !self.is_busy(&agent_id)
+            && self.services.has_ready_failed_turn(&agent_id)
+        {
             let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
