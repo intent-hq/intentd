@@ -1267,4 +1267,25 @@ async fn queue_merge_keeps_secret_notices_separate() {
     assert_eq!(queue.len(), 4, "{queue:?}");
     assert_eq!(queue[0]["content"], "get rid of the card");
     assert_eq!(queue[3]["content"], "thanks");
+
+    let other = create_agent(&svc, &ws, "NoticeFirst").await;
+    let first = svc
+        .enqueue_message_with_id(
+            &other,
+            Some("n1".into()),
+            "User declined the secret.".into(),
+            None,
+            None,
+            Some(json!({
+                "type": "secret_declined", "source": "system",
+                "requestId": "sec-n1", "name": "KEY", "fromPrincipalId": "a",
+            })),
+            None,
+            false,
+            MessageOrigin::User,
+        )
+        .0;
+    let typed = enqueue(&svc, &other, "typed-after", "a", "and another thing");
+    assert_ne!(typed.id, first.id, "typed text never joins a queued notice");
+    assert_eq!(svc.queue_snapshot(&other).len(), 2);
 }

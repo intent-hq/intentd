@@ -130,6 +130,16 @@ async fn fixture(
     (tmp, svc, ws, id, port)
 }
 
+async fn resolutions(svc: &Services, id: &AgentId) -> serde_json::Value {
+    serde_json::Value::Object(
+        svc.store
+            .get_agent_session_summary(id)
+            .await
+            .unwrap()
+            .secret_request_resolutions(),
+    )
+}
+
 async fn provide(
     svc: &Services,
     ws: &intent_core::WorkspaceId,
@@ -176,6 +186,11 @@ async fn provide_answers_only_once_the_machine_holds_the_value() {
         "the request stays pending"
     );
     assert!(svc.secret_vault.resolve(&ws, &id, &["API_KEY"]).is_err());
+    assert_eq!(
+        resolutions(&svc, &id).await,
+        serde_json::json!({}),
+        "a failed delivery records nothing"
+    );
 
     let answered = provide(&svc, &ws, &ticket.request_id).await.unwrap();
     assert_eq!(answered["name"], "API_KEY", "{answered}");
@@ -186,6 +201,10 @@ async fn provide_answers_only_once_the_machine_holds_the_value() {
     assert!(
         svc.secret_vault.resolve(&ws, &id, &["API_KEY"]).is_err(),
         "the backend keeps no copy"
+    );
+    assert_eq!(
+        resolutions(&svc, &id).await,
+        serde_json::json!({ ticket.request_id.clone(): "provided" })
     );
 
     let listed = with_caller(Caller::Daemon, svc.secret_list_op(ws.clone(), id.clone()))
