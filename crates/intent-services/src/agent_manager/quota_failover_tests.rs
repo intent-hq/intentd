@@ -3053,3 +3053,51 @@ async fn a_new_message_after_a_stopped_silent_retry_carries_the_failed_one() {
         "{last}"
     );
 }
+
+/// Review of intentd#3739: a failed entry flushed later than its own row (a
+/// recovery send ran alone first, then a batch carried the failed entry and
+/// a newer message) drops only its row from the replay, not the exchanges
+/// after it.
+#[intent_test_macros::daemon_test]
+async fn a_flushed_failed_entry_drops_only_its_own_row_from_the_replay() {
+    let fx = Fixture::new(json!({ "response": "unused" })).await;
+    let append = |role: &'static str, text: &'static str, metadata: Option<Value>| {
+        let store = fx.mgr.services.store.clone();
+        let agent = fx.agent.clone();
+        async move {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    metadata.as_ref(),
+                    &now_iso(),
+                )
+                .await
+                .unwrap()
+                .id
+        }
+    };
+    let failed = append("user", "the failed request", None).await;
+    append("user", "the recovery send", None).await;
+    append("assistant", "the recovery reply", None).await;
+    append(
+        "user",
+        "a later message",
+        Some(json!({ "queueInfo": { "queuedMessageId": "q-later" } })),
+    )
+    .await;
+    let flushed = vec![failed, "q-later".to_string()];
+
+    fx.mgr.recreated.lock().unwrap().insert(fx.agent.clone());
+    let body = fx
+        .mgr
+        .build_turn_body(&fx.agent, "batched request", Some(&flushed))
+        .await;
+
+    assert!(body.contains("the recovery send"), "{body}");
+    assert!(body.contains("the recovery reply"), "{body}");
+    assert!(!body.contains("the failed request"), "{body}");
+    assert!(!body.contains("a later message"), "{body}");
+    assert!(body.ends_with("batched request"), "{body}");
+}

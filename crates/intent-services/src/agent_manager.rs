@@ -6891,11 +6891,22 @@ impl AgentManager {
             .filter(|source| group_source_ids.contains(source))
             .collect();
         let first_flushed = flushed_ids.and_then(|ids| {
-            messages.iter().position(|message| {
-                queue_source(message).is_some_and(|id| ids.contains(&id))
-                    || (message.role == "user" && ids.contains(&message.id))
-            })
+            messages
+                .iter()
+                .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
+        // A flushed failed turn's entry names its directly persisted user
+        // row: drop just that row, which may precede unrelated exchanges.
+        let flushed_rows: HashSet<&str> = flushed_ids
+            .into_iter()
+            .flatten()
+            .filter(|id| {
+                messages
+                    .iter()
+                    .any(|message| message.role == "user" && &message.id == *id)
+            })
+            .map(String::as_str)
+            .collect();
         // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
         // already persisted assistant/tool rows after the current user row,
         // the backup continues that turn — older history, then the cut-short
@@ -6965,6 +6976,7 @@ impl AgentManager {
             .filter(|message| {
                 message.role != "user"
                     || (!excluded_group_sources.contains(&message.id)
+                        && !flushed_rows.contains(message.id.as_str())
                         && !queue_source(message)
                             .is_some_and(|source| excluded_group_sources.contains(&source)))
             })
