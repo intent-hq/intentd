@@ -2759,6 +2759,7 @@ async fn manager_tracks_lookup_stop_and_shuts_down() {
 #[tokio::test]
 async fn shutdown_flushes_partial_live_turn_as_interrupted_assistant_row() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-shutdown-flush");
     let with_partial = AgentId::from("a-partial");
     let without_partial = AgentId::from("a-no-partial");
@@ -3217,6 +3218,7 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
 #[tokio::test]
 async fn try_begin_drops_a_live_turn_slot_that_outlived_its_turn() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-stale-slot");
     let id = AgentId::from("a-stale-slot");
     seed_agent(&mgr, &ws, &id).await;
@@ -3255,6 +3257,7 @@ async fn try_begin_drops_a_live_turn_slot_that_outlived_its_turn() {
 #[tokio::test]
 async fn try_begin_leaves_a_slot_whose_teardown_flush_is_in_flight() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-pinned-slot");
     let id = AgentId::from("a-pinned-slot");
     seed_agent(&mgr, &ws, &id).await;
@@ -3291,6 +3294,7 @@ async fn try_begin_leaves_a_slot_whose_teardown_flush_is_in_flight() {
 #[tokio::test]
 async fn try_begin_drops_a_slot_whose_flush_already_gave_up() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-flush-gave-up");
     // Deliberately NOT seeded: no agent_session row, so the flush's INSERT
     // violates agent_message's foreign key.
@@ -3345,6 +3349,7 @@ async fn try_begin_drops_a_slot_whose_flush_already_gave_up() {
 #[tokio::test]
 async fn re_pinning_an_abandoned_slot_makes_it_in_flight_again() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-repin");
     let id = AgentId::from("a-repin");
     track(&mgr, &id);
@@ -3385,6 +3390,7 @@ async fn re_pinning_an_abandoned_slot_makes_it_in_flight_again() {
 #[tokio::test]
 async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-losing-claim");
     let id = AgentId::from("a-losing-claim");
     seed_agent(&mgr, &ws, &id).await;
@@ -3414,6 +3420,7 @@ async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
 #[tokio::test]
 async fn winning_try_begin_auto_unarchives_the_workspace() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-auto-unarchive");
     let id = AgentId::from("a-auto-unarchive");
     seed_agent(&mgr, &ws, &id).await;
@@ -3544,6 +3551,7 @@ fn init_revive_repo(dir: &std::path::Path) {
 async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
     let root = test_tempdir("intentd-revive-fail-root-");
     let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-revive-fail");
     let id = AgentId::from("a-revive-fail");
     seed_agent(&mgr, &ws, &id).await;
@@ -3607,6 +3615,7 @@ async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
 async fn winning_try_begin_revives_a_retired_workspace() {
     let root = test_tempdir("intentd-revive-root-");
     let (_tmp, mgr, bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-revive");
     let id = AgentId::from("a-revive");
     seed_agent(&mgr, &ws, &id).await;
@@ -3787,7 +3796,11 @@ async fn retired_workspace_with_two_agents(
 const PURGE_NOTICE_PREFIX: &str = "[SYSTEM NOTICE] This workspace's folder was purged";
 
 /// How many times the folder-purged notice appears in `id`'s next prompt.
-async fn purge_notices_in_next_prompt(mgr: &AgentManager, id: &AgentId, ws: &WorkspaceId) -> usize {
+async fn purge_notices_in_next_prompt(
+    mgr: &Arc<AgentManager>,
+    id: &AgentId,
+    ws: &WorkspaceId,
+) -> usize {
     assert!(mgr.try_begin(id, ws).await, "claim wins");
     let prompt = mgr
         .build_turn_prompt(id, ws, "hello", &super::TurnOptions::default())
@@ -3817,6 +3830,7 @@ async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents
     let root = test_tempdir("intentd-purge-notice-root-");
     let repo = test_tempdir("intentd-purge-notice-repo-");
     let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-purge-notice");
     let (a, b) = (AgentId::from("a-trigger"), AgentId::from("a-other"));
     let wt = retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
@@ -3872,6 +3886,7 @@ async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents
 #[tokio::test]
 async fn archive_script_notice_reaches_each_agents_next_turn_once() {
     let (_tmp, mgr, _bus) = manager_with_bus_in(None).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-archive-script-notice");
     let agent = AgentId::from("a-archive-script");
     seed_agent(&mgr, &ws, &agent).await;
@@ -3917,6 +3932,7 @@ async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_ev
     let root = test_tempdir("intentd-purge-manual-root-");
     let repo = test_tempdir("intentd-purge-manual-repo-");
     let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-purge-manual");
     let (a, b) = (AgentId::from("a-first"), AgentId::from("a-second"));
     let wt = retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
@@ -3995,6 +4011,7 @@ async fn pending_purge_notice_survives_a_later_ordinary_unarchive() {
     let root = test_tempdir("intentd-purge-rearchive-root-");
     let repo = test_tempdir("intentd-purge-rearchive-repo-");
     let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-purge-rearchive");
     let (a, b) = (AgentId::from("a-reviver"), AgentId::from("a-idle"));
     retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
@@ -4036,6 +4053,7 @@ async fn pending_purge_notice_survives_a_later_ordinary_unarchive() {
 async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
     let root = test_tempdir("intentd-revive-race-root-");
     let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-revive-race");
     let id = AgentId::from("a-revive-race");
     seed_agent(&mgr, &ws, &id).await;
@@ -4144,6 +4162,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
 #[tokio::test]
 async fn winning_try_begin_in_active_workspace_persists_no_notice() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-active-no-notice");
     let id = AgentId::from("a-active-no-notice");
     seed_agent(&mgr, &ws, &id).await;
@@ -4175,6 +4194,7 @@ async fn winning_try_begin_in_active_workspace_persists_no_notice() {
 #[tokio::test]
 async fn suppressed_reclaim_persists_no_notice() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-suppressed-reclaim");
     let id = AgentId::from("a-suppressed-reclaim");
     seed_agent(&mgr, &ws, &id).await;
@@ -4184,11 +4204,13 @@ async fn suppressed_reclaim_persists_no_notice() {
         .await
         .expect("archive row");
 
-    assert!(matches!(
-        mgr.try_begin_outcome(&id, &ws, false, super::TurnOrigin::Delivery)
-            .await,
-        super::TryBeginOutcome::Started(_)
-    ));
+    let super::TryBeginOutcome::Started(claim) = mgr
+        .try_begin_outcome(&id, &ws, false, super::TurnOrigin::Delivery)
+        .await
+    else {
+        panic!("suppressed re-claim starts");
+    };
+    claim.hand_off();
     let after = mgr.services.store.get_workspace(&ws).await.unwrap();
     assert!(
         after.archived,
@@ -4223,6 +4245,7 @@ async fn suppressed_reclaim_persists_no_notice() {
 #[tokio::test]
 async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-flag-hygiene");
     let id = AgentId::from("a-flag-hygiene");
     seed_agent(&mgr, &ws, &id).await;
@@ -4262,6 +4285,7 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
 #[tokio::test]
 async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-arm-race");
     let id = AgentId::from("a-arm-race");
     seed_agent(&mgr, &ws, &id).await;
@@ -4308,6 +4332,7 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
 #[tokio::test]
 async fn winning_try_begin_survives_auto_unarchive_failure() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-missing-row");
     let id = AgentId::from("a-orphan-turn");
     // No workspace/session rows seeded: the workspace read inside the
@@ -9669,6 +9694,7 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
 #[tokio::test]
 async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -9754,6 +9780,7 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
 #[tokio::test]
 async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -9886,6 +9913,7 @@ async fn wedged_connection() -> (
 #[tokio::test]
 async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-wedged"));
     seed_agent(&mgr, &ws, &id).await;
     let (conn, _agent_r, _agent_w) = wedged_connection().await;
@@ -10515,6 +10543,7 @@ async fn agent_send_to_an_idle_agent_carries_no_attribution_note() {
 #[tokio::test]
 async fn interrupt_flushes_partial_live_turn_as_interrupted_assistant_row() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-flush"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -10573,6 +10602,7 @@ async fn interrupt_flushes_partial_live_turn_as_interrupted_assistant_row() {
 #[tokio::test]
 async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-empty"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -10646,6 +10676,7 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
 #[tokio::test]
 async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-done"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -10757,6 +10788,7 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
 #[tokio::test]
 async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-susp"));
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
@@ -10950,7 +10982,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
 }
 
 /// Front door whose caller is cancelled mid-claim in
-/// [`cancelled_caller_after_slot_claim_still_runs_the_turn`].
+/// [`cancel_caller_after_slot_claim`].
 #[derive(Clone, Copy, Debug)]
 enum CancelledFrontDoor {
     /// `agent.delegate`'s child start and `ws.agent.send`.
@@ -10960,19 +10992,73 @@ enum CancelledFrontDoor {
     /// Every queue kick of an idle agent (`agent.queueMessage`, a child
     /// report, a hook dispatch) — intent-hq/intent#9985.
     QueueDrain,
+    /// `agent.sendQueuedMessageNow`.
+    SendQueuedMessageNow,
+    /// `agent.sendQueuedMessagesNow`.
+    SendQueuedMessagesNow,
+    /// Any other holder of a bare [`super::TurnSlotClaim`].
+    BareClaim,
 }
 
-/// intent-hq/intent#9927: a caller dropped after the delivery claimed the
-/// in-flight slot (the workspace JS 30s budget expiring around
-/// `ws.agent.delegate` or `ws.agent.wakeOrCreate`) must not strand the slot.
-/// Before the fix the claim, the user row and the worker spawn all ran on the
-/// caller's future, so the drop left the agent `busy` with no worker:
-/// `isResponding: true`, `turnInFlight: false`, and every later message
-/// queued behind a turn that never existed.
-async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFrontDoor) {
+impl CancelledFrontDoor {
+    /// Whether the claim-to-spawn step runs detached from the caller, so the
+    /// claimed message itself still runs after the cancellation.
+    fn detached(self) -> bool {
+        !matches!(self, Self::BareClaim)
+    }
+}
+
+struct CancelledClaim {
+    _tmp: TempDb,
+    _env: EnvGuard,
+    mgr: Arc<AgentManager>,
+    ws: WorkspaceId,
+    id: AgentId,
+    log: MockCallLog,
+}
+
+impl CancelledClaim {
+    fn prompts(&self) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "session/prompt")
+            .count()
+    }
+
+    /// Wait until `prompts` turns ran and the agent holds no slot or worker.
+    async fn settle(&self, door: CancelledFrontDoor, prompts: usize) {
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while self.prompts() < prompts
+                    || self.mgr.is_busy(&self.id)
+                    || !self.mgr.workers.lock().unwrap().is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{door:?}: expected {prompts} turn(s) and a released slot \
+                 (prompts={}, busy={}, workers={})",
+                self.prompts(),
+                self.mgr.is_busy(&self.id),
+                self.mgr.workers.lock().unwrap().len()
+            )
+        });
+    }
+}
+
+/// Start `door` against an idle mock agent, pause it right after its slot
+/// claim, abort the caller, then let the paused claim continue.
+async fn cancel_caller_after_slot_claim(door: CancelledFrontDoor) -> CancelledClaim {
     let script = mock_agent_script();
-    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
-    let (_tmp, mgr) = manager().await;
+    let env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let (tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     mgr.services.attach_agent_manager(&mgr);
     let ws = WorkspaceId::from("ws-cancelled-claim");
@@ -10986,20 +11072,29 @@ async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFr
         .get_mut(&id)
         .unwrap()
         .align_with_mock_for_test();
+    let queued = matches!(
+        door,
+        CancelledFrontDoor::QueueDrain
+            | CancelledFrontDoor::SendQueuedMessageNow
+            | CancelledFrontDoor::SendQueuedMessagesNow
+    )
+    .then(|| {
+        mgr.services
+            .enqueue_message(
+                &id,
+                "child report".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                intent_core::MessageOrigin::Automatic,
+            )
+            .0
+            .id
+    });
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
-    if matches!(door, CancelledFrontDoor::QueueDrain) {
-        mgr.services.enqueue_message(
-            &id,
-            "child report".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            intent_core::MessageOrigin::Automatic,
-        );
-    }
     let caller = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
@@ -11023,6 +11118,17 @@ async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFr
                         .deliver_wake_message(&ws, &id, "recovery wake", None)
                         .await
                 }
+                CancelledFrontDoor::SendQueuedMessageNow => {
+                    mgr.send_queued_message_now(id, ws, queued.unwrap()).await
+                }
+                CancelledFrontDoor::SendQueuedMessagesNow => {
+                    mgr.send_queued_messages_now(id, ws, vec![queued.unwrap()])
+                        .await
+                }
+                CancelledFrontDoor::BareClaim => {
+                    let _claim = mgr.try_begin_turn(&id, &ws).await;
+                    std::future::pending().await
+                }
             }
         }
     });
@@ -11036,36 +11142,31 @@ async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFr
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     pause.resume.notify_one();
+    CancelledClaim {
+        _tmp: tmp,
+        _env: env,
+        mgr,
+        ws,
+        id,
+        log,
+    }
+}
 
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(30)),
-        async {
-            loop {
-                let prompted = log
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|(method, _)| method == "session/prompt");
-                if prompted && !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        },
-    )
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "{door:?}: the claimed turn must run and release its slot after the caller is cancelled \
-             (busy={}, workers={})",
-            mgr.is_busy(&id),
-            mgr.workers.lock().unwrap().len()
-        )
-    });
-    let messages = mgr
+/// intent-hq/intent#9927: a caller dropped after the delivery claimed the
+/// in-flight slot (the workspace JS 30s budget expiring around
+/// `ws.agent.delegate` or `ws.agent.wakeOrCreate`) must not strand the slot.
+/// Before the fix the claim, the user row and the worker spawn all ran on the
+/// caller's future, so the drop left the agent `busy` with no worker:
+/// `isResponding: true`, `turnInFlight: false`, and every later message
+/// queued behind a turn that never existed.
+async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFrontDoor) {
+    let cancelled = cancel_caller_after_slot_claim(door).await;
+    cancelled.settle(door, 1).await;
+    let messages = cancelled
+        .mgr
         .services
         .store
-        .get_agent_messages(&id, None)
+        .get_agent_messages(&cancelled.id, None)
         .await
         .unwrap();
     assert_eq!(
@@ -11073,7 +11174,11 @@ async fn cancelled_caller_after_slot_claim_still_runs_the_turn(door: CancelledFr
         1,
         "{door:?}: the claimed message is persisted exactly once"
     );
-    assert!(mgr.services.queue_snapshot(&id).is_empty());
+    assert!(cancelled
+        .mgr
+        .services
+        .queue_snapshot(&cancelled.id)
+        .is_empty());
 }
 
 #[tokio::test]
@@ -11093,6 +11198,155 @@ async fn wake_delivery_cancelled_after_slot_claim_still_runs_the_turn() {
 #[tokio::test]
 async fn queue_drain_cancelled_after_slot_claim_still_runs_the_turn() {
     cancelled_caller_after_slot_claim_still_runs_the_turn(CancelledFrontDoor::QueueDrain).await;
+}
+
+/// intentd#3742 review: a batch "send now" whose caller is cancelled while
+/// an append fails must still finish the failure handling: the session parks
+/// in `Error` with the batch requeued, instead of `Active` with no turn, slot
+/// or worker. `before_error` cancels before the handler's first read; the
+/// other case cancels once `Error` is durable.
+async fn send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(
+    before_error: bool,
+) {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-send-now-append-failure");
+    let id = AgentId::from("send-now-append-failure");
+    seed_agent(&mgr, &ws, &id).await;
+    let ids = ["send-now-fail-0", "send-now-fail-1"];
+    for entry in ids {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(entry.into()),
+            format!("{entry} content"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+    }
+    sqlx::query("CREATE TRIGGER fail_send_now_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    let caller = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move {
+            mgr.send_queued_messages_now(id, ws, ids.iter().map(|m| (*m).to_string()).collect())
+                .await
+        }
+    });
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("the batch claimed the slot and reached its first append");
+    assert!(mgr.is_busy(&id));
+    if before_error {
+        caller.abort();
+        pause.resume.notify_one();
+    } else {
+        pause.resume.notify_one();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap()
+                    != AgentStatus::Error
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("the append failure persists Error");
+        caller.abort();
+    }
+    let _ = caller.await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the failed batch releases its slot");
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error,
+        "before_error={before_error}: the failed batch parks for agent.retry"
+    );
+    assert_eq!(
+        mgr.services
+            .queue_snapshot(&id)
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        ids,
+        "before_error={before_error}: the failed batch is requeued in order"
+    );
+}
+
+#[tokio::test]
+async fn send_queued_messages_now_cancelled_after_slot_claim_before_error_parks_error() {
+    send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(true).await;
+}
+
+#[tokio::test]
+async fn send_queued_messages_now_cancelled_after_slot_claim_after_error_keeps_error() {
+    send_queued_messages_now_cancelled_after_slot_claim_during_append_failure(false).await;
+}
+
+/// The slot claim is a drop guard, so no entry point can strand the slot by
+/// being cancelled between the claim and the worker spawn, detached or not:
+/// the next message still starts a turn.
+#[tokio::test]
+async fn every_entry_point_cancelled_after_slot_claim_frees_the_slot_for_the_next_message() {
+    for door in [
+        CancelledFrontDoor::SendMessage,
+        CancelledFrontDoor::WakeDelivery,
+        CancelledFrontDoor::QueueDrain,
+        CancelledFrontDoor::SendQueuedMessageNow,
+        CancelledFrontDoor::SendQueuedMessagesNow,
+        CancelledFrontDoor::BareClaim,
+    ] {
+        let cancelled = cancel_caller_after_slot_claim(door).await;
+        let ran = usize::from(door.detached());
+        cancelled.settle(door, ran).await;
+        let sent = cancelled
+            .mgr
+            .send_message(
+                cancelled.id.clone(),
+                cancelled.ws.clone(),
+                "next message".into(),
+                None,
+                super::TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sent["queued"], false,
+            "{door:?}: the next message starts a turn"
+        );
+        cancelled.settle(door, ran + 1).await;
+    }
 }
 
 /// The detached drain must reuse the caller's instruction admission. A fresh
@@ -11350,7 +11604,7 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
         "cancelled send".into(),
         super::TurnOptions::default(),
         true,
-        cancelled,
+        cancelled.duplicate_for_test(),
     );
     assert!(
         !mgr.workers.lock().unwrap().contains_key(&id),
@@ -11358,8 +11612,8 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
     );
     assert!(!mgr.is_busy(&id));
 
-    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap();
-    assert_ne!(fresh, cancelled);
+    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap().hand_off();
+    assert_ne!(fresh, cancelled.admission());
     mgr.spawn_worker(
         id.clone(),
         ws.clone(),
@@ -11429,7 +11683,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
     let id = AgentId::from("retire-cleanup");
     seed_agent(&mgr, &ws, &id).await;
     seed_top_level_peer(&mgr, &id).await;
-    let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let mut cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let flush = if matches!(cleanup, RetiredCleanup::Flush) {
         mgr.services.enqueue_message(
             &id,
@@ -11460,13 +11714,13 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         .agent_restore_op(id.clone(), Some(ws.clone()))
         .await
         .unwrap();
-    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap();
-    assert_ne!(cancelled, fresh);
+    let fresh = mgr.try_begin_turn(&id, &ws).await.unwrap().hand_off();
+    assert_ne!(cancelled.admission(), fresh);
     // Resume exactly the old request's error/empty-drain exit after Restore
     // and a new claim. No scheduler timing or provider process is involved.
     match cleanup {
-        RetiredCleanup::Idle => mgr.release_slot(&id, cancelled).await,
-        RetiredCleanup::Slot => mgr.finish_admission(&id, cancelled, false).await,
+        RetiredCleanup::Idle => mgr.release_slot(cancelled).await,
+        RetiredCleanup::Slot => cancelled.release(false).await,
         RetiredCleanup::PersistFailure => {
             mgr.fail_admitted_persist(
                 &id,
@@ -11480,10 +11734,10 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         RetiredCleanup::Flush => {
             let (entry, draining) = flush.unwrap();
             let prep = mgr
-                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, cancelled)
+                .prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, &mut cancelled)
                 .await;
             assert!(matches!(prep, super::FlushPrep::Parked));
-            mgr.finish_admission(&id, cancelled, false).await;
+            cancelled.release(false).await;
             assert!(
                 mgr.services
                     .store
@@ -11674,6 +11928,7 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
 #[tokio::test]
 async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-flush"));
     seed_agent(&mgr, &ws, &id).await;
     track(&mgr, &id);
@@ -11715,6 +11970,7 @@ async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
 #[tokio::test]
 async fn stop_with_empty_live_turn_persists_empty_interrupted_row() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-empty"));
     seed_agent(&mgr, &ws, &id).await;
     track(&mgr, &id);
@@ -11993,6 +12249,7 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
 #[tokio::test]
 async fn stop_fallback_kill_path_arms_redelivery_for_next_turn() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-fb"));
     seed_agent(&mgr, &ws, &id).await;
     track(&mgr, &id);
@@ -12038,7 +12295,7 @@ fn restarted_manager(mgr: &AgentManager) -> AgentManager {
 /// Drive a zero-output user stop that arms the redelivery payload (the
 /// spawn-window fallback path — no `acpSessionId`), shared by the
 /// persistence regression tests below.
-async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+async fn arm_redelivery_via_fallback_stop(mgr: &Arc<AgentManager>, ws: &WorkspaceId, id: &AgentId) {
     seed_agent(mgr, ws, id).await;
     track(mgr, id);
     assert!(mgr.try_begin(id, ws).await);
@@ -12073,6 +12330,7 @@ async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, 
 #[tokio::test]
 async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-restart"));
     arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
 
@@ -12202,6 +12460,7 @@ async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
 #[tokio::test]
 async fn hard_stop_clears_persisted_stop_redelivery() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-clear"));
     arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
 
@@ -12234,6 +12493,7 @@ async fn hard_stop_clears_persisted_stop_redelivery() {
 #[tokio::test]
 async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-gap"));
     arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
 
@@ -12273,6 +12533,7 @@ async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
 #[tokio::test]
 async fn stop_many_clears_persisted_stop_redeliveries_in_batch() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let swept: Vec<AgentId> = (0..3)
         .map(|i| AgentId::from(format!("a-stop-many-{i}")))
         .collect();
@@ -12331,6 +12592,7 @@ async fn stop_many_clears_persisted_stop_redeliveries_in_batch() {
 #[tokio::test]
 async fn shutdown_with_empty_live_turn_persists_empty_interrupted_row() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (
         WorkspaceId::from("ws-shutdown-empty"),
         AgentId::from("a-shutdown-empty"),
@@ -14877,6 +15139,7 @@ async fn stop_clears_pending_recreate_flag() {
 #[tokio::test]
 async fn is_busy_reflects_try_begin_and_end_turn() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-busy"), AgentId::from("a-busy"));
     assert!(!mgr.is_busy(&id), "fresh agent is not busy");
     assert!(mgr.try_begin(&id, &ws).await);
@@ -14893,6 +15156,7 @@ async fn is_busy_reflects_try_begin_and_end_turn() {
 #[tokio::test]
 async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-list-busy");
     let id = AgentId::from("agent-list-busy");
 
@@ -14916,6 +15180,7 @@ async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
 #[tokio::test]
 async fn idle_since_advances_across_a_turn_between_two_reads() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-idle-since");
     let (a, b) = (AgentId::from("agent-idle-a"), AgentId::from("agent-idle-b"));
 
@@ -15136,6 +15401,7 @@ async fn list_active_statement_count_is_constant_in_busy_agents() {
 async fn try_begin_persists_active_status_and_emits_event() {
     use intent_core::events::AGENT_STATUS_CHANGED;
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-begin"), AgentId::from("a-begin"));
     seed_agent(&mgr, &ws, &id).await;
 
@@ -15175,6 +15441,7 @@ async fn try_begin_persists_active_status_and_emits_event() {
 async fn end_turn_persists_runtime_idle_and_emits_event() {
     use intent_core::events::AGENT_STATUS_CHANGED;
     let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-end"), AgentId::from("a-end"));
     seed_agent(&mgr, &ws, &id).await;
     assert!(mgr.try_begin(&id, &ws).await);
@@ -17470,10 +17737,10 @@ async fn wake_to_busy_vanished_session_fails_closed() {
         AgentId::from("a-2762-busy"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    assert!(
-        mgr.try_begin_turn(&id, &ws).await.is_some(),
-        "claim the in-flight slot so the wake takes the busy enqueue branch"
-    );
+    mgr.try_begin_turn(&id, &ws)
+        .await
+        .expect("claim the in-flight slot so the wake takes the busy enqueue branch")
+        .hand_off();
     mgr.services
         .store
         .delete_agent_session(&ws, &id)
@@ -29301,6 +29568,7 @@ fn start_running_worker(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
 #[tokio::test]
 async fn checkpoint_shutdown_enrolls_agents_with_running_workers() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let idle_worker = AgentId::from("idle-with-worker");
     let busy_worker = AgentId::from("busy-with-worker");
     let busy_plain = AgentId::from("busy-plain");
@@ -29758,10 +30026,11 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
 #[tokio::test]
 async fn shutdown_admission_requeues_flush_popped_before_closure() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-shutdown-flush-popped");
     let id = AgentId::from("shutdown-flush-popped");
     seed_agent(&mgr, &ws, &id).await;
-    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let mut claim = mgr.try_begin_turn(&id, &ws).await.unwrap();
     mgr.services.enqueue_message_with_id(
         &id,
         Some("popped-before-shutdown".into()),
@@ -29777,10 +30046,11 @@ async fn shutdown_admission_requeues_flush_popped_before_closure() {
     let (entry, draining) = mgr.services.dequeue_message_draining(&id).unwrap();
     mgr.begin_shutdown();
     assert!(matches!(
-        mgr.prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, admission)
+        mgr.prepare_admitted_flush_turn(&id, &ws, vec![entry], draining, &mut claim)
             .await,
         super::FlushPrep::Parked
     ));
+    claim.hand_off();
     // An unrelated queue mutation must not durably overwrite the popped entry.
     mgr.services.persist_queue_snapshot(&id).await;
     mgr.shutdown().await;
@@ -29794,6 +30064,7 @@ async fn shutdown_admission_requeues_flush_popped_before_closure() {
 #[tokio::test]
 async fn shutdown_durable_failed_persist_handback_keeps_original_entry() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let ws = WorkspaceId::from("ws-shutdown-failed-handback");
     let id = AgentId::from("shutdown-failed-handback");
     seed_agent(&mgr, &ws, &id).await;
@@ -29983,7 +30254,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     let ws = WorkspaceId::from("ws-shutdown-batch-failure");
     let id = AgentId::from("shutdown-batch-failure");
     seed_agent(&mgr, &ws, &id).await;
-    let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
+    let mut claim = mgr.try_begin_turn(&id, &ws).await.unwrap();
     for n in 0..3 {
         mgr.services.enqueue_message_with_id(
             &id,
@@ -30010,12 +30281,14 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     let worker_id = id.clone();
     let worker_ws = ws.clone();
     let preparation = tokio::spawn(async move {
-        matches!(
+        let parked = matches!(
             worker_mgr
-                .prepare_admitted_flush_turn(&worker_id, &worker_ws, entries, draining, admission)
+                .prepare_admitted_flush_turn(&worker_id, &worker_ws, entries, draining, &mut claim)
                 .await,
             super::FlushPrep::Parked
-        )
+        );
+        claim.hand_off();
+        parked
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -30144,7 +30417,7 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
                     .await
                     .is_err());
             } else {
-                let admission = worker_mgr
+                let mut claim = worker_mgr
                     .try_begin_turn(&worker_id, &worker_ws)
                     .await
                     .unwrap();
@@ -30160,11 +30433,12 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
                             &worker_ws,
                             vec![entry],
                             guard,
-                            admission
+                            &mut claim
                         )
                         .await,
                     super::FlushPrep::Parked
                 ));
+                claim.hand_off();
             }
         });
         timeout(

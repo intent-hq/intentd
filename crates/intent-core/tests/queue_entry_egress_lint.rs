@@ -152,7 +152,10 @@ const REGISTERED_EGRESS: &[(&str, Key)] = &[
         "RemoveQueuedMessage",
         Key::Fn("agent_remove_queued_message_op"),
     ),
-    ("SendQueuedMessageNow", Key::Fn("send_queued_message_now")),
+    (
+        "SendQueuedMessageNow",
+        Key::Fn("send_queued_message_now_detached"),
+    ),
     ("Diagnostics", Key::Fn("agent_diagnostics_op")),
     ("Diagnostics", Key::Fn("queue_snapshot_preview")),
 ];

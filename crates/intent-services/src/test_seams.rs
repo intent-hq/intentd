@@ -198,13 +198,16 @@ impl AgentManager {
         self.is_busy(agent_id)
     }
 
-    /// Test seam: `try_begin_turn`; the turn admission is opaque.
+    /// Test seam: `try_begin_turn`; the turn admission is opaque and the
+    /// slot stays held until the test releases it another way.
     pub async fn try_begin_turn_for_test(
-        &self,
+        self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Option<impl Sized + Send> {
-        self.try_begin_turn(agent_id, workspace_id).await
+        self.try_begin_turn(agent_id, workspace_id)
+            .await
+            .map(crate::agent_manager::TurnSlotClaim::hand_off)
     }
 }
 

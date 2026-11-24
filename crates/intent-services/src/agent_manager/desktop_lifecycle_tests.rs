@@ -14,6 +14,7 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
         Arc::new(BusEventSink::new(h.services.event_bus.clone().unwrap())),
         4,
     );
+    let manager = Arc::new(manager);
     assert!(manager.try_begin(&h.agent, &h.workspace).await);
     manager.end_turn(&h.agent).await;
     assert_eq!(
@@ -94,6 +95,7 @@ async fn desktop_lifecycle_terminal_turn_failure_revokes_active_and_pending_cont
             Arc::new(BusEventSink::new(h.services.event_bus.clone().unwrap())),
             4,
         );
+        let manager = Arc::new(manager);
         assert!(manager.try_begin(&h.agent, &h.workspace).await);
         let options = TurnOptions::default();
         let failure = Error::Internal("desktop lifecycle test provider failure".into());
