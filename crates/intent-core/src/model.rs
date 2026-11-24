@@ -5037,8 +5037,7 @@ impl AgentSession {
                 entries
                     .iter()
                     .filter(|(id, outcome)| {
-                        !id.is_empty()
-                            && matches!(outcome.as_str(), Some("provided" | "declined"))
+                        !id.is_empty() && matches!(outcome.as_str(), Some("provided" | "declined"))
                     })
                     .map(|(id, outcome)| (id.clone(), outcome.clone()))
                     .collect()
