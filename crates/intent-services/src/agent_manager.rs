@@ -3413,6 +3413,12 @@ pub struct AgentManager {
     worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    /// Parks `agent_retry` after its unlocked Error check.
+    #[cfg(test)]
+    retry_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    /// Fails the next status read of a send's failed-turn redrive.
+    #[cfg(test)]
+    redrive_store_fault: std::sync::atomic::AtomicBool,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3561,6 +3567,10 @@ impl AgentManager {
             worker_finish_pause: Mutex::new(None),
             #[cfg(test)]
             failed_wake_disposal_pause: Mutex::new(None),
+            #[cfg(test)]
+            retry_pause: Mutex::new(None),
+            #[cfg(test)]
+            redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -9515,7 +9525,16 @@ impl AgentManager {
             });
             queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
-            self.redrive_failed_turn(&agent_id, &workspace_id).await?;
+            // The message is queued: an error here must not reach the client,
+            // which would send it again. It stays queued behind the failed
+            // one for the next send or Try again to redrive.
+            if let Err(error) = self.redrive_failed_turn(&agent_id, &workspace_id).await {
+                tracing::warn!(
+                    agent = %agent_id,
+                    %error,
+                    "could not lift a failed turn's park after queueing a new message; it stays queued"
+                );
+            }
             return Ok(result);
         }
         #[cfg(test)]
@@ -11517,27 +11536,104 @@ impl AgentManager {
             .store
             .get_agent_session_summary(&agent_id)
             .await?;
+        Self::check_retry_not_retired(&agent_id, &session)?;
 
-        // Soft-retire inertness: a retired session must not be redriven —
-        // `agent.restore` is the deliberate return-to-service path.
+        // Only allow retry when the session status is `error`
+        if session.status != AgentStatus::Error {
+            return Ok(json!({ "ok": false }));
+        }
+        #[cfg(test)]
+        {
+            let pause = self.retry_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+
+        // Use the session's persisted workspace_id for safety (cross-workspace guard)
+        let workspace_id = session.workspace_id.clone();
+
+        // The check above ran unlocked: a send's redrive or another retry
+        // may have lifted the park and started a turn since. Every turn
+        // start persists `Active` under the turn-start gate, so `Error`
+        // re-read under it means no turn started since the failure and any
+        // worker still holding the slot is the failed one. Only then does
+        // this retry own the restart and tear down.
+        let owned = {
+            let gate = self.turn_start_gates.for_agent(&agent_id);
+            let _starting = gate.lock().await;
+            let session = self
+                .services
+                .store
+                .get_agent_session_summary(&agent_id)
+                .await?;
+            Self::check_retry_not_retired(&agent_id, &session)?;
+            if session.status == AgentStatus::Error {
+                Some(self.lift_failed_park(&agent_id, &session).await?)
+            } else {
+                None
+            }
+        };
+        let Some((redriven, stale)) = owned else {
+            self.clone()
+                .try_drain_queue(agent_id.clone(), workspace_id)
+                .await;
+            let redriven = self.is_busy(&agent_id) || self.services.has_ready_to_send(&agent_id);
+            return Ok(json!({ "ok": true, "redriven": redriven }));
+        };
+
+        // Kill the stale child outside the gate: its handle is already
+        // detached, so no new turn can reach it.
+        if let Some(child) = stale {
+            child.kill_tree().await;
+        }
+
+        // Start the drain loop to redrive the requeued message. Peek the
+        // head entry's turn correlation id BEFORE the drain pops it so the
+        // response names the turn being redriven (monorepo#1022).
+        let mut turn_id = None;
+        if redriven {
+            turn_id = self.services.peek_ready_turn_id(&agent_id);
+            self.clone().try_drain_queue(agent_id, workspace_id).await;
+        }
+
+        let mut result = json!({ "ok": true, "redriven": redriven });
+        if let Some(tid) = turn_id {
+            result["turnId"] = json!(tid);
+        }
+        Ok(result)
+    }
+
+    /// Soft-retire inertness: a retired session must not be redriven —
+    /// `agent.restore` is the deliberate return-to-service path.
+    fn check_retry_not_retired(
+        agent_id: &AgentId,
+        session: &intent_store::AgentSessionSummary,
+    ) -> Result<()> {
         if session.retired_at.is_some() {
             return Err(Error::InvalidParams(format!(
                 "agent {} is retired; restore it with agent.restore before retrying",
                 agent_id.0
             )));
         }
+        Ok(())
+    }
 
-        // Only allow retry when the session status is `error`
-        if session.status != AgentStatus::Error {
-            return Ok(json!({ "ok": false }));
-        }
-        let original = repository_origin::capture(&self.handles, &agent_id);
+    /// The owned half of [`AgentManager::agent_retry`], run under the
+    /// turn-start gate with the session still `Error`: clear the failure
+    /// state, flip the status, abort the failed worker and detach its
+    /// child. Returns whether a queued message waits to be redriven and the
+    /// detached child for the caller to kill once the gate is released.
+    async fn lift_failed_park(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        session: &intent_store::AgentSessionSummary,
+    ) -> Result<(bool, Option<RuntimeTeardown>)> {
+        let original = repository_origin::capture(&self.handles, agent_id);
         if let Some(original) = &original {
             original.retire();
         }
-
-        // Use the session's persisted workspace_id for safety (cross-workspace guard)
-        let workspace_id = &session.workspace_id;
 
         // monorepo#940: consult poisoning BEFORE `clear_failure_streak` below —
         // the identical-failure streak feeds `session_poisoned`, so checking
@@ -11548,7 +11644,7 @@ impl AgentManager {
         // the redrive's `start_session` skips the resume and opens a fresh
         // `session/new` (recreated-flag history prepend + token-usage
         // baseline fold).
-        if self.services.session_poisoned(&session) {
+        if self.services.session_poisoned(session) {
             tracing::warn!(
                 agent = %agent_id,
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
@@ -11562,13 +11658,13 @@ impl AgentManager {
         // so the redrive starts from a clean slate — and the failure-wake
         // dedup records too, so a post-retry failure with the SAME error text
         // (new information the retrying party is waiting on) still delivers.
-        self.services.clear_failure_streak(&agent_id);
-        self.services.clear_failure_wake_dedup(&agent_id);
+        self.services.clear_failure_streak(agent_id);
+        self.services.clear_failure_wake_dedup(agent_id);
 
         // Empty queue → nothing will drive a `pending` status forward, so
         // clear the error to `idle` instead (idle is permitted iff no
         // ready-to-send work remains, PROTOCOL §5.5/§6.5 invariant).
-        let mut redriven = self.services.has_ready_to_send(&agent_id);
+        let mut redriven = self.services.has_ready_to_send(agent_id);
         let next_status = if redriven {
             AgentStatus::Pending
         } else {
@@ -11576,57 +11672,43 @@ impl AgentManager {
         };
 
         // Clear the error status and emit agent:status-changed
-        self.persist_retry_status(&agent_id, workspace_id, next_status)
+        self.persist_retry_status(agent_id, &session.workspace_id, next_status)
             .await?;
 
-        // Abort any in-flight worker task and release the in-flight slot.
+        // Abort the failed worker task and release the in-flight slot.
         // Any terminal-error context the aborted worker's streaming path
         // stashed (monorepo#2050) is stale on the same terms as the streak
         // cleared above — retry is the clean-slate escape hatch.
-        if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
+        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
-        self.services.discard_pending_terminal_error(&agent_id);
+        self.services.discard_pending_terminal_error(agent_id);
         // Retry is the clean-slate escape hatch for the truncation-redrive
         // episode too (monorepo#2863): drop the streak and any stale arm.
-        self.services.clear_truncation_redrives(&agent_id);
-        self.services.take_truncation_redrive(&agent_id);
-        self.release_in_flight_slot(&agent_id);
-
-        // Tear down any stale child handle (use kill_child_only to avoid
-        // overwriting the status we just set)
-        if let Some(original) = original {
-            self.kill_original_child(&agent_id, &original).await;
-        }
+        self.services.clear_truncation_redrives(agent_id);
+        self.services.take_truncation_redrive(agent_id);
+        self.release_in_flight_slot(agent_id);
 
         // Close the check-then-flip race: a message enqueued between the queue
         // check above and the status flip had its own drain attempt suppressed
         // by the Error gate in `try_drain_queue` (STAB-52), and this path was
         // about to skip the drain too — stranding a ready-to-send message.
-        // Re-poll under the post-Error status; anything there is a redrive.
-        if !redriven && self.services.has_ready_to_send(&agent_id) {
+        // Re-poll under the post-Error status, still under the gate so no
+        // turn started since can be overwritten; anything there is a redrive.
+        if !redriven && self.services.has_ready_to_send(agent_id) {
             redriven = true;
-            self.persist_retry_status(&agent_id, workspace_id, AgentStatus::Pending)
+            self.persist_retry_status(agent_id, &session.workspace_id, AgentStatus::Pending)
                 .await?;
         }
 
-        // Start the drain loop to redrive the requeued message. Peek the
-        // head entry's turn correlation id BEFORE the drain pops it so the
-        // response names the turn being redriven (monorepo#1022).
-        let mut turn_id = None;
-        if redriven {
-            turn_id = self.services.peek_ready_turn_id(&agent_id);
-            self.clone()
-                .try_drain_queue(agent_id, workspace_id.clone())
-                .await;
-        }
-
-        let mut result = json!({ "ok": true, "redriven": redriven });
-        if let Some(tid) = turn_id {
-            result["turnId"] = json!(tid);
-        }
-        Ok(result)
+        // Detach any stale child handle (taking only this exact origin so the
+        // status just set is not overwritten).
+        let stale = original.and_then(|original| {
+            repository_origin::take(&self.handles, agent_id, &original, Some(&self.registry))
+                .and_then(|mut handle| RuntimeTeardown::take(&mut handle))
+        });
+        Ok((redriven, stale))
     }
 
     /// Lift a failed turn's `Error` park for a fresh send queued behind its
@@ -11642,6 +11724,13 @@ impl AgentManager {
         {
             let gate = self.turn_start_gates.for_agent(agent_id);
             let _starting = gate.lock().await;
+            #[cfg(test)]
+            if self
+                .redrive_store_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Internal("injected redrive store fault".into()));
+            }
             if !self.is_busy(agent_id)
                 && self
                     .services
