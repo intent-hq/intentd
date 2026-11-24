@@ -515,7 +515,9 @@ command execution is off. A change applies to top-level workspace agents created
 afterwards, not to existing agents, sub-agents, background hooks or Assistant chat. When
 such an agent asks for a secret such as an API key, a "Secret requested" card with a
 masked field appears above the message box after its turn ends. **Provide** sends the
-value; **Skip** declines at once and tells the agent. The down arrow (Hide) collapses the
+value; **Skip** declines at once and tells the agent. Intent remembers the answer, so
+the card leaves the message box and stays gone after a reload or restart (older versions
+could keep a declined card showing). The down arrow (Hide) collapses the
 card to a chip without losing a typed value. The value is not put in the chat: Intent
 holds it in daemon memory and passes it only to that agent's
 `ws.host.exec` commands that name it, redacting exact copies from their output. It is

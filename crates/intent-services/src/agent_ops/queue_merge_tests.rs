@@ -1228,3 +1228,43 @@ async fn queue_attachments_and_prepend_attachments_are_merge_barriers() {
         }
     }
 }
+
+/// A secret notice (PROTOCOL §5.56) is stamped with the answering user's
+/// principal, but it is never merged with that user's queued text: merged,
+/// one row's metadata hides the other's (the notice, or the user's words).
+#[tokio::test]
+async fn queue_merge_keeps_secret_notices_separate() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Merge").await;
+    let notice = |id: &str, kind: &str| {
+        svc.enqueue_message_with_id(
+            &agent,
+            Some(id.into()),
+            "User declined the secret.".into(),
+            None,
+            None,
+            Some(json!({
+                "type": kind,
+                "source": "system",
+                "requestId": format!("sec-{id}"),
+                "name": "KEY",
+                "fromPrincipalId": "a",
+            })),
+            None,
+            false,
+            MessageOrigin::User,
+        )
+        .0
+    };
+    let typed = enqueue(&svc, &agent, "typed", "a", "get rid of the card");
+    let declined = notice("declined", "secret_declined");
+    assert_ne!(declined.id, typed.id);
+    let provided = notice("provided", "secret_provided");
+    assert_ne!(provided.id, declined.id);
+    let after = enqueue(&svc, &agent, "after", "a", "thanks");
+    assert_ne!(after.id, provided.id);
+    let queue = svc.queue_snapshot(&agent);
+    assert_eq!(queue.len(), 4, "{queue:?}");
+    assert_eq!(queue[0]["content"], "get rid of the card");
+    assert_eq!(queue[3]["content"], "thanks");
+}

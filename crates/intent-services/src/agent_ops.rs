@@ -332,7 +332,7 @@ pub(crate) struct PendingQuestionMutationLocks {
 }
 
 impl PendingQuestionMutationLocks {
-    fn lock_for(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn lock_for(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
             .expect("pending-question lock map poisoned")
@@ -1795,6 +1795,18 @@ impl QueueEntryGate {
 /// Reserved metadata containing the original metadata of merged submissions.
 pub(crate) const MERGED_MESSAGE_METADATA_KEY: &str = "mergedMessageMetadata";
 
+/// A secret notice (PROTOCOL §5.56) carries the answering user's stamp, yet
+/// must stay its own row: merged, one side's metadata hides the other's.
+fn is_secret_notice(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|m| m.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| {
+            t == crate::secret_requests::SECRET_PROVIDED_METADATA_TYPE
+                || t == crate::secret_requests::SECRET_DECLINED_METADATA_TYPE
+        })
+}
+
 fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
     let Some(Value::Object(metadata)) = existing else {
         return;
@@ -2207,7 +2219,9 @@ impl QueuedMessage {
     }
 
     fn can_merge_pending(&self, incoming: &Self) -> bool {
-        !crate::discussion_activity::is_discussion(self.message_metadata.as_ref())
+        !is_secret_notice(self.message_metadata.as_ref())
+            && !is_secret_notice(incoming.message_metadata.as_ref())
+            && !crate::discussion_activity::is_discussion(self.message_metadata.as_ref())
             && !crate::discussion_activity::is_discussion(incoming.message_metadata.as_ref())
             && !self.persisted
             && !incoming.persisted

@@ -7,9 +7,11 @@
 //! `secretEnv`, with exact matches redacted from their output.
 //!
 //! **Memory only.** [`SecretVault`] is the single owner of every value and
-//! pending request. Nothing here is persisted, logged or put into an event:
+//! pending request. No value is persisted, logged or put into an event:
 //! values live in [`Zeroizing`] buffers and are wiped when dropped (forget,
-//! agent delete/retire, workspace archive/delete, daemon restart).
+//! agent delete/retire, workspace archive/delete, daemon restart). Only the
+//! answer outcome (`requestId -> "provided" | "declined"`) is persisted, in
+//! the agent's `secretRequestResolutions` session metadata.
 //!
 //! **Owned by the requesting agent.** Entries are keyed by
 //! `(workspaceId, agentId)`; another agent — including the owner's own
@@ -38,6 +40,9 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_SECRET_ENV_ENTRIES: usize = 32;
 /// Answered outcomes remembered per agent for `secret.list` (oldest dropped).
 const MAX_ANSWERED_PER_AGENT: usize = 32;
+/// Retention cap on the persisted `secretRequestResolutions` map (oldest
+/// evicted on insert), bounding the session metadata and `agent.get`.
+pub(crate) const MAX_SECRET_REQUEST_RESOLUTIONS: usize = 100;
 
 /// `messageMetadata.type` of the provided notice.
 pub(crate) const SECRET_PROVIDED_METADATA_TYPE: &str = "secret_provided";
@@ -1019,6 +1024,8 @@ impl Services {
                 .answer(&workspace_id, &request_id, outcome, value)
                 .ok_or_else(|| unknown_request(&request_id))?,
         };
+        self.record_secret_resolution(&workspace_id, &answer.agent_id, &request_id, outcome)
+            .await;
         let (content, metadata_type) = match outcome {
             Outcome::Provided => (provided_notice(&answer.name), SECRET_PROVIDED_METADATA_TYPE),
             Outcome::Declined => (declined_notice(&answer.name), SECRET_DECLINED_METADATA_TYPE),
@@ -1058,6 +1065,59 @@ impl Services {
         // already started its turn, so clients never see a transient `idle`.
         self.maybe_emit_display_status_changed(&workspace_id).await;
         Ok(json!({ "ok": true, "requestId": request_id, "name": answer.name }))
+    }
+
+    /// Persist `requestId -> outcome` in the agent's
+    /// [`intent_core::SECRET_REQUEST_RESOLUTIONS_KEY`] map (oldest entries
+    /// evicted past [`MAX_SECRET_REQUEST_RESOLUTIONS`]) and emit
+    /// `agent:updated` carrying the map, so every client settles the card
+    /// without depending on the notice row. Fail-soft: the request is
+    /// already answered in the vault.
+    async fn record_secret_resolution(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        request_id: &str,
+        outcome: Outcome,
+    ) {
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+        let mut resolutions = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session.secret_request_resolutions(),
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, error = %error, "secret resolution: session read failed");
+                return;
+            }
+        };
+        resolutions.shift_remove(request_id);
+        resolutions.insert(request_id.to_owned(), json!(outcome.as_str()));
+        while resolutions.len() > MAX_SECRET_REQUEST_RESOLUTIONS {
+            let Some(oldest) = resolutions.keys().next().cloned() else {
+                break;
+            };
+            resolutions.shift_remove(&oldest);
+        }
+        let written = self
+            .store
+            .set_agent_session_metadata_key_json(
+                workspace_id,
+                agent_id,
+                intent_core::SECRET_REQUEST_RESOLUTIONS_KEY,
+                &Value::Object(resolutions.clone()).to_string(),
+                &intent_core::now_iso(),
+            )
+            .await;
+        if let Err(error) = written {
+            tracing::warn!(agent = %agent_id, error = %error, "secret resolution: write failed");
+            return;
+        }
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": agent_id.0, "secretRequestResolutions": resolutions }),
+        )
+        .await;
     }
 
     /// `secret.provide` for a remote agent (§5.56 remote agents): the value
@@ -1213,6 +1273,9 @@ impl Services {
 
 #[cfg(test)]
 mod remote_tests;
+
+#[cfg(test)]
+mod resolution_tests;
 
 #[cfg(test)]
 mod tests {
