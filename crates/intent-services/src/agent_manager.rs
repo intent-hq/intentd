@@ -544,13 +544,20 @@ fn remote_session_id(agent_id: &AgentId) -> String {
     format!("remote:{agent_id}")
 }
 
-/// The session a turn of `session` is cancelled on: its stored ACP session,
-/// or a remote agent's placeholder (its cancel goes to the machine).
-fn cancellable_session_id(agent_id: &AgentId, session: &AgentSession) -> Option<String> {
-    session.acp_session_id.clone().or_else(|| {
-        intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
-            .map(|_| remote_session_id(agent_id))
-    })
+/// What a cancel can reach for an agent, read from its live runtime handle
+/// (never from the stored `acpSessionId`, which not every runtime kind has).
+enum LiveCancel {
+    /// No runtime is installed: nothing runs to cancel.
+    NoRuntime,
+    /// A runtime is installed, but no turn's session was started on it yet.
+    NoSession,
+    /// The live runtime and the session its turns prompt on.
+    Session {
+        runtime: Arc<runtime::Runtime<'static>>,
+        notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
+        repository_origin: Arc<RepositoryOrigin>,
+        session_id: String,
+    },
 }
 
 /// Settle a hung `session/prompt` after the idle timeout WITHOUT killing the
@@ -7418,23 +7425,27 @@ impl AgentManager {
         interrupted_by: Option<InterruptedBy>,
     ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
-        // The live connection is the interrupt capability; grab it WITHOUT
-        // removing the handle so the child stays alive for resume.
-        let original = self.handles.lock().unwrap().get(agent_id).map(|h| {
-            (
-                h.execution.runtime.clone(),
-                h.execution.runtime.notifications(),
-                h.repository_origin.clone(),
-            )
-        });
-        let Some((conn, notes, repository_origin)) = original else {
-            // No live session to interrupt → keep-alive is a no-op; fall back to
-            // the hard kill path (itself a no-op when the agent is already gone).
-            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
+        // The live runtime is the interrupt capability; grab it WITHOUT
+        // removing the handle so the child stays alive for resume. It also
+        // names the session to cancel: the one its turns prompt on.
+        let (conn, notes, repository_origin, acp_session_id) = match self.live_cancel(agent_id) {
+            LiveCancel::Session {
+                runtime,
+                notifications,
+                repository_origin,
+                session_id,
+            } => (runtime, notifications, repository_origin, session_id),
+            // Nothing to keep alive: no runtime, or no turn's session started
+            // on it. Fall back to the hard kill path (itself a no-op when the
+            // agent is already gone).
+            LiveCancel::NoRuntime | LiveCancel::NoSession => {
+                return InterruptOutcome::killed(
+                    self.stop_with_redelivery_arm(agent_id, reason).await,
+                );
+            }
         };
-        // Resolve the persisted session for the workspace (terminal event) + the
-        // `acpSessionId` to cancel. Without an `acpSessionId` there is no
-        // in-flight turn to interrupt, so fall back to the kill path.
+        // The persisted session: the workspace (terminal event) and the
+        // provider quirks below.
         let session = self
             .services
             .store
@@ -7449,12 +7460,6 @@ impl AgentManager {
                 interrupted_row_id: None,
             };
         }
-        let acp_session_id = session
-            .as_ref()
-            .and_then(|s| cancellable_session_id(agent_id, s));
-        let Some(acp_session_id) = acp_session_id else {
-            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
-        };
         // Pin the live-turn slot BEFORE aborting the worker: the abort drops
         // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
         // read after the abort would race that drop and frequently lose the
@@ -7597,14 +7602,15 @@ impl AgentManager {
         // `mark_idle` below no-op (handle removed, registry deregistered) —
         // fine, a killed child leaves no stragglers to drain and nothing for
         // the idle sweep to hold.
-        let remote = acp_session_id == remote_session_id(agent_id);
         match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(&acp_session_id)).await
         {
             Ok(Ok(())) => self.arm_stale_cancel(agent_id),
-            // The link to the machine is down: the stop is queued for it
-            // instead, so the turn does not keep running there.
-            Ok(Err(e)) if remote => {
-                tracing::info!(agent = %agent_id, error = %e, "remote cancel undeliverable: stopping the run on its machine");
+            // The cancel did not reach a runtime that is still running (a
+            // remote agent whose machine link is down): stop the runtime, so
+            // the turn does not keep running (a remote stop is queued for its
+            // machine).
+            Ok(Err(e)) if conn.is_alive() => {
+                tracing::info!(agent = %agent_id, error = %e, "session/cancel undeliverable to a live runtime: stopping it");
                 self.kill_original_child(agent_id, &repository_origin).await;
             }
             Ok(Err(e)) if is_cancel_transport_closed(&e) => {
@@ -10729,16 +10735,7 @@ impl AgentManager {
         else {
             return false;
         };
-        let cancellable = self.contains(agent_id)
-            && self
-                .services
-                .store
-                .get_agent_session_summary(agent_id)
-                .await
-                .ok()
-                .and_then(|s| cancellable_session_id(agent_id, &s))
-                .is_some();
-        if !cancellable {
+        if !matches!(self.live_cancel(agent_id), LiveCancel::Session { .. }) {
             return false;
         }
 
@@ -12352,7 +12349,44 @@ impl AgentManager {
             .map(|started| started.session_id)
     }
 
+    /// Every turn's session comes from here: the session is bound on the
+    /// runtime handle it was started on, so a cancel finds it there.
     async fn ensure_started_owned(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<StartedSession> {
+        let started =
+            boxed_await(|| self.ensure_started_unbound(agent_id, workspace_id)).await?;
+        if let Some(handle) = self.handles.lock().unwrap().get(agent_id) {
+            if std::ptr::addr_eq(
+                Arc::as_ptr(&handle.execution.runtime),
+                Arc::as_ptr(&started.turn.runtime),
+            ) {
+                handle.execution.bind_session(&started.session_id);
+            }
+        }
+        Ok(started)
+    }
+
+    /// The live cancel target of `agent_id`; see [`LiveCancel`].
+    fn live_cancel(&self, agent_id: &AgentId) -> LiveCancel {
+        let handles = self.handles.lock().unwrap();
+        let Some(handle) = handles.get(agent_id) else {
+            return LiveCancel::NoRuntime;
+        };
+        let Some(session_id) = handle.execution.session_id() else {
+            return LiveCancel::NoSession;
+        };
+        LiveCancel::Session {
+            runtime: handle.execution.runtime.clone(),
+            notifications: handle.execution.runtime.notifications(),
+            repository_origin: handle.repository_origin.clone(),
+            session_id,
+        }
+    }
+
+    async fn ensure_started_unbound(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
