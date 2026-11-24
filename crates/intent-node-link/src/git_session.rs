@@ -423,7 +423,10 @@ async fn run_service(
                 .await
                 .map_err(|error| access_code(&error))?;
             if let Some(at) = hold.orphaned.as_deref() {
-                remote = remote.orphaned(at).map_err(|_| codes::FAILED)?;
+                remote = remote.orphaned(at).map_err(|error| {
+                    tracing::warn!(%error, "node git: refused the session: bad orphaned home");
+                    codes::FAILED
+                })?;
             }
             if hold.pins_only {
                 remote = remote.pins_only();
@@ -443,7 +446,10 @@ async fn run_service(
     let drain = service == GitService::ReceivePack;
     let mut command = command;
     command.kill_on_drop(!drain);
-    let mut child = command.spawn().map_err(|_| codes::FAILED)?;
+    let mut child = command.spawn().map_err(|error| {
+        tracing::warn!(%error, ?service, "node git: could not start the session's git");
+        codes::FAILED
+    })?;
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(codes::FAILED);
     };

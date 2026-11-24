@@ -36,8 +36,17 @@ fn keyring() -> std::sync::Arc<postgres::SecretKeyring> {
     std::sync::Arc::new(postgres::SecretKeyring::new("test", &[0x5a; 32]).unwrap())
 }
 
+/// `git` with no host or user configuration.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -79,7 +88,7 @@ fn push_request(source: &Path, commit: &str, ref_name: &str) -> Vec<u8> {
     let zero = "0".repeat(commit.len());
     let line = format!("{zero} {commit} {ref_name}\0report-status\n");
     let mut request = format!("{:04x}{line}0000", line.len() + 4).into_bytes();
-    let mut pack = Command::new("git")
+    let mut pack = git_command()
         .arg("-C")
         .arg(source)
         .args(["pack-objects", "--quiet", "--stdout", "--revs"])
@@ -98,8 +107,43 @@ fn push_request(source: &Path, commit: &str, ref_name: &str) -> Vec<u8> {
     request
 }
 
+/// Head's receive-pack for a node session of `remote` into `head`, fed
+/// `request`; its reply.
+async fn push(head: &Path, remote: &AgentRemote, request: &[u8]) -> String {
+    let mut command = service_command(GitService::ReceivePack, head, remote)
+        .expect("head's receive hooks are installed once a tenant is served");
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let request = request.to_vec();
+    let (reply, status) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async move {
+            // Receive-pack advertises first; read it all while writing.
+            let read = tokio::spawn(async move {
+                let mut reply = Vec::new();
+                stdout.read_to_end(&mut reply).await.unwrap();
+                reply
+            });
+            stdin.write_all(&request).await.unwrap();
+            drop(stdin);
+            let reply = read.await.unwrap();
+            (reply, child.wait().await.unwrap())
+        },
+    )
+    .await
+    .expect("receive-pack finishes");
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    assert!(status.success(), "receive-pack: {status:?}: {reply}");
+    reply
+}
+
 /// After `serve_tenant`, head's receive-pack for a node session runs with
-/// head's update hook and lands the pushed agent ref.
+/// head's update hook: it lands the session's agent ref and refuses one
+/// outside the session's prefix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_served_tenant_accepts_a_node_push() {
     let Some(pool) = pool().await else { return };
@@ -124,38 +168,26 @@ async fn a_served_tenant_accepts_a_node_push() {
     let remote = AgentRemote::new("ws-1", "agent-1").unwrap();
     let ref_name = format!("{}head", remote.ref_prefix());
 
-    let mut command = service_command(GitService::ReceivePack, &head, &remote)
-        .expect("head's receive hooks are installed once a tenant is served");
-    let mut child = command
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let request = push_request(&dir.path().join("source"), &commit, &ref_name);
-    let reply = tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(30)),
-        async move {
-            // Receive-pack advertises first; read it all while writing.
-            let read = tokio::spawn(async move {
-                let mut reply = Vec::new();
-                stdout.read_to_end(&mut reply).await.unwrap();
-                reply
-            });
-            stdin.write_all(&request).await.unwrap();
-            drop(stdin);
-            let reply = read.await.unwrap();
-            let status = child.wait().await.unwrap();
-            (reply, status)
-        },
-    )
-    .await
-    .expect("receive-pack finishes");
-    let (reply, status) = reply;
-    let reply = String::from_utf8_lossy(&reply);
-    assert!(status.success(), "receive-pack: {status:?}: {reply}");
-    assert!(reply.contains(&format!("ok {ref_name}")), "{reply}");
+    let source = dir.path().join("source");
+    let pushed = push(&head, &remote, &push_request(&source, &commit, &ref_name)).await;
+    assert!(pushed.contains(&format!("ok {ref_name}")), "{pushed}");
     assert_eq!(git(&head, &["rev-parse", &ref_name]), commit);
+
+    // The hook runs: a ref outside the session's prefix is refused.
+    let outside = "refs/heads/main";
+    let refused = push(&head, &remote, &push_request(&source, &commit, outside)).await;
+    assert!(refused.contains(&format!("ng {outside}")), "{refused}");
+    assert!(
+        git_command()
+            .arg("-C")
+            .arg(&head)
+            .args(["rev-parse", "--verify", "--quiet", outside])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty(),
+        "the refused ref was not written"
+    );
 
     served.fence().fire("test done");
     served.stopped().await;

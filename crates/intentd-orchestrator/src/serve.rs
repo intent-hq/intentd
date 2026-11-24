@@ -121,8 +121,10 @@ pub async fn serve_tenant_with(
         )));
     }
     // Machines push their agents' and homes' work into this head: without
-    // the hooks every push is refused. Before the claim, so a failure
-    // claims nothing.
+    // the hooks every push is refused. Fatal on purpose, unlike `intentd`
+    // (which also runs local agents): an orchestrator runs agents only on
+    // machines, so a head that refuses every push cannot serve. Before the
+    // claim, so a failure claims nothing.
     install_receive_hooks(data_dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: node git receive hooks: {e}")))?;
     let (store, lease) = Store::open_postgres_owned(
@@ -172,19 +174,21 @@ pub async fn serve_tenant_with(
 
 /// Install head's git receive hooks under `data_dir`, once per process
 /// (`intent_git::node_git::configure_receive_hooks`, as `intentd` does at
-/// start): the hooks are process-wide and identical for every tenant, so a
-/// later tenant's open must not clear them under a push of an earlier one.
-/// A different `data_dir` installs them afresh there.
+/// start). The hooks are process-wide and the same for every tenant, so
+/// only the first open installs them: installing clears the hooks
+/// directory first, and a push running then would see no `update` hook and
+/// land unchecked. Later opens (any `data_dir`) keep the first install;
+/// every push re-verifies it and reinstalls it in place when altered. A
+/// failed install is retried by the next open.
 fn install_receive_hooks(data_dir: &Path) -> Result<()> {
-    static INSTALLED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    static INSTALLED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
     let mut installed = INSTALLED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if installed.as_deref() == Some(data_dir) {
-        return Ok(());
+    if !*installed {
+        intent_git::node_git::configure_receive_hooks(data_dir)?;
+        *installed = true;
     }
-    intent_git::node_git::configure_receive_hooks(data_dir)?;
-    *installed = Some(data_dir.to_owned());
     Ok(())
 }
 
