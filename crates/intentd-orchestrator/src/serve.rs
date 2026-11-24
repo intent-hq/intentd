@@ -69,8 +69,9 @@ impl Admission for Unfenced {
 /// # Errors
 /// For an invalid tenant id; `Error::SchemaMismatch` when the schema does
 /// not match this build; `Error::NotOwner` when another instance holds a
-/// live lease (nothing was written); when the tenant's directory or
-/// settings cannot be set up; when the runtime is not multi-thread.
+/// live lease (nothing was written); when head's git receive hooks, the
+/// tenant's directory or its settings cannot be set up; when the runtime is
+/// not multi-thread.
 pub async fn serve_tenant(
     pool: PgPool,
     tenant: &str,
@@ -119,6 +120,11 @@ pub async fn serve_tenant_with(
             "tenant {tenant}: serving needs the multi-thread Tokio runtime"
         )));
     }
+    // Machines push their agents' and homes' work into this head: without
+    // the hooks every push is refused. Before the claim, so a failure
+    // claims nothing.
+    install_receive_hooks(data_dir)
+        .map_err(|e| Error::Internal(format!("tenant {tenant}: node git receive hooks: {e}")))?;
     let (store, lease) = Store::open_postgres_owned(
         pool,
         id,
@@ -162,6 +168,24 @@ pub async fn serve_tenant_with(
         heartbeat,
         report: Some(runner.spawn()),
     })
+}
+
+/// Install head's git receive hooks under `data_dir`, once per process
+/// (`intent_git::node_git::configure_receive_hooks`, as `intentd` does at
+/// start): the hooks are process-wide and identical for every tenant, so a
+/// later tenant's open must not clear them under a push of an earlier one.
+/// A different `data_dir` installs them afresh there.
+fn install_receive_hooks(data_dir: &Path) -> Result<()> {
+    static INSTALLED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let mut installed = INSTALLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if installed.as_deref() == Some(data_dir) {
+        return Ok(());
+    }
+    intent_git::node_git::configure_receive_hooks(data_dir)?;
+    *installed = Some(data_dir.to_owned());
+    Ok(())
 }
 
 /// The tenant's `Services` over `bus`: every path under `dir`, in

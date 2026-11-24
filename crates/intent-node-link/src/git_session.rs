@@ -430,7 +430,11 @@ async fn run_service(
             }
         }
         (
-            service_command(service, &repository, &remote).map_err(|_| codes::FAILED)?,
+            service_command(service, &repository, &remote).map_err(|error| {
+                // The machine sees only the code; say why here.
+                tracing::warn!(%error, ?service, "node git: refused the session");
+                codes::FAILED
+            })?,
             Vec::new(),
         )
     };

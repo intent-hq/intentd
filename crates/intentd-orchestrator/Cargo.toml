@@ -27,6 +27,7 @@ postgres = ["intent-store/postgres"]
 base64 = { workspace = true }
 intent-app = { workspace = true }
 intent-core = { workspace = true }
+intent-git = { workspace = true }
 intent-services = { workspace = true }
 intent-store = { workspace = true }
 intent-transport = { workspace = true }
