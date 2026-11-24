@@ -15852,7 +15852,13 @@ pub async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
         return;
     };
     if let Err(e) = bus.publish(&event).await {
-        tracing::warn!(error = %e, "failed to publish change event");
+        if bus.store().refused_by_own_fence(&e) {
+            // Expected after this process stopped serving the tenant; the
+            // bus writer and the fence's fire already logged it.
+            tracing::debug!(error = %e, "change event refused by this process's fired tenant fence");
+        } else {
+            tracing::warn!(error = %e, "failed to publish change event");
+        }
     }
 }
 

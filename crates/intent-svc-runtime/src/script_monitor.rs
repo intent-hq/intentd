@@ -191,6 +191,15 @@ impl ScriptMonitorExt for Services {
                     () = services.feature_settings_tasks().closed() => break,
                     _ = sweep.tick() => {}
                 }
+                // Once this process's tenant fence fired, every write of
+                // the tenant is refused: nothing is left to maintain here.
+                if services
+                    .store()
+                    .tenant_fence()
+                    .is_some_and(|fence| fence.is_fenced())
+                {
+                    break;
+                }
                 let completions = services
                     .runtime()
                     .script_locks
@@ -208,7 +217,12 @@ impl ScriptMonitorExt for Services {
                     .cleanup_completed_script_notifications()
                     .await
                 {
-                    tracing::warn!(%error, "completed notification cleanup will retry");
+                    if services.store().refused_by_own_fence(&error) {
+                        // The fence fired during this tick; the next one stops.
+                        tracing::debug!(%error, "completed notification cleanup refused by the fired tenant fence");
+                    } else {
+                        tracing::warn!(%error, "completed notification cleanup will retry");
+                    }
                 }
                 if let Ok(rows) = services.store().pending_script_monitors().await {
                     for (row, _) in rows {

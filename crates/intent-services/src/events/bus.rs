@@ -607,6 +607,7 @@ impl Drop for Subscription {
 /// buffered events after the channel closes (before yielding `None`), so no
 /// event is dropped at shutdown.
 async fn writer_task(store: Store, rx: mpsc::Receiver<WriterRequest>, broadcast_tx: RawBus) {
+    let fence_store = store.clone();
     writer_loop(
         move |events: Arc<[NewEvent]>| {
             let store = store.clone();
@@ -614,6 +615,7 @@ async fn writer_task(store: Store, rx: mpsc::Receiver<WriterRequest>, broadcast_
         },
         rx,
         broadcast_tx,
+        move |e: &Error| fence_store.refused_by_own_fence(e),
     )
     .await;
 }
@@ -627,6 +629,7 @@ pub(crate) async fn writer_loop<F, Fut>(
     insert: F,
     mut rx: mpsc::Receiver<WriterRequest>,
     broadcast_tx: RawBus,
+    own_refusal: impl Fn(&Error) -> bool,
 ) where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -649,7 +652,7 @@ pub(crate) async fn writer_loop<F, Fut>(
                 Err(_) => break,
             }
         }
-        flush_batch(&insert, &mut pending, &broadcast_tx).await;
+        flush_batch(&insert, &mut pending, &broadcast_tx, &own_refusal).await;
     }
 }
 
@@ -659,8 +662,12 @@ pub(crate) async fn writer_loop<F, Fut>(
 /// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
 /// returned event) keeps the original full payload so live consumers (§7.1
 /// tool-block synthesis) are unaffected.
-async fn flush_batch<F, Fut>(insert: &F, pending: &mut Vec<WriterRequest>, broadcast_tx: &RawBus)
-where
+async fn flush_batch<F, Fut>(
+    insert: &F,
+    pending: &mut Vec<WriterRequest>,
+    broadcast_tx: &RawBus,
+    own_refusal: &impl Fn(&Error) -> bool,
+) where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
@@ -668,7 +675,13 @@ where
         .iter()
         .map(|(ev, _)| truncate_tool_call_for_persist(ev).unwrap_or_else(|| ev.clone()))
         .collect();
-    flush_prepared(|| insert(Arc::clone(&events)), pending, broadcast_tx).await;
+    flush_prepared(
+        || insert(Arc::clone(&events)),
+        pending,
+        broadcast_tx,
+        own_refusal,
+    )
+    .await;
 }
 
 /// Insert-retry + broadcast/resolve core of [`flush_batch`], generic over the
@@ -711,6 +724,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
     mut insert: F,
     pending: &mut Vec<WriterRequest>,
     broadcast_tx: &RawBus,
+    own_refusal: impl Fn(&Error) -> bool,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -769,16 +783,38 @@ pub(crate) async fn flush_prepared<F, Fut>(
                 .collect();
             event_types.sort_unstable();
             event_types.dedup();
-            tracing::error!(
-                events = pending.len(),
-                event_types = ?event_types,
-                error = %e,
-                "event batch insert failed; dropping batch (not persisted, not broadcast)"
-            );
-            // On batch failure, resolve all oneshots with the same error message.
+            let fenced = own_refusal(&e);
+            if fenced {
+                // This process's own fence refused the batch after it
+                // fired (a clean stop, or a lost lease the fence already
+                // logged at WARN): the expected end of the tenant here.
+                tracing::debug!(
+                    events = pending.len(),
+                    event_types = ?event_types,
+                    error = %e,
+                    "event batch refused by this process's fired tenant fence; dropped"
+                );
+            } else {
+                tracing::error!(
+                    events = pending.len(),
+                    event_types = ?event_types,
+                    error = %e,
+                    "event batch insert failed; dropping batch (not persisted, not broadcast)"
+                );
+            }
+            // On batch failure, resolve all oneshots with the same error
+            // message, keeping `NotOwner` so publishers can tell a fence
+            // refusal apart.
+            let refusal = match &e {
+                Error::NotOwner(reason) if fenced => Some(reason.clone()),
+                _ => None,
+            };
             let err_msg = format!("batch insert failed: {e}");
             for (_, tx) in pending.drain(..) {
-                let _ = tx.send(Err(Error::Internal(err_msg.clone())));
+                let _ = tx.send(Err(refusal.as_ref().map_or_else(
+                    || Error::Internal(err_msg.clone()),
+                    |reason| Error::NotOwner(reason.clone()),
+                )));
             }
         }
     }

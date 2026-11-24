@@ -104,6 +104,17 @@ impl TenantFence {
         self.0.reason.borrow().as_deref().map(str::to_owned)
     }
 
+    /// Whether `error` is this fence's own refusal: `NotOwner` once the
+    /// fence fired. Such a refusal is the expected end of a write after
+    /// this process stopped serving the tenant (a clean stop, or a lost
+    /// lease); [`Self::fire`] already logged why at WARN, so callers log
+    /// these quietly and do not retry them. The fence still refuses: this
+    /// only classifies the error.
+    #[must_use]
+    pub fn refused(&self, error: &crate::Error) -> bool {
+        matches!(error, crate::Error::NotOwner(_)) && self.is_fenced()
+    }
+
     /// Wait until the fence fires. Cancel-safe.
     pub async fn fenced(&self) {
         let mut rx = self.0.reason.subscribe();
@@ -423,6 +434,20 @@ mod tests {
 
     fn wait() -> Duration {
         intentd_test_support::test_timeout(Duration::from_secs(10))
+    }
+
+    /// Only `NotOwner` after the fire is the fence's own refusal: before
+    /// the fire a `NotOwner` (another process took the tenant) and any
+    /// other error stay what they are.
+    #[test]
+    fn refused_is_not_owner_after_the_fire() {
+        let fence = TenantFence::new();
+        let not_owner = crate::Error::NotOwner("tenant t: taken over".into());
+        let other = crate::Error::Internal("disk full".into());
+        assert!(!fence.refused(&not_owner), "not fired yet");
+        assert!(fence.fire("stopping"));
+        assert!(fence.refused(&not_owner));
+        assert!(!fence.refused(&other));
     }
 
     #[tokio::test]
