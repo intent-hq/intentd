@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.287] - 2026-11-24
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* Install head's git receive hooks so machine pushes land ([#3734](https://github.com/intent-hq/intentd/pull/3734))
+
+
 ## [0.11.286] - 2026-11-24
 
 ### 🐛 Bug Fixes
