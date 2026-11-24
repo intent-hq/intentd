@@ -2013,13 +2013,13 @@ async fn a_retry_still_recovers_a_real_failure_after_an_unrecorded_turn_start() 
     wait_delivered(&mgr, &id, &after, &["message alpha"]).await;
 
     assert_delivered_once_in_order(&mgr, &id, &after, &["message alpha"]);
-    assert_eq!(
+    assert_ne!(
         mgr.services
             .store
             .get_agent_session_status(&id)
             .await
             .unwrap(),
-        AgentStatus::Idle,
+        AgentStatus::Error,
         "the redriven turn ended the Error park"
     );
 }

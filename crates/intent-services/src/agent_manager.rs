@@ -8253,7 +8253,7 @@ impl AgentManager {
                         auto_unarchive,
                         fence,
                         origin,
-                        admission,
+                        claim.admission(),
                     )
                 })
                 .await
@@ -8311,7 +8311,7 @@ impl AgentManager {
                         true,
                         fence,
                         TurnOrigin::Delivery,
-                        popped.1,
+                        popped.1.admission(),
                     )
                 })
                 .await
