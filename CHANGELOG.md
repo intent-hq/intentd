@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.286] - 2026-11-24
+
+### 🐛 Bug Fixes
+
+- *(agents)* Finish claimed queue drains when the caller is cancelled ([#3723](https://github.com/intent-hq/intentd/pull/3723))
+- Route every default forge registry build through the API-base seam ([#3725](https://github.com/intent-hq/intentd/pull/3725))
+
+### 📚 Documentation
+
+- *(guide)* Describe settings search ([#3730](https://github.com/intent-hq/intentd/pull/3730))
+- *(guide)* The dock sits at the top-left on Intent OS ([#3731](https://github.com/intent-hq/intentd/pull/3731))
+- Describe HTML file previews ([#3727](https://github.com/intent-hq/intentd/pull/3727))
+
+
 ## [0.11.285] - 2026-11-23
 
 ### 📚 Documentation
