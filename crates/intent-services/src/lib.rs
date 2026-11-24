@@ -1803,8 +1803,15 @@ impl Services {
         let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
         let mut services = Self::new_with_repository_sources(store, secrets, None);
         services.isolated_secrets_dir = Some(Arc::new(dir));
-        services.github_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
-        services
+        services.with_isolated_github_api_base()
+    }
+
+    /// Every test constructor starts at [`ISOLATED_GITHUB_API_BASE_URI`];
+    /// [`Services::with_github_api_base_uri`] replaces it with a mock.
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    fn with_isolated_github_api_base(mut self) -> Self {
+        self.github_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
+        self
     }
 
     /// Select the backing file before constructing any secret wrapper.
@@ -1813,7 +1820,7 @@ impl Services {
         store: Store,
         file_secrets: intent_core::FileSecretStore,
     ) -> Self {
-        Self::new_with_repository_sources(store, file_secrets, None)
+        Self::new_with_repository_sources(store, file_secrets, None).with_isolated_github_api_base()
     }
 
     /// Hidden test support: select disposable original sources before attachment.
@@ -1827,6 +1834,7 @@ impl Services {
         descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
     ) -> Self {
         Self::new_with_repository_sources(store, secrets, descriptor)
+            .with_isolated_github_api_base()
     }
 
     fn new_with_repository_sources(
@@ -33362,7 +33370,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.pullsFiles").await?;
-            let sc = pr_ops::resolve_source_control(injected, self.github_api_base_uri.as_deref(), &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let head_sha = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha
                 .filter(|sha| !sha.is_empty()).ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
