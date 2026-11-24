@@ -987,14 +987,18 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
     // Review of intentd#2957: the next message continues on the backup
     // (home's earlier output no longer skips the backoff).
     send_as_user(&mgr, &id, &ws, "carry on").await;
-    // The backup also takes the undelivered "back home" message, so it runs
-    // two turns.
-    backup_again.finish.add_permits(2);
-    backup_again.wait_prompts(2).await;
+    // The undelivered "back home" message rides the same turn, first.
+    backup_again.finish.add_permits(1);
+    backup_again.wait_prompts(1).await;
     wait_idle(&mgr, &id).await;
     assert_eq!(port.asked.load(Ordering::SeqCst), 4, "home is not retried");
-    let delivered = format!("{:?}", backup_again.prompts.lock().unwrap());
-    assert!(delivered.contains("carry on"), "{delivered}");
+    assert_eq!(backup_again.prompts.lock().unwrap().len(), 1, "one turn");
+    let delivered = prompt_text(&backup_again, 0);
+    let carry_on = delivered.find("carry on").expect("the new message is sent");
+    assert!(
+        delivered.find("back home").is_some_and(|at| at < carry_on),
+        "{delivered}"
+    );
     let session = mgr
         .services
         .store
@@ -1580,4 +1584,167 @@ async fn a_remote_failover_replays_the_earlier_conversation_to_the_backup() {
     let sent = prompt_text(&backup_run, 0);
     assert!(sent.contains("kumquat"), "history replayed: {sent}");
     assert!(sent.trim_end().ends_with("what was the word?"), "{sent}");
+}
+
+const FIRST_MESSAGE: &str = "default secret requests to on";
+
+/// The first turn of a remote agent fails with no output: its Default runs
+/// out of quota and the backup cannot start on the machine
+/// (`remote-failover-unavailable`). `then` are the launches after that.
+async fn remote_failed_first_turn(
+    name: &str,
+    then: Vec<Launch>,
+) -> (TempDb, Arc<AgentManager>, WorkspaceId, AgentId) {
+    let ws = WorkspaceId::from(format!("ws-{name}"));
+    let id = AgentId::from(format!("agent-{name}"));
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let mut launches = vec![
+        Launch::Runs(primary),
+        Launch::Fails("the machine's limit on awake memory is reached"),
+    ];
+    launches.extend(then);
+    let port = ScriptedRemote::new(launches);
+    let (tmp, mgr, _backup) = remote_agent_with_backup(port, &id, &ws).await;
+    send(&mgr, &id, &ws, FIRST_MESSAGE).await;
+    wait_idle(&mgr, &id).await;
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    (tmp, mgr, ws, id)
+}
+
+/// Every prompt text `run` received, joined.
+fn all_prompts(run: &FakeRuntime) -> String {
+    let count = run.prompts.lock().unwrap().len();
+    (0..count)
+        .map(|n| prompt_text(run, n))
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+#[intent_test_macros::daemon_test]
+async fn try_again_after_a_failed_remote_first_turn_resends_the_message() {
+    let retry = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("remote-first-turn-retry", vec![Launch::Runs(retry.clone())])
+            .await;
+
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    retry.wait_prompts(1).await;
+    retry.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let sent = all_prompts(&retry);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    assert!(sent.trim_end().ends_with(FIRST_MESSAGE), "{sent}");
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_new_message_after_a_failed_remote_first_turn_carries_the_failed_one() {
+    let next = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("remote-first-turn-new", vec![Launch::Runs(next.clone())]).await;
+
+    send(&mgr, &id, &ws, "try again?").await;
+    next.wait_prompts(1).await;
+    next.finish.add_permits(2);
+    wait_idle(&mgr, &id).await;
+
+    let sent = all_prompts(&next);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    let new = sent.find("try again?").expect("the new message is sent");
+    assert!(sent.find(FIRST_MESSAGE).unwrap() < new, "{sent}");
+}
+
+/// The observed sequence: the first turn fails, "Try again" runs with no
+/// output until the user stops it, and the next message fails over to the
+/// backup, which starts this time. The backup's fresh session still gets
+/// the original message ahead of the new one.
+#[intent_test_macros::daemon_test]
+async fn a_backup_after_a_stopped_silent_retry_gets_the_failed_first_message() {
+    let silent = FakeRuntime::new();
+    let primary_again = FakeRuntime::new();
+    primary_again.quota_failures.store(1, Ordering::SeqCst);
+    let backup = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+        "remote-first-turn-stopped",
+        vec![
+            Launch::Runs(silent.clone()),
+            Launch::Runs(primary_again.clone()),
+            Launch::Runs(backup.clone()),
+        ],
+    )
+    .await;
+
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    silent.wait_prompts(1).await;
+    mgr.stop(&id).await;
+    wait_idle(&mgr, &id).await;
+
+    send(&mgr, &id, &ws, "try again?").await;
+    backup.wait_prompts(1).await;
+    backup.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let sent = prompt_text(&backup, 0);
+    assert_eq!(sent.matches(FIRST_MESSAGE).count(), 1, "{sent}");
+    let new = sent.find("try again?").expect("the new message is sent");
+    assert!(sent.find(FIRST_MESSAGE).unwrap() < new, "{sent}");
+}
+
+/// Review of intentd#3739: two messages sent at once to an agent whose
+/// first turn failed. Neither recovery may cancel the turn the other
+/// started: the failed message and both new ones each reach the provider
+/// exactly once. Sweeps interleavings by delaying the second send.
+#[intent_test_macros::daemon_test]
+async fn two_sends_after_a_failed_remote_first_turn_deliver_every_message_once() {
+    for yields in 0..6u32 {
+        let next = FakeRuntime::new();
+        next.finish.add_permits(8);
+        let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+            &format!("remote-first-turn-race-{yields}"),
+            vec![Launch::Runs(next.clone())],
+        )
+        .await;
+
+        let second = async {
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            send(&mgr, &id, &ws, "message beta").await;
+        };
+        tokio::join!(send(&mgr, &id, &ws, "message alpha"), second);
+        next.wait_prompts(1).await;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !all_prompts(&next).contains("message beta")
+                    || !all_prompts(&next).contains("message alpha")
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("yields={yields}: {}", all_prompts(&next)));
+        wait_idle(&mgr, &id).await;
+
+        let sent = all_prompts(&next);
+        for text in [FIRST_MESSAGE, "message alpha", "message beta"] {
+            assert_eq!(
+                sent.matches(text).count(),
+                1,
+                "yields={yields} {text}: {sent}"
+            );
+        }
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "yields={yields}"
+        );
+    }
 }

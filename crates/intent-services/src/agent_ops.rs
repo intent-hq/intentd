@@ -19909,6 +19909,19 @@ impl Services {
             })
     }
 
+    /// Whether a failed turn's message waits ready-to-send in the queue for
+    /// a retry (`requeued_after_failure`).
+    pub(crate) fn has_ready_failed_turn(&self, agent_id: &AgentId) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| {
+                q.iter()
+                    .any(|m| m.requeued_after_failure && m.ready_to_send())
+            })
+    }
+
     /// `true` iff the agent's queue still holds a ready-to-send entry with
     /// this exact `id` — the test-side view of what
     /// [`Self::claim_parked_recovery_send`] would pop.

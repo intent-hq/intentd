@@ -6387,7 +6387,9 @@ impl AgentManager {
             .iter()
             .flatten()
             .flat_map(|entry| {
-                std::iter::once(entry.id.clone()).chain(
+                // A failed turn's requeued entry names its directly persisted
+                // user row among its submission ids.
+                entry.submission_ids().into_iter().chain(
                     entry
                         .recovery_sources
                         .iter()
@@ -6893,6 +6895,18 @@ impl AgentManager {
                 .iter()
                 .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
+        // A flushed failed turn's entry names its directly persisted user
+        // row: drop just that row, which may precede unrelated exchanges.
+        let flushed_rows: HashSet<&str> = flushed_ids
+            .into_iter()
+            .flatten()
+            .filter(|id| {
+                messages
+                    .iter()
+                    .any(|message| message.role == "user" && &message.id == *id)
+            })
+            .map(String::as_str)
+            .collect();
         // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
         // already persisted assistant/tool rows after the current user row,
         // the backup continues that turn — older history, then the cut-short
@@ -6962,6 +6976,7 @@ impl AgentManager {
             .filter(|message| {
                 message.role != "user"
                     || (!excluded_group_sources.contains(&message.id)
+                        && !flushed_rows.contains(message.id.as_str())
                         && !queue_source(message)
                             .is_some_and(|source| excluded_group_sources.contains(&source)))
             })
@@ -9355,6 +9370,39 @@ impl AgentManager {
                 .await;
             return Ok(result);
         }
+        // A fresh send into an `Error` session whose failed turn's message
+        // still waits in the queue: queue this one behind it and lift the
+        // Error park, so the batch flush delivers both in order in one turn.
+        // A direct turn would run this message alone, and a provider session
+        // that never saw the failed one would lack it. While the failing
+        // worker still holds the slot, the parked recovery send below
+        // applies instead.
+        if session.status == AgentStatus::Error
+            && !self.is_busy(&agent_id)
+            && self.services.has_ready_failed_turn(&agent_id)
+        {
+            let (queued, position) = self.services.enqueue_submission(
+                &agent_id,
+                Some(message_id.clone()),
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                options.origin,
+            )?;
+            let mut result = json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            queued.attach_correlation(&mut result);
+            self.services.publish_queue_updated(&agent_id).await;
+            self.redrive_failed_turn(&agent_id, &workspace_id).await?;
+            return Ok(result);
+        }
         #[cfg(test)]
         if options.reject_on_shutdown {
             if let Some(park) = &self.services.interrupted_resume_park {
@@ -11445,6 +11493,39 @@ impl AgentManager {
             result["turnId"] = json!(tid);
         }
         Ok(result)
+    }
+
+    /// Lift a failed turn's `Error` park for a fresh send queued behind its
+    /// message, then drain. Unlike [`AgentManager::agent_retry`] it tears
+    /// nothing down: the flip happens once, under the turn-start gate, and
+    /// a concurrent send that finds the park already lifted only kicks the
+    /// drain, so it can never cancel the turn the first one started.
+    async fn redrive_failed_turn(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        {
+            let gate = self.turn_start_gates.for_agent(agent_id);
+            let _starting = gate.lock().await;
+            if !self.is_busy(agent_id)
+                && self
+                    .services
+                    .store
+                    .get_agent_session_status(agent_id)
+                    .await?
+                    == AgentStatus::Error
+            {
+                self.services.clear_failure_streak(agent_id);
+                self.services.clear_failure_wake_dedup(agent_id);
+                self.persist_retry_status(agent_id, workspace_id, AgentStatus::Pending)
+                    .await?;
+            }
+        }
+        self.clone()
+            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+            .await;
+        Ok(())
     }
 
     /// Persist an `agent.retry` status transition (clearing any persisted
