@@ -32,9 +32,10 @@
 //
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
-// whole process tree. Directives are whole one-line prompts "@<name>
-// [label]", never words inside a prompt (a stopped "@block" redelivered
-// with the next message is two lines and runs as an ordinary turn):
+// whole process tree. Directives are a whole one-line user message (the last
+// prompt block) "@<name> [label]", never words inside a prompt (a stopped
+// "@block" redelivered with the next message is two lines and runs as an
+// ordinary turn):
 // "@block" parks until session/cancel, "@block-slow-cancel" likewise but
 // answers the cancel 1.5 s later, "@slow" waits 300 ms, "@many" streams 200
 // extra chunks, and "@spawn-exit" starts another `sleep` in its own process
@@ -499,7 +500,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         });
         return send({ id: msg.id, error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } } });
       }
-      const directive = command.match(/^@([a-z-]+)(?: [^\n]*)?$/)?.[1];
+      // The user's message is the last block: a first turn's notices and
+      // skills catalog are blocks before it.
+      const message = promptText({ prompt: (msg.params?.prompt ?? []).slice(-1) })
+        .replace(/^\[Role Reminder: [\s\S]*?\]\n\n/, '');
+      const directive = message.match(/^@([a-z-]+)(?: [^\n]*)?$/)?.[1];
       if (directive && !['block', 'block-slow-cancel', 'slow', 'many', 'spawn-exit'].includes(directive)) {
         return send({ id: msg.id, error: { code: -32602, message: `unknown directive @${directive}` } });
       }

@@ -868,11 +868,27 @@ async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
 /// The fixture's directives are whole prompts: a prompt that only mentions
 /// one (a stopped "@block" message redelivered with the next, as during
 /// intentd#3707) runs as an ordinary turn instead of parking, and a
-/// misspelled directive fails at once instead of hanging the test.
+/// misspelled directive fails at once instead of hanging the test. The
+/// first turn's checkout notice block does not hide a directive.
 #[tokio::test]
 async fn node_fixture_directives_trigger_only_on_the_whole_prompt() {
     let Some(h) = harness(1, &[]) else { return };
+    *h.checkouts.notice.lock().unwrap() = Some("wip-not-restored.".into());
     h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "first".into(), text("@block first"))
+        .await;
+    wait_for(&h.runner, "first turn output", |r| {
+        r.turn_id.as_deref() == Some("first") && matches!(r.body, JournalBody::Notification { .. })
+    })
+    .await;
+    h.runner.cancel(&AgentId::from("a1")).await;
+    let all = wait_for(&h.runner, "cancelled turn", turn_ended("a1", "first")).await;
+    assert_eq!(
+        turn_end(find(&all, turn_ended("a1", "first"))),
+        ("cancelled", None),
+        "a first-turn @block parks behind the checkout notice"
+    );
     let prompts = [
         "sixth block\n\nseventh",
         "@block sixth\n\nseventh",
