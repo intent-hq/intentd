@@ -195,32 +195,90 @@ struct StatusControl {
     services: Services,
     host: HostEnvironment,
     ws: Arc<OnceLock<WsApiServer>>,
+    /// The WSS port once bound; for the synchronous [`SystemControl::status`].
+    port: Arc<OnceLock<u16>>,
     started: std::time::Instant,
-    /// `None` where `sysinfo` cannot sample this host: usage reads 0.
-    process: Option<std::sync::Mutex<sysinfo::System>>,
+    /// Kept fresh by [`sample_usage`], never collected on the request path.
+    sample: Arc<std::sync::Mutex<UsageSample>>,
+}
+
+/// What [`sample_usage`] last read: this process's CPU (100 = one core) and
+/// resident memory, and the host's addresses for `localIps`.
+#[derive(Default)]
+struct UsageSample {
+    cpu_percent: f32,
+    memory_bytes: u64,
+    local_v4: Vec<String>,
+    local_v6: Vec<String>,
+}
+
+/// How often [`sample_usage`] reads CPU and memory: CPU is a delta between
+/// two reads, so a fixed interval keeps it steady however often clients poll.
+const USAGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many [`USAGE_INTERVAL`]s apart the host's addresses are re-read.
+const ROUTES_EVERY: u32 = 10;
+
+/// Keep `sample` fresh until `stop` ran: CPU and memory every
+/// [`USAGE_INTERVAL`], the addresses every [`ROUTES_EVERY`] of them, off the
+/// runtime's worker threads. Without `sysinfo` on this host, usage reads 0.
+async fn sample_usage(sample: Arc<std::sync::Mutex<UsageSample>>, stop: ListenersStop) {
+    let process = sysinfo::System::new()
+        .ok()
+        .zip(sysinfo::get_current_pid().ok());
+    let process = Arc::new(std::sync::Mutex::new(process));
+    let mut tick = tokio::time::interval(USAGE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks = 0_u32;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            () = stop.stopped() => return,
+        }
+        let routes = ticks.is_multiple_of(ROUTES_EVERY);
+        ticks = ticks.wrapping_add(1);
+        let process = process.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut process = process
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let usage = process.as_mut().and_then(|(system, pid)| {
+                system.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[*pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::nothing()
+                        .with_cpu()
+                        .with_memory(),
+                );
+                system
+                    .process(*pid)
+                    .map(|process| (process.cpu_usage(), process.memory()))
+            });
+            let routes = routes.then(|| {
+                (
+                    intent_transport::collect_local_ips(),
+                    intent_transport::collect_local_ipv6s(),
+                )
+            });
+            (usage, routes)
+        })
+        .await;
+        let Ok((usage, routes)) = read else { continue };
+        let mut sample = sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cpu, memory)) = usage {
+            sample.cpu_percent = cpu;
+            sample.memory_bytes = memory;
+        }
+        if let Some((v4, v6)) = routes {
+            sample.local_v4 = v4;
+            sample.local_v6 = v6;
+        }
+    }
 }
 
 impl StatusControl {
-    /// This process's CPU (100 = one core) and resident memory, sampled now.
-    fn usage(&self) -> (f32, u64) {
-        let (Ok(pid), Some(process)) = (sysinfo::get_current_pid(), &self.process) else {
-            return (0.0, 0);
-        };
-        let mut system = process
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[pid]),
-            true,
-            sysinfo::ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory(),
-        );
-        system
-            .process(pid)
-            .map_or((0.0, 0), |process| (process.cpu_usage(), process.memory()))
-    }
-
     fn snapshot(&self, port: Option<u16>) -> SystemStatus {
         use intent_app::remote::RemoteServicesExt as _;
         let ws = self.ws.get();
@@ -228,14 +286,20 @@ impl StatusControl {
         // Agents run only on other machines; a local manager, if any, is
         // counted as `intentd` counts its own.
         let manager = self.services.agent_manager();
-        let (cpu_percent, memory_bytes) = self.usage();
-        let local_ips = match (ws, tcp) {
-            (Some(ws), true) => intent_transport::advertised_hosts(
-                Some(&ws.bound_addresses()),
-                &intent_transport::collect_local_ips(),
-                &intent_transport::collect_local_ipv6s(),
-            ),
-            _ => Vec::new(),
+        let (cpu_percent, memory_bytes, local_ips) = {
+            let sample = self
+                .sample
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let local_ips = match (ws, tcp) {
+                (Some(ws), true) => intent_transport::advertised_hosts(
+                    Some(&ws.bound_addresses()),
+                    &sample.local_v4,
+                    &sample.local_v6,
+                ),
+                _ => Vec::new(),
+            };
+            (sample.cpu_percent, sample.memory_bytes, local_ips)
         };
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_owned(),
@@ -296,7 +360,7 @@ impl SystemControl for StatusControl {
     }
 
     fn status(&self) -> SystemStatus {
-        self.snapshot(None)
+        self.snapshot(self.port.get().copied())
     }
 
     fn metadata_status(
@@ -454,12 +518,15 @@ pub async fn start_client_listeners(
     let host = tokio::task::spawn_blocking(intent_transport::detect_host_environment)
         .await
         .map_err(|e| format!("host environment: {e}"))?;
+    let port_slot = Arc::new(OnceLock::new());
+    let sample = Arc::new(std::sync::Mutex::new(UsageSample::default()));
     let control: Arc<dyn SystemControl> = Arc::new(StatusControl {
         services: services.clone(),
         host: host.clone(),
         ws: ws_slot.clone(),
+        port: port_slot.clone(),
         started: std::time::Instant::now(),
-        process: sysinfo::System::new().ok().map(std::sync::Mutex::new),
+        sample: sample.clone(),
     });
     let (mut ws, pairing) = if config.insecure {
         tracing::warn!(
@@ -509,6 +576,7 @@ pub async fn start_client_listeners(
         .await
         .map_err(|e| format!("WSS listener on port {}: {e}", config.ws_port))?;
     let _ = ws_slot.set(ws.clone());
+    let _ = port_slot.set(ws_port);
 
     let socket_path = config.socket_path.clone();
     // A stale socket file would pass the bind wait below; the listener
@@ -545,12 +613,14 @@ pub async fn start_client_listeners(
         secure = !config.insecure,
         "serving the default tenant's clients"
     );
+    let stop = ListenersStop {
+        ws,
+        stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
+        stopped: Arc::new(tokio::sync::watch::channel(false).0),
+    };
+    tokio::spawn(sample_usage(sample, stop.clone()));
     Ok(ClientListeners {
-        stop: ListenersStop {
-            ws,
-            stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
-            stopped: Arc::new(tokio::sync::watch::channel(false).0),
-        },
+        stop,
         ws_port,
         socket_path,
         socket,

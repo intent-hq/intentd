@@ -256,11 +256,24 @@ async fn system_status_is_served_after_hello_on_both_listeners() {
     assert_eq!(status["updateSupported"], json!(false), "{status}");
     assert_eq!(status["exactUpdateSupported"], json!(false), "{status}");
     assert!(status["uptimeSeconds"].is_u64(), "{status}");
-    let shutdown = uds.rpc(3, "system.shutdown", json!({})).await;
-    assert!(
-        shutdown.get("error").is_some(),
-        "the orchestrator is not stopped by a client: {shutdown}"
-    );
+    // No control command is installed: each is an unknown method, and the
+    // connection keeps serving.
+    for (id, method, params) in [
+        (3, "system.shutdown", json!({})),
+        (
+            4,
+            "system.gitCredential",
+            json!({ "protocol": "https", "host": "github.com" }),
+        ),
+    ] {
+        let refused = uds.rpc(id, method, params).await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32601),
+            "{method}: {refused}"
+        );
+    }
+    result(&uds.rpc(5, "system.status", json!({})).await);
 
     let token = services
         .secret_source()
@@ -274,6 +287,9 @@ async fn system_status_is_served_after_hello_on_both_listeners() {
     assert_eq!(remote["running"], json!(true), "{remote}");
     assert_eq!(remote["host"]["locality"], json!("remote"), "{remote}");
     assert_eq!(remote["port"], json!(port), "{remote}");
+    let update = ws_rpc(&mut ws, 3, "system.requestUpdate", json!({})).await;
+    assert_eq!(update["error"]["code"], json!(-32601), "{update}");
+    result(&ws_rpc(&mut ws, 4, "system.status", json!({})).await);
     listeners.stop().await;
 }
 
