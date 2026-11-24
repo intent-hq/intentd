@@ -7108,7 +7108,7 @@ mod normal_launch {
                                 .try_drain_queue(agent.clone(), workspace.clone())
                                 .await;
                             assert!(manager.services.has_ready_to_send(&agent));
-                            manager.release_slot(&agent, slot).await;
+                            manager.release_slot(slot).await;
                         }
                         manager
                             .clone()
@@ -7209,11 +7209,13 @@ mod normal_launch {
         let result = h
             .daemon(async move {
                 let slot = manager.try_begin_turn(&agent, &workspace).await.unwrap();
+                let admission = slot.admission();
                 if mode == "lost-slot" {
-                    manager.release_slot(&agent, slot).await;
+                    manager.release_slot(slot).await;
+                    return prepared.run(&manager, admission).await;
                 }
-                let result = prepared.run(&manager, slot).await;
-                manager.release_slot(&agent, slot).await;
+                let result = prepared.run(&manager, admission).await;
+                manager.release_slot(slot).await;
                 result
             })
             .await;

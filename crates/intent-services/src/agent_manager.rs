@@ -3025,9 +3025,9 @@ enum TurnOrigin {
 /// prompt worker owns the slot and its receiver); `ReapClaimed` lost to the
 /// idle-reap sweep holding the agent mid-kill (monorepo#2118) — nobody owns
 /// the slot, the handle is being torn down, so no work may be handed to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum TryBeginOutcome {
-    Started(TurnAdmission),
+    Started(TurnSlotClaim),
     Busy,
     ReapClaimed,
     /// The claim won, but the workspace is Retired and its revive failed:
@@ -3039,6 +3039,96 @@ enum TryBeginOutcome {
 /// cannot register a worker against a later claim after retirement/restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TurnAdmission(usize);
+
+/// A claimed in-flight slot that no running turn owns yet. Every claim is
+/// handed out as this guard: dropping it without [`Self::hand_off`] (a caller
+/// cancelled between the claim and the worker spawn) releases the slot and
+/// re-checks the queue, so no caller can leave the agent busy with no turn
+/// (intent-hq/intent#9927, intent-hq/intent#9985).
+#[must_use = "dropping an unhanded claim releases the slot"]
+pub(crate) struct TurnSlotClaim {
+    manager: Arc<AgentManager>,
+    agent_id: AgentId,
+    workspace_id: WorkspaceId,
+    admission: TurnAdmission,
+    armed: bool,
+    /// Whether the drop-release persists `RuntimeIdle`. Off once a release
+    /// that keeps the persisted status (`Error`) has started.
+    persist_idle: bool,
+}
+
+impl TurnSlotClaim {
+    pub(crate) fn admission(&self) -> TurnAdmission {
+        self.admission
+    }
+
+    /// Give the slot to its next owner: a spawned worker, the running worker
+    /// itself, retirement teardown, or a release that already ran.
+    pub(crate) fn hand_off(mut self) -> TurnAdmission {
+        self.armed = false;
+        self.admission
+    }
+
+    /// Release the slot without starting a turn. A cancellation during the
+    /// release still completes it from `Drop`.
+    pub(crate) async fn release(mut self, persist_idle: bool) {
+        self.persist_idle = persist_idle;
+        self.manager
+            .finish_admission(&self.agent_id, self.admission, persist_idle)
+            .await;
+        self.armed = false;
+    }
+}
+
+#[cfg(test)]
+impl TurnSlotClaim {
+    /// An unarmed copy, so a test can replay a stale claim.
+    fn duplicate_for_test(&self) -> Self {
+        Self {
+            manager: self.manager.clone(),
+            agent_id: self.agent_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            admission: self.admission,
+            armed: false,
+            persist_idle: self.persist_idle,
+        }
+    }
+}
+
+impl std::fmt::Debug for TurnSlotClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnSlotClaim")
+            .field("agent_id", &self.agent_id)
+            .field("admission", &self.admission)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TurnSlotClaim {
+    fn drop(&mut self) {
+        if !self.armed || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        // `Drop` is sync and the release takes the turn-start gate, so it
+        // runs as a small detached task. `finish_admission` releases only
+        // while this claim still owns the slot.
+        let manager = self.manager.clone();
+        let agent_id = self.agent_id.clone();
+        let workspace_id = self.workspace_id.clone();
+        let (admission, persist_idle) = (self.admission, self.persist_idle);
+        tracing::debug!(agent = %agent_id, "releasing a turn slot claim dropped before its turn started");
+        drop(intent_core::spawn_daemon(async move {
+            manager
+                .finish_admission(&agent_id, admission, persist_idle)
+                .await;
+            manager
+                .redrive_parked_recovery_send(&agent_id, &workspace_id)
+                .await;
+            manager.try_drain_queue(agent_id, workspace_id).await;
+        }));
+    }
+}
 
 /// Why [`AgentManager::claim_slot_sync`] did not claim: the two
 /// [`TryBeginOutcome`] losses, or the caller's own claim precondition
@@ -8098,8 +8188,11 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     #[cfg(test)]
-    async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        self.try_begin_turn(agent_id, workspace_id).await.is_some()
+    async fn try_begin(self: &Arc<Self>, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
+        self.try_begin_turn(agent_id, workspace_id)
+            .await
+            .map(TurnSlotClaim::hand_off)
+            .is_some()
     }
 
     /// [`AgentManager::try_begin_turn`] with the loss reason: callers that behave
@@ -8118,7 +8211,7 @@ impl AgentManager {
     /// while HOLDING the slot and park instead (monorepo#2513, PR #1244
     /// review).
     async fn try_begin_outcome(
-        &self,
+        self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
@@ -8137,7 +8230,7 @@ impl AgentManager {
         match self.claim_slot_sync(agent_id, workspace_id, || {
             Ok::<(), std::convert::Infallible>(())
         }) {
-            Ok(((), admission)) => {
+            Ok(((), claim)) => {
                 if boxed_await(|| {
                     self.begin_turn_side_effects(
                         agent_id,
@@ -8149,12 +8242,13 @@ impl AgentManager {
                 })
                 .await
                 {
-                    TryBeginOutcome::Started(admission)
+                    TryBeginOutcome::Started(claim)
                 } else {
                     // Retired workspace whose revive failed: give the slot
                     // back; the caller treats it as "not started" and keeps
                     // the message queued.
                     self.release_slot_sync(agent_id);
+                    claim.hand_off();
                     TryBeginOutcome::ReviveFailed
                 }
             }
@@ -8178,10 +8272,10 @@ impl AgentManager {
     /// `stop_reason` (the turn-start side effects run only after a successful
     /// claim). Returns the popped entry with its draining guard.
     async fn try_begin_recovery_redrive(
-        &self,
+        self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-    ) -> Option<((QueuedMessage, DrainingGuard), TurnAdmission)> {
+    ) -> Option<((QueuedMessage, DrainingGuard), TurnSlotClaim)> {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
         let fence = boxed_await(|| self.services.turn_start_archive_fence(workspace_id)).await;
@@ -8209,8 +8303,9 @@ impl AgentManager {
                 } else {
                     // Retired workspace whose revive failed: release the
                     // slot and put the popped entry back at the queue head.
-                    let ((message, draining), _) = popped;
+                    let ((message, draining), claim) = popped;
                     self.release_slot_sync(agent_id);
+                    claim.hand_off();
                     self.services.requeue_front(agent_id, message);
                     drop(draining);
                     None
@@ -8240,11 +8335,11 @@ impl AgentManager {
     /// (`draining_queue_entries` → `agent_queues` → `parked_recovery_sends`);
     /// nothing acquires those and then `busy`, so the order is acyclic.
     fn claim_slot_sync<T, E>(
-        &self,
+        self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         precondition: impl FnOnce() -> std::result::Result<T, E>,
-    ) -> std::result::Result<(T, TurnAdmission), SlotClaimLoss<E>> {
+    ) -> std::result::Result<(T, TurnSlotClaim), SlotClaimLoss<E>> {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
@@ -8316,7 +8411,15 @@ impl AgentManager {
             .lock()
             .unwrap()
             .insert(agent_id.clone(), workspace_id.clone());
-        Ok((claimed, admission))
+        let claim = TurnSlotClaim {
+            manager: self.clone(),
+            agent_id: agent_id.clone(),
+            workspace_id: workspace_id.clone(),
+            admission,
+            armed: true,
+            persist_idle: true,
+        };
+        Ok((claimed, claim))
     }
 
     /// Start of the current continuous stretch with no turn in flight, or
@@ -8587,15 +8690,19 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         content: &str,
         options: &TurnOptions,
-        admission: TurnAdmission,
+        mut claim: TurnSlotClaim,
     ) {
+        // A cancelled failure path must not overwrite the `Error` it persists.
+        claim.persist_idle = false;
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
-        if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
+        if self.is_shutting_down() || !self.owns_admission(agent_id, claim.admission()) {
+            claim.hand_off();
             return;
         }
         handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
         self.release_in_flight_slot(agent_id);
+        claim.hand_off();
     }
 
     async fn prepare_admitted_flush_turn(
@@ -9450,7 +9557,7 @@ impl AgentManager {
         mut options: TurnOptions,
         session_status: AgentStatus,
     ) -> Result<Value> {
-        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+        let Some(claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // A resume may have claimed its durable interruption before closure
             // and awaited store work since the entry check. Refuse here too:
             // shutdown is monotonic and the failed claim created no busy slot
@@ -9580,7 +9687,7 @@ impl AgentManager {
                 // `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
                 // the slot we just released will be reclaimed below if the
                 // queue is ready and the agent is otherwise free.
-                self.finish_admission(&agent_id, admission, true).await;
+                claim.release(true).await;
                 // Check-then-act race guard (monorepo#564): if the session
                 // vanished between the up-front validation and the append
                 // (concurrent delete), fail closed like the guard rather than
@@ -9665,7 +9772,7 @@ impl AgentManager {
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
             .await;
-        self.spawn_worker(agent_id, workspace_id, content, options, true, admission);
+        self.spawn_worker(agent_id, workspace_id, content, options, true, claim);
         Ok(json!({
             "success": true,
             "queued": false,
@@ -9950,7 +10057,7 @@ impl AgentManager {
         // STAB-52 gate holds for `agent.retry`. Under the archived-workspace
         // exemption only a user-origin entry may drain; the normal path
         // claims first, then pops the queue head (or a flush batch).
-        let admission;
+        let claim;
         let dequeued = if redrive_error_park {
             let Some((popped, claimed)) = self
                 .try_begin_recovery_redrive(&agent_id, &workspace_id)
@@ -9958,7 +10065,7 @@ impl AgentManager {
             else {
                 return;
             };
-            admission = claimed;
+            claim = claimed;
             // Same `failed → in_progress` displayStatus recompute the direct
             // Error-redrive arm of `send_message` performs: the claim's own
             // recompute still read `status = Error` and was a no-op.
@@ -9970,7 +10077,7 @@ impl AgentManager {
             let Some(claimed) = self.try_begin_turn(&agent_id, &workspace_id).await else {
                 return;
             };
-            admission = claimed;
+            claim = claimed;
             // Batch flush: with MORE THAN ONE eligible entry waiting, drain
             // them all into ONE combined provider turn while persisting each
             // entry as its own transcript row. Under an archived-workspace
@@ -9989,25 +10096,18 @@ impl AgentManager {
                         &workspace_id,
                         batch,
                         draining,
-                        admission,
+                        claim.admission(),
                     )
                     .await
                 {
                     FlushPrep::Turn { content, options } => {
-                        self.spawn_worker(
-                            agent_id,
-                            workspace_id,
-                            content,
-                            *options,
-                            true,
-                            admission,
-                        );
+                        self.spawn_worker(agent_id, workspace_id, content, *options, true, claim);
                     }
                     FlushPrep::Parked => {
                         // Release the slot without overwriting the Error
                         // status just persisted, so `agent.retry` (or a
                         // future message) can redrive.
-                        self.finish_admission(&agent_id, admission, false).await;
+                        claim.release(false).await;
                     }
                 }
                 return;
@@ -10022,7 +10122,7 @@ impl AgentManager {
         let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the
             // ready-to-send queue between the check above and the dequeue.
-            self.finish_admission(&agent_id, admission, true).await;
+            claim.release(true).await;
             // monorepo#1280: the racing retraction saw this drain's
             // in-flight slot (`agent_is_busy` true) and skipped its own
             // redelivery, expecting a turn to end with a terminal
@@ -10114,14 +10214,8 @@ impl AgentManager {
             ..TurnOptions::default()
         };
         if !user_persisted {
-            self.fail_admitted_persist(
-                &agent_id,
-                &workspace_id,
-                &next.content,
-                &options,
-                admission,
-            )
-            .await;
+            self.fail_admitted_persist(&agent_id, &workspace_id, &next.content, &options, claim)
+                .await;
             return;
         }
         drop(draining);
@@ -10134,7 +10228,7 @@ impl AgentManager {
             next.content,
             options,
             user_persisted,
-            admission,
+            claim,
         );
     }
 
@@ -10289,7 +10383,7 @@ impl AgentManager {
         // Preempt a cancellable in-flight turn keep-alive (no-op when idle
         // or during turn startup, where preemption would kill the child).
         self.preempt_busy_turn(&agent_id, &mut options).await;
-        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+        let Some(claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // The slot is still held (turn startup, or a concurrent send won
             // the race): restore the entry at the FRONT so it is the next
             // message delivered, and report the queued outcome honestly.
@@ -10366,7 +10460,7 @@ impl AgentManager {
                     // Transactional guarantee: release the slot and restore
                     // the entry at the FRONT (`persisted: false`, so a retry
                     // re-attempts the append), then surface the failure.
-                    self.finish_admission(&agent_id, admission, true).await;
+                    claim.release(true).await;
                     self.services.requeue_front(&agent_id, entry);
                     drop(draining);
                     self.services.publish_queue_updated(&agent_id).await;
@@ -10413,14 +10507,7 @@ impl AgentManager {
             .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
-        self.spawn_worker(
-            agent_id,
-            workspace_id,
-            entry.content,
-            options,
-            true,
-            admission,
-        );
+        self.spawn_worker(agent_id, workspace_id, entry.content, options, true, claim);
         Ok(json!({
             "success": true,
             "queued": false,
@@ -10477,7 +10564,7 @@ impl AgentManager {
                 file_blocks: interrupt.prepend_file_blocks,
             },
         );
-        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+        let Some(claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             self.services.requeue_front_batch(&agent_id, entries);
             drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
@@ -10488,7 +10575,13 @@ impl AgentManager {
         self.services
             .commit_provisional_queue_delivery(&agent_id, &entries);
         match self
-            .prepare_admitted_flush_turn(&agent_id, &workspace_id, entries, draining, admission)
+            .prepare_admitted_flush_turn(
+                &agent_id,
+                &workspace_id,
+                entries,
+                draining,
+                claim.admission(),
+            )
             .await
         {
             FlushPrep::Turn {
@@ -10500,11 +10593,11 @@ impl AgentManager {
                 options.origin = intent_core::MessageOrigin::User;
                 options.interrupt_priority = true;
                 let turn_id = options.turn_id.clone();
-                self.spawn_worker(agent_id, workspace_id, content, *options, true, admission);
+                self.spawn_worker(agent_id, workspace_id, content, *options, true, claim);
                 Ok(json!({"success":true,"queued":false,"messageIds":ids,"turnId":turn_id}))
             }
             FlushPrep::Parked => {
-                self.finish_admission(&agent_id, admission, false).await;
+                claim.release(false).await;
                 Ok(json!({"success":true,"queued":true,"messageIds":ids}))
             }
         }
@@ -10923,12 +11016,15 @@ impl AgentManager {
         content: String,
         mut options: TurnOptions,
         user_persisted: bool,
-        admission: TurnAdmission,
+        claim: TurnSlotClaim,
     ) {
         // Hold through spawn + registration: retirement either sees this
         // worker in its abort sweep or prevents it from starting at all.
         let closed = self.admission_closed.lock().unwrap();
         let retired = self.retired.lock().unwrap();
+        // The rest of this function is synchronous, so the worker owns the
+        // slot from here on.
+        let admission = claim.hand_off();
         if *closed || retired.contains(&agent_id) || !self.owns_admission(&agent_id, admission) {
             // Teardown owns the cancelled slot. Never release a newer claim
             // installed by restore while this old send was persisting.
@@ -11046,10 +11142,10 @@ impl AgentManager {
     /// Returns the admission when the slot was claimed, `None` when a turn was
     /// already in flight (the caller must enqueue instead).
     pub(crate) async fn try_begin_turn(
-        &self,
+        self: &Arc<Self>,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-    ) -> Option<TurnAdmission> {
+    ) -> Option<TurnSlotClaim> {
         match self
             .try_begin_outcome(agent_id, workspace_id, true, TurnOrigin::Delivery)
             .await
@@ -11228,7 +11324,7 @@ impl AgentManager {
             .try_begin_outcome(agent_id, workspace_id, true, TurnOrigin::HarnessWake)
             .await
         {
-            TryBeginOutcome::Started(admission) => admission,
+            TryBeginOutcome::Started(claim) => claim,
             TryBeginOutcome::Busy => {
                 // Outcome deliberately ignored: the prompt turn that won the
                 // slot is itself the recovery — an empty zero-settle drive
@@ -11269,6 +11365,8 @@ impl AgentManager {
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
         let closed = self.admission_closed.lock().unwrap();
         let retired = self.retired.lock().unwrap();
+        // Synchronous through the drive's registration below.
+        let admission = admission.hand_off();
         if *closed || retired.contains(agent_id) || !self.owns_admission(agent_id, admission) {
             return true;
         }
@@ -11570,9 +11668,9 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         options: TurnOptions,
-        admission: TurnAdmission,
+        claim: TurnSlotClaim,
     ) {
-        self.spawn_worker(agent_id, workspace_id, content, options, true, admission);
+        self.spawn_worker(agent_id, workspace_id, content, options, true, claim);
     }
 
     /// Release an in-flight slot claimed via [`AgentManager::try_begin_turn`]
@@ -11580,8 +11678,8 @@ impl AgentManager {
     /// [`AgentManager::finish_prepersisted_turn_spawn`]). Public-in-crate seam
     /// so `Services::deliver_wake_message` can hand control back to the drain
     /// loop after a store error, mirroring the `send_message` self-drain path.
-    pub(crate) async fn release_slot(&self, agent_id: &AgentId, admission: TurnAdmission) {
-        self.finish_admission(agent_id, admission, true).await;
+    pub(crate) async fn release_slot(&self, claim: TurnSlotClaim) {
+        claim.release(true).await;
     }
 
     /// Whether the cached handle's child process + transport still look live
@@ -17148,12 +17246,13 @@ async fn run_message_worker(
             .await;
             break 'outer;
         }
-        if let TryBeginOutcome::Started(next_admission) = boxed_await(|| {
+        if let TryBeginOutcome::Started(next_claim) = boxed_await(|| {
             mgr.try_begin_outcome(&agent_id, &workspace_id, false, TurnOrigin::Delivery)
         })
         .await
         {
-            admission = next_admission;
+            // This running worker owns the re-claimed slot.
+            admission = next_claim.hand_off();
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
             // the popped entry can be a wake parked by the archived gates
             // AFTER the gate at the top of this drain ran — e.g. the
@@ -25748,7 +25847,7 @@ mod agent_retry_tests {
                         ..TurnOptions::default()
                     },
                     true,
-                    admission,
+                    admission.hand_off(),
                 )
                 .await;
                 assert!(
@@ -25773,9 +25872,9 @@ mod agent_retry_tests {
         let agent = AgentId::from("monitor-stale-worker");
         let ws = WorkspaceId::from("monitor-stale-workspace");
         let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
-        let old = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        let old = mgr.try_begin_turn(&agent, &ws).await.unwrap().hand_off();
         mgr.end_turn(&agent).await;
-        let new = mgr.try_begin_turn(&agent, &ws).await.unwrap();
+        let new = mgr.try_begin_turn(&agent, &ws).await.unwrap().hand_off();
         mgr.finish_monitor_worker(&agent, &ws, old).await;
         assert!(mgr.owns_admission(&agent, new));
         assert!(mgr.is_busy(&agent));
@@ -25817,7 +25916,7 @@ mod agent_retry_tests {
                 ..TurnOptions::default()
             },
             true,
-            admission,
+            admission.hand_off(),
         )
         .await;
         assert!(

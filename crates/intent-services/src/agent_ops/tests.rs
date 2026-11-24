@@ -24258,7 +24258,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
     assert!(svc.find_watches_for_child(&target).is_empty());
 
-    manager.release_slot(&target, admission).await;
+    manager.release_slot(admission).await;
 }
 
 /// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
@@ -24333,7 +24333,7 @@ async fn wake_or_create_queued_registers_watch() {
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, target);
 
-    manager.release_slot(&target, admission).await;
+    manager.release_slot(admission).await;
 }
 
 /// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
@@ -24405,7 +24405,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     );
     assert_eq!(watches[0].id, seeded_sub_id);
 
-    manager.release_slot(&target, admission).await;
+    manager.release_slot(admission).await;
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
@@ -25547,7 +25547,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
             .expect("marker read"),
         "turn start clears the once-per-period advisory marker"
     );
-    manager.release_slot(&child, admission).await;
+    manager.release_slot(admission).await;
 
     // Period 2: the child stalls monitoring-idle again — the SAME armed
     // watch hears a FRESH advisory instead of waiting in silence (the
@@ -25647,7 +25647,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
             .expect("marker read"),
         "turn start clears the grouped pair's marker too"
     );
-    manager.release_slot(&child, admission).await;
+    manager.release_slot(admission).await;
 
     // Period 2: the SAME armed watch (same id) delivers a second advisory —
     // the per-period stable id keeps it out of the durable-wake dedup.
