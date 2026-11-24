@@ -177,3 +177,42 @@ async fn reader_keeps_only_known_outcomes() {
         json!({ "a": "provided", "b": "declined" })
     );
 }
+
+/// A whole-session write from a snapshot read before the answer (a busy
+/// agent's rename) keeps the recorded outcome, in both whole-row and
+/// whole-metadata writes.
+#[intent_test_macros::daemon_test]
+async fn stale_whole_session_writes_keep_resolutions() {
+    let (_tmp, svc, ws, agent, _bus) = setup().await;
+    for full_row in [true, false] {
+        let stale = svc
+            .store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("snapshot");
+        let request_id = request(&svc, &ws, &agent, if full_row { "ROW" } else { "DOC" }).await;
+        svc.secret_answer_op(ws.clone(), request_id.clone(), Outcome::Declined, None)
+            .await
+            .expect("decline");
+        if full_row {
+            svc.store
+                .update_agent_session(&ws, &stale)
+                .await
+                .expect("whole-row write");
+        } else {
+            svc.store
+                .update_agent_session_metadata(&ws, &agent, stale.metadata.as_ref(), &now_iso())
+                .await
+                .expect("whole-metadata write");
+        }
+        let lite = svc
+            .agent_get_op(agent.clone(), Some(ws.clone()))
+            .await
+            .expect("agent.get");
+        assert_eq!(
+            lite.metadata.secret_request_resolutions.get(&request_id),
+            Some(&json!("declined")),
+            "full_row={full_row}"
+        );
+    }
+}
