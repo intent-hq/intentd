@@ -1928,20 +1928,28 @@ async fn a_retry_does_not_cancel_a_turn_whose_active_write_failed() {
     let next = FakeRuntime::new();
     let (_tmp, mgr, ws, id) =
         remote_failed_first_turn("retry-vs-unrecorded", vec![Launch::Runs(next.clone())]).await;
-    assert!(mgr.services.clear_queue(&id), "the failed message was queued");
+    assert!(
+        mgr.services.clear_queue(&id),
+        "the failed message was queued"
+    );
 
     mgr.active_write_fault
         .store(true, std::sync::atomic::Ordering::SeqCst);
     send(&mgr, &id, &ws, "message alpha").await;
     next.wait_prompts(1).await;
     assert_eq!(
-        mgr.services.store.get_agent_session_status(&id).await.unwrap(),
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
         AgentStatus::Error,
         "the Active write failed"
     );
 
     let retried = mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
     assert_eq!(retried["ok"], json!(true), "{retried}");
+    assert_eq!(retried["redriven"], json!(true), "{retried}");
     next.finish.add_permits(8);
     wait_delivered(&mgr, &id, &next, &["message alpha"]).await;
 
@@ -1951,5 +1959,67 @@ async fn a_retry_does_not_cancel_a_turn_whose_active_write_failed() {
         0,
         "{}",
         all_prompts(&next)
+    );
+}
+
+/// The turn whose `Active` write failed then fails for real, requeues its
+/// message and still holds the slot: Try again owns that failure, tears the
+/// worker down and redrives the message on a fresh turn.
+#[intent_test_macros::daemon_test]
+async fn a_retry_still_recovers_a_real_failure_after_an_unrecorded_turn_start() {
+    let next = FakeRuntime::new();
+    let after = FakeRuntime::new();
+    after.finish.add_permits(8);
+    let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+        "retry-after-unrecorded",
+        vec![Launch::Runs(next.clone()), Launch::Runs(after.clone())],
+    )
+    .await;
+    assert!(
+        mgr.services.clear_queue(&id),
+        "the failed message was queued"
+    );
+
+    mgr.active_write_fault
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    send(&mgr, &id, &ws, "message alpha").await;
+    next.wait_prompts(1).await;
+    crate::agent_manager::persist_terminal_error_status_via_services(
+        &mgr.services,
+        &id,
+        &ws,
+        "the provider failed",
+    )
+    .await;
+    let options = super::super::super::TurnOptions::default();
+    mgr.services
+        .enqueue_submission(
+            &id,
+            None,
+            "message alpha".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            options.origin,
+        )
+        .unwrap();
+    assert!(mgr.is_busy(&id), "the failed worker still holds the slot");
+
+    let retried = mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    assert_eq!(retried["ok"], json!(true), "{retried}");
+    assert_eq!(retried["redriven"], json!(true), "{retried}");
+    wait_delivered(&mgr, &id, &after, &["message alpha"]).await;
+
+    assert_delivered_once_in_order(&mgr, &id, &after, &["message alpha"]);
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Idle,
+        "the redriven turn ended the Error park"
     );
 }
