@@ -105,6 +105,36 @@ pub enum TenantClaim {
     },
 }
 
+/// Another instance holds a live lease on a tenant, so a startup open
+/// ([`Store::try_open_postgres_owned`](crate::Store::try_open_postgres_owned))
+/// claimed and wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseHeld {
+    /// The tenant id.
+    pub tenant: String,
+    /// The instance that holds the lease.
+    pub owner: String,
+    /// When the lease lapses unless renewed, by the database clock.
+    pub expires_at: OffsetDateTime,
+}
+
+impl LeaseHeld {
+    /// The `Error::NotOwner` [`Store::open_postgres_owned`](crate::Store::open_postgres_owned)
+    /// answers for it, naming the owner and the expiry.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        Error::NotOwner(format!(
+            "tenant {} is owned by instance {} until {} (database clock); this process can \
+             claim it only after that lease expires",
+            self.tenant, self.owner, self.expires_at
+        ))
+    }
+}
+
+/// What a startup open found: the tenant opened and claimed, or
+/// [`LeaseHeld`] (nothing was claimed or written).
+pub type OwnedOpen = std::result::Result<(crate::Store, TenantLease), LeaseHeld>;
+
 /// This process's claim on one tenant, shared by every store of the tenant
 /// in the process (`tenant_registry`). `None` until a claim succeeds.
 #[derive(Clone, Default)]
@@ -218,6 +248,12 @@ fn fence(tenant: &str, claim: Option<&Claim>, row: &WriterRow) -> Result<()> {
 const LEASE_LOCK_SQL: &str = "SELECT owner_instance, epoch, \
      (extract(epoch FROM expires_at) * 1000)::bigint, expires_at <= clock_timestamp() \
      FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE";
+
+/// How long the tenant's ($1) lease has left by the database clock, in ms;
+/// 0 once it expired.
+const LEASE_EXPIRES_IN_SQL: &str = "SELECT GREATEST(0, \
+     (extract(epoch FROM expires_at - clock_timestamp()) * 1000)::bigint) \
+     FROM tenant_lease WHERE tenant_id = $1";
 
 /// Takes the lease ($1 tenant, $2 instance, $3 epoch, $4 TTL in ms).
 const LEASE_TAKE_SQL: &str = "INSERT INTO tenant_lease \
@@ -335,6 +371,19 @@ impl PgStore {
             expires_at: timestamp(expires_ms)?,
             renew_by: started + ttl,
         }))
+    }
+
+    /// See [`Store::postgres_lease_expires_in`](crate::Store::postgres_lease_expires_in).
+    /// One read of the lease row, outside the writer lock.
+    pub(crate) async fn lease_expires_in(&self) -> Result<Option<Duration>> {
+        let mut tx = self.begin().await?;
+        let ms: Option<i64> = sqlx::query_scalar(LEASE_EXPIRES_IN_SQL)
+            .bind(self.tenant())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(ms.map(|ms| Duration::from_millis(u64::try_from(ms).unwrap_or(0))))
     }
 
     /// See [`Store::renew_tenant_lease`](crate::Store::renew_tenant_lease).
@@ -532,6 +581,26 @@ impl crate::Store {
         }
     }
 
+    /// How long the current lease on Postgres tenant `tenant` has left, by
+    /// the database clock: zero once it expired (a claim may then succeed),
+    /// `None` when the tenant was never claimed. It reads the lease row
+    /// only, claiming and writing nothing, so a process refused with
+    /// `Error::NotOwner` by [`Self::open_postgres_owned`] can wait that long
+    /// before it claims again.
+    ///
+    /// # Errors
+    /// `Error::StoreBusy` when no pool connection comes free;
+    /// `Error::Internal` when the statement fails.
+    pub async fn postgres_lease_expires_in(
+        pool: PgPool,
+        tenant: TenantId,
+    ) -> Result<Option<Duration>> {
+        let key = super::tenant_registry::tenant_key(&pool, &tenant);
+        PgStore::for_key(pool, tenant, PostgresOptions::default(), key)
+            .lease_expires_in()
+            .await
+    }
+
     /// The orchestrator's startup open: [`Self::open_postgres`] that claims
     /// the tenant for this process as `instance` (for `ttl`) after the
     /// schema gate and before anything else writes (provisioning, then every
@@ -549,6 +618,26 @@ impl crate::Store {
         ttl: Duration,
         _orchestrator: crate::OrchestratorOnly,
     ) -> Result<(Self, TenantLease)> {
+        let key = super::tenant_registry::tenant_key(&pool, &tenant);
+        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl)
+            .await?
+            .map_err(LeaseHeld::into_error)
+    }
+
+    /// [`Self::open_postgres_owned`], with another instance's live lease as
+    /// an inner `Err(LeaseHeld)` instead of an error, so a caller can tell that
+    /// refusal (nothing claimed or written) from any later failure.
+    ///
+    /// # Errors
+    /// As [`Self::open_postgres_owned`], except a live lease.
+    pub async fn try_open_postgres_owned(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        instance: &str,
+        ttl: Duration,
+        _orchestrator: crate::OrchestratorOnly,
+    ) -> Result<OwnedOpen> {
         let key = super::tenant_registry::tenant_key(&pool, &tenant);
         Self::open_owned_keyed(pool, tenant, options, key, instance, ttl).await
     }
@@ -573,7 +662,9 @@ impl crate::Store {
             "{}@process:{process}",
             super::tenant_registry::tenant_key(&pool, &tenant)
         );
-        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl).await
+        Self::open_owned_keyed(pool, tenant, options, key, instance, ttl)
+            .await?
+            .map_err(LeaseHeld::into_error)
     }
 
     async fn open_owned_keyed(
@@ -583,26 +674,26 @@ impl crate::Store {
         key: String,
         instance: &str,
         ttl: Duration,
-    ) -> Result<(Self, TenantLease)> {
+    ) -> Result<OwnedOpen> {
         let store = PgStore::for_key(pool, tenant, options, key);
         super::check_schema(&store.pool).await?;
         let lease = match store.claim_lease(instance, ttl).await? {
             TenantClaim::TenantOwned(lease) => lease,
             TenantClaim::AlreadyOwned { owner, expires_at } => {
-                return Err(Error::NotOwner(format!(
-                    "tenant {} is owned by instance {owner} until {expires_at} (database \
-                     clock); this process can claim it only after that lease expires",
-                    store.tenant()
-                )));
+                return Ok(Err(LeaseHeld {
+                    tenant: store.tenant().to_owned(),
+                    owner,
+                    expires_at,
+                }));
             }
         };
         store.provision().await?;
-        Ok((
+        Ok(Ok((
             Self {
                 backend: crate::Backend::Postgres(store),
             },
             lease,
-        ))
+        )))
     }
 }
 

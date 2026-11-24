@@ -4,9 +4,16 @@
 //! the one tenant [`DEFAULT_TENANT`]; a set value must name at least one.
 //!
 //! A tenant whose fence fires stops on its own; the others keep running.
+//! A tenant another instance still holds (a crashed one's lease has not
+//! lapsed yet) is claimed once its lease lapses or is released, re-read
+//! every second, with all tenants waiting within one [`CLAIM_WAIT_ENV`]
+//! (two lease TTLs by default).
+//!
 //! The process exits [`FENCE_OVERRAN_EXIT`] when a fence step overran (its
 //! work may outlive the lease), 1 when a tenant cannot be opened at start
-//! or every tenant stopped, and 0 on Ctrl-C or SIGTERM after stopping every tenant.
+//! (its lease still held after the claim wait included) or every tenant
+//! stopped, and 0 on Ctrl-C or SIGTERM after stopping every tenant (also
+//! while waiting for a lease, which it then leaves alone).
 //! On Ctrl-C or SIGTERM each tenant whose work stopped cleanly releases its
 //! lease, so a restart or standby takes it over at once instead of waiting
 //! out the TTL.
@@ -21,10 +28,10 @@ use std::sync::Arc;
 
 use intent_store::postgres::SecretKeyring;
 use intentd_orchestrator::secrets::{keyring_from_env, KEY_ENV};
-use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
+use intentd_orchestrator::serve::{try_serve_tenant, LeaseTiming, ServedTenant, Serving};
 use intentd_orchestrator::{
-    instance_id, is_fatal, tenants_from_env, DEFAULT_TENANT, FENCE_OVERRAN_EXIT, INSTANCE_ENV,
-    POSTGRES_URL_ENV, TENANTS_ENV,
+    claim_wait_from_env, instance_id, is_fatal, tenants_from_env, wait_for_lease, CLAIM_WAIT_ENV,
+    DEFAULT_TENANT, FENCE_OVERRAN_EXIT, INSTANCE_ENV, POSTGRES_URL_ENV, TENANTS_ENV,
 };
 
 /// Connections the shared pool keeps; each tenant writes through it.
@@ -113,6 +120,7 @@ async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, Strin
         .map_err(|e| format!("data dir: {e}"))?
         .data_dir;
     let instance = instance_id(std::env::var(INSTANCE_ENV).ok().as_deref());
+    let claim_wait = claim_wait_from_env(std::env::var(CLAIM_WAIT_ENV).ok().as_deref())?;
     // Listen before any tenant opens, and race every startup step against
     // the signal, so a hung step cannot swallow it. On a signal, the open
     // in flight gets up to OPEN_GRACE to finish; then every open tenant is
@@ -135,36 +143,69 @@ async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, Strin
     // are doing.
     let (stopped_tx, mut stopped) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut served: Vec<ServedTenant> = Vec::new();
+    // A live lease on a tenant (an instance that just crashed, or one still
+    // running) is waited out, all tenants together within one claim wait.
+    let waiting_until = tokio::time::Instant::now()
+        .checked_add(claim_wait)
+        .ok_or_else(|| format!("{CLAIM_WAIT_ENV}: too long"))?;
     for tenant in &tenants {
-        // Boxed so the grace below takes ownership: a timed-out open (and
-        // the heartbeat it may already run) is dropped right there, not
-        // kept renewing while stop_all waits for the other tenants.
-        let mut opening = Box::pin(serve_tenant(
-            pool.clone(),
-            tenant,
-            &data_dir,
-            &instance,
-            LeaseTiming::default(),
-            keyring.clone(),
-            orchestrator_token(),
-        ));
-        let opened = tokio::select! {
-            opened = &mut opening => opened.map_err(|e| format!("tenant {tenant}: {e}")),
-            () = &mut shutdown => {
-                tracing::info!(tenant, "stopping every tenant during startup");
-                let graced = tokio::time::timeout(OPEN_GRACE, opening).await;
-                match graced {
-                    Ok(Ok(mut opened)) => {
-                        watch(&mut opened, &stopped_tx);
-                        served.push(opened);
+        let opened = loop {
+            // Boxed so the grace below takes ownership: a timed-out open
+            // (and the heartbeat it may already run) is dropped right
+            // there, not kept renewing while stop_all waits for the others.
+            let mut opening = Box::pin(try_serve_tenant(
+                pool.clone(),
+                tenant,
+                &data_dir,
+                &instance,
+                LeaseTiming::default(),
+                keyring.clone(),
+                orchestrator_token(),
+            ));
+            let opened = tokio::select! {
+                opened = &mut opening => opened,
+                () = &mut shutdown => {
+                    tracing::info!(tenant, "stopping every tenant during startup");
+                    let graced = tokio::time::timeout(OPEN_GRACE, opening).await;
+                    match graced {
+                        Ok(Ok(Serving::Served(opened))) => {
+                            let mut opened = *opened;
+                            watch(&mut opened, &stopped_tx);
+                            served.push(opened);
+                        }
+                        Ok(Ok(Serving::Held(_))) => {}
+                        Ok(Err(error)) => tracing::warn!(tenant, %error, "the tenant did not open"),
+                        Err(_) => tracing::warn!(
+                            tenant,
+                            "the tenant did not open in time; its lease lapses after its TTL"
+                        ),
                     }
-                    Ok(Err(error)) => tracing::warn!(tenant, %error, "the tenant did not open"),
-                    Err(_) => tracing::warn!(
-                        tenant,
-                        "the tenant did not open in time; its lease lapses after its TTL"
-                    ),
+                    return Ok(stop_all(&mut served, &mut stopped).await);
                 }
-                return Ok(stop_all(&mut served, &mut stopped).await);
+            };
+            let held = match opened {
+                Ok(Serving::Served(opened)) => break Ok(*opened),
+                Ok(Serving::Held(held)) => held,
+                Err(error) => break Err(format!("tenant {tenant}: {error}")),
+            };
+            // Only a refused claim waits: nothing of this tenant's was
+            // claimed or written, so a signal from here on has nothing of it
+            // to stop or release.
+            tracing::info!(
+                tenant,
+                owner = %held.owner,
+                expires_at = %held.expires_at,
+                "waiting for the tenant lease to lapse before claiming it"
+            );
+            let waited = tokio::select! {
+                waited = wait_for_tenant_lease(&pool, tenant, waiting_until) => waited,
+                () = &mut shutdown => {
+                    tracing::info!(tenant, "stopped while waiting for the tenant lease");
+                    return Ok(stop_all(&mut served, &mut stopped).await);
+                }
+            };
+            if !waited {
+                break Err(format!("tenant {tenant}: {}", held.into_error()));
             }
         };
         match opened {
@@ -203,6 +244,20 @@ async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, Strin
             }
         }
     }
+}
+
+/// [`wait_for_lease`] on `tenant`'s lease row
+/// (`Store::postgres_lease_expires_in`), until `until`.
+async fn wait_for_tenant_lease(
+    pool: &intent_store::postgres::PgPool,
+    tenant: &str,
+    until: tokio::time::Instant,
+) -> bool {
+    let Ok(id) = intent_store::postgres::TenantId::new(tenant) else {
+        return false;
+    };
+    let read = || intent_store::Store::postgres_lease_expires_in(pool.clone(), id.clone());
+    wait_for_lease(read, until).await
 }
 
 /// Watch `tenant`'s fence report ([`on_stopped`]).
