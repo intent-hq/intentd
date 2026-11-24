@@ -1969,7 +1969,7 @@ In Chief, claims use an administrator’s desktop connection.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/multi-select-sidebar-tabs.ts; src/store/renderer/slices/sidebar-nav/sidebar-nav-selectors.ts; src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,WorkspaceAgentsList,WorkspaceShellList,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,ContextItemRow,NotesPanel,ExpandableFileSearch,SidebarHeaderAction,SidebarActionIcon,ChangesRefreshAction,SidebarPrDropdown}.svelte; src/features/external-editors/components/OpenComboButton.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/multi-select-sidebar-tabs.ts; src/store/renderer/slices/sidebar-nav/sidebar-nav-selectors.ts; src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,WorkspaceAgentsList,WorkspaceShellList,NoteMetadataBar}.svelte; src/lib/components/settings/SidebarIconsSettings.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,ContextItemRow,NotesPanel,ExpandableFileSearch,SidebarHeaderAction,SidebarActionIcon,ChangesRefreshAction,SidebarPrDropdown}.svelte; src/features/external-editors/components/OpenComboButton.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
@@ -1981,6 +1981,11 @@ expanded row and collapsed rail, and in a workspace with other people it opens
 above **Agents** until you choose a section. Otherwise **People** follows
 **Agents**. The **Agents** tab shows the main agent's avatar, or a robot while no
 main agent is available.
+To hide a section icon, right-click it and choose **Hide from sidebar**, or turn it
+off in **Settings → Appearance → Sidebar icons**; turn it back on there. **Context**,
+**Changes**, **Files**, **Browsers** and **Shells** can be hidden; **Agents** always
+shows. The choice applies to every workspace. A hidden section still opens from a
+link, and its icon shows while that section is open. Older versions may differ.
 A token-usage total appears beside **Agents** once tokens have been used. It
 excludes cached tokens; its details list cached context as a separate row.
 The workspace status image appears as a compact thumbnail in **Context**; click
