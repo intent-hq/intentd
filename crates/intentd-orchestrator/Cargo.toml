@@ -52,6 +52,8 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 intent-store = { workspace = true, features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
+# The startup parity guard (tests/startup_parity.rs) scans intentd's main.rs.
+regex = "1.12"
 serde_json = { workspace = true }
 # The Postgres tests lock a lease row to stop renewals. No feature of its
 # own: `postgres` turns sqlx's Postgres driver on through intent-store.

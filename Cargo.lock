@@ -2909,6 +2909,7 @@ dependencies = [
  "intent-transport",
  "intentd-test-support",
  "nix 0.31.3",
+ "regex",
  "rustls",
  "rustls-pki-types",
  "serde_json",

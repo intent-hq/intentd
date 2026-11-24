@@ -16,6 +16,7 @@ use std::future::Future;
 
 use intent_services::Services;
 
+pub mod agents;
 pub mod tenant;
 
 /// Workspace transfer (plan, export, import), re-exported for the daemon and

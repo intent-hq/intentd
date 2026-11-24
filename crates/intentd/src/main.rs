@@ -16,11 +16,10 @@ use intent_app::StartupExt as _;
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
-    live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
-    AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
-    PermissionPolicy, ProcessSample, RemoteAgentMemory, RemoteAgentRoot, Services, TreeMemoryProbe,
-    TreeSample, WatcherRegistry, WorkspaceSetupStates,
+    agent_memory_budget_bytes, host_total_memory_bytes, init_adapter_slots, live_adapters,
+    max_concurrent_adapters, recommended_memory_budget_bytes, AgentManager, AgentMemorySnapshot,
+    EventBus, GitStatusRefresher, PermissionPolicy, ProcessSample, RemoteAgentMemory,
+    RemoteAgentRoot, Services, TreeMemoryProbe, TreeSample, WatcherRegistry, WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -2520,8 +2519,7 @@ async fn cmd_serve_owned(
     // Resolve the concurrent agent cap: positive effective value → explicit
     // override; 0 (the schema default) → auto (RAM-based default_process_cap).
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
-    let process_cap =
-        max_concurrent_agents(&boot_settings.effective).unwrap_or_else(default_process_cap);
+    let process_cap = intent_app::agents::process_cap(&boot_settings.effective);
     // Install the daemon-wide ephemeral-adapter bound before anything can
     // spawn one. One-shot completions and model probes hold no agent slot, so
     // this — not `process_cap` — is what stops a quick-action fan-out from
@@ -2637,59 +2635,20 @@ async fn cmd_serve_owned(
     // here because the budget is installed on the registry right after the
     // manager exists, while the sampler task that fills it needs that manager.
     let child_usage = Arc::new(ChildTreeUsage::default());
-    let manager = Arc::new(
-        AgentManager::new(
-            services.clone(),
-            Arc::new(BusEventSink::new(bus.clone())),
+    // Built and attached by the shared builder the orchestrator also uses
+    // (`intent_app::agents`), so the `agent.*` RPC handlers drive the live
+    // spawn/turn/MCP loop: logs, generated configs, temp folders and the
+    // chief cwd under the data dir, each swept first.
+    let manager = intent_app::agents::start_agent_manager(
+        &services,
+        &bus,
+        intent_app::agents::AgentManagerSetup {
+            data_dir: &config.data_dir,
+            chief_cwd_root,
             process_cap,
-        )
-        .with_policy_override(permission_policy)
-        // STAB-53: capture each spawned child's stderr under
-        // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
-        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
-        // Per-agent generated config files (`--mcp-config`, `--rules`,
-        // pi-extension delivery) are written under the daemon-owned
-        // `<data_dir>/agent-configs` instead of the global OS temp dir
-        // (monorepo#1302). Swept at startup (no agent child is live yet)
-        // so files leaked by a killed daemon don't accumulate.
-        .with_agent_config_root({
-            let root = intent_core::agent_configs_root(&config.data_dir);
-            if let Err(e) = intent_core::sweep_agent_configs(&root) {
-                tracing::warn!(error = %e, path = %root.display(), "agent-configs sweep failed");
-            }
-            root
-        })
-        // Every agent gets a private temp folder (`TMPDIR` / `TMP` / `TEMP`)
-        // under a per-daemon root in the OS temp dir, so agents never share
-        // fixed temp file names. Folders outlive each launch so a restarted
-        // agent finds its files; the startup sweep (and the hourly one below)
-        // reclaims only folders unused for `AGENT_TMP_MAX_IDLE`.
-        .with_agent_tmp_root({
-            let root = intent_core::agent_tmp_root(&config.data_dir);
-            if let Err(e) =
-                intent_core::sweep_agent_tmp_root(&root, intent_core::AGENT_TMP_MAX_IDLE)
-            {
-                tracing::warn!(error = %e, path = %root.display(), "agent temp sweep failed");
-            }
-            root
-        })
-        // STAB-50: chief provider children spawn in the dedicated, empty
-        // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
-        // startup (no chief child is live yet) so leftovers a provider
-        // scribbled into its cwd don't accumulate across daemon runs and
-        // get re-indexed.
-        .with_chief_cwd_root({
-            let root = chief_cwd_root;
-            if let Err(e) = intent_core::sweep_chief_cwd(&root) {
-                tracing::warn!(error = %e, path = %root.display(), "chief-cwd sweep failed");
-            }
-            root
-        }),
+            policy_override: permission_policy,
+        },
     );
-    // Attach the manager to the services surface so the `agent.*` RPC handlers
-    // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
-    // visible to every clone, including the api handed to the transport below).
-    services.attach_agent_manager(&manager);
     manager.start_unsloth_idle_reaper();
     // Read-only tree probe for `agent.diagnostics` per-agent subtree memory
     // attribution (monorepo#2063 A2): installed unconditionally, unlike the
@@ -2798,7 +2757,7 @@ async fn cmd_serve_owned(
     // error is fatal before listeners start: a new queue mutation must never
     // replace durable entries from an unreconciled, empty in-memory map.
     let rehydrated = if startup_error.is_none() && !bootstrap.cancellation.stopping() {
-        match restore_startup_queues(&services).await {
+        match intent_app::agents::restore_startup_queues(&services).await {
             Ok(count) => count,
             Err(error) => {
                 startup_error.get_or_insert(error.into());
@@ -8398,13 +8357,6 @@ fn should_resume_on_start(
     }
 }
 
-/// Queue restoration must succeed before serving any queue mutations.
-async fn restore_startup_queues(services: &Services) -> intent_core::Result<usize> {
-    let count = services.rehydrate_agent_queues().await?;
-    services.desktop_recover().await?;
-    Ok(count)
-}
-
 /// Run recovery off the listener path. Shutdown stops between operations;
 /// an admitted operation drains so its durable claim cannot be stranded by
 /// cancellation. Provider turns themselves remain owned by `AgentManager`.
@@ -9267,7 +9219,7 @@ for line in sys.stdin:
             .unwrap();
         let services = Services::new_isolated(store.clone());
         let startup: intent_core::Result<()> = async {
-            restore_startup_queues(&services).await?;
+            intent_app::agents::restore_startup_queues(&services).await?;
             // Models the first request after listeners are allowed to start:
             // an empty in-memory queue would replace the saved snapshot.
             store.replace_agent_queue(&agent, &[]).await?;
@@ -9287,7 +9239,12 @@ for line in sys.stdin:
             saved.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["recovered-0", "recovered-1"]
         );
-        assert_eq!(restore_startup_queues(&services).await.unwrap(), 2);
+        assert_eq!(
+            intent_app::agents::restore_startup_queues(&services)
+                .await
+                .unwrap(),
+            2
+        );
         intent_core::with_caller(
             intent_core::Caller::Daemon,
             services.agent_queue_message(agent, "later send".into(), None, None, None),

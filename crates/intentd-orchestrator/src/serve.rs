@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_app::tenant::{Admission, TenantRuntime};
+use intent_app::StartupExt as _;
 use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
 use intent_services::retention::TenantSweepTiming;
-use intent_services::{EventBus, Services, SettingsRegistry};
+use intent_services::{
+    AgentManager, EventBus, Services, SettingsRegistry, StartupCompletionRecovery,
+};
 use intent_store::postgres::{
     LeaseHeartbeat, LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId,
     LEASE_RENEW_INTERVAL, LEASE_TTL,
@@ -49,6 +52,9 @@ pub struct ServedTenant {
     fence: TenantFence,
     /// Renews the lease; dropping it fires the fence.
     heartbeat: LeaseHeartbeat,
+    /// The tenant's agent manager: `services` holds only a weak handle, so
+    /// this one keeps every `agent.*` turn running while the tenant serves.
+    agents: Arc<AgentManager>,
     report: Option<tokio::task::JoinHandle<SelfFenceReport>>,
 }
 
@@ -217,6 +223,9 @@ async fn try_serve_tenant_with(
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
+    let recovered = recover_tenant(&services, &bus, &dir, &fence)
+        .await
+        .map_err(|e| Error::Internal(format!("tenant {tenant}: startup recovery: {e}")))?;
     let runtime = TenantRuntime::start_with_sweeps(
         &services,
         &dir,
@@ -226,6 +235,26 @@ async fn try_serve_tenant_with(
         sweeps,
     )
     .await;
+    if let Some(completions) = recovered.completions {
+        // Deliver what finished while no one served the tenant, off the
+        // open path, as `intentd` does once it serves. Stops between
+        // operations once the fence fires, and is cancelled with the
+        // tenant's other tasks.
+        let services = services.clone();
+        let fence = fence.clone();
+        runner.adopt_task(intent_core::spawn_daemon(async move {
+            let (stop, stopping) = tokio::sync::watch::channel(fence.is_fenced());
+            let reconcile = services.reconcile_startup_completions(completions, &stopping);
+            tokio::pin!(reconcile);
+            tokio::select! {
+                () = &mut reconcile => {}
+                () = fence.fenced() => {
+                    let _ = stop.send(true);
+                    reconcile.await;
+                }
+            }
+        }));
+    }
     tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
     Ok(Serving::Served(Box::new(ServedTenant {
         tenant: tenant.to_owned(),
@@ -237,8 +266,111 @@ async fn try_serve_tenant_with(
         reverse,
         fence,
         heartbeat,
+        agents: recovered.agents,
         report: Some(runner.spawn()),
     })))
+}
+
+/// What [`recover_tenant`] restored.
+struct Recovered {
+    /// The tenant's agent manager (the strong handle: `Services` holds a
+    /// weak one).
+    agents: Arc<AgentManager>,
+    /// The completion bookkeeping to reconcile once the tenant serves;
+    /// `None` once the fence fired.
+    completions: Option<StartupCompletionRecovery>,
+}
+
+/// The agent state a restart left in the tenant's store, restored before
+/// its work starts, in `intentd`'s order (`cmd_serve_owned`): the boot
+/// settings migrations and provider profile cleanups, the agent manager
+/// (so `agent.*` turns run, on machines too), stale session flags, the
+/// machine connector's tailcat binary, deletes a previous owner stopped
+/// part-way, the agent send queues, stop redeliveries, and the completion
+/// bookkeeping. Each step is skipped once `fence` fired; the steps
+/// `intentd` treats as startup failures fail the open.
+async fn recover_tenant(
+    services: &Services,
+    bus: &EventBus,
+    dir: &Path,
+    fence: &TenantFence,
+) -> Result<Recovered> {
+    if let Some(registry) = services.settings_registry() {
+        intent_services::run_boot_settings_migrations(&registry, services.store()).await?;
+    }
+    // Remove secrets journaled by an interrupted profile create/delete.
+    services.sweep_provider_profile_secrets().await;
+    services.migrate_remote_choices().await;
+    let agents = intent_app::agents::start_agent_manager(
+        services,
+        bus,
+        intent_app::agents::AgentManagerSetup {
+            data_dir: dir,
+            chief_cwd_root: chief_cwd_root(dir),
+            process_cap: intent_app::agents::process_cap(&services.effective_settings()),
+            policy_override: None,
+        },
+    );
+    tracing::info!(process_cap = agents.registry().cap(), "agent manager ready");
+    let live = || !fence.is_fenced();
+    if live() {
+        // Agent sessions are process-local: every active flag a previous
+        // owner left is stale, and so is every in-flight status.
+        match services.store().reset_all_active_flags().await {
+            Ok(0) => {}
+            Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
+            Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+        }
+        match services.heal_stale_agent_sessions().await {
+            Ok(0) => {}
+            Ok(healed) => {
+                tracing::info!(healed, "healed stale in-flight agent sessions on startup");
+            }
+            Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
+        }
+    }
+    // Machines with only a tailcat route are dialed through this binary.
+    // Set before the pending-delete sweep, whose deletes send machines
+    // their final stops.
+    services.configure_remote_machines(Some(intent_core::tailcat::resolve_tailcat_bin()));
+    if live() {
+        if let Err(error) = services.finish_pending_deletes(|| fence.is_fenced()).await {
+            tracing::warn!(%error, "pending delete sweep failed");
+        }
+        match services.rearm_delete_graces().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "re-armed stored delete deadlines"),
+            Err(error) => tracing::warn!(%error, "re-arming stored delete deadlines failed"),
+        }
+        let queued = intent_app::agents::restore_startup_queues(services).await?;
+        if queued > 0 {
+            tracing::info!(queued, "rehydrated persisted agent queue messages");
+        }
+    }
+    if live() {
+        match agents.rehydrate_stop_redeliveries().await {
+            Ok(0) => {}
+            Ok(rehydrated) => tracing::info!(
+                rehydrated,
+                "rehydrated persisted stop-redelivery payloads on startup"
+            ),
+            Err(e) => tracing::warn!(error = %e, "stop-redelivery rehydration failed"),
+        }
+    }
+    let completions = if live() {
+        Some(services.prepare_startup_completion_recovery().await)
+    } else {
+        None
+    };
+    Ok(Recovered {
+        agents,
+        completions,
+    })
+}
+
+/// The tenant's chief cwd, as [`tenant_services`] configures it.
+fn chief_cwd_root(dir: &Path) -> PathBuf {
+    intent_core::chief_cwd_root(dir)
 }
 
 /// Install head's git receive hooks under `data_dir`, once per process
@@ -284,7 +416,7 @@ fn tenant_services(
             .with_secret_store(secrets)
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
-            .with_chief_cwd_root(dir.join("chief-cwd"))
+            .with_chief_cwd_root(chief_cwd_root(dir))
             .with_models_cache_dir(dir)
             .with_provider_profiles_dir(dir)
             .with_script_output_dir(dir)
@@ -316,6 +448,12 @@ impl ServedTenant {
     #[must_use]
     pub fn secrets(&self) -> &Arc<crate::secrets::TenantSecrets> {
         &self.secrets
+    }
+
+    /// The tenant's agent manager.
+    #[must_use]
+    pub fn agents(&self) -> &Arc<AgentManager> {
+        &self.agents
     }
 
     /// The tenant's event bus.

@@ -1,0 +1,631 @@
+//! Every startup step `intentd serve` takes is accounted for in the
+//! orchestrator: wired (and the call is found in the orchestrator's or the
+//! shared startup code), refused in orchestrator mode with a reason, or a
+//! known gap with its follow-up. A step `intentd` gains that is in none of
+//! these lists fails this test, so the orchestrator cannot silently skip it
+//! again, as it skipped the agent manager (no agent turn ever ran) and head's
+//! git receive hooks (every machine push was refused).
+//!
+//! "A step" is a call in `cmd_serve` / `cmd_serve_owned` (intentd's
+//! `src/main.rs`): a method on the services, the agent manager, the store
+//! or the MCP hub, a `with_*` builder call, or a free function call. Plain
+//! values, parses, clones and test seams are listed as plumbing.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+/// How the orchestrator handles one of `intentd`'s startup steps.
+enum Step {
+    /// The orchestrator does it too: this call must appear (as `name(`) in
+    /// the orchestrator's sources or the shared startup code in
+    /// `intent-app`, outside tests.
+    Wired(&'static str),
+    /// Never in orchestrator mode, and why.
+    Refused(&'static str),
+    /// Not done yet: what the orchestrator lacks without it.
+    Gap(&'static str),
+    /// Not a startup step: a value, a parse, a clone, a teardown detail or a
+    /// test seam.
+    Plumbing,
+}
+
+use Step::{Gap, Plumbing, Refused, Wired};
+
+/// Every startup call of `intentd serve`, keyed as [`startup_calls`] names
+/// them.
+const STEPS: &[(&str, Step)] = &[
+    // The services the orchestrator builds per tenant (`tenant_services`).
+    (".with_assets_root", Wired("with_assets_root")),
+    (".with_chief_cwd_root", Wired("with_chief_cwd_root")),
+    (".with_event_bus", Wired("with_event_bus")),
+    (".with_models_cache_dir", Wired("with_models_cache_dir")),
+    (".with_orchestrator_mode", Wired("with_orchestrator_mode")),
+    (
+        ".with_provider_profiles_dir",
+        Wired("with_provider_profiles_dir"),
+    ),
+    (".with_reverse_dispatch", Wired("with_reverse_dispatch")),
+    (".with_script_output_dir", Wired("with_script_output_dir")),
+    (".with_settings_registry", Wired("with_settings_registry")),
+    ("intent_app::compose", Wired("intent_app::compose")),
+    (
+        ".with_hooks_max_per_agent",
+        Gap("`[hooks] maxPerAgent` is the built-in default for every tenant"),
+    ),
+    (
+        ".with_node_mode",
+        Refused("an orchestrator is never in node mode"),
+    ),
+    (
+        ".with_workspace_setup_states",
+        Plumbing, // `Services` makes its own when none is shared.
+    ),
+    (
+        ".with_suspend_tracker",
+        Refused("host sleep and wake detection is for a desktop daemon"),
+    ),
+    (
+        "services.with_suspend_tracker",
+        Refused("host sleep and wake detection is for a desktop daemon"),
+    ),
+    // Restores and agents, before the tenant's work starts (`recover_tenant`).
+    (
+        "intent_services::run_boot_settings_migrations",
+        Wired("run_boot_settings_migrations"),
+    ),
+    (
+        "services.sweep_provider_profile_secrets",
+        Wired("sweep_provider_profile_secrets"),
+    ),
+    (
+        "services.migrate_remote_choices",
+        Wired("migrate_remote_choices"),
+    ),
+    ("intent_app::agents::process_cap", Wired("process_cap")),
+    (
+        "intent_app::agents::start_agent_manager",
+        Wired("start_agent_manager"),
+    ),
+    ("intent_core::agent_logs_root", Wired("agent_logs_root")),
+    ("intent_core::chief_cwd_root", Wired("chief_cwd_root")),
+    ("manager.registry().cap", Wired("registry().cap")),
+    (
+        "services.store().reset_all_active_flags",
+        Wired("reset_all_active_flags"),
+    ),
+    (
+        "services.heal_stale_agent_sessions",
+        Wired("heal_stale_agent_sessions"),
+    ),
+    (
+        "services.configure_remote_machines",
+        Wired("configure_remote_machines"),
+    ),
+    ("tunnel::resolve_tailcat_bin", Wired("resolve_tailcat_bin")),
+    (
+        "intent_git::node_git::configure_receive_hooks",
+        Wired("configure_receive_hooks"),
+    ),
+    (
+        "services.finish_pending_deletes",
+        Wired("finish_pending_deletes"),
+    ),
+    ("services.rearm_delete_graces", Wired("rearm_delete_graces")),
+    (
+        "intent_app::agents::restore_startup_queues",
+        Wired("restore_startup_queues"),
+    ),
+    (
+        "manager.rehydrate_stop_redeliveries",
+        Wired("rehydrate_stop_redeliveries"),
+    ),
+    (
+        "services.prepare_startup_completion_recovery",
+        Wired("prepare_startup_completion_recovery"),
+    ),
+    (
+        "services.reconcile_startup_completions",
+        Wired("reconcile_startup_completions"),
+    ),
+    // Shared with `intentd` through `TenantRuntime::start`.
+    (
+        "intent_app::tenant::restore_registries",
+        Wired("restore_registries"),
+    ),
+    (
+        "intent_app::tenant::start_background",
+        Wired("start_background"),
+    ),
+    ("settle_startup_attachment_retention", Wired("into_tasks")),
+    (
+        "spawn_stream_retention_loop",
+        Wired("spawn_tenant_retention_loop"),
+    ),
+    (
+        "spawn_idempotency_reap_loop",
+        Wired("spawn_tenant_reap_loop"),
+    ),
+    // The tenant's stop (its self-fence's order).
+    (
+        "services.shutdown_pty_sessions",
+        Wired("shutdown_pty_sessions"),
+    ),
+    ("services.host_exec_runtime", Wired("host_exec_runtime")),
+    (
+        "manager.shutdown_with_native_outcome",
+        Wired("manager.shutdown"),
+    ),
+    (
+        "manager.begin_shutdown",
+        Gap("the fence stops agents without first refusing new turns"),
+    ),
+    (
+        "manager.checkpoint_shutdown",
+        Gap("a stopped tenant's in-flight turns are not captured as interrupted"),
+    ),
+    (
+        "services.shutdown_agent_deliveries",
+        Gap("agent deliveries are cancelled with the tenant, not drained"),
+    ),
+    (
+        "services.begin_settings_shutdown",
+        Gap("settings runtime hooks are not fenced before the tenant stops"),
+    ),
+    (
+        "services.shutdown_settings",
+        Gap("settings runtime hooks are not joined before the tenant stops"),
+    ),
+    (
+        "services.shutdown_store_writers",
+        Gap("the tenant's store writers are not drained when it stops"),
+    ),
+    (
+        "intent_services::host_exec_stream::registry",
+        Gap("streamed host commands are process-wide and not stopped per tenant"),
+    ),
+    // Client listeners (`crate::listen`).
+    ("ensure_tls_certificate", Wired("ensure_tls_certificate")),
+    ("get_or_create_token", Wired("get_or_create_token")),
+    ("spawn_proc_usage_sampler", Wired("sample_usage")),
+    (
+        "resolve_token_store",
+        Refused("the owner token is a tenant secret (`crate::listen`)"),
+    ),
+    (
+        "boot_ws_listener",
+        Refused("the listeners are configured from the environment (`ListenConfig`)"),
+    ),
+    (
+        "resolve_ws_listener_port",
+        Refused("the listeners are configured from the environment (`ListenConfig`)"),
+    ),
+    (
+        "ws_options_from_env",
+        Refused("the listeners are configured from the environment (`ListenConfig`)"),
+    ),
+    (
+        "ensure_loopback_bind",
+        Refused("the listeners bind what `ListenConfig` names"),
+    ),
+    (
+        "services.attach_server_control",
+        Refused("settings do not start or stop the orchestrator's listeners"),
+    ),
+    (
+        "services.attach_machine_routes",
+        Refused("an orchestrator is never a machine (`executor.mint` is refused)"),
+    ),
+    (
+        "executor::start_in_daemon",
+        Refused("an orchestrator is never a machine: it runs no backend's agents"),
+    ),
+    (
+        "services.attach_invite_link_builder",
+        Gap("`workspace.invite.list` rows carry no `url`"),
+    ),
+    (
+        "services.attach_agent_rpc",
+        Gap("the Assistant's `ws.rpc` has no loopback connection"),
+    ),
+    (
+        "spawn_route_info_sampler",
+        Gap("`system.status` reports no local addresses or hostname"),
+    ),
+    (
+        "spawn_workspaces_disk_sampler",
+        Gap("`system.status` reports no workspaces disk space"),
+    ),
+    (
+        "intent_services::try_workspaces_provisioning_parent",
+        Gap("`system.status` reports no workspaces disk space"),
+    ),
+    // Process-wide daemon setup.
+    (
+        "acquire_data_dir_lock",
+        Refused("each tenant is held by its Postgres lease instead"),
+    ),
+    (
+        "acquire_single_instance",
+        Refused("each tenant is held by its Postgres lease instead"),
+    ),
+    (
+        "apply_startup_pins",
+        Refused("a tenant's paths are set explicitly, not pinned from the environment"),
+    ),
+    (
+        "fd_limit::raise_at_startup",
+        Gap("the soft descriptor limit is not raised"),
+    ),
+    (
+        "probe_cow_at_startup",
+        Gap("the copy-on-write probe runs on first use, not at start"),
+    ),
+    (
+        "intent_core::workload::init",
+        Gap("scripts, terminals and host commands run without memory containment"),
+    ),
+    (
+        "intent_services::workload_memory_ceiling",
+        Gap("scripts, terminals and host commands run without memory containment"),
+    ),
+    (
+        "init_adapter_slots",
+        Refused("an orchestrator spawns no adapter: one-shot completions run on machines"),
+    ),
+    (
+        "max_concurrent_adapters",
+        Refused("an orchestrator spawns no adapter: one-shot completions run on machines"),
+    ),
+    (
+        "resolve_permission_policy",
+        Refused("`INTENTD_PERMISSION_POLICY` is a desktop override; tenants use their setting"),
+    ),
+    // Local agent processes, which an orchestrator never runs.
+    (
+        "manager.start_unsloth_idle_reaper",
+        Refused("local models: an orchestrator runs no agent itself"),
+    ),
+    (
+        "manager.set_tree_probe",
+        Refused("local agent process trees: an orchestrator runs no agent itself"),
+    ),
+    (
+        "manager.registry().set_memory_budget",
+        Refused("local agent memory: an orchestrator runs no agent itself"),
+    ),
+    (
+        "agent_memory_budget_bytes",
+        Refused("local agent memory: an orchestrator runs no agent itself"),
+    ),
+    (
+        "recommended_memory_budget_bytes",
+        Refused("local agent memory: an orchestrator runs no agent itself"),
+    ),
+    (
+        "host_total_memory_bytes",
+        Refused("local agent memory: an orchestrator runs no agent itself"),
+    ),
+    (
+        "spawn_child_tree_sampler",
+        Refused("local agent process trees: an orchestrator runs no agent itself"),
+    ),
+    (
+        "spawn_idle_reap_loop",
+        Gap("idle agents are never evicted from the tenant's agent registry"),
+    ),
+    // Resume on start.
+    (
+        "services.prepare_startup_resume",
+        Gap("interrupted agents are not resumed when a tenant is claimed"),
+    ),
+    (
+        "run_startup_resume_sweep",
+        Gap("interrupted agents are not resumed when a tenant is claimed"),
+    ),
+    (
+        "should_resume_on_start",
+        Gap("interrupted agents are not resumed when a tenant is claimed"),
+    ),
+    (
+        "resolve_resume_setting",
+        Gap("interrupted agents are not resumed when a tenant is claimed"),
+    ),
+    (
+        "detect_has_display",
+        Gap("interrupted agents are not resumed when a tenant is claimed"),
+    ),
+    // Repository context.
+    (
+        "api_services.initialize_repository_wire",
+        Gap("qualified repository reads are unavailable"),
+    ),
+    (
+        "services.initialize_gitlab_repository_binding",
+        Gap("the GitLab repository binding is not restored at start"),
+    ),
+    (
+        "services.prewarm_repository_metadata",
+        Gap("repository metadata is read on first use"),
+    ),
+    // Watchers.
+    (
+        "spawn_watcher_registry_init",
+        Gap("file changes in head's worktrees do not refresh clients"),
+    ),
+    (
+        "services.git_status_cache",
+        Gap("file changes in head's worktrees do not refresh clients"),
+    ),
+    (
+        "services.worktree_presence",
+        Gap("file changes in head's worktrees do not refresh clients"),
+    ),
+    (
+        "spawn_config_watcher_init",
+        Gap("a tenant's `config.toml` is not reloaded when edited"),
+    ),
+    // External MCP servers.
+    (
+        "services.mcp_hub",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        "mcp_hub.spawn_health_monitor",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        "services.start_enabled_mcp_servers",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        "mcp_hub.begin_background_shutdown",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        "mcp_hub.shutdown",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        "settle_mcp_background",
+        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+    ),
+    (
+        ".with_host_exec",
+        Gap("the outstanding-RPC limiter does not count streamed host commands"),
+    ),
+    // `SQLite` only.
+    ("store.activate_incremental_vacuum", Refused("SQLite only")),
+    (
+        "store.spawn_periodic_wal_checkpoint",
+        Refused("SQLite only"),
+    ),
+    (
+        "spawn_retired_note_paging_cleanup",
+        Refused("SQLite only: Postgres never had the retired paging tables"),
+    ),
+    // The desktop host: sleep and wake, the sitter, the tunnel.
+    (
+        "suspend::spawn_suspend_detector",
+        Refused("host sleep and wake detection is for a desktop daemon"),
+    ),
+    (
+        "services.resume_suspend_interrupted_agents",
+        Refused("host sleep and wake detection is for a desktop daemon"),
+    ),
+    (
+        "tunnel::recycle_on_resume",
+        Refused("host sleep and wake detection is for a desktop daemon"),
+    ),
+    (
+        "spawn_staged_restart_watcher",
+        Refused("the sitter's staged updates: an orchestrator is not run by the sitter"),
+    ),
+    (
+        "spawn_idle_update_requester",
+        Refused("the sitter's staged updates: an orchestrator is not run by the sitter"),
+    ),
+    (
+        "services.command_script_activity",
+        Refused("the sitter's staged updates: an orchestrator is not run by the sitter"),
+    ),
+    // Plumbing.
+    ("cmd_serve", Plumbing),
+    ("cmd_serve_owned", Plumbing),
+    ("banner_build_commit", Plumbing),
+    ("env_flag", Plumbing),
+    ("parse_locality_mode", Plumbing),
+    ("parse_resume_test_default", Plumbing),
+    ("resolve_config", Plumbing),
+    ("resolve_daemon_mode", Plumbing),
+    ("shutdown_signal", Plumbing),
+    ("signal", Plumbing),
+    ("startup::admission_unchanged", Plumbing),
+    ("startup::preparing_test_gate", Plumbing),
+    ("initialize_gitlab_test_transports", Plumbing),
+    ("intent_core::spawn_daemon", Plumbing),
+    ("manager.clone", Plumbing),
+    ("mcp_hub.clone", Plumbing),
+    ("services.clone", Plumbing),
+    ("store.clone", Plumbing),
+    ("services.secret_source", Plumbing),
+    ("services.remote_feature().map_or", Plumbing),
+    ("services.mcp_servers_create", Plumbing),
+    ("services.mcp_servers_toggle", Plumbing),
+    ("services.settings_update", Plumbing),
+    (".with_reverse_registry", Plumbing),
+];
+
+/// Calls never worth classifying: the standard library, Tokio, JSON.
+const IGNORED_PREFIXES: &[&str] = &["std::", "tokio::", "serde_json::", "u64::"];
+
+/// Rust keywords the free-call scan sees followed by `(`.
+const KEYWORDS: &[&str] = &[
+    "if", "match", "while", "for", "loop", "return", "move", "async", "fn", "in", "as", "let",
+    "mut", "ref", "drop", "else", "await",
+];
+
+fn crates_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// `name`'s body in `source`: from `async fn name(` to the next top-level
+/// closing brace.
+fn body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source
+        .find(&format!("async fn {name}("))
+        .unwrap_or_else(|| panic!("intentd's main.rs has no `async fn {name}`"));
+    let end = source[start..]
+        .find("\n}\n")
+        .map_or(source.len(), |end| start + end);
+    &source[start..end]
+}
+
+/// Every startup call of `intentd serve`, keyed `receiver.method` (the
+/// receiver normalized: any `*services*` binding is `services`), `.with_*`,
+/// or the called path.
+fn startup_calls() -> BTreeSet<String> {
+    let main = std::fs::read_to_string(crates_dir().join("intentd/src/main.rs")).unwrap();
+    let text = format!(
+        "{}\n{}",
+        body(&main, "cmd_serve"),
+        body(&main, "cmd_serve_owned")
+    );
+    let comments = regex::Regex::new(r"//[^\n]*").unwrap();
+    let attributes = regex::Regex::new(r"#\[[^\]]*\]").unwrap();
+    let chains = regex::Regex::new(r"\n\s*\.").unwrap();
+    let text = comments.replace_all(&text, "");
+    let text = attributes.replace_all(&text, "");
+    let text = chains.replace_all(&text, ".");
+
+    let mut calls = BTreeSet::new();
+    let method =
+        regex::Regex::new(r"\b(\w*services\w*|manager|store|mcp_hub)\.((?:\w+\(\)\.)*\w+)\(")
+            .unwrap();
+    for found in method.captures_iter(&text) {
+        let receiver = match &found[1] {
+            "api_services" => "api_services",
+            r if r.contains("services") => "services",
+            r => r,
+        };
+        calls.insert(format!("{receiver}.{}", &found[2]));
+    }
+    let builder = regex::Regex::new(r"\.(with_\w+)\(").unwrap();
+    for found in builder.captures_iter(&text) {
+        calls.insert(format!(".{}", &found[1]));
+    }
+    // A free call: a path of lowercase segments, called, and not a method
+    // (after `.`) or the tail of a type's path (after `::`).
+    let path = regex::Regex::new(r"[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*").unwrap();
+    for found in path.find_iter(&text) {
+        let called = text[found.end()..].starts_with('(');
+        let after_dot_or_path = text[..found.start()].ends_with(['.', ':']);
+        let lowercase = found
+            .as_str()
+            .split("::")
+            .all(|segment| segment.starts_with(|c: char| c.is_ascii_lowercase() || c == '_'));
+        let call = found.as_str();
+        if !called
+            || after_dot_or_path
+            || !lowercase
+            || KEYWORDS.contains(&call)
+            || IGNORED_PREFIXES.iter().any(|p| call.starts_with(p))
+        {
+            continue;
+        }
+        calls.insert(call.to_owned());
+    }
+    calls
+}
+
+/// The orchestrator's sources and the shared startup code, tests left out.
+fn orchestrator_sources() -> String {
+    let crates = crates_dir();
+    let files = [
+        "intentd-orchestrator/src/lib.rs",
+        "intentd-orchestrator/src/main.rs",
+        "intentd-orchestrator/src/serve.rs",
+        "intentd-orchestrator/src/listen.rs",
+        "intentd-orchestrator/src/secrets.rs",
+        "intent-app/src/lib.rs",
+        "intent-app/src/tenant.rs",
+        "intent-app/src/agents.rs",
+    ];
+    files
+        .iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(crates.join(file))
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            match text.find("#[cfg(test)]\nmod tests") {
+                Some(tests) => text[..tests].to_owned(),
+                None => text,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn every_intentd_startup_step_is_wired_refused_or_a_known_gap() {
+    let calls = startup_calls();
+    let steps: BTreeMap<&str, &Step> = STEPS.iter().map(|(key, step)| (*key, step)).collect();
+    assert_eq!(steps.len(), STEPS.len(), "a step is listed twice");
+    let sources = orchestrator_sources();
+
+    let unlisted: Vec<&String> = calls
+        .iter()
+        .filter(|call| !steps.contains_key(call.as_str()))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "intentd's startup (crates/intentd/src/main.rs, cmd_serve_owned) calls {unlisted:?}, \
+         which the orchestrator neither does nor refuses: wire it in \
+         intentd-orchestrator (serve.rs) or the shared startup in intent-app, or list it in \
+         this test's STEPS as Refused (with why) or a Gap (with its follow-up)"
+    );
+    let stale: Vec<&str> = steps
+        .keys()
+        .copied()
+        .filter(|key| !calls.contains(*key))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "STEPS lists {stale:?}, which intentd's startup no longer calls: remove them"
+    );
+    let unwired: Vec<(&str, &str)> = STEPS
+        .iter()
+        .filter_map(|(key, step)| match step {
+            Wired(call) if !sources.contains(&format!("{call}(")) => Some((*key, *call)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        unwired.is_empty(),
+        "STEPS says these are wired, but the orchestrator's sources never call them: \
+         {unwired:?}"
+    );
+    for (key, step) in STEPS {
+        if let Refused(why) | Gap(why) = step {
+            assert!(!why.is_empty(), "{key}: say why");
+        }
+    }
+}
+
+/// The guard sees the steps it must: the agent manager and the receive
+/// hooks, which the orchestrator once skipped.
+#[test]
+fn the_startup_scan_finds_the_steps_the_orchestrator_once_skipped() {
+    let calls = startup_calls();
+    for step in [
+        "intent_app::agents::start_agent_manager",
+        "intent_git::node_git::configure_receive_hooks",
+        "services.store().reset_all_active_flags",
+        "intent_app::tenant::restore_registries",
+        "init_adapter_slots",
+        "mcp_hub.spawn_health_monitor",
+    ] {
+        assert!(calls.contains(step), "{step} not found in {calls:?}");
+    }
+}
