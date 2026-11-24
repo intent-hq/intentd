@@ -282,9 +282,9 @@ Open Settings and use these sidebar labels (English labels shown):
 | Advanced | Labs, connection, data, reset | `/settings?tab=advanced#connection` |
 
 To find a setting by name, type in **Search settings** at the top of the Settings
-sidebar (Cmd+F or Ctrl+F focuses it). Matching settings show grouped by section, with
-their usual controls, so the user can change them in the results; click a section
-label to open it. Escape clears the search. Older versions may have no search field.
+sidebar (Cmd+F or Ctrl+F focuses it). Matching settings show grouped by Settings tab,
+with their usual controls, so the user can change them in the results; click a group
+label to open that tab. Escape clears the search. Older versions may have no search field.
 
 Starting with the desktop release that reorganizes Settings, the sidebar uses the
 labels above. Earlier releases use **Agent defaults**, **Input and shortcuts** and
