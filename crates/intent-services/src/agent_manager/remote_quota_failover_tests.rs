@@ -1748,3 +1748,156 @@ async fn two_sends_after_a_failed_remote_first_turn_deliver_every_message_once()
         );
     }
 }
+
+/// Wait until every `texts` reached `run`, then until the agent settles.
+async fn wait_delivered(mgr: &Arc<AgentManager>, id: &AgentId, run: &FakeRuntime, texts: &[&str]) {
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !texts.iter().all(|text| all_prompts(run).contains(text)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("not every message was sent: {}", all_prompts(run)));
+    wait_idle(mgr, id).await;
+}
+
+/// Each of `texts` reached `run` exactly once, in order, and nothing waits.
+fn assert_delivered_once_in_order(mgr: &AgentManager, id: &AgentId, run: &FakeRuntime, texts: &[&str]) {
+    let sent = all_prompts(run);
+    let mut last = 0;
+    for text in texts {
+        assert_eq!(sent.matches(text).count(), 1, "{text}: {sent}");
+        let at = sent.find(text).unwrap();
+        assert!(at >= last, "{text} out of order: {sent}");
+        last = at;
+    }
+    assert!(mgr.services.queue_snapshot(id).is_empty(), "{sent}");
+    assert_eq!(
+        run.responses.load(Ordering::SeqCst),
+        run.prompts.lock().unwrap().len(),
+        "a turn was aborted mid-prompt: {sent}"
+    );
+}
+
+/// Arm the `agent_retry` pause and start a retry that parks after its
+/// unlocked Error check.
+async fn paused_retry(
+    mgr: &Arc<AgentManager>,
+    id: &AgentId,
+    ws: &WorkspaceId,
+) -> (Arc<crate::agent_manager::TurnStartPause>, tokio::task::JoinHandle<Value>) {
+    let pause = Arc::new(crate::agent_manager::TurnStartPause::default());
+    *mgr.retry_pause.lock().unwrap() = Some(pause.clone());
+    let retry = tokio::spawn({
+        let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
+        async move { mgr.agent_retry(id, ws).await.unwrap() }
+    });
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("the retry reaches its pause");
+    (pause, retry)
+}
+
+/// Review of intentd#3739: Try again checked the Error status, then a new
+/// message's redrive started the turn. The retry must not abort that turn.
+#[intent_test_macros::daemon_test]
+async fn a_retry_racing_a_new_message_does_not_cancel_its_turn() {
+    let next = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("retry-vs-send", vec![Launch::Runs(next.clone())]).await;
+
+    let (pause, retry) = paused_retry(&mgr, &id, &ws).await;
+    send(&mgr, &id, &ws, "message alpha").await;
+    next.wait_prompts(1).await;
+    pause.resume.notify_one();
+    retry.await.unwrap();
+    next.finish.add_permits(8);
+    wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
+
+    assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
+    assert_eq!(next.cancels.load(Ordering::SeqCst), 0, "{}", all_prompts(&next));
+}
+
+/// Two Try again clicks: the second must not abort the turn the first started.
+#[intent_test_macros::daemon_test]
+async fn a_second_retry_does_not_cancel_the_first_ones_turn() {
+    let next = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("retry-vs-retry", vec![Launch::Runs(next.clone())]).await;
+
+    let (pause, second) = paused_retry(&mgr, &id, &ws).await;
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    next.wait_prompts(1).await;
+    pause.resume.notify_one();
+    second.await.unwrap();
+    next.finish.add_permits(8);
+    wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE]).await;
+
+    assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE]);
+    assert_eq!(next.cancels.load(Ordering::SeqCst), 0, "{}", all_prompts(&next));
+}
+
+/// Try again and a new message at once, across interleavings: every message
+/// reaches the provider once, in order.
+#[intent_test_macros::daemon_test]
+async fn a_retry_and_a_new_message_at_once_deliver_every_message_once() {
+    for yields in 0..6u32 {
+        let next = FakeRuntime::new();
+        next.finish.add_permits(8);
+        let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+            &format!("retry-and-send-{yields}"),
+            vec![Launch::Runs(next.clone())],
+        )
+        .await;
+
+        let delayed_send = async {
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            send(&mgr, &id, &ws, "message alpha").await;
+        };
+        let (retried, ()) = tokio::join!(mgr.agent_retry(id.clone(), ws.clone()), delayed_send);
+        retried.unwrap();
+        wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
+
+        assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
+    }
+}
+
+/// Review of intentd#3739: the store fails while a new message lifts the
+/// failed turn's park. The message is already queued, so the send reports
+/// it queued (a failure would make the client send it again), and the next
+/// Try again delivers both.
+#[intent_test_macros::daemon_test]
+async fn a_store_error_after_queueing_reports_the_message_queued() {
+    let next = FakeRuntime::new();
+    next.finish.add_permits(8);
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("redrive-store-error", vec![Launch::Runs(next.clone())]).await;
+
+    mgr.redrive_store_fault
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "message alpha".into(),
+            None,
+            super::super::super::TurnOptions::default(),
+        )
+        .await
+        .expect("the queued message is not reported as failed");
+    assert_eq!(result["queued"], json!(true), "{result}");
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 2);
+
+    mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
+
+    assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
+}

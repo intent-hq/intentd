@@ -3323,6 +3323,12 @@ pub struct AgentManager {
     worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    /// Parks `agent_retry` after its unlocked Error check.
+    #[cfg(test)]
+    retry_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    /// Fails the next status read of a send's failed-turn redrive.
+    #[cfg(test)]
+    redrive_store_fault: std::sync::atomic::AtomicBool,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3471,6 +3477,10 @@ impl AgentManager {
             worker_finish_pause: Mutex::new(None),
             #[cfg(test)]
             failed_wake_disposal_pause: Mutex::new(None),
+            #[cfg(test)]
+            retry_pause: Mutex::new(None),
+            #[cfg(test)]
+            redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -11394,6 +11404,14 @@ impl AgentManager {
         if session.status != AgentStatus::Error {
             return Ok(json!({ "ok": false }));
         }
+        #[cfg(test)]
+        {
+            let pause = self.retry_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let original = repository_origin::capture(&self.handles, &agent_id);
         if let Some(original) = &original {
             original.retire();
@@ -11505,6 +11523,13 @@ impl AgentManager {
         {
             let gate = self.turn_start_gates.for_agent(agent_id);
             let _starting = gate.lock().await;
+            #[cfg(test)]
+            if self
+                .redrive_store_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Internal("injected redrive store fault".into()));
+            }
             if !self.is_busy(agent_id)
                 && self
                     .services
