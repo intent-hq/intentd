@@ -11438,7 +11438,7 @@ impl AgentManager {
                 None
             }
         };
-        let Some((mut redriven, stale)) = owned else {
+        let Some((redriven, stale)) = owned else {
             self.clone()
                 .try_drain_queue(agent_id.clone(), workspace_id)
                 .await;
@@ -11450,17 +11450,6 @@ impl AgentManager {
         // detached, so no new turn can reach it.
         if let Some(child) = stale {
             child.kill_tree().await;
-        }
-
-        // Close the check-then-flip race: a message enqueued between the queue
-        // check above and the status flip had its own drain attempt suppressed
-        // by the Error gate in `try_drain_queue` (STAB-52), and this path was
-        // about to skip the drain too — stranding a ready-to-send message.
-        // Re-poll under the post-Error status; anything there is a redrive.
-        if !redriven && self.services.has_ready_to_send(&agent_id) {
-            redriven = true;
-            self.persist_retry_status(&agent_id, &workspace_id, AgentStatus::Pending)
-                .await?;
         }
 
         // Start the drain loop to redrive the requeued message. Peek the
@@ -11538,7 +11527,7 @@ impl AgentManager {
         // Empty queue → nothing will drive a `pending` status forward, so
         // clear the error to `idle` instead (idle is permitted iff no
         // ready-to-send work remains, PROTOCOL §5.5/§6.5 invariant).
-        let redriven = self.services.has_ready_to_send(agent_id);
+        let mut redriven = self.services.has_ready_to_send(agent_id);
         let next_status = if redriven {
             AgentStatus::Pending
         } else {
@@ -11563,6 +11552,18 @@ impl AgentManager {
         self.services.clear_truncation_redrives(agent_id);
         self.services.take_truncation_redrive(agent_id);
         self.release_in_flight_slot(agent_id);
+
+        // Close the check-then-flip race: a message enqueued between the queue
+        // check above and the status flip had its own drain attempt suppressed
+        // by the Error gate in `try_drain_queue` (STAB-52), and this path was
+        // about to skip the drain too — stranding a ready-to-send message.
+        // Re-poll under the post-Error status, still under the gate so no
+        // turn started since can be overwritten; anything there is a redrive.
+        if !redriven && self.services.has_ready_to_send(agent_id) {
+            redriven = true;
+            self.persist_retry_status(agent_id, &session.workspace_id, AgentStatus::Pending)
+                .await?;
+        }
 
         // Detach any stale child handle (taking only this exact origin so the
         // status just set is not overwritten).
