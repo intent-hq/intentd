@@ -19,8 +19,8 @@ async fn busy_owner(svc: &Services, ws: &WorkspaceId, owner: &AgentId) -> Arc<Ag
         1,
     ));
     svc.attach_agent_manager(&manager);
-    let admission = manager.try_begin_turn(owner, ws).await;
-    assert!(admission.is_some(), "claim the owner's turn slot");
+    let claim = manager.try_begin_turn(owner, ws).await;
+    claim.expect("claim the owner's turn slot").hand_off();
     assert!(manager.is_busy(owner));
     manager
 }

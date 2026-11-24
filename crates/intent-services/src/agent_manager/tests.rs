@@ -17626,10 +17626,10 @@ async fn wake_to_busy_vanished_session_fails_closed() {
         AgentId::from("a-2762-busy"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    assert!(
-        mgr.try_begin_turn(&id, &ws).await.is_some(),
-        "claim the in-flight slot so the wake takes the busy enqueue branch"
-    );
+    mgr.try_begin_turn(&id, &ws)
+        .await
+        .expect("claim the in-flight slot so the wake takes the busy enqueue branch")
+        .hand_off();
     mgr.services
         .store
         .delete_agent_session(&ws, &id)
