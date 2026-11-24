@@ -245,8 +245,12 @@ impl Services {
             );
             return Ok(issue);
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         let issue = sc
             .get_issue(repo_ref, number)
             .await

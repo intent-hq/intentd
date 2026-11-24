@@ -1749,6 +1749,12 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// already bound — so it is deliberately not wrapped in this timeout.
 pub(crate) const PR_REFRESH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The GitHub API base [`Services::new_isolated`] starts with: loopback port
+/// 0, which nothing can listen on, so an unmocked forge read fails locally.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+pub const ISOLATED_GITHUB_API_BASE_URI: &str = "http://127.0.0.1:0";
+
 impl Services {
     /// Wire the services surface over a persistence handle, keeping secrets in
     /// the process-wide default file (`~/intent/.secrets.json` or
@@ -1773,11 +1779,15 @@ impl Services {
     /// Test constructor: [`Services::new`] over a per-instance scratch
     /// secrets file instead of the home default, so a test can never read,
     /// write or migrate the developer's real `~/intent/.secrets.json` (or its
-    /// `.collaboration` sibling). The scratch dir lives until the last clone
-    /// drops. Use this in every test: under nextest the default constructor
-    /// only avoids the real home by falling back to one scratch store shared
-    /// by the whole test process (see [`intent_core::test_isolation`]), and
-    /// plain `cargo test` has no guard at all.
+    /// `.collaboration` sibling). The GitHub API base defaults to
+    /// [`ISOLATED_GITHUB_API_BASE_URI`], so a test that forgets
+    /// [`Services::with_github_api_base_uri`] gets a local connection error
+    /// instead of sending its token to api.github.com. The scratch dir lives
+    /// until the last clone drops. Use this in every test: under nextest the
+    /// default constructor only avoids the real home by falling back to one
+    /// scratch store shared by the whole test process (see
+    /// [`intent_core::test_isolation`]), and plain `cargo test` has no guard
+    /// at all.
     ///
     /// # Panics
     ///
@@ -1793,6 +1803,7 @@ impl Services {
         let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
         let mut services = Self::new_with_repository_sources(store, secrets, None);
         services.isolated_secrets_dir = Some(Arc::new(dir));
+        services.github_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
         services
     }
 
@@ -6871,8 +6882,12 @@ impl Services {
             }
             return Ok(deferred);
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         for (root_id, repo, numbers) in targets {
             let mut fetched = Vec::new();
             for number in numbers {
@@ -6983,8 +6998,12 @@ impl Services {
             return Ok(PrRefreshOutcome::Skipped);
         }
 
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         self.refresh_workspace_pr_with_sc(ws, &sc).await
     }
 
@@ -7518,6 +7537,7 @@ impl Services {
         // auto-detect, prune, commit-sha backfill) still run below.
         let sc = match pr_ops::resolve_source_control(
             self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
             &self.secret_source(),
         )
         .await
@@ -22906,9 +22926,15 @@ impl WorkspaceApi for Services {
                     let mut pr_derived_branch = false;
                     if let Some(link) = pr_link.as_ref() {
                         let source_control = services.source_control.clone();
+                        let api_base = services.github_api_base_uri.clone();
                         let secrets = services.secret_source();
                         match boxed_await(|| async move {
-                            pr_ops::resolve_source_control(source_control, &secrets).await
+                            pr_ops::resolve_source_control(
+                                source_control,
+                                api_base.as_deref(),
+                                &secrets,
+                            )
+                            .await
                         })
                             .await
                         {
@@ -32890,7 +32916,12 @@ impl WorkspaceApi for Services {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -33195,7 +33226,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.pullsCreate").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
             // the engine sends `input.source_branch` as the raw `head`,
@@ -33253,7 +33289,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.pullsChecks").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -33282,7 +33323,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.pullsReviews").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let page = sc
@@ -33316,7 +33362,7 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.pullsFiles").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(injected, self.github_api_base_uri.as_deref(), &self.secret_source()).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let head_sha = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha
                 .filter(|sha| !sha.is_empty()).ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
@@ -33353,7 +33399,12 @@ impl WorkspaceApi for Services {
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let (limit, cursor) = (req.limit, req.cursor());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_prs(
@@ -33408,7 +33459,12 @@ impl WorkspaceApi for Services {
             let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .list_prs(
                     &repo_ref,
@@ -33462,7 +33518,12 @@ impl WorkspaceApi for Services {
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .list_org_prs(
                     &org,
@@ -33511,7 +33572,12 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.pullsMerge").await?;
             let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let outcome = sc
                 .merge_pr(
@@ -33552,7 +33618,12 @@ impl WorkspaceApi for Services {
             self.require_host_execution("github.reposList").await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .list_repos(intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -33578,7 +33649,12 @@ impl WorkspaceApi for Services {
             // `expectedHeadSha` is accepted for FE shape parity; the engine
             // `update_branch` does not take a race guard, so it is unused.
             let _ = expected_head_sha;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             sc.update_branch(&repo_ref, number)
                 .await
@@ -33601,7 +33677,12 @@ impl WorkspaceApi for Services {
             self.require_host_execution("github.reposSearch").await?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .search_repos(&query, intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -33646,7 +33727,12 @@ impl WorkspaceApi for Services {
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let (limit, cursor) = (req.limit, req.cursor());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_issues(
@@ -33703,7 +33789,12 @@ impl WorkspaceApi for Services {
             let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .list_issues(
                     &repo_ref,
@@ -33746,7 +33837,12 @@ impl WorkspaceApi for Services {
                 .await?;
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let (limit, cursor) = (req.limit, req.cursor());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_review_comments(
@@ -33778,7 +33874,12 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.replyReviewComment")
                 .await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let rc = sc
                 .reply_to_review_comment(&repo_ref, number, comment_id, &body)
@@ -33802,7 +33903,12 @@ impl WorkspaceApi for Services {
                 .await?;
             let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let (limit, cursor) = (req.limit, req.cursor());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .get_review_threads(
@@ -33826,7 +33932,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.resolveThread").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let is_resolved = sc
                 .resolve_thread(&thread_id)
                 .await
@@ -33843,7 +33954,12 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.unresolveThread")
                 .await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let is_resolved = sc
                 .unresolve_thread(&thread_id)
                 .await
@@ -33860,7 +33976,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.reposGet").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             match sc.get_repo(&owner, &repo).await {
                 Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
                 // FE `getGitHubRepo` returns `GithubRepo | null`; a missing repo
@@ -33891,7 +34012,12 @@ impl WorkspaceApi for Services {
             let prefix = prefix
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty());
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let page = sc
                 .list_remote_branches(
                     &owner,
@@ -33990,7 +34116,12 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         self.execution_call(async move {
             self.require_host_execution("github.repoConfigGet").await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             let source = format!(
                 "{}/{}@{}",
@@ -34045,7 +34176,12 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.relatedReposList")
                 .await?;
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
             // payload (directory, non-base64/non-UTF-8 content) folds the
@@ -34085,11 +34221,16 @@ impl WorkspaceApi for Services {
             Self::require_administrator("github.authStatus")?;
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
-            let is_configured =
-                match pr_ops::resolve_source_control(injected, &self.secret_source()).await {
-                    Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
-                    Err(_) => false,
-                };
+            let is_configured = match pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await
+            {
+                Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
+                Err(_) => false,
+            };
             let slot = state.lock().await;
             Ok(github_auth_ops::auth_status_to_wire(
                 is_configured,
@@ -34269,7 +34410,12 @@ impl WorkspaceApi for Services {
                 return Ok(serde_json::json!({ "users": [] }));
             }
             let limit = github_browse_ops::clamp_user_search_limit(limit);
-            let sc = pr_ops::resolve_source_control(injected, &self.secret_source()).await?;
+            let sc = pr_ops::resolve_source_control(
+                injected,
+                self.github_api_base_uri.as_deref(),
+                &self.secret_source(),
+            )
+            .await?;
             let users = sc
                 .search_users(query, limit)
                 .await
@@ -34491,6 +34637,7 @@ impl WorkspaceApi for Services {
                     let (method, user) = if is_configured {
                         let user = match pr_ops::resolve_source_control(
                             self.source_control.clone(),
+                            self.github_api_base_uri.as_deref(),
                             &self.secret_source(),
                         )
                         .await
@@ -37398,8 +37545,12 @@ impl Services {
         }
         let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -37452,8 +37603,12 @@ impl Services {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
         let repo_ref = pr_ops::repo_of(&ws)?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
