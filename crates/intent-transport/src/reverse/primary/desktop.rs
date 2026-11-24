@@ -40,12 +40,15 @@ pub(super) fn resolve(
 ) -> DesktopResult<DesktopConnection> {
     let state = registry.inner.lock();
     let entry = resolve_entry(&state.entries, target).map_err(|_| {
-        // A named client that is connected but cannot execute (a web tab)
-        // is incapable, not offline.
+        // A named client that is connected, and allowed to host browser
+        // work, but cannot execute (a web tab) is incapable, not offline.
+        // A connection without that authority keeps the old answer:
+        // capability is not permission (desktop.md).
         let connected = match target {
-            ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => {
-                state.entries.iter().any(|entry| entry.has_client(id))
-            }
+            ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => state
+                .entries
+                .iter()
+                .any(|entry| entry.has_client(id) && entry.channel.may_host_browser()),
             ReverseTarget::Default | ReverseTarget::Preferred(_) => false,
         };
         if connected {
@@ -231,6 +234,27 @@ mod tests {
                 "{target:?}"
             );
         }
+        // Without the authority to host browser work the answer stays
+        // offline: capability is not permission.
+        let guest = registry.register(
+            ReverseChannel::new(mpsc::channel(4).0).with_administrator(false),
+            ReverseTransport::Wss,
+        );
+        let guest_identity = ReverseClientIdentity {
+            client_id: ClientId::from("guest"),
+            name: None,
+            capabilities: json!({"browserExec":true,"desktopControl":1}),
+            host: ClientHostInfo::default(),
+        };
+        guest.bind_device(guest_identity.clone(), principal.clone());
+        guest.bind_hello(guest_identity);
+        assert_eq!(
+            registry
+                .desktop_resolve(&ReverseTarget::Client(ClientId::from("guest")), &principal)
+                .unwrap_err()
+                .code,
+            "desktop-offline"
+        );
         drop(web);
         assert_eq!(
             registry

@@ -78,7 +78,19 @@ impl TenantFence {
     /// Fire the fence: this process stops serving the tenant. Only the first
     /// call counts (its `reason` is kept); returns whether this call fired.
     pub fn fire(&self, reason: impl Into<String>) -> bool {
-        let reason: Arc<str> = reason.into().into();
+        self.fire_at(reason.into(), false)
+    }
+
+    /// [`Self::fire`] because this process lost the tenant (another process
+    /// took the lease over, or it could not renew in time): logged at ERROR,
+    /// since this is the incident behind every refusal that follows
+    /// ([`Self::refused`] logs those quietly).
+    pub fn fire_lost(&self, reason: impl Into<String>) -> bool {
+        self.fire_at(reason.into(), true)
+    }
+
+    fn fire_at(&self, reason: String, lost: bool) -> bool {
+        let reason: Arc<str> = reason.into();
         let fired = self.0.reason.send_if_modified(|current| {
             if current.is_some() {
                 return false;
@@ -86,7 +98,9 @@ impl TenantFence {
             *current = Some(reason.clone());
             true
         });
-        if fired {
+        if fired && lost {
+            tracing::error!(%reason, "tenant fence fired: this process lost the tenant and stops serving it");
+        } else if fired {
             tracing::warn!(%reason, "tenant fence fired: this process stops serving the tenant");
         }
         fired

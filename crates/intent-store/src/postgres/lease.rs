@@ -206,7 +206,7 @@ impl ClaimSlot {
         }
         let checked = fence(tenant, claim.as_ref(), row);
         if let (Err(e), Some(claim)) = (&checked, &claim) {
-            claim.fence.fire(e.to_string());
+            claim.fence.fire_lost(e.to_string());
         }
         checked
     }
@@ -425,7 +425,7 @@ impl PgStore {
                 claim.instance,
                 claim.epoch
             ));
-            claim.fence.fire(e.to_string());
+            claim.fence.fire_lost(e.to_string());
             return Err(e);
         };
         timestamp(ms)
@@ -892,7 +892,7 @@ async fn heartbeat(
     state: watch::Sender<LeaseState>,
 ) -> Error {
     let lose = |e: Error| {
-        fence.fire(e.to_string());
+        fence.fire_lost(e.to_string());
         state.send_replace(LeaseState::Lost(e.to_string()));
         e
     };
