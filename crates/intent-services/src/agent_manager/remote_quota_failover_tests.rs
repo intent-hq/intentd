@@ -1696,3 +1696,55 @@ async fn a_backup_after_a_stopped_silent_retry_gets_the_failed_first_message() {
     let new = sent.find("try again?").expect("the new message is sent");
     assert!(sent.find(FIRST_MESSAGE).unwrap() < new, "{sent}");
 }
+
+/// Review of intentd#3739: two messages sent at once to an agent whose
+/// first turn failed. Neither recovery may cancel the turn the other
+/// started: the failed message and both new ones each reach the provider
+/// exactly once. Sweeps interleavings by delaying the second send.
+#[intent_test_macros::daemon_test]
+async fn two_sends_after_a_failed_remote_first_turn_deliver_every_message_once() {
+    for yields in 0..6u32 {
+        let next = FakeRuntime::new();
+        next.finish.add_permits(8);
+        let (_tmp, mgr, ws, id) = remote_failed_first_turn(
+            &format!("remote-first-turn-race-{yields}"),
+            vec![Launch::Runs(next.clone())],
+        )
+        .await;
+
+        let second = async {
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            send(&mgr, &id, &ws, "message beta").await;
+        };
+        tokio::join!(send(&mgr, &id, &ws, "message alpha"), second);
+        next.wait_prompts(1).await;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !all_prompts(&next).contains("message beta")
+                    || !all_prompts(&next).contains("message alpha")
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("yields={yields}: {}", all_prompts(&next)));
+        wait_idle(&mgr, &id).await;
+
+        let sent = all_prompts(&next);
+        for text in [FIRST_MESSAGE, "message alpha", "message beta"] {
+            assert_eq!(
+                sent.matches(text).count(),
+                1,
+                "yields={yields} {text}: {sent}"
+            );
+        }
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "yields={yields}"
+        );
+    }
+}

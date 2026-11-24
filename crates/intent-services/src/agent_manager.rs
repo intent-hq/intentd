@@ -9371,12 +9371,12 @@ impl AgentManager {
             return Ok(result);
         }
         // A fresh send into an `Error` session whose failed turn's message
-        // still waits in the queue: queue this one behind it and redrive as
-        // `agent.retry` does, so the batch flush delivers both in order in
-        // one turn. A direct turn would run this message alone, and a
-        // provider session that never saw the failed one would lack it.
-        // While the failing worker still holds the slot, the parked
-        // recovery send below applies instead: a retry would abort it.
+        // still waits in the queue: queue this one behind it and lift the
+        // Error park, so the batch flush delivers both in order in one turn.
+        // A direct turn would run this message alone, and a provider session
+        // that never saw the failed one would lack it. While the failing
+        // worker still holds the slot, the parked recovery send below
+        // applies instead.
         if session.status == AgentStatus::Error
             && !self.is_busy(&agent_id)
             && self.services.has_ready_failed_turn(&agent_id)
@@ -9400,7 +9400,7 @@ impl AgentManager {
             });
             queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
-            self.agent_retry(agent_id, workspace_id).await?;
+            self.redrive_failed_turn(&agent_id, &workspace_id).await?;
             return Ok(result);
         }
         #[cfg(test)]
@@ -11493,6 +11493,39 @@ impl AgentManager {
             result["turnId"] = json!(tid);
         }
         Ok(result)
+    }
+
+    /// Lift a failed turn's `Error` park for a fresh send queued behind its
+    /// message, then drain. Unlike [`AgentManager::agent_retry`] it tears
+    /// nothing down: the flip happens once, under the turn-start gate, and
+    /// a concurrent send that finds the park already lifted only kicks the
+    /// drain, so it can never cancel the turn the first one started.
+    async fn redrive_failed_turn(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        {
+            let gate = self.turn_start_gates.for_agent(agent_id);
+            let _starting = gate.lock().await;
+            if !self.is_busy(agent_id)
+                && self
+                    .services
+                    .store
+                    .get_agent_session_status(agent_id)
+                    .await?
+                    == AgentStatus::Error
+            {
+                self.services.clear_failure_streak(agent_id);
+                self.services.clear_failure_wake_dedup(agent_id);
+                self.persist_retry_status(agent_id, workspace_id, AgentStatus::Pending)
+                    .await?;
+            }
+        }
+        self.clone()
+            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+            .await;
+        Ok(())
     }
 
     /// Persist an `agent.retry` status transition (clearing any persisted
