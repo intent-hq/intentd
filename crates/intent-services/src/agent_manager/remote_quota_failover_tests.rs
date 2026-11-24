@@ -1765,7 +1765,12 @@ async fn wait_delivered(mgr: &Arc<AgentManager>, id: &AgentId, run: &FakeRuntime
 }
 
 /// Each of `texts` reached `run` exactly once, in order, and nothing waits.
-fn assert_delivered_once_in_order(mgr: &AgentManager, id: &AgentId, run: &FakeRuntime, texts: &[&str]) {
+fn assert_delivered_once_in_order(
+    mgr: &AgentManager,
+    id: &AgentId,
+    run: &FakeRuntime,
+    texts: &[&str],
+) {
     let sent = all_prompts(run);
     let mut last = 0;
     for text in texts {
@@ -1788,7 +1793,10 @@ async fn paused_retry(
     mgr: &Arc<AgentManager>,
     id: &AgentId,
     ws: &WorkspaceId,
-) -> (Arc<crate::agent_manager::TurnStartPause>, tokio::task::JoinHandle<Value>) {
+) -> (
+    Arc<crate::agent_manager::TurnStartPause>,
+    tokio::task::JoinHandle<Value>,
+) {
     let pause = Arc::new(crate::agent_manager::TurnStartPause::default());
     *mgr.retry_pause.lock().unwrap() = Some(pause.clone());
     let retry = tokio::spawn({
@@ -1821,7 +1829,12 @@ async fn a_retry_racing_a_new_message_does_not_cancel_its_turn() {
     wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
 
     assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
-    assert_eq!(next.cancels.load(Ordering::SeqCst), 0, "{}", all_prompts(&next));
+    assert_eq!(
+        next.cancels.load(Ordering::SeqCst),
+        0,
+        "{}",
+        all_prompts(&next)
+    );
 }
 
 /// Two Try again clicks: the second must not abort the turn the first started.
@@ -1840,7 +1853,12 @@ async fn a_second_retry_does_not_cancel_the_first_ones_turn() {
     wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE]).await;
 
     assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE]);
-    assert_eq!(next.cancels.load(Ordering::SeqCst), 0, "{}", all_prompts(&next));
+    assert_eq!(
+        next.cancels.load(Ordering::SeqCst),
+        0,
+        "{}",
+        all_prompts(&next)
+    );
 }
 
 /// Try again and a new message at once, across interleavings: every message
