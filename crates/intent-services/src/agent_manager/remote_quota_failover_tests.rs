@@ -1919,3 +1919,37 @@ async fn a_store_error_after_queueing_reports_the_message_queued() {
 
     assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
 }
+
+/// A new message's turn starts but its `Active` write fails, so the store
+/// still says `Error`. Try again must not take that turn for the failed one
+/// and cancel it.
+#[intent_test_macros::daemon_test]
+async fn a_retry_does_not_cancel_a_turn_whose_active_write_failed() {
+    let next = FakeRuntime::new();
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("retry-vs-unrecorded", vec![Launch::Runs(next.clone())]).await;
+    assert!(mgr.services.clear_queue(&id), "the failed message was queued");
+
+    mgr.active_write_fault
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    send(&mgr, &id, &ws, "message alpha").await;
+    next.wait_prompts(1).await;
+    assert_eq!(
+        mgr.services.store.get_agent_session_status(&id).await.unwrap(),
+        AgentStatus::Error,
+        "the Active write failed"
+    );
+
+    let retried = mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+    assert_eq!(retried["ok"], json!(true), "{retried}");
+    next.finish.add_permits(8);
+    wait_delivered(&mgr, &id, &next, &["message alpha"]).await;
+
+    assert_delivered_once_in_order(&mgr, &id, &next, &["message alpha"]);
+    assert_eq!(
+        next.cancels.load(Ordering::SeqCst),
+        0,
+        "{}",
+        all_prompts(&next)
+    );
+}

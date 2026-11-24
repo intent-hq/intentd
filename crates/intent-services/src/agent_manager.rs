@@ -3419,6 +3419,9 @@ pub struct AgentManager {
     /// Fails the next status read of a send's failed-turn redrive.
     #[cfg(test)]
     redrive_store_fault: std::sync::atomic::AtomicBool,
+    /// Fails the next turn start's `Active` write.
+    #[cfg(test)]
+    active_write_fault: std::sync::atomic::AtomicBool,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3571,6 +3574,8 @@ impl AgentManager {
             retry_pause: Mutex::new(None),
             #[cfg(test)]
             redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            active_write_fault: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -8585,16 +8590,24 @@ impl AgentManager {
                 }
             }
             self.services.agent_activity_begin(workspace_id).await;
-            // Clear stop_reason when starting a new turn: successful turns leave it cleared.
-            self.persist_status_with_stop_reason(
-                agent_id,
-                workspace_id,
-                AgentStatus::Active,
-                true,
-                Some(None),
-                true,
-            )
-            .await;
+            #[cfg(test)]
+            let faulted = self
+                .active_write_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let faulted = false;
+            if !faulted {
+                // Clear stop_reason when starting a new turn: successful turns leave it cleared.
+                self.persist_status_with_stop_reason(
+                    agent_id,
+                    workspace_id,
+                    AgentStatus::Active,
+                    true,
+                    Some(None),
+                    true,
+                )
+                .await;
+            }
         }
         true
     }
