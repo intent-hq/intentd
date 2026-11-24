@@ -832,7 +832,7 @@ async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
     let Some(h) = harness(1, &[]) else { return };
     h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("block"))
+        .prompt(&AgentId::from("a1"), "t1".into(), text("@block"))
         .await;
     wait_for(&h.runner, "first turn output", |r| {
         r.turn_id.as_deref() == Some("t1") && matches!(r.body, JournalBody::Notification { .. })
@@ -865,6 +865,41 @@ async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
     h.runner.shutdown().await;
 }
 
+/// The fixture's directives are whole prompts: a prompt that only mentions
+/// one (a stopped "@block" message redelivered with the next, as during
+/// intentd#3707) runs as an ordinary turn instead of parking, and a
+/// misspelled directive fails at once instead of hanging the test.
+#[tokio::test]
+async fn node_fixture_directives_trigger_only_on_the_whole_prompt() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    let prompts = [
+        "sixth block\n\nseventh",
+        "@block sixth\n\nseventh",
+        "a block slow-cancel with many words, slow spawn-exit",
+    ];
+    for (i, prompt) in prompts.iter().enumerate() {
+        let turn = format!("t{i}");
+        h.runner
+            .prompt(&AgentId::from("a1"), turn.clone(), text(prompt))
+            .await;
+        let all = wait_for(&h.runner, prompt, turn_ended("a1", &turn)).await;
+        assert_eq!(
+            turn_end(find(&all, turn_ended("a1", &turn))),
+            ("end_turn", None),
+            "{prompt:?}"
+        );
+    }
+    h.runner
+        .prompt(&AgentId::from("a1"), "typo".into(), text("@blok"))
+        .await;
+    let all = wait_for(&h.runner, "typo", turn_ended("a1", "typo")).await;
+    let (_, error) = turn_end(find(&all, turn_ended("a1", "typo")));
+    assert!(error.unwrap().contains("@blok"), "{error:?}");
+    assert_eq!(h.runner.running(), vec![AgentId::from("a1")]);
+    h.runner.shutdown().await;
+}
+
 #[tokio::test]
 async fn node_runner_answers_a_prompt_for_an_exited_agent() {
     let Some(h) = harness(1, &[]) else { return };
@@ -894,7 +929,7 @@ async fn node_runner_tags_every_chunk_of_a_turn_even_when_the_journal_lags() {
     // 201 notifications arrive faster than they are fsync'd; the turn ends
     // (and the next one starts) while most are still queued.
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("many"))
+        .prompt(&AgentId::from("a1"), "t1".into(), text("@many"))
         .await;
     wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
     h.runner
@@ -904,7 +939,7 @@ async fn node_runner_tags_every_chunk_of_a_turn_even_when_the_journal_lags() {
     let tag = |r: &JournalRecord| match &r.body {
         JournalBody::Notification { notification } => {
             let text = notification.to_string();
-            if text.contains("chunk ") || text.contains("echo: many") {
+            if text.contains("chunk ") || text.contains("echo: @many") {
                 Some(("t1", r.turn_id.clone()))
             } else if text.contains("echo: next") {
                 Some(("t2", r.turn_id.clone()))
@@ -1008,7 +1043,7 @@ async fn node_runner_kills_a_helper_started_just_before_the_provider_exits() {
     let Some(h) = harness(1, &[]) else { return };
     h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("spawn-exit"))
+        .prompt(&AgentId::from("a1"), "t1".into(), text("@spawn-exit"))
         .await;
     wait_for(&h.runner, "exit", exited("a1")).await;
     let path = h
@@ -1049,7 +1084,7 @@ async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled()
     let Some(h) = harness(1, &[]) else { return };
     h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("many"))
+        .prompt(&AgentId::from("a1"), "t1".into(), text("@many"))
         .await;
     // Stop as soon as the burst starts arriving, with most of it queued.
     wait_for(&h.runner, "first output", |r| {

@@ -2065,7 +2065,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         &mut rpc_ws,
         500,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "block here" }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "@block here" }),
     )
     .await;
     let busy = timeout(wait(), async {

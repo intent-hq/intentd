@@ -390,14 +390,14 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         &mut rpc_ws,
         74,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": kid, "content": "block here" }),
+        json!({ "workspaceId": ws_id, "agentId": kid, "content": "@block here" }),
     )
     .await;
     // A remote turn's text is not served mid-turn: its first streamed
-    // chunk ("echo: block here") moves the stream stamp, and then it parks.
+    // chunk ("echo: @block here") moves the stream stamp, and then it parks.
     agent_until(&mut rpc_ws, (&ws_id, &kid), 75, |a| {
         a["turnInFlight"] == true
-            && a["lastUserMessage"] == "block here"
+            && a["lastUserMessage"] == "@block here"
             && streamed(a) != streamed_before
     })
     .await;
