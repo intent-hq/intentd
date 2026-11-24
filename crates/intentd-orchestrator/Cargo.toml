@@ -32,6 +32,7 @@ intent-services = { workspace = true }
 intent-store = { workspace = true }
 intent-transport = { workspace = true }
 sha2 = "0.11"
+sysinfo = { version = "0.40.3", default-features = false, features = ["system"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

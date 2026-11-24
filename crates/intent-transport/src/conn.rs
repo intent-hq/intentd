@@ -1336,9 +1336,7 @@ async fn finish_prepared_rpc(
 /// daemon version (intent-hq/intent#7256). Only library-level compositions
 /// without a control surface (no daemon binary) fall back to this crate's.
 fn hello_version(control: Option<&Arc<dyn SystemControl>>) -> &str {
-    control.map_or(env!("CARGO_PKG_VERSION"), |control| {
-        control.daemon_version()
-    })
+    control.map_or(crate::VERSION, |control| control.daemon_version())
 }
 
 fn is_dispatchable(parsed: Option<&Value>) -> bool {

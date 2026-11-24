@@ -29,7 +29,7 @@ use intent_services::{EventBus, Services};
 use intent_transport::{
     AsyncTokenStore, ConnectionGuard, ConnectionHook, ConnectionSet, HostEnvironment,
     PairingSnapshot, PrimaryReverseRegistry, RpcLimiter, SecretTokenStore, ServerPairingInfo,
-    WsApiServer, WsOptions,
+    SystemControl, SystemStatus, WsApiServer, WsOptions,
 };
 
 /// The local socket path; `<data_dir>/orchestrator.sock` when unset.
@@ -184,6 +184,236 @@ impl ServerPairingInfo for Pairing {
     }
 }
 
+/// `system.status` on both listeners: `intentd`'s wire shape with this
+/// process's values, so the app's daemon-health poll sees a healthy
+/// backend. Status only ([`SystemServices::StatusOnly`]): `system.shutdown`,
+/// `system.requestUpdate` and `system.gitCredential` stay unserved, since a
+/// client must not stop or update a process that serves other tenants.
+///
+/// [`SystemServices::StatusOnly`]: intent_transport::control::SystemServices::StatusOnly
+struct StatusControl {
+    services: Services,
+    host: HostEnvironment,
+    /// Weak: the listener owns this control, so a strong reference would
+    /// keep a stopped listener (and the tenant's `Services`) alive. The
+    /// strong one is [`ListenersStop`]'s.
+    ws: Arc<OnceLock<std::sync::Weak<WsApiServer>>>,
+    /// The WSS port once bound; for the synchronous [`SystemControl::status`].
+    port: Arc<OnceLock<u16>>,
+    started: std::time::Instant,
+    /// Kept fresh by [`sample_usage`], never collected on the request path.
+    sample: Arc<std::sync::Mutex<UsageSample>>,
+}
+
+/// What [`sample_usage`] last read: this process's CPU (100 = one core) and
+/// resident memory, and the host's addresses for `localIps`.
+#[derive(Default)]
+struct UsageSample {
+    cpu_percent: f32,
+    memory_bytes: u64,
+    local_v4: Vec<String>,
+    local_v6: Vec<String>,
+}
+
+/// How often [`sample_usage`] reads CPU and memory: CPU is a delta between
+/// two reads, so a fixed interval keeps it steady however often clients poll.
+const USAGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many [`USAGE_INTERVAL`]s apart the host's addresses are re-read.
+const ROUTES_EVERY: u32 = 10;
+
+/// Keep `sample` fresh until the listeners stop (or are dropped): CPU and memory every
+/// [`USAGE_INTERVAL`], the addresses every [`ROUTES_EVERY`] of them, off the
+/// runtime's worker threads. Without `sysinfo` on this host, usage reads 0.
+async fn sample_usage(
+    sample: Arc<std::sync::Mutex<UsageSample>>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) {
+    let process = sysinfo::System::new()
+        .ok()
+        .zip(sysinfo::get_current_pid().ok());
+    let process = Arc::new(std::sync::Mutex::new(process));
+    let mut tick = tokio::time::interval(USAGE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks = 0_u32;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            // Stopped, or every handle to the listeners dropped.
+            _ = stopped.wait_for(|stopped| *stopped) => return,
+        }
+        let routes = ticks.is_multiple_of(ROUTES_EVERY);
+        ticks = ticks.wrapping_add(1);
+        let process = process.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut process = process
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let usage = process.as_mut().and_then(|(system, pid)| {
+                system.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[*pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::nothing()
+                        .with_cpu()
+                        .with_memory(),
+                );
+                system
+                    .process(*pid)
+                    .map(|process| (process.cpu_usage(), process.memory()))
+            });
+            let routes = routes.then(|| {
+                (
+                    intent_transport::collect_local_ips(),
+                    intent_transport::collect_local_ipv6s(),
+                )
+            });
+            (usage, routes)
+        })
+        .await;
+        let Ok((usage, routes)) = read else { continue };
+        let mut sample = sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cpu, memory)) = usage {
+            sample.cpu_percent = cpu;
+            sample.memory_bytes = memory;
+        }
+        if let Some((v4, v6)) = routes {
+            sample.local_v4 = v4;
+            sample.local_v6 = v6;
+        }
+    }
+}
+
+impl StatusControl {
+    fn snapshot(&self, port: Option<u16>) -> SystemStatus {
+        use intent_app::remote::RemoteServicesExt as _;
+        let ws = self.ws.get().and_then(std::sync::Weak::upgrade);
+        let ws = ws.as_deref();
+        let tcp = port.is_some();
+        // Agents run only on other machines; a local manager, if any, is
+        // counted as `intentd` counts its own.
+        let manager = self.services.agent_manager();
+        let (cpu_percent, memory_bytes, local_ips) = {
+            let sample = self
+                .sample
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let local_ips = match (ws, tcp) {
+                (Some(ws), true) => intent_transport::advertised_hosts(
+                    Some(&ws.bound_addresses()),
+                    &sample.local_v4,
+                    &sample.local_v6,
+                ),
+                _ => Vec::new(),
+            };
+            (sample.cpu_percent, sample.memory_bytes, local_ips)
+        };
+        SystemStatus {
+            listen_mode: if tcp { "both" } else { "uds" }.to_owned(),
+            uds: true,
+            tcp,
+            port,
+            clients: ws.map_or(0, WsApiServer::client_count),
+            agents: manager.as_ref().map_or(0, |m| m.registry().size()),
+            fingerprint: ws.and_then(|ws| ws.fingerprint().map(str::to_owned)),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            // A server process: no display of its own.
+            has_display: false,
+            max_agents: manager.as_ref().map_or(0, |m| m.registry().cap()),
+            version: self.daemon_version().to_owned(),
+            build_commit: intent_transport::BUILD_COMMIT.map(str::to_owned),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            local_ips,
+            tc_address: None,
+            hostname: self.host.hostname.clone(),
+            pretty_hostname: self.host.pretty_hostname.clone(),
+            device_kind: self.host.device_kind.clone(),
+            hardware_model: self.host.hardware_model.clone(),
+            cpu_percent,
+            memory_bytes,
+            child_processes: None,
+            child_memory_bytes: None,
+            child_memory_peak_bytes: None,
+            agent_memory_bytes: None,
+            agent_process_count: None,
+            agent_memory_budget_bytes: None,
+            agent_memory_charged_bytes: None,
+            queued_spawns: None,
+            workspaces_disk_available_bytes: None,
+            workspaces_disk_total_bytes: None,
+            file_watch: None,
+            fd_count: None,
+            fd_limit: None,
+            // No sitter supervises the orchestrator.
+            update_supported: false,
+            busy_agents: manager.as_ref().map_or(0, |m| m.list_busy().len()),
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: Some(intent_transport::RemoteLinks {
+                backends: 0,
+                machines: self
+                    .services
+                    .remote_feature()
+                    .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
+            }),
+            workload_containment: None,
+        }
+    }
+}
+
+impl SystemControl for StatusControl {
+    fn services(&self) -> intent_transport::control::SystemServices {
+        intent_transport::control::SystemServices::StatusOnly
+    }
+
+    fn status(&self) -> SystemStatus {
+        self.snapshot(self.port.get().copied())
+    }
+
+    fn metadata_status(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SystemStatus> + Send + '_>> {
+        Box::pin(async move {
+            let ws = self.ws.get().and_then(std::sync::Weak::upgrade);
+            let port = match ws {
+                Some(ws) => ws.bound_port().await,
+                None => None,
+            };
+            self.snapshot(port)
+        })
+    }
+
+    /// The version `client.hello` advertised before this control was
+    /// installed: the transport's, which ships in `intentd`'s version group.
+    fn daemon_version(&self) -> &str {
+        intent_transport::VERSION
+    }
+
+    fn host_environment(&self) -> HostEnvironment {
+        self.host.clone()
+    }
+
+    fn request_shutdown(&self) {}
+
+    fn request_update(&self) -> Result<(), String> {
+        Err("the orchestrator is not updated through a client".to_owned())
+    }
+
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<intent_transport::control::GitCredential>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { None })
+    }
+}
+
 /// The running client listeners. They serve until [`Self::stop`] or the
 /// end of the process; the tenant's fence closes their connections.
 pub struct ClientListeners {
@@ -197,6 +427,8 @@ pub struct ClientListeners {
 #[derive(Clone)]
 pub struct ListenersStop {
     ws: WsApiServer,
+    /// What the status control reaches weakly; dropped with the last clone.
+    _status_ws: Arc<WsApiServer>,
     stop_socket: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     stopped: Arc<tokio::sync::watch::Sender<bool>>,
 }
@@ -294,6 +526,20 @@ pub async fn start_client_listeners(
         ..WsOptions::default()
     };
     let ws_slot = Arc::new(OnceLock::new());
+    let host = tokio::task::spawn_blocking(intent_transport::detect_host_environment)
+        .await
+        .map_err(|e| format!("host environment: {e}"))?;
+    let port_slot = Arc::new(OnceLock::new());
+    let status_ws_slot = Arc::new(OnceLock::new());
+    let sample = Arc::new(std::sync::Mutex::new(UsageSample::default()));
+    let control: Arc<dyn SystemControl> = Arc::new(StatusControl {
+        services: services.clone(),
+        host: host.clone(),
+        ws: status_ws_slot.clone(),
+        port: port_slot.clone(),
+        started: std::time::Instant::now(),
+        sample: sample.clone(),
+    });
     let (mut ws, pairing) = if config.insecure {
         tracing::warn!(
             bind = ?config.bind_addresses,
@@ -305,7 +551,7 @@ pub async fn start_client_listeners(
             bus.clone(),
             options,
             reverse.clone(),
-            None,
+            Some(control.clone()),
         );
         (ws, None)
     } else {
@@ -320,9 +566,7 @@ pub async fn start_client_listeners(
         let pairing: Arc<dyn ServerPairingInfo> = Arc::new(Pairing {
             tls_dir: config.tls_dir.clone(),
             tokens: (*tokens).clone(),
-            host: tokio::task::spawn_blocking(intent_transport::detect_host_environment)
-                .await
-                .map_err(|e| format!("host environment: {e}"))?,
+            host,
             ws: ws_slot.clone(),
         });
         let mut ws = WsApiServer::new_with_reverse(
@@ -332,7 +576,7 @@ pub async fn start_client_listeners(
             &tokens,
             options,
             reverse.clone(),
-            None,
+            Some(control.clone()),
         )
         .map_err(|e| format!("WSS listener: {e}"))?;
         ws.install_pairing_info(pairing.clone());
@@ -344,6 +588,9 @@ pub async fn start_client_listeners(
         .await
         .map_err(|e| format!("WSS listener on port {}: {e}", config.ws_port))?;
     let _ = ws_slot.set(ws.clone());
+    let status_ws = Arc::new(ws.clone());
+    let _ = status_ws_slot.set(Arc::downgrade(&status_ws));
+    let _ = port_slot.set(ws_port);
 
     let socket_path = config.socket_path.clone();
     // A stale socket file would pass the bind wait below; the listener
@@ -358,7 +605,7 @@ pub async fn start_client_listeners(
                 api,
                 bus,
                 &socket_path,
-                None,
+                Some(control),
                 pairing,
                 reverse,
                 limiter,
@@ -380,12 +627,15 @@ pub async fn start_client_listeners(
         secure = !config.insecure,
         "serving the default tenant's clients"
     );
+    let stop = ListenersStop {
+        ws,
+        _status_ws: status_ws,
+        stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
+        stopped: Arc::new(tokio::sync::watch::channel(false).0),
+    };
+    tokio::spawn(sample_usage(sample, stop.stopped.subscribe()));
     Ok(ClientListeners {
-        stop: ListenersStop {
-            ws,
-            stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
-            stopped: Arc::new(tokio::sync::watch::channel(false).0),
-        },
+        stop,
         ws_port,
         socket_path,
         socket,

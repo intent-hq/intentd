@@ -48,6 +48,11 @@ pub use ws::{
     GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions, GUEST_CAP_RETRY_AFTER_SECS,
 };
 
+/// This crate's version, which ships in `intentd`'s release-plz version
+/// group: what `client.hello` advertises for a composition without its own
+/// daemon binary version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Source commit embedded at build time, when the build environment can identify it.
 pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
 
