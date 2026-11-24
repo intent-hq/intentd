@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
-    JournalBody, JournalRecord, LinkFrame, LinkHello, LinkWelcome, MachineCapabilities,
-    ProviderCapability, ProviderStatus,
+    JournalBody, JournalRecord, LaunchCommand, LinkFrame, LinkHello, LinkWelcome,
+    MachineCapabilities, ProviderCapability, ProviderStatus,
 };
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
@@ -250,19 +250,27 @@ impl Machine {
         })
     }
 
-    /// The link head's connector keeps, skipping any that closed already
-    /// (`remoteMachines.add`'s probe). The machine has nothing to replay.
-    async fn bound(&mut self) -> MachineEnd {
+    /// The link head launches the agent on, and the launch: links that
+    /// close without one (`remoteMachines.add`'s probe, which a send may
+    /// still reach just before it closes) are skipped. The machine has
+    /// nothing to replay.
+    async fn launched(&mut self) -> (MachineEnd, LaunchCommand) {
         loop {
-            let end = self.accept().await;
-            let replayed = end
+            let mut end = self.accept().await;
+            let _ = end
                 .link
                 .send(&LinkFrame::ReplayComplete {
                     through_seq: NodeCounter(0),
                 })
                 .await;
-            if replayed.is_ok() {
-                return end;
+            let launch = end
+                .next(wait(), |frame| match frame {
+                    LinkFrame::Launch(command) => Some(command),
+                    _ => None,
+                })
+                .await;
+            if let Some(launch) = launch {
+                return (end, launch);
             }
         }
     }
@@ -312,7 +320,8 @@ impl MachineEnd {
     }
 
     /// The next frame `pick` accepts, answering capability requests and
-    /// skipping everything else. `None` when none arrives within `within`.
+    /// skipping everything else. `None` when none arrives within `within`
+    /// or the link closes first.
     async fn next<T>(
         &mut self,
         within: Duration,
@@ -322,23 +331,27 @@ impl MachineEnd {
             loop {
                 match self.events.recv().await {
                     Some(LinkEvent::Frame(LinkFrame::Capabilities)) => {
-                        self.send(LinkFrame::CapabilitiesReply {
-                            capabilities: capabilities(),
-                        })
-                        .await;
+                        // A closing link is seen on the next receive.
+                        let _ = self
+                            .link
+                            .send(&LinkFrame::CapabilitiesReply {
+                                capabilities: capabilities(),
+                            })
+                            .await;
                     }
                     Some(LinkEvent::Frame(frame)) => {
                         if let Some(found) = pick(frame) {
-                            return found;
+                            return Some(found);
                         }
                     }
                     Some(LinkEvent::Request(_)) => {}
-                    None => panic!("the link closed"),
+                    None => return None,
                 }
             }
         })
         .await
         .ok()
+        .flatten()
     }
 }
 
@@ -466,14 +479,7 @@ async fn a_tenant_agent_runs_its_turn_on_a_machine() {
 
     // Head dials the machine for the agent: it is told to launch it, then
     // gets the message.
-    let mut end = machine.bound().await;
-    let launch = end
-        .next(wait(), |frame| match frame {
-            LinkFrame::Launch(command) => Some(command),
-            _ => None,
-        })
-        .await
-        .expect("the agent is launched on the machine");
+    let (mut end, launch) = machine.launched().await;
     assert_eq!(launch.agent_id, agent_id);
     assert_eq!(launch.provider, "mock");
     end.journal(

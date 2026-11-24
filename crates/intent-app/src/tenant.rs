@@ -453,6 +453,42 @@ pub struct TenantRuntime {
     connections: ClientConnections,
     tasks: Vec<AbortHandle>,
     loops: Vec<AbortHandle>,
+    recovery: Recovery,
+}
+
+/// The tenant's startup completion reconcile: stopped between operations
+/// and joined by the self-fence.
+#[derive(Clone)]
+struct Recovery {
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
+    running: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self {
+            stop: Arc::new(tokio::sync::watch::channel(false).0),
+            running: Arc::default(),
+        }
+    }
+}
+
+impl Recovery {
+    fn stopping(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    fn hold(&self, running: JoinHandle<()>) {
+        *lock(&self.running) = Some(running);
+    }
+
+    async fn drain(&self) {
+        self.stop.send_replace(true);
+        let running = lock(&self.running).take();
+        if let Some(running) = running {
+            let _ = running.await;
+        }
+    }
 }
 
 impl TenantRuntime {
@@ -524,7 +560,13 @@ impl TenantRuntime {
             runner.adopt_task(task);
         }
         let stopping = services.clone();
+        let recovery = Recovery::default();
+        let draining = recovery.clone();
         runner.on_tasks(move || async move {
+            // Before the agent manager stops: a wake the reconcile admitted
+            // finishes (its durable claim is never stranded); later ones are
+            // skipped.
+            draining.drain().await;
             stopping.shutdown_pty_sessions().await;
             stopping.host_exec_runtime().shutdown().await;
             if let Some(manager) = stopping.agent_manager() {
@@ -535,7 +577,28 @@ impl TenantRuntime {
             connections,
             tasks,
             loops,
+            recovery,
         }
+    }
+
+    /// Reconcile the completion bookkeeping restored at start
+    /// (`Services::prepare_startup_completion_recovery`) on a task of its
+    /// own: deliver what finished while no one served the backend. The
+    /// tenant's self-fence drains it before the agent manager stops, as
+    /// `intentd` joins it.
+    pub fn reconcile_completions(
+        &self,
+        services: &Services,
+        completions: intent_services::StartupCompletionRecovery,
+    ) {
+        let services = services.clone();
+        let stopping = self.recovery.stopping();
+        let running = intent_core::spawn_daemon(async move {
+            services
+                .reconcile_startup_completions(completions, &stopping)
+                .await;
+        });
+        self.recovery.hold(running);
     }
 
     /// The tenant's client connections.
@@ -554,5 +617,35 @@ impl TenantRuntime {
     #[must_use]
     pub fn loops_running(&self) -> usize {
         self.loops.iter().filter(|task| !task.is_finished()).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// The fence's drain tells the reconcile to stop and waits until it
+    /// has: an operation it already admitted finishes first.
+    #[tokio::test]
+    async fn the_drain_stops_the_reconcile_and_waits_for_it() {
+        let recovery = Recovery::default();
+        let mut stopping = recovery.stopping();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        recovery.hold(tokio::spawn(async move {
+            let _ = stopping.wait_for(|stop| *stop).await;
+            // The admitted operation's last step, after the stop request.
+            tokio::task::yield_now().await;
+            done.store(true, Ordering::SeqCst);
+        }));
+        recovery.drain().await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the drain joined the reconcile"
+        );
+        // Draining again (nothing held) returns at once.
+        recovery.drain().await;
     }
 }

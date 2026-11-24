@@ -223,9 +223,26 @@ async fn try_serve_tenant_with(
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
-    let recovered = recover_tenant(&services, &bus, &dir, &fence)
-        .await
-        .map_err(|e| Error::Internal(format!("tenant {tenant}: startup recovery: {e}")))?;
+    let recovered = match recover_tenant(&services, &bus, &dir, &fence).await {
+        Ok(recovered) => recovered,
+        Err(failed) => {
+            // Nothing of the tenant's work started: stop what recovery set
+            // up (the agent manager, delete timers it re-armed) and give the
+            // lease back so another instance claims the tenant at once.
+            fence.fire("the tenant's startup recovery failed");
+            if let Some(agents) = failed.agents {
+                agents.shutdown().await;
+            }
+            let _ = runner.stop().await;
+            if let Err(error) = heartbeat.release().await {
+                tracing::warn!(tenant, %error, "could not release the tenant lease");
+            }
+            return Err(Error::Internal(format!(
+                "tenant {tenant}: startup recovery: {}",
+                failed.error
+            )));
+        }
+    };
     let runtime = TenantRuntime::start_with_sweeps(
         &services,
         &dir,
@@ -237,23 +254,9 @@ async fn try_serve_tenant_with(
     .await;
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
-        // open path, as `intentd` does once it serves. Stops between
-        // operations once the fence fires, and is cancelled with the
-        // tenant's other tasks.
-        let services = services.clone();
-        let fence = fence.clone();
-        runner.adopt_task(intent_core::spawn_daemon(async move {
-            let (stop, stopping) = tokio::sync::watch::channel(fence.is_fenced());
-            let reconcile = services.reconcile_startup_completions(completions, &stopping);
-            tokio::pin!(reconcile);
-            tokio::select! {
-                () = &mut reconcile => {}
-                () = fence.fenced() => {
-                    let _ = stop.send(true);
-                    reconcile.await;
-                }
-            }
-        }));
+        // open path. Machines receive the wakes; no client needs to be
+        // connected for them.
+        runtime.reconcile_completions(&services, completions);
     }
     tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
     Ok(Serving::Served(Box::new(ServedTenant {
@@ -269,6 +272,13 @@ async fn try_serve_tenant_with(
         agents: recovered.agents,
         report: Some(runner.spawn()),
     })))
+}
+
+/// Why [`recover_tenant`] failed, and the agent manager it had attached
+/// by then, for the caller to stop.
+struct RecoveryFailed {
+    error: Error,
+    agents: Option<Arc<AgentManager>>,
 }
 
 /// What [`recover_tenant`] restored.
@@ -288,15 +298,21 @@ struct Recovered {
 /// machine connector's tailcat binary, deletes a previous owner stopped
 /// part-way, the agent send queues, stop redeliveries, and the completion
 /// bookkeeping. Each step is skipped once `fence` fired; the steps
-/// `intentd` treats as startup failures fail the open.
+/// `intentd` treats as startup failures (the settings migrations, the
+/// queues) fail the open, with the agent manager attached so far.
 async fn recover_tenant(
     services: &Services,
     bus: &EventBus,
     dir: &Path,
     fence: &TenantFence,
-) -> Result<Recovered> {
+) -> std::result::Result<Recovered, RecoveryFailed> {
     if let Some(registry) = services.settings_registry() {
-        intent_services::run_boot_settings_migrations(&registry, services.store()).await?;
+        intent_services::run_boot_settings_migrations(&registry, services.store())
+            .await
+            .map_err(|error| RecoveryFailed {
+                error,
+                agents: None,
+            })?;
     }
     // Remove secrets journaled by an interrupted profile create/delete.
     services.sweep_provider_profile_secrets().await;
@@ -342,7 +358,15 @@ async fn recover_tenant(
             Ok(count) => tracing::info!(count, "re-armed stored delete deadlines"),
             Err(error) => tracing::warn!(%error, "re-arming stored delete deadlines failed"),
         }
-        let queued = intent_app::agents::restore_startup_queues(services).await?;
+        let queued = match intent_app::agents::restore_startup_queues(services).await {
+            Ok(queued) => queued,
+            Err(error) => {
+                return Err(RecoveryFailed {
+                    error,
+                    agents: Some(agents),
+                })
+            }
+        };
         if queued > 0 {
             tracing::info!(queued, "rehydrated persisted agent queue messages");
         }
