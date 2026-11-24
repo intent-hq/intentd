@@ -1873,7 +1873,12 @@ async fn a_message_sent_after_try_again_lifts_the_park_follows_the_failed_one() 
     let (_tmp, mgr, ws, id) =
         remote_failed_first_turn("lifted-then-send", vec![Launch::Runs(next.clone())]).await;
 
-    let session = mgr.services.store.get_agent_session_summary(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_summary(&id)
+        .await
+        .unwrap();
     let (redriven, stale) = mgr.lift_failed_park(&id, &session).await.unwrap();
     assert!(redriven);
     if let Some(child) = stale {
