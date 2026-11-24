@@ -100,12 +100,7 @@ fn nth_arg(toks: &[Token], open: usize, n: usize) -> Vec<&str> {
 
 /// `None`, `Option::None` (any path ending so), or `None::<_>`.
 fn is_none_literal(arg: &[&str]) -> bool {
-    match arg {
-        ["None"] => true,
-        ["None", "::", ..] => true,
-        [.., "::", "None"] => true,
-        _ => false,
-    }
+    matches!(arg, ["None"] | ["None", "::", ..] | [.., "::", "None"])
 }
 
 fn text_at(toks: &[Token], i: usize) -> &str {
