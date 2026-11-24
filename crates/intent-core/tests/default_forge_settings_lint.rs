@@ -17,7 +17,11 @@
 //!   (`unwrap_or_else(SourceControlSettings::default)`);
 //! - `SourceControlRegistry::from_settings`;
 //! - `GitHubSourceControl::new(` / `::anonymous(` with a bare `None` argument,
-//!   which also means api.github.com without the seam.
+//!   which also means api.github.com without the seam;
+//! - `default_forge_registry(` / `resolve_source_control(` with a `None`
+//!   (`None`, `Option::None`, `None::<_>`) override argument, which drops the
+//!   calling `Services`' own override (about 25 PR reads ignored
+//!   `Services::with_github_api_base_uri` this way).
 //!
 //! The resolver's file, [`RESOLVER_FILE`], may hold exactly one default-settings
 //! build and one registry build: a second one there fails, and so does the
@@ -44,11 +48,13 @@ const RESOLVER_FILE: &str = "crates/intent-services/src/pr_ops.rs";
 /// cannot name the forge crate's type, so its sources are skipped.
 const CONFIG_TYPE_CRATE: &str = "crates/intent-core/";
 
-/// Build kinds: default forge settings, a registry build, and a direct client
-/// built with a literal `None` API base.
+/// Build kinds: default forge settings, a registry build, a direct client
+/// built with a literal `None` API base, and a resolver call that drops the
+/// caller's override with a literal `None`.
 const DEFAULT_SETTINGS: usize = 0;
 const REGISTRY: usize = 1;
 const DIRECT_CLIENT: usize = 2;
+const RESOLVER_CALL: usize = 3;
 
 /// Built at runtime so the tokens this lint matches stay out of its own text.
 fn names() -> [String; 4] {
@@ -58,6 +64,43 @@ fn names() -> [String; 4] {
         ["GitHub", "SourceControl"].concat(),
         ["settings", "_file"].concat(),
     ]
+}
+
+/// The resolver entry points that take the caller's API-base override, with
+/// the override's argument position.
+fn resolver_names() -> [(String, usize); 2] {
+    [
+        (["default_forge", "_registry"].concat(), 0),
+        (["resolve_source", "_control"].concat(), 1),
+    ]
+}
+
+/// The tokens of top-level argument `n` of the call whose `(` is `toks[open]`.
+fn nth_arg(toks: &[Token], open: usize, n: usize) -> Vec<&str> {
+    let depth = toks[open].depth;
+    let mut index = 0;
+    let mut arg = Vec::new();
+    for t in &toks[open + 1..] {
+        let closes = t.depth == depth && t.text == ")";
+        if closes || (t.depth == depth + 1 && t.text == ",") {
+            if index == n || closes {
+                break;
+            }
+            index += 1;
+        } else if index == n {
+            arg.push(t.text.as_str());
+        }
+    }
+    if index == n {
+        arg
+    } else {
+        Vec::new()
+    }
+}
+
+/// `None`, `Option::None` (any path ending so), or `None::<_>`.
+fn is_none_literal(arg: &[&str]) -> bool {
+    matches!(arg, ["None"] | ["None", "::", ..] | [.., "::", "None"])
 }
 
 fn text_at(toks: &[Token], i: usize) -> &str {
@@ -89,14 +132,26 @@ fn passes_bare_none(toks: &[Token], open: usize) -> bool {
 /// Every forge build in `src`'s non-test code, as `(kind, line)` in source
 /// order: `SourceControlSettings::default` (called or passed as a function,
 /// unless qualified by `settings_file::`), `SourceControlRegistry::from_settings`,
-/// and `GitHubSourceControl::new(` / `::anonymous(` with a bare `None`
-/// argument (api.github.com without the seam).
+/// `GitHubSourceControl::new(` / `::anonymous(` with a bare `None`
+/// argument (api.github.com without the seam), and resolver calls with a
+/// `None` override argument (the caller's override dropped).
 fn builds(src: &str) -> Vec<(usize, usize)> {
     let blanked = blank_cfg_test_items(&lex(src).blanked);
     let toks: Vec<Token> = tokenize_str(&blanked);
     let [settings, registry, client, config_module] = names();
+    let resolvers = resolver_names();
     let mut out = Vec::new();
     for (i, t) in toks.iter().enumerate() {
+        let override_at = resolvers
+            .iter()
+            .find(|(name, _)| *name == t.text)
+            .map(|(_, at)| *at);
+        if let Some(at) = override_at {
+            if text_at(&toks, i + 1) == "(" && is_none_literal(&nth_arg(&toks, i + 1, at)) {
+                out.push((RESOLVER_CALL, t.line));
+            }
+            continue;
+        }
         if text_at(&toks, i + 1) != "::" {
             continue;
         }
@@ -133,7 +188,7 @@ fn is_resolver_shape(builds: &[(usize, usize)]) -> bool {
 
 /// Offenders in one file as `file:line`. In the resolver's file the
 /// default-settings and registry builds pass only in the resolver's shape;
-/// direct clients built with `None` fail everywhere.
+/// direct clients and resolver calls given a `None` fail everywhere.
 fn offenders_in(rel: &str, src: &str) -> Vec<String> {
     if rel.starts_with(CONFIG_TYPE_CRATE) {
         return Vec::new();
@@ -142,7 +197,7 @@ fn offenders_in(rel: &str, src: &str) -> Vec<String> {
     let resolver = rel == RESOLVER_FILE && is_resolver_shape(&found);
     found
         .into_iter()
-        .filter(|(kind, _)| !resolver || *kind == DIRECT_CLIENT)
+        .filter(|(kind, _)| !resolver || matches!(*kind, DIRECT_CLIENT | RESOLVER_CALL))
         .map(|(_, line)| format!("{rel}:{line}"))
         .collect()
 }
@@ -184,8 +239,9 @@ fn forge_registries_are_built_only_by_the_resolver() {
         offenders.is_empty(),
         "build the default forge client with `pr_ops::default_forge_registry` (it applies \
          the INTENTD_GITHUB_API_BASE_URI test seam) instead of default source-control \
-         settings or a direct registry call, and pass `invite_ops::resolve_api_base_uri(..)` \
-         rather than `None` to a direct GitHub client:\n{}",
+         settings or a direct registry call, pass `invite_ops::resolve_api_base_uri(..)` \
+         rather than `None` to a direct GitHub client, and pass the `Services`' own \
+         `github_api_base_uri` rather than `None` to the resolver:\n{}",
         offenders.join("\n")
     );
 }
@@ -250,4 +306,27 @@ fn the_resolver_file_may_hold_exactly_one_build_of_each_kind() {
     let second = format!("{resolver}fn other() {{ let _ = {settings}::default(); }}\n");
     assert_eq!(offenders_in(RESOLVER_FILE, &second).len(), 3);
     assert_eq!(offenders_in("elsewhere.rs", &resolver).len(), 2);
+}
+
+#[test]
+fn resolver_calls_with_a_none_override_are_flagged() {
+    let [(forge, _), (resolve, _)] = resolver_names();
+    let flagged = format!(
+        "let a = pr_ops::{forge}(None, &secrets).await;\n\
+         let b = {resolve}(injected, None, &secrets).await;\n\
+         let c = {resolve}(injected, Option::None, &s).await;\n\
+         let d = {forge}(None::<&str>, &s).await;\n"
+    );
+    assert_eq!(
+        offenders_in("a.rs", &flagged),
+        vec!["a.rs:1", "a.rs:2", "a.rs:3", "a.rs:4"]
+    );
+    assert_eq!(offenders_in(RESOLVER_FILE, &flagged).len(), 4);
+    let seamed = format!(
+        "let a = pr_ops::{forge}(self.github_api_base_uri.as_deref(), &s).await;\n\
+         let b = {resolve}(injected, api_base.as_deref(), &s).await;\n\
+         let c = {resolve}(None, self.github_api_base_uri.as_deref(), &s).await;\n\
+         async fn {forge}(override_uri: Option<&str>, s: &S) {{}}\n"
+    );
+    assert!(offenders_in("b.rs", &seamed).is_empty());
 }

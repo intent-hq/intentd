@@ -140,6 +140,7 @@ impl Services {
                         if let Err(intent_core::Error::RateLimited(detail)) = &outcome {
                             if let Ok(sc) = pr_ops::resolve_source_control(
                                 services.source_control.clone(),
+                                services.github_api_base_uri.as_deref(),
                                 &services.secret_source(),
                             )
                             .await
@@ -249,9 +250,12 @@ impl Services {
         {
             return;
         }
-        let Ok(sc) =
-            pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-                .await
+        let Ok(sc) = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await
         else {
             return;
         };

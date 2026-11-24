@@ -2567,8 +2567,12 @@ impl Services {
                 return Ok((entry, false));
             }
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         let monitored = self.monitored_pr_keys().await;
         // Test seam: park in the miss→fetch window so a test can land a
         // concurrent fill before the shared path's authoritative lookup.
@@ -3017,8 +3021,12 @@ impl Services {
             }
         }
 
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
         let target = intent_core::ReviewTarget {
             repository: intent_core::RepositoryTarget {
@@ -3954,8 +3962,12 @@ impl Services {
         if monitor.state != PrMonitorState::Active {
             return Ok(false);
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone(), &self.secret_source())
-            .await?;
+        let sc = pr_ops::resolve_source_control(
+            self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
+            &self.secret_source(),
+        )
+        .await?;
         let repo_ref = monitor.repo();
         let monitored = self.monitored_pr_keys().await;
         // A full fetch, stored for the sweep and the on-demand readers.
@@ -4216,6 +4228,7 @@ impl Services {
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(
                 self.source_control.clone(),
+                self.github_api_base_uri.as_deref(),
                 &self.secret_source(),
             )
             .await
@@ -4256,6 +4269,7 @@ impl Services {
         }
         let sc = match pr_ops::resolve_source_control(
             self.source_control.clone(),
+            self.github_api_base_uri.as_deref(),
             &self.secret_source(),
         )
         .await

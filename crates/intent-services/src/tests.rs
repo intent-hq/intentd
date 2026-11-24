@@ -18521,6 +18521,74 @@ pub(crate) mod pr {
         assert_eq!(v["user"]["login"], "octocat", "{v}");
     }
 
+    /// Test services that forget the API-base override must fail locally,
+    /// never send a fake token to api.github.com (intentd#3725 found one such
+    /// leak only because GitHub answered "Bad credentials"). Every test
+    /// constructor must resolve GitHub to loopback.
+    #[intent_test_macros::daemon_test]
+    async fn isolated_services_without_a_mock_never_reach_a_non_loopback_github() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let scratch = test_tempdir("intentd-github-base-");
+        let file = || intent_core::FileSecretStore::with_path(scratch.path().join(".secrets.json"));
+        let constructors = [
+            ("new_isolated", Services::new_isolated(store.clone())),
+            (
+                "new_with_file_secrets",
+                Services::new_with_file_secrets(store.clone(), file()),
+            ),
+            (
+                "new_repository_fixture",
+                Services::new_repository_fixture(store.clone(), file(), None),
+            ),
+        ];
+        for (name, svc) in &constructors {
+            let base = crate::invite_ops::resolve_api_base_uri(svc.github_api_base_uri.as_deref())
+                .unwrap_or_else(|| panic!("{name}: no GitHub API base, so api.github.com"));
+            let host = base
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split(['/', ':']).next())
+                .unwrap_or_default();
+            assert!(
+                matches!(host, "127.0.0.1" | "localhost"),
+                "{name}: GitHub API base must be loopback, got {base}"
+            );
+        }
+
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_fake")
+            .expect("seed token");
+        let svc = Services::new_isolated(store).with_secret_store(mem);
+        let err = svc
+            .source_control_get_user("github".into(), None)
+            .await
+            .expect_err("no mock is listening");
+        assert!(
+            !matches!(err, intent_core::Error::SourceControlUnauthorized { .. }),
+            "a GitHub reply leaked through: {err:?}"
+        );
+    }
+
+    /// The PR-read resolver applies the services' own override, not only
+    /// `$INTENTD_GITHUB_API_BASE_URI`: authStatus reads its user from the mock.
+    #[intent_test_macros::daemon_test]
+    async fn source_control_auth_status_github_reads_the_user_through_the_api_base_override() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_fake")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo"), "g1").await;
+        let svc = Services::new_isolated(store)
+            .with_secret_store(mem)
+            .with_github_api_base_uri(base);
+        let v = svc
+            .source_control_auth_status("github".into(), None)
+            .await
+            .expect("authStatus");
+        assert_eq!(v["user"]["login"], "octocat", "{v}");
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_identity_proof_create_against_a_dead_host_is_unreachable() {
         let (_t, svc) = github_svc().await;
