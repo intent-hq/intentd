@@ -1863,6 +1863,28 @@ async fn a_second_retry_does_not_cancel_the_first_ones_turn() {
 
 /// Try again and a new message at once, across interleavings: every message
 /// reaches the provider once, in order.
+/// The gap the sweep above can hit: `Try again` lifted the failed turn's
+/// park and freed the slot, but its drain has not started. A message sent
+/// then waits behind the failed one instead of running first on its own.
+#[intent_test_macros::daemon_test]
+async fn a_message_sent_after_try_again_lifts_the_park_follows_the_failed_one() {
+    let next = FakeRuntime::new();
+    next.finish.add_permits(8);
+    let (_tmp, mgr, ws, id) =
+        remote_failed_first_turn("lifted-then-send", vec![Launch::Runs(next.clone())]).await;
+
+    let session = mgr.services.store.get_agent_session_summary(&id).await.unwrap();
+    let (redriven, stale) = mgr.lift_failed_park(&id, &session).await.unwrap();
+    assert!(redriven);
+    if let Some(child) = stale {
+        child.kill_tree().await;
+    }
+
+    send(&mgr, &id, &ws, "message alpha").await;
+    wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
+    assert_delivered_once_in_order(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]);
+}
+
 #[intent_test_macros::daemon_test]
 async fn a_retry_and_a_new_message_at_once_deliver_every_message_once() {
     for yields in 0..6u32 {
