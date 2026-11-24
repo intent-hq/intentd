@@ -210,6 +210,73 @@ async fn the_insecure_dev_seat_serves_plain_ws_without_a_token() {
     listeners.stop().await;
 }
 
+/// `system.status` is served on both listeners with `intentd`'s wire shape
+/// and orchestrator values, so the app's daemon-health poll sees a healthy
+/// backend instead of `-32601`. Only the status read is installed: the
+/// daemon's control commands (`system.shutdown`) stay unserved.
+#[tokio::test]
+async fn system_status_is_served_after_hello_on_both_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+    let (services, bus, reverse) = sqlite_tenant(dir.path()).await;
+    let connections = ClientConnections::default();
+    let listeners = start_client_listeners(
+        &config(dir.path(), false),
+        &services,
+        &bus,
+        reverse,
+        &connections,
+    )
+    .await
+    .unwrap();
+    let port = listeners.ws_port();
+    let fingerprint = listeners.fingerprint().unwrap().to_owned();
+
+    let mut uds = Uds::connect(listeners.socket_path()).await;
+    let hello = uds
+        .rpc(1, "client.hello", json!({ "clientId": "web-a" }))
+        .await;
+    let server_version = result(&hello)["server"]["version"].clone();
+    assert!(server_version.is_string(), "{hello}");
+    let status = uds.rpc(2, "system.status", json!({})).await;
+    let status = result(&status);
+    assert_eq!(status["running"], json!(true), "{status}");
+    assert_eq!(status["version"], server_version, "{status}");
+    assert_eq!(
+        status["protocolVersion"],
+        result(&hello)["protocolVersion"],
+        "{status}"
+    );
+    assert_eq!(status["listenMode"], json!("both"), "{status}");
+    assert_eq!(status["transports"], json!(["uds", "tcp"]), "{status}");
+    assert_eq!(status["port"], json!(port), "{status}");
+    assert_eq!(status["fingerprint"], json!(fingerprint), "{status}");
+    assert_eq!(status["host"]["locality"], json!("local"), "{status}");
+    assert_eq!(status["host"]["os"], json!(std::env::consts::OS));
+    assert_eq!(status["agents"], json!(0), "{status}");
+    assert_eq!(status["updateSupported"], json!(false), "{status}");
+    assert_eq!(status["exactUpdateSupported"], json!(false), "{status}");
+    assert!(status["uptimeSeconds"].is_u64(), "{status}");
+    let shutdown = uds.rpc(3, "system.shutdown", json!({})).await;
+    assert!(
+        shutdown.get("error").is_some(),
+        "the orchestrator is not stopped by a client: {shutdown}"
+    );
+
+    let token = services
+        .secret_source()
+        .load(TOKEN_ACCOUNT)
+        .unwrap()
+        .unwrap();
+    let mut ws = wss(port, &fingerprint, Some(&token)).await.unwrap();
+    result(&ws_rpc(&mut ws, 1, "client.hello", json!({ "clientId": "web-b" })).await);
+    let remote = ws_rpc(&mut ws, 2, "system.status", json!({})).await;
+    let remote = result(&remote);
+    assert_eq!(remote["running"], json!(true), "{remote}");
+    assert_eq!(remote["host"]["locality"], json!("remote"), "{remote}");
+    assert_eq!(remote["port"], json!(port), "{remote}");
+    listeners.stop().await;
+}
+
 #[tokio::test]
 async fn a_socket_that_cannot_bind_fails_the_start() {
     let dir = tempfile::tempdir().unwrap();
