@@ -86,6 +86,16 @@ impl SettingsFollowerSlot {
     }
 }
 
+/// Releases the tenant's machine-run hooks when dropped: they hold the
+/// tenant's `Services`, which hold the machine runs.
+struct ReleaseMachineRuns(Services);
+
+impl Drop for ReleaseMachineRuns {
+    fn drop(&mut self) {
+        self.0.release_machine_runs();
+    }
+}
+
 /// The tenant's work is admitted until its fence fires.
 struct Unfenced(TenantFence);
 
@@ -305,10 +315,9 @@ async fn try_serve_tenant_with(
         crate::mcp::start_tenant_mcp(&services, &mut runner);
     }
     crate::tenant_watch::start(&services, &bus, &admission, &mut runner);
-    // After the runtime's stops, which still reach the machines: the
-    // machine runs' hooks hold `services`, which hold the machine runs.
-    let release = services.clone();
-    runner.on_tasks(move || async move { release.release_machine_runs() });
+    // Owned, so released once every fence step ran: the stops run
+    // concurrently and may still settle machine runs through the hooks.
+    runner.own(ReleaseMachineRuns(services.clone()));
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be

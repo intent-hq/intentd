@@ -261,11 +261,27 @@ fn tail(text: &str, max: usize) -> &str {
 
 impl MachineRuns {
     pub(crate) fn new(hooks: Hooks) -> Self {
+        let (restart_backoff, stop_wait) = (hooks.restart_backoff, hooks.stop_wait);
+        Self::with_hooks(Some(Arc::new(hooks)), restart_backoff, stop_wait)
+    }
+
+    /// A registry whose hooks are already released: installed by an owner
+    /// released before it had one, so no later manager builds hooks over
+    /// the owner's `Services`.
+    pub(crate) fn released() -> Self {
+        Self::with_hooks(None, Duration::ZERO, Duration::ZERO)
+    }
+
+    fn with_hooks(
+        hooks: Option<Arc<Hooks>>,
+        restart_backoff: Duration,
+        stop_wait: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                restart_backoff: hooks.restart_backoff,
-                stop_wait: hooks.stop_wait,
-                hooks: Mutex::new(Some(Arc::new(hooks))),
+                restart_backoff,
+                stop_wait,
+                hooks: Mutex::new(hooks),
                 runs: Mutex::default(),
                 settled: watch::channel(0).0,
                 ending: Mutex::default(),
