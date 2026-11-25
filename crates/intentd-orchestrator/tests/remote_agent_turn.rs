@@ -120,6 +120,7 @@ fn capabilities() -> MachineCapabilities {
         visible: true,
         status: ProviderStatus::SignedIn,
         models: vec!["mock-model".into()],
+        model_labels: std::collections::BTreeMap::new(),
         models_stale: false,
     });
     capabilities
