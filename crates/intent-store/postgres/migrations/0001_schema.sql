@@ -1847,7 +1847,7 @@ CREATE INDEX IF NOT EXISTS idx_event_session ON event (tenant_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_event_type ON event (tenant_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_event_ws_time ON event (tenant_id, workspace_id, timestamp);
 -- The seq cursor (event_repo.rs EventSeq): events_after and max_event_seq.
-CREATE INDEX IF NOT EXISTS idx_event_row_seq ON event (tenant_id, row_seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_row_seq ON event (tenant_id, row_seq);
 CREATE INDEX IF NOT EXISTS idx_event_subscription_agent ON event_subscription (tenant_id, subscriber_agent_id);
 CREATE INDEX IF NOT EXISTS executor_credential_active ON executor_credential (tenant_id, created_at, id) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS home_move_node ON home_move (tenant_id, node_id);

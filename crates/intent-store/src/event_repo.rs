@@ -89,9 +89,13 @@ pub struct NewEvent {
 ///   writer of the tenant (the counter is shared by all of the tenant's
 ///   tables, hence the gaps).
 /// - `SQLite`: the row's `rowid`; the single write connection serializes
-///   writers. `SQLite` reuses a deleted maximum `rowid` and a full `VACUUM`
-///   may renumber rows, so a `SQLite` seq is a cursor within one process
-///   lifetime, not a durable cross-restart cursor.
+///   writers. `SQLite` reuses a deleted maximum `rowid`, even within one
+///   process: retention deletes by timestamp, so it can remove the newest
+///   row, and the next insert then takes that row's seq again. A consumer
+///   whose cursor equals the reused seq skips that event. A full `VACUUM`
+///   may also renumber rows. So a `SQLite` seq is safe as a cursor only
+///   while no delete can remove the newest row between reads; a durable
+///   cursor needs an `AUTOINCREMENT` seq first.
 ///
 /// The seq stays inside the daemon: it is not part of [`Event`] or the wire.
 pub type EventSeq = u64;
@@ -829,6 +833,43 @@ mod tests {
             metadata: None,
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_event_seq_increases_and_pages_by_cursor() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        assert_eq!(store.max_event_seq().await.expect("max"), 0);
+
+        let (first, first_seq) = store
+            .insert_event_seq(&new_event("test:a", json!({})))
+            .await
+            .expect("insert one");
+        let batch = store
+            .insert_events_seq(&[
+                new_event("test:b", json!({})),
+                new_event("test:c", json!({})),
+            ])
+            .await
+            .expect("insert batch");
+
+        assert!(first_seq > 0);
+        assert!(batch[0].1 > first_seq && batch[1].1 > batch[0].1);
+        assert_eq!(store.max_event_seq().await.expect("max"), batch[1].1);
+
+        let page = store.events_after(0, 2).await.expect("page 1");
+        assert_eq!(
+            page.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(),
+            [first.id.as_str(), batch[0].0.id.as_str()]
+        );
+        let rest = store.events_after(page[1].1, -1).await.expect("page 2");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].0.id, batch[1].0.id);
+        assert!(store
+            .events_after(batch[1].1, -1)
+            .await
+            .expect("past max")
+            .is_empty());
     }
 
     #[tokio::test]
