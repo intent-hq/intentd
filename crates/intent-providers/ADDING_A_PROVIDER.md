@@ -423,7 +423,7 @@ and `provider_models`.
   (`unavailableReason`), the model probe never opens a session, and agent start fails.
   The guard runs under the launch's composed env (`dsh_cli::launch_env`: profile overlay,
   provider env, login-shell gap-fill, as in `intent_acp::spawn`). The verdict is cached
-  per binary, version, effective `DSH_*` env and DSH patch-file stamps. Refresh `tests/fixtures/dsh-dump-config-*.txt` when verifying a new DSH.
+  per binary, version, effective `DSH_*` env and DSH patch-file stamps. When verifying a new DSH, refresh `tests/fixtures/dsh-dump-config-*.txt` and check that the patch files DSH loads still match the stamped paths in `DshLaunchEnv::fingerprint` (`$DSH_HOME/cordis.patch.yml`, `profiles/acp/{cordis.patch.yml,cordis.yml,package.json}`).
 - **Auth** — `authMethods` is empty; sign-in is a DeepSeek API key (`DEEPSEEK_API_KEY` in
   the daemon or login-shell env, or `$DSH_HOME/.credentials.yaml` / `.env`). The check
   reads presence only and starts no process. A signed-out `session/new` succeeds; the
