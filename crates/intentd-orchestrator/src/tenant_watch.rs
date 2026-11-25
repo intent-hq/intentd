@@ -1,5 +1,7 @@
-//! A tenant's repository context, file watchers and `config.toml` live
-//! reload, as `intentd serve` starts them for its one backend.
+//! A tenant's repository context and file watchers, as `intentd serve`
+//! starts them for its one backend. Its settings live in its Postgres row
+//! and are followed there (`crate::settings`), so no `config.toml` is
+//! watched.
 //!
 //! The watchers see the checkouts on head. A workspace whose home is on a
 //! machine is watched there (the machine's `HomeWatches`): its file and
@@ -13,9 +15,7 @@ use std::sync::Arc;
 use intent_app::tenant::Admission;
 use intent_core::tenant_fence::SelfFence;
 use intent_core::{BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId, WorkspaceListFilter};
-use intent_services::{
-    ConfigWatcher, EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry,
-};
+use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 
 /// Restore the tenant's GitLab repository binding from its settings and
 /// secrets, before its work starts (`intentd` does it at start). Without a
@@ -28,8 +28,8 @@ pub(crate) async fn restore_repository_binding(services: &Services) {
 }
 
 /// Start the tenant's repository metadata prewarm, its file and `.git`
-/// watchers with the git-status refresher, and its `config.toml` live
-/// reload, and register their stop on `runner`. Nothing starts once
+/// watchers with the git-status refresher, and register their stop on
+/// `runner`. Nothing starts once
 /// `admission` refuses.
 pub(crate) fn start(
     services: &Services,
@@ -71,16 +71,8 @@ pub(crate) fn start(
                     services.worktree_presence(),
                 ))
             });
-            let mut config = start_config_reload(&hub, &services);
             let _ = stopped.await;
-            tokio::join!(
-                async {
-                    if let Some(config) = config.as_mut() {
-                        config.shutdown().await;
-                    }
-                },
-                registry.shutdown(),
-            );
+            registry.shutdown().await;
         })
     };
     runner.on_tasks(move || async move {
@@ -107,38 +99,6 @@ pub(crate) fn start(
 /// How long the watchers may take to stop: under the fence's step budget
 /// (`intent_core::tenant_fence::SELF_FENCE_STEP_BUDGET`, one second).
 const STOP_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
-
-/// Watch the tenant's `config.toml` over `hub`: a valid edit is applied as
-/// `settings.update` applies it; an invalid one keeps the last good values.
-fn start_config_reload(
-    hub: &Arc<intent_services::SharedWatchHub>,
-    services: &Services,
-) -> Option<ConfigWatcher> {
-    let registry = services.settings_registry()?;
-    let reload = services.clone();
-    match ConfigWatcher::start_prepared_reload(
-        hub,
-        registry,
-        services.settings_revision_gate(),
-        move |text, expected, admission| {
-            let services = reload.clone();
-            async move {
-                services
-                    .apply_prepared_settings_reload(text, expected, admission)
-                    .await
-            }
-        },
-    ) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "config.toml live reload did not start; edits apply when the tenant restarts"
-            );
-            None
-        }
-    }
-}
 
 /// The tenant's workspaces as head's watchers see them: a workspace homed on
 /// a machine is left out of the list, is not watched here when it is

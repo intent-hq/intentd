@@ -1,11 +1,11 @@
-//! A tenant's repository context, file watchers and `config.toml` live
-//! reload run as `intentd serve` runs them: after the tenant restarts on
-//! another instance, a workspace on head reports its repository (the
-//! metadata prewarm fills its owner and name), a file edit in it refreshes
-//! its git status (`changes:git-status`), and an edit of the tenant's
-//! `config.toml` is applied without a restart. A workspace whose home is on
-//! a machine gets its status from that home only: head's own copy of it is
-//! neither watched nor scanned. All of it stops with the tenant's fence.
+//! A tenant's repository context and file watchers run as `intentd serve`
+//! runs them: after the tenant restarts on another instance, a workspace on
+//! head reports its repository (the metadata prewarm fills its owner and
+//! name) and a file edit in it refreshes its git status
+//! (`changes:git-status`). A workspace whose home is on a machine gets its
+//! status from that home only: head's own copy of it is neither watched nor
+//! scanned. (A tenant's settings live in its Postgres row; live settings
+//! changes are covered by `tenant_settings.rs`.)
 //!
 //! Needs `--features postgres` and `INTENT_STORE_TEST_PG_URL` (the
 //! `store-postgres` CI job sets both); skipped without the URL unless
@@ -124,27 +124,8 @@ async fn stop(mut served: ServedTenant) {
 /// The machine the homed workspace lives on.
 const MACHINE: &str = "machine-1";
 
-fn rtk_enabled(served: &ServedTenant) -> bool {
-    served
-        .services()
-        .settings_registry()
-        .expect("the tenant has a settings registry")
-        .snapshot()
-        .effective
-        .rtk
-        .enabled
-}
-
-/// Replace the tenant's `config.toml` as an editor saves: write a temporary
-/// file and rename it over.
-fn save_config(dir: &Path, text: &str) {
-    let tmp = dir.join("config.toml.tmp");
-    std::fs::write(&tmp, text).unwrap();
-    std::fs::rename(&tmp, dir.join("config.toml")).unwrap();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() {
+async fn a_restarted_tenant_reports_its_repository_and_git_status() {
     let Some(pool) = pool().await else { return };
     if Command::new("git").arg("--version").output().is_err() {
         eprintln!("skipping: git is not on PATH");
@@ -297,37 +278,7 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
         "head published a git status for a workspace homed on a machine: {homed_scan:?}"
     );
 
-    // Its config: an edit of the tenant's config.toml applies at once.
-    let before = rtk_enabled(&second);
-    save_config(second.dir(), &format!("[rtk]\nenabled = {}\n", !before));
-    tokio::time::timeout(wait(), async {
-        while rtk_enabled(&second) == before {
-            // timing-guard: poll until the debounced reload has applied
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the config.toml edit is applied without a restart");
-
-    // Everything stops with the fence: a later config edit is not applied.
-    let applied = !before;
-    let dir = second.dir().to_path_buf();
-    let services = second.services().clone();
     stop(second).await;
-    save_config(&dir, &format!("[rtk]\nenabled = {before}\n"));
-    // timing-guard: give a still-running watcher several debounce windows
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(
-        services
-            .settings_registry()
-            .unwrap()
-            .snapshot()
-            .effective
-            .rtk
-            .enabled,
-        applied,
-        "a fenced tenant reloads nothing"
-    );
 }
 
 /// Add a workspace over the repository `repo` on head to the tenant's store.

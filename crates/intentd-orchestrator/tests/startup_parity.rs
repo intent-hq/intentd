@@ -345,7 +345,9 @@ const STEPS: &[(&str, Step)] = &[
     ("services.worktree_presence", Wired("worktree_presence")),
     (
         "spawn_config_watcher_init",
-        Wired("ConfigWatcher::start_prepared_reload"),
+        // Replaced: a tenant's settings are its Postgres row, followed for
+        // other processes' writes (serve.rs `follow_settings`).
+        Wired("StoreSettingsFollower::start"),
     ),
     // External MCP servers: a tenant's hub refuses stdio (it starts no
     // process); agents get the tools of its http servers. The tenant's
