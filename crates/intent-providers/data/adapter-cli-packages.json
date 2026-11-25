@@ -39,7 +39,7 @@
       "name": "@agentclientprotocol/codex-acp",
       "optionalDependencies": {},
       "peerDependencies": {},
-      "version": "2.10.0"
+      "version": "2.12.0"
     },
     "pinConstant": "CODEX_ACP_NPX_PACKAGE"
   },
