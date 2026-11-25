@@ -758,3 +758,166 @@ parity_test!(event_subscriptions_round_trip, |store, tenant| {
             .unwrap();
     }
 });
+
+/// Seqs of `pairs`, asserting each returned event is the tenant's.
+#[track_caller]
+fn seqs_of(pairs: &[(Event, u64)], tenant: &str) -> Vec<u64> {
+    for (e, _) in pairs {
+        assert_eq!(e.data["tenant"], tenant, "another tenant's event: {e:?}");
+    }
+    pairs.iter().map(|(_, s)| *s).collect()
+}
+
+#[track_caller]
+fn assert_strictly_increasing(seqs: &[u64]) {
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seqs must strictly increase: {seqs:?}"
+    );
+}
+
+parity_test!(event_seq_cursor_pages_in_commit_order, |store, tenant| {
+    assert_eq!(store.max_event_seq().await.unwrap(), 0);
+    assert!(store.events_after(0, -1).await.unwrap().is_empty());
+    assert!(store.insert_events_seq(&[]).await.unwrap().is_empty());
+
+    let e = |i: u32| ev("ws-a", &format!("n{i}"), "note:updated", &ts(i), tenant);
+    let (first, s1) = store.insert_event_seq(&e(1)).await.unwrap();
+    assert!(s1 > 0);
+    assert_eq!(store.max_event_seq().await.unwrap(), s1);
+    // A write to another table between batches: on Postgres it takes a
+    // number from the same tenant counter, so the event seqs have a gap.
+    store.set_setting("seq-gap", tenant).await.unwrap();
+    let batch = store.insert_events_seq(&[e(2), e(3), e(4)]).await.unwrap();
+    // Input order, and the timestamp does not decide the seq.
+    let (late, s5) = store
+        .insert_event_seq(&ev("ws-b", "n5", "note:updated", OLD, tenant))
+        .await
+        .unwrap();
+    let mut inserted = vec![(first, s1)];
+    inserted.extend(batch);
+    inserted.push((late, s5));
+    assert_eq!(
+        labels(&inserted.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>()),
+        ["n1", "n2", "n3", "n4", "n5"]
+    );
+    let seqs = seqs_of(&inserted, tenant);
+    assert_strictly_increasing(&seqs);
+    assert_eq!(store.max_event_seq().await.unwrap(), s5);
+
+    // The full read matches what the inserts returned, ids and all.
+    let all = store.events_after(0, -1).await.unwrap();
+    assert_eq!(seqs_of(&all, tenant), seqs);
+    let ids = |v: &[(Event, u64)]| v.iter().map(|(e, _)| e.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&all), ids(&inserted));
+    assert_eq!(all[0].0, inserted[0].0);
+
+    // Paging by the last seen seq reassembles the log.
+    let mut paged = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = store.events_after(cursor, 2).await.unwrap();
+        assert!(page.len() <= 2);
+        let Some((_, last)) = page.last() else { break };
+        cursor = *last;
+        paged.extend(page);
+    }
+    assert_eq!(seqs_of(&paged, tenant), seqs);
+    assert_eq!(cursor, s5);
+
+    // A cursor in a gap or mid-log starts right after it.
+    assert_eq!(
+        seqs_of(&store.events_after(seqs[1] - 1, 1).await.unwrap(), tenant),
+        [seqs[1]]
+    );
+    assert_eq!(
+        seqs_of(&store.events_after(seqs[2], -1).await.unwrap(), tenant),
+        seqs[3..]
+    );
+    assert!(store.events_after(0, 0).await.unwrap().is_empty());
+
+    // Nothing past the watermark, however far.
+    assert!(store.events_after(s5, 10).await.unwrap().is_empty());
+    assert!(store.events_after(s5 + 1000, -1).await.unwrap().is_empty());
+    assert!(store.events_after(u64::MAX, -1).await.unwrap().is_empty());
+
+    // The plain inserts take seqs too.
+    store.insert_event(&e(6)).await.unwrap();
+    store.insert_events(&[e(7)]).await.unwrap();
+    let tail = store.events_after(s5, -1).await.unwrap();
+    assert_eq!(
+        labels(&tail.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>()),
+        ["n6", "n7"]
+    );
+    assert_strictly_increasing(&[vec![s5], seqs_of(&tail, tenant)].concat());
+    assert_eq!(store.max_event_seq().await.unwrap(), tail[1].1);
+});
+
+parity_test!(
+    event_seq_is_unique_and_ordered_across_concurrent_writers,
+    |store, tenant| {
+        const WRITERS: usize = 8;
+        const BATCHES: usize = 5;
+        const PER_BATCH: usize = 4;
+        let start = store.max_event_seq().await.unwrap();
+        let mut writers = tokio::task::JoinSet::new();
+        for w in 0..WRITERS {
+            let store = store.clone();
+            let tenant = tenant.to_owned();
+            writers.spawn(async move {
+                let mut mine = Vec::new();
+                for b in 0..BATCHES {
+                    let batch: Vec<NewEvent> = (0..PER_BATCH)
+                        .map(|i| {
+                            ev(
+                                "ws-a",
+                                &format!("w{w}-b{b}-{i}"),
+                                "note:updated",
+                                OLD,
+                                &tenant,
+                            )
+                        })
+                        .collect();
+                    // Each writer's own later commits get later seqs.
+                    mine.extend(store.insert_events_seq(&batch).await.unwrap());
+                }
+                mine
+            });
+        }
+        let mut returned = Vec::new();
+        while let Some(mine) = writers.join_next().await {
+            let mine = mine.unwrap();
+            assert_strictly_increasing(&seqs_of(&mine, tenant));
+            returned.extend(mine);
+        }
+        assert_eq!(returned.len(), WRITERS * BATCHES * PER_BATCH);
+
+        // The log holds exactly the returned (id, seq) pairs, in seq order, and
+        // a batch's rows are numbered together (no other writer interleaves).
+        let log = store.events_after(start, -1).await.unwrap();
+        let seqs = seqs_of(&log, tenant);
+        assert_strictly_increasing(&seqs);
+        let mut expected: Vec<(String, u64)> =
+            returned.iter().map(|(e, s)| (e.id.clone(), *s)).collect();
+        expected.sort_by_key(|(_, s)| *s);
+        let got: Vec<(String, u64)> = log.iter().map(|(e, s)| (e.id.clone(), *s)).collect();
+        assert_eq!(got, expected);
+        for chunk in log.chunks(PER_BATCH) {
+            let batch = chunk[0].0.data["n"]
+                .as_str()
+                .unwrap()
+                .rsplit_once('-')
+                .unwrap()
+                .0
+                .to_owned();
+            for (i, (e, _)) in chunk.iter().enumerate() {
+                assert_eq!(
+                    e.data["n"],
+                    format!("{batch}-{i}"),
+                    "batch split: {chunk:?}"
+                );
+            }
+        }
+        assert_eq!(store.max_event_seq().await.unwrap(), *seqs.last().unwrap());
+    }
+);
