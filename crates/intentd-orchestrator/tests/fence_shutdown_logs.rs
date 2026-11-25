@@ -96,7 +96,6 @@ async fn a_clean_stop_logs_no_error_for_the_fences_own_refusals() {
             ws_port: 0,
             tls_dir: dir.path().join("tls"),
             insecure: false,
-            public_hosts: Vec::new(),
         })
         .await
         .unwrap();

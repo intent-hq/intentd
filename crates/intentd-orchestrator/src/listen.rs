@@ -71,8 +71,6 @@ pub struct ListenConfig {
     pub ws_port: u16,
     pub tls_dir: PathBuf,
     pub insecure: bool,
-    /// [`PUBLIC_HOSTS_ENV`].
-    pub public_hosts: Vec<String>,
 }
 
 impl ListenConfig {
@@ -105,17 +103,12 @@ impl ListenConfig {
             Some("1" | "true") => true,
             Some(other) => return Err(format!("{INSECURE_ENV}: {other:?} is not 1/true/0/false")),
         };
-        let public_hosts = match set(PUBLIC_HOSTS_ENV) {
-            Some(raw) => parse_public_hosts(&raw)?,
-            None => Vec::new(),
-        };
         Ok(Self {
             socket_path,
             bind_addresses,
             ws_port,
             tls_dir,
             insecure,
-            public_hosts,
         })
     }
 }
@@ -139,6 +132,18 @@ fn parse_bind(raw: &str) -> Result<Vec<IpAddr>, String> {
         addresses.push(loopback);
     }
     Ok(addresses)
+}
+
+/// The public hosts in [`PUBLIC_HOSTS_ENV`], read through `var`; none
+/// when unset.
+///
+/// # Errors
+/// When an entry is not a host name or IP address.
+pub fn public_hosts_from_env(var: impl Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
+    match var(PUBLIC_HOSTS_ENV).filter(|value| !value.trim().is_empty()) {
+        Some(raw) => parse_public_hosts(&raw),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// `raw` ([`PUBLIC_HOSTS_ENV`]): comma-separated host names or IP
@@ -600,6 +605,30 @@ pub async fn start_client_listeners(
     reverse: Arc<PrimaryReverseRegistry>,
     connections: &ClientConnections,
 ) -> Result<ClientListeners, String> {
+    start_client_listeners_with_public_hosts(
+        config,
+        services,
+        bus,
+        reverse,
+        connections,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`start_client_listeners`], with invite links naming `public_hosts`
+/// ([`PUBLIC_HOSTS_ENV`]; none: no invite is minted without a tunnel).
+///
+/// # Errors
+/// As [`start_client_listeners`].
+pub async fn start_client_listeners_with_public_hosts(
+    config: &ListenConfig,
+    services: &Services,
+    bus: &EventBus,
+    reverse: Arc<PrimaryReverseRegistry>,
+    connections: &ClientConnections,
+    public_hosts: Vec<String>,
+) -> Result<ClientListeners, String> {
     let hook = ConnectionHook::new(Arc::new(TenantConnections(connections.clone())));
     // The tenant's `server.maxOutstandingRpcs` (its own config.toml), across
     // both listeners, as `intentd` caps its own. Client host commands run
@@ -663,7 +692,7 @@ pub async fn start_client_listeners(
             tokens: (*tokens).clone(),
             host,
             ws: status_ws_slot.clone(),
-            public_hosts: config.public_hosts.clone(),
+            public_hosts,
         });
         let mut ws = WsApiServer::new_with_reverse(
             api.clone(),

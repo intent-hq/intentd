@@ -21,7 +21,6 @@ fn unset_listens_on_the_loopback_with_auth() {
             ws_port: DEFAULT_WS_PORT,
             tls_dir: PathBuf::from("/data"),
             insecure: false,
-            public_hosts: Vec::new(),
         }
     );
     assert_eq!(DEFAULT_WS_PORT, 5191, "next to intentd's 5181");
@@ -35,8 +34,7 @@ fn blank_values_are_unset() {
             (BIND_ENV, ""),
             (WS_PORT_ENV, " "),
             (TLS_DIR_ENV, ""),
-            (INSECURE_ENV, ""),
-            (PUBLIC_HOSTS_ENV, " ")
+            (INSECURE_ENV, "")
         ])
         .unwrap(),
         config(&[]).unwrap()
@@ -51,10 +49,6 @@ fn every_value_can_be_set() {
         (WS_PORT_ENV, "0"),
         (TLS_DIR_ENV, "/shared/tls"),
         (INSECURE_ENV, "1"),
-        (
-            PUBLIC_HOSTS_ENV,
-            " orch.example.com, 203.0.113.7,[2001:db8::1] ,",
-        ),
     ])
     .unwrap();
     assert_eq!(config.socket_path, PathBuf::from("/run/o.sock"));
@@ -65,10 +59,6 @@ fn every_value_can_be_set() {
     assert_eq!(config.ws_port, 0);
     assert_eq!(config.tls_dir, PathBuf::from("/shared/tls"));
     assert!(config.insecure);
-    assert_eq!(
-        config.public_hosts,
-        ["orch.example.com", "203.0.113.7", "2001:db8::1"]
-    );
 }
 
 #[test]
@@ -94,10 +84,6 @@ fn invalid_values_are_errors_never_defaults() {
         (WS_PORT_ENV, "70000"),
         (WS_PORT_ENV, "http"),
         (INSECURE_ENV, "yes"),
-        (PUBLIC_HOSTS_ENV, "https://orch.example.com"),
-        (PUBLIC_HOSTS_ENV, "orch.example.com:5191"),
-        (PUBLIC_HOSTS_ENV, "orch.example.com/ws"),
-        (PUBLIC_HOSTS_ENV, "[not-v6]"),
     ] {
         let error = config(&[(name, value)]).unwrap_err();
         assert!(error.contains(name), "{name}={value}: {error}");
@@ -105,4 +91,32 @@ fn invalid_values_are_errors_never_defaults() {
     assert!(!config(&[(INSECURE_ENV, "false")]).unwrap().insecure);
     assert!(!config(&[(INSECURE_ENV, "0")]).unwrap().insecure);
     assert!(config(&[(INSECURE_ENV, "true")]).unwrap().insecure);
+}
+
+fn public_hosts(raw: Option<&str>) -> Result<Vec<String>, String> {
+    public_hosts_from_env(|name| {
+        (name == PUBLIC_HOSTS_ENV)
+            .then(|| raw.map(str::to_owned))
+            .flatten()
+    })
+}
+
+#[test]
+fn public_hosts_are_a_trimmed_list_of_bare_names_or_addresses() {
+    for unset in [None, Some(""), Some(" ")] {
+        assert_eq!(public_hosts(unset).unwrap(), Vec::<String>::new());
+    }
+    assert_eq!(
+        public_hosts(Some(" orch.example.com, 203.0.113.7,[2001:db8::1] ,")).unwrap(),
+        ["orch.example.com", "203.0.113.7", "2001:db8::1"]
+    );
+    for invalid in [
+        "https://orch.example.com",
+        "orch.example.com:5191",
+        "orch.example.com/ws",
+        "[not-v6]",
+    ] {
+        let error = public_hosts(Some(invalid)).unwrap_err();
+        assert!(error.contains(PUBLIC_HOSTS_ENV), "{invalid}: {error}");
+    }
 }

@@ -15,19 +15,20 @@ use intent_core::{AgentId, WorkspaceApi as _, WorkspaceId};
 use intent_services::{EventBus, Services};
 use intent_transport::auth::TOKEN_ACCOUNT;
 use intent_transport::PrimaryReverseRegistry;
-use intentd_orchestrator::listen::{start_client_listeners, ClientListeners, ListenConfig};
+use intentd_orchestrator::listen::{
+    start_client_listeners_with_public_hosts, ClientListeners, ListenConfig,
+};
 use serde_json::{json, Value};
 
 const PUBLIC_HOST: &str = "orchestrator.example.test";
 
-fn config(dir: &Path, public_hosts: &[&str]) -> ListenConfig {
+fn config(dir: &Path) -> ListenConfig {
     ListenConfig {
         socket_path: dir.join("o.sock"),
         bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
         ws_port: 0,
         tls_dir: dir.join("tls"),
         insecure: false,
-        public_hosts: public_hosts.iter().map(|h| (*h).to_owned()).collect(),
     }
 }
 
@@ -41,12 +42,13 @@ async fn listening(dir: &Path, public_hosts: &[&str]) -> (Services, ClientListen
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse.clone())
         .with_workspaces_root(dir.join("workspaces"));
-    let listeners = start_client_listeners(
-        &config(dir, public_hosts),
+    let listeners = start_client_listeners_with_public_hosts(
+        &config(dir),
         &services,
         &bus,
         reverse,
         &ClientConnections::default(),
+        public_hosts.iter().map(|h| (*h).to_owned()).collect(),
     )
     .await
     .unwrap();
@@ -287,7 +289,7 @@ mod postgres {
         )
         .await
         .expect("serve the tenant");
-        let listeners = served.listen(&config(dir.path(), &[])).await.unwrap();
+        let listeners = served.listen(&config(dir.path())).await.unwrap();
         let workspace = format!("ws-{}", uuid::Uuid::new_v4().simple());
         let now = intent_core::now_iso();
         served
