@@ -2904,6 +2904,7 @@ dependencies = [
  "intent-app",
  "intent-core",
  "intent-git",
+ "intent-node-connections",
  "intent-services",
  "intent-store",
  "intent-transport",

@@ -1437,6 +1437,88 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
     node.shutdown();
 }
 
+/// Leased ownership (as the orchestrator uses) on a live link: when the
+/// lease is lost mid-link (renewals fail until it lapses, then another
+/// process takes it), head closes the link at once with no ack, its redial
+/// waits out the other holder, and a clean stop frees the lease.
+#[tokio::test]
+async fn a_leased_link_closes_once_its_lease_is_lost_and_releases_it_on_stop() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let ttl = Duration::from_millis(600);
+    let ownership = Arc::new(intent_node_connections::LeaseLinkOwnership::new(
+        backend.store().clone(),
+        uuid::Uuid::new_v4().to_string().into(),
+        ttl,
+    ));
+    let mut owned = tuning();
+    owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
+    let node = backend.bare_with(&machine, owned).await;
+    let machine_id = node.status().node_id;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+
+    let mut first = machine.accept().await;
+    first.replay_complete(0).await;
+    first.journal(note(1, &agent, "one")).await;
+    first.acked(1).await;
+    // Held past its TTL: the keeper renews it.
+    tokio::time::sleep(ttl * 2).await;
+    first.journal(note(2, &agent, "two")).await;
+    assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
+    first.acked(2).await;
+
+    // Cut off from the store: the lease lapses and another process takes
+    // it. Once renewal finds that, the link closes without waiting for a
+    // write.
+    ownership.stall_renewals().await;
+    let other = loop {
+        if let Some(lease) = backend
+            .store()
+            .acquire_lease(
+                intent_node_connections::LINK_LEASE_SCOPE,
+                &machine_id,
+                ttl * 20,
+            )
+            .await
+            .unwrap()
+        {
+            break lease;
+        }
+        tokio::time::sleep(ttl / 4).await;
+    };
+    // Back in touch: the next renewal finds the lease taken.
+    ownership.resume_renewals();
+    closed_without_writes(&mut first, NodeCounter(3)).await;
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(2));
+
+    // Once the other holder lets go, this process claims the link again with
+    // a higher epoch and a newer generation.
+    backend.store().release_lease(other).await.unwrap();
+    let second = machine.accept().await;
+    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    assert_eq!(second.hello.acked_seq, NodeCounter(2));
+
+    // A stopped connector releases its lease at once.
+    node.shutdown();
+    tokio::time::timeout(wait(), async {
+        loop {
+            if backend
+                .store()
+                .acquire_lease(intent_node_connections::LINK_LEASE_SCOPE, &machine_id, ttl)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stopped connector released the link lease");
+}
+
 /// The head's domain as a recording of what the connector calls back with.
 #[derive(Default)]
 struct Recording {

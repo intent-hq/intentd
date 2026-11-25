@@ -39,7 +39,10 @@ pub use handle::{
     UseGuard,
 };
 pub use inbound::{LinkView, NodeInbound};
-pub use ownership::{process_head_session, Fenced, LinkClaim, LinkOwnership, LocalOwnership};
+pub use ownership::{
+    process_head_session, Fenced, LeaseLinkOwnership, LinkClaim, LinkOwnership, LocalOwnership,
+    LINK_LEASE_SCOPE, LINK_LEASE_TTL,
+};
 
 /// Lock `mutex`, taking over a poisoned one.
 #[doc(hidden)]

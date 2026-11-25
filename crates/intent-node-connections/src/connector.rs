@@ -144,18 +144,16 @@ pub struct Tuning {
     /// its record and leaving `Shared::in_grace`.
     #[cfg(any(test, feature = "test-support"))]
     pub grace_gate: GraceGate,
-    /// Test seam: the link ownership the connector claims and fences with,
-    /// instead of this process owning every link.
-    #[cfg(any(test, feature = "test-support"))]
+    /// The link ownership the connector claims and fences with: one per
+    /// backend, shared by its connectors (the orchestrator's leases, or a
+    /// test's). Unset, this process owns every link ([`crate::LocalOwnership`]).
     pub ownership: OwnershipSeam,
 }
 
 /// See [`Tuning::ownership`].
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 pub struct OwnershipSeam(pub Option<Arc<dyn crate::LinkOwnership>>);
 
-#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for OwnershipSeam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OwnershipSeam")
@@ -254,7 +252,6 @@ impl Default for Tuning {
             forge_resolver: ForgeResolver::default(),
             #[cfg(any(test, feature = "test-support"))]
             grace_gate: GraceGate::default(),
-            #[cfg(any(test, feature = "test-support"))]
             ownership: OwnershipSeam::default(),
         }
     }
@@ -1950,7 +1947,12 @@ impl RemoteNode {
                 shared.wake();
             }
         }
-        intent_core::spawn_daemon(run(shared.clone(), lease, Ingest::new(acked), demands));
+        let shared_run = shared.clone();
+        intent_core::spawn_daemon(async move {
+            run(shared_run, lease.clone(), Ingest::new(acked), demands).await;
+            // The connector stopped: free the link for another process.
+            lease.release().await;
+        });
         intent_core::spawn_daemon(expire_final_stops(Arc::downgrade(&shared)));
         Ok(Self { shared })
     }
@@ -3299,6 +3301,9 @@ async fn run(
             Ended::Shutdown => return,
             Ended::Idle => {
                 tracing::info!(machine = %target.id, "remote machine: idle; disconnected");
+                // Hold the link only while it is wanted: another process may
+                // claim it meanwhile, and the next dial here claims it again.
+                lease.release().await;
             }
             Ended::Lost => {
                 retry = shared.wants_link();
@@ -3337,9 +3342,17 @@ async fn serve(
     let mut idle_check = tokio::time::interval(shared.tuning.idle_check);
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ingest.start_link();
+    // Another process took the link over, or this one could not keep it:
+    // close it now rather than at its next durable write.
+    let lost = lease.lost(link.binding().generation);
+    tokio::pin!(lost);
     let ended = loop {
         let due = acks.due();
         tokio::select! {
+            () = &mut lost => {
+                tracing::warn!("remote machine: this process no longer owns the link; closing it");
+                break Ended::Lost;
+            }
             event = events.recv() => {
                 let Some(event) = event else { break Ended::Lost };
                 match event {

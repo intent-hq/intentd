@@ -6,10 +6,21 @@
 //! the newest one). Before each durable write for that link (the journal
 //! ack, the welcome) the holder checks its claim ([`LinkOwnership::fence`]).
 //! A fenced holder writes nothing and closes the link.
+//!
+//! [`LocalOwnership`] (the desktop) owns every link of its process.
+//! [`LeaseLinkOwnership`] (the orchestrator) holds one store lease per
+//! machine link, so any process may own any link and a takeover fences the
+//! previous holder's writes in the database.
 
+use intent_core::node_link::LinkWelcome;
 use intent_core::nodes::{LeaseOwner, NodeCounter};
 use intent_core::{BoxFuture, Result};
 use intent_store::Store;
+
+use crate::lease::LinkWrite;
+
+mod leased;
+pub use leased::{LeaseLinkOwnership, LINK_LEASE_SCOPE, LINK_LEASE_TTL};
 
 /// The epoch of every [`LocalOwnership`] claim: one process owns every
 /// link, so no claim is ever compared against another's epoch.
@@ -70,6 +81,71 @@ pub trait LinkOwnership: Send + Sync + 'static {
     ///
     /// [`Fenced`] when another process owns the link now.
     fn fence<'a>(&'a self, claim: &'a LinkClaim) -> BoxFuture<'a, std::result::Result<(), Fenced>>;
+
+    /// Persist the journal ack `seq` for `claim`'s link: only while the claim
+    /// holds, checked in the write itself where the owner can.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkWrite::Fenced`] when the claim no longer holds; otherwise when
+    /// the store write fails.
+    fn persist_ack<'a>(
+        &'a self,
+        store: &'a Store,
+        claim: &'a LinkClaim,
+        seq: NodeCounter,
+    ) -> BoxFuture<'a, std::result::Result<NodeCounter, LinkWrite>> {
+        Box::pin(async move {
+            self.fence(claim).await.map_err(LinkWrite::Fenced)?;
+            Ok(store.advance_node_lease_ack(&claim.owner, seq).await?)
+        })
+    }
+
+    /// Record `welcome` for `claim`'s link: only while the claim holds,
+    /// checked in the write itself where the owner can.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkWrite::Fenced`] when the claim no longer holds; otherwise when
+    /// the store write fails.
+    fn record_welcome<'a>(
+        &'a self,
+        store: &'a Store,
+        claim: &'a LinkClaim,
+        welcome: &'a LinkWelcome,
+    ) -> BoxFuture<'a, std::result::Result<(), LinkWrite>> {
+        Box::pin(async move {
+            self.fence(claim).await.map_err(LinkWrite::Fenced)?;
+            let platform = &welcome.capabilities.platform;
+            store
+                .record_node_welcome(
+                    &claim.owner,
+                    platform.os,
+                    platform.arch,
+                    welcome.capabilities.capacity.agent_cap,
+                    &welcome.capabilities.intentd_version,
+                )
+                .await
+                .map(drop)
+                .map_err(LinkWrite::Failed)
+        })
+    }
+
+    /// Resolves once `claim` is lost (taken over, or its renewal failed past
+    /// its expiry): the link bound under it must close. Never resolves for
+    /// an owner whose claims cannot be lost.
+    fn lost<'a>(&'a self, claim: &'a LinkClaim) -> BoxFuture<'a, ()> {
+        let _ = claim;
+        Box::pin(std::future::pending())
+    }
+
+    /// Give up the link of `owner`'s machine, so another process can claim
+    /// it at once: the connector stopped. A no-op for an owner that holds
+    /// nothing.
+    fn release<'a>(&'a self, owner: &'a LeaseOwner) -> BoxFuture<'a, ()> {
+        let _ = owner;
+        Box::pin(async {})
+    }
 
     /// The `hello.headSession` every link of this owner offers.
     fn head_session(&self) -> &str;
@@ -247,5 +323,102 @@ mod tests {
         let owned = LocalOwnership::with_head_session(store, session.clone());
         assert_eq!(owned.head_session(), &*session);
         assert_ne!(owned.head_session(), process_head_session());
+    }
+
+    fn leased(store: &Store, ttl: std::time::Duration) -> LeaseLinkOwnership {
+        LeaseLinkOwnership::new(store.clone(), uuid::Uuid::new_v4().to_string().into(), ttl)
+    }
+
+    const TTL: std::time::Duration = std::time::Duration::from_millis(400);
+
+    #[tokio::test]
+    async fn one_leased_owner_holds_a_link_until_it_releases_it() {
+        let (_dir, store, owner) = store_with_lease().await;
+        let (a, b) = (leased(&store, TTL), leased(&store, TTL));
+        let first = a.claim(&owner).await.unwrap();
+        assert_eq!(
+            a.claim(&owner).await.unwrap().epoch,
+            first.epoch,
+            "a redial keeps the lease"
+        );
+        let error = b.claim(&owner).await.unwrap_err();
+        assert!(
+            error.to_string().contains("remote-link-owned-elsewhere"),
+            "{error}"
+        );
+        assert_eq!(a.fence(&first).await, Ok(()));
+        // Renewed past its TTL.
+        tokio::time::sleep(TTL * 2).await;
+        assert!(b.claim(&owner).await.is_err());
+        assert_eq!(a.fence(&first).await, Ok(()));
+
+        a.release(&owner).await;
+        let taken = b
+            .claim(&owner)
+            .await
+            .expect("a release frees the link at once");
+        assert!(taken.epoch > first.epoch);
+        assert!(taken.generation > first.generation);
+        assert!(a.fence(&first).await.is_err());
+        a.lost(&first).await;
+        assert!(matches!(
+            a.persist_ack(&store, &first, NodeCounter(3)).await,
+            Err(LinkWrite::Fenced(_))
+        ));
+        assert_eq!(
+            store.get_node_lease(&owner).await.unwrap().ack_seq,
+            NodeCounter(0)
+        );
+        assert_eq!(
+            b.persist_ack(&store, &taken, NodeCounter(3)).await.unwrap(),
+            NodeCounter(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_leased_owner_loses_the_link_after_its_ttl() {
+        let (_dir, store, owner) = store_with_lease().await;
+        let (a, b) = (leased(&store, TTL), leased(&store, TTL));
+        let first = a.claim(&owner).await.unwrap();
+        a.stall_renewals().await;
+        let deadline = tokio::time::Instant::now() + intentd_test_support::test_timeout(TTL * 10);
+        let taken = loop {
+            match b.claim(&owner).await {
+                Ok(claim) => break claim,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(TTL / 8).await;
+                }
+                Err(error) => panic!("the lapsed link was never free: {error}"),
+            }
+        };
+        assert!(taken.epoch > first.epoch);
+        assert!(taken.generation > first.generation);
+        // Back in touch: the next renewal finds the lease taken.
+        a.resume_renewals();
+        tokio::time::timeout(intentd_test_support::test_timeout(TTL * 5), a.lost(&first))
+            .await
+            .expect("a taken lease loses the claim");
+        assert!(a.fence(&first).await.is_err());
+        let error = a.claim(&owner).await.unwrap_err();
+        assert!(
+            error.to_string().contains("remote-link-owned-elsewhere"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_of_a_superseded_generation_resolves_lost_at_once() {
+        let (_dir, store, owner) = store_with_lease().await;
+        let a = leased(&store, TTL);
+        let first = a.claim(&owner).await.unwrap();
+        let other = LinkClaim {
+            epoch: first.epoch + 1,
+            ..first.clone()
+        };
+        tokio::time::timeout(intentd_test_support::test_timeout(TTL), a.lost(&other))
+            .await
+            .expect("a claim this owner does not hold is lost");
+        assert!(a.fence(&other).await.is_err());
+        assert_eq!(a.fence(&first).await, Ok(()));
     }
 }
