@@ -1344,6 +1344,7 @@ const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "workspace.changeHistory",
     "workspaceInitializer.state",
     "hardwareConsole.state",
+    "providerSwitch.state",
     "daemon.mode",
     "agents.permissionPolicy",
 ];
@@ -2359,6 +2360,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Hardware console state",
             "Persisted hardware-console configuration (key assignments, action mappings, prompt-picker limit)",
             "hardware",
+            Some(json!({})),
+        ),
+        // --- Group A: provider switch state -----------------------------------
+        // FE-owned memory of the last provider/model chosen per failed
+        // (provider, model) pair in the bulk "Switch all" dialog.
+        object(
+            "providerSwitch.state",
+            "Provider switch choices",
+            "Last provider and model chosen per failed provider and model when switching failed agents in bulk",
+            "providers",
             Some(json!({})),
         ),
         // --- Group B: context engine ----------------------------------------
@@ -4984,6 +4995,7 @@ mod tests {
             "workspace.changeHistory",
             "workspaceInitializer.state",
             "hardwareConsole.state",
+            "providerSwitch.state",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");

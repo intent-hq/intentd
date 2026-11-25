@@ -1738,6 +1738,7 @@ mod tests {
             "workspace.changeHistory",
             "workspaceInitializer.state",
             "hardwareConsole.state",
+            "providerSwitch.state",
             "repos.known",
             "endUserRules",
             "permissions.rules",

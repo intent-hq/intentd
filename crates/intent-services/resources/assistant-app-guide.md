@@ -1794,7 +1794,7 @@ top directions.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts; src/features/notifications/main/notification.service.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/{agent-failure-toast-saga,agent-failure-group-saga}.ts; src/features/agent/{agent-failure-groups,bulk-provider-switch,provider-switch-targets}.ts; src/store/renderer/slices/provider-switch-dialog/provider-switch-dialog-slice.ts; src/lib/components/modals/ProviderSwitchDialog.svelte; src/features/notifications/main/notification.service.ts. -->
 
 While the desktop app is in front, an agent finishing work shows an in-app
 notification naming the agent and its workspace instead of a system notification;
@@ -1806,6 +1806,21 @@ and automatic workspace unarchiving are skipped when that workspace is already
 selected, even if another conversation, file, or note is open. Notifications for
 other workspaces can still appear. The workspace's agent status and conversation
 notices remain available.
+
+When two or more top-level agents fail for the same provider reason — a usage or
+rate limit, or a required sign-in — one notification covers them, such as
+"Claude Code usage or rate limit reached — 5 agents", instead of one per agent.
+It lists the first few agents and their workspaces, and shows when at least one
+of them is outside the selected workspace. **Retry all** retries every listed
+agent on its current provider. For sign-in, run the login command first. **Switch
+all…** opens a dialog with one row per failed provider and model. Each row has a
+target provider and model, prefilled with the last choice for that row. **Switch
+and retry** moves each agent and restarts its failed turn. It also moves the
+agent's failed delegated agents, but does not restart them. Each row then shows how
+many agents were switched, not available, or failed, with any error; an agent whose
+target is not available in its workspace is left as is. Nothing switches until you confirm. Closing the notification hides it until
+another agent fails for the same reason. Delegated agents never get their own
+notification. Older versions may differ.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; src/lib/components/chat/failure-transcript.ts; src/shared/provider-catalog.ts; src/store/renderer/slices/agent-availability/sagas/provider-availability-saga.ts; src/lib/components/ui/toast/AgentFailureToast.svelte; messages/en.json. -->
 
@@ -1843,7 +1858,8 @@ blocker notice can remain in the conversation after the current warning clears.
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
 whose usage limit was reached, and **Retry** lets you try the same provider
-again after its limit resets. For sign-in errors, including an expired Claude
+again after its limit resets. When several agents hit the same limit, use the
+grouped notification's **Switch all…** instead of switching each chat. For sign-in errors, including an expired Claude
 OAuth login, run the displayed CLI login command on the host running the agent,
 complete sign-in, then retry. Signing in to the Claude desktop app does not sign
 in its CLI. For **Agent session corrupted**, retry starts a fresh session and
