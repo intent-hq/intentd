@@ -1,9 +1,11 @@
 //! Leases on Postgres: processes that share one tenant hold a leased unit
 //! of work one at a time. See `lease_repo.rs` for the rules.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_store::{Error, Store};
+use tokio::sync::Barrier;
 
 use crate::harness::TestDb;
 
@@ -29,7 +31,7 @@ async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
 /// other keeps losing; release frees the key at once with a higher token
 /// for the next holder; a lease is not re-entrant; other keys and other
 /// tenants are other work; a non-holder's release is a no-op.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_processes_race_one_key_and_release_frees_it() {
     let Some(db) = crate::harness::test_db(false).await else {
         return;
@@ -38,10 +40,19 @@ async fn two_processes_race_one_key_and_release_frees_it() {
     let a = open_as_process(&db, tenant, "process-a").await;
     let b = open_as_process(&db, tenant, "process-b").await;
 
-    let racers = (0..8).map(|i| {
-        let s = if i % 2 == 0 { a.clone() } else { b.clone() };
-        tokio::spawn(async move { (i % 2, s.acquire_lease(SCOPE, "", TTL).await.unwrap()) })
-    });
+    // Every racer is spawned before any is awaited and all wait at one
+    // barrier, so the acquisitions reach the database together.
+    let start = Arc::new(Barrier::new(8));
+    let racers: Vec<_> = (0..8)
+        .map(|i| {
+            let s = if i % 2 == 0 { a.clone() } else { b.clone() };
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                (i % 2, s.acquire_lease(SCOPE, "", TTL).await.unwrap())
+            })
+        })
+        .collect();
     let mut winners = Vec::new();
     for racer in racers {
         let (side, lease) = racer.await.unwrap();

@@ -478,13 +478,23 @@ mod tests {
             .is_none());
     }
 
-    #[tokio::test]
+    /// Every acquirer is spawned before any is awaited and all wait at one
+    /// barrier, on several worker threads, so they contend for the lease
+    /// table's lock together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_acquirers_get_one_lease() {
         let (store, _dir) = store().await;
-        let tries = (0..16).map(|_| {
-            let s = store.clone();
-            tokio::spawn(async move { s.acquire_lease("scan", "", TTL).await.unwrap() })
-        });
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let tries: Vec<_> = (0..16)
+            .map(|_| {
+                let s = store.clone();
+                let start = std::sync::Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    s.acquire_lease("scan", "", TTL).await.unwrap()
+                })
+            })
+            .collect();
         let mut won = Vec::new();
         for t in tries {
             won.extend(t.await.unwrap());
