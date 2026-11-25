@@ -81,8 +81,10 @@ pub struct NewEvent {
     pub data: serde_json::Value,
 }
 
-/// A durable event's position in its tenant's event log: strictly
-/// increasing in commit order, never 0, with gaps allowed.
+/// A durable event's position in its tenant's event log: never 0, with
+/// gaps allowed. On Postgres it strictly increases in commit order. On
+/// `SQLite` it increases only while the newest row is not deleted (see
+/// below); a consumer must handle reuse before relying on it as a cursor.
 ///
 /// - Postgres: the row's `row_seq`, taken from the tenant's row counter
 ///   under the tenant writer lock, so seq order is commit order across every
