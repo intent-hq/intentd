@@ -295,7 +295,7 @@ fn provider(id: &str, status: ProviderStatus, models: Vec<String>) -> ProviderCa
         visible: true,
         status,
         models,
-        model_labels: Default::default(),
+        model_labels: std::collections::BTreeMap::new(),
         models_stale: false,
     }
 }

@@ -1765,6 +1765,26 @@ async fn save_reported(
         .expect("saved");
 }
 
+#[tokio::test]
+async fn models_forwards_nonempty_model_labels() {
+    let backend = Backend::new().await;
+    let mut claude = entry(
+        "claude-code",
+        intent_core::node_link::ProviderStatus::SignedIn,
+        &["opus"],
+    );
+    claude.model_labels.insert("opus".into(), "Opus 5.5".into());
+    save_reported(&backend, "m-lbl", "Label box", Some(vec![claude])).await;
+    let out = backend
+        .call("models", json!({ "nodeId": "m-lbl" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        out["machines"][0]["providers"][0]["modelLabels"],
+        json!({ "opus": "Opus 5.5" })
+    );
+}
+
 fn entry(
     id: &str,
     status: intent_core::node_link::ProviderStatus,
@@ -1775,7 +1795,7 @@ fn entry(
         visible: true,
         status,
         models: models.iter().map(|m| (*m).to_owned()).collect(),
-        model_labels: Default::default(),
+        model_labels: std::collections::BTreeMap::new(),
         models_stale: id == "codex",
     }
 }

@@ -369,13 +369,16 @@ fn machine_models_json(
         .filter(|entry| provider.is_none_or(|id| entry.id == id))
         .filter(|entry| model.is_none_or(|model| entry.models.iter().any(|m| m == model)))
         .map(|entry| {
-            json!({
+            let mut value = json!({
                 "id": entry.id,
                 "status": entry.status,
                 "models": entry.models,
-                "modelLabels": entry.model_labels,
                 "modelsStale": entry.models_stale,
-            })
+            });
+            if !entry.model_labels.is_empty() {
+                value["modelLabels"] = json!(entry.model_labels);
+            }
+            value
         })
         .collect();
     if providers.is_empty() && (provider.is_some() || model.is_some()) {

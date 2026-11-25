@@ -120,7 +120,7 @@ impl Services {
                 .is_none(),
                 status: launch_status(&resolve_provider_launch(provider.id, &settings)),
                 models: Vec::new(),
-                model_labels: Default::default(),
+                model_labels: std::collections::BTreeMap::new(),
                 models_stale: true,
             })
             .collect()

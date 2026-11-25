@@ -283,7 +283,7 @@ mod tests {
             visible: true,
             status,
             models: models.iter().map(|m| (*m).to_owned()).collect(),
-            model_labels: Default::default(),
+            model_labels: std::collections::BTreeMap::new(),
             models_stale: false,
         });
         row.platform = Some(platform);
