@@ -200,18 +200,57 @@ fn services_fields(src: &str) -> Vec<String> {
         .collect()
 }
 
-/// The restore, sweep and loop functions `src` (tenant.rs) calls.
+/// The restore, sweep and loop functions `src` (tenant.rs) calls, with or
+/// without a turbofish (`.spawn_x::<T>(…)`).
 fn tenant_loops(src: &str) -> BTreeSet<String> {
     let blanked = lex(src).blanked;
     let tokens = tokenize_str(&blanked);
-    tokens
-        .windows(3)
-        .filter(|w| (w[0].is(".") || w[0].is("::")) && w[1].is_ident() && w[2].is("("))
-        .map(|w| w[1].text.as_str())
-        .filter(|name| LOOP_PREFIXES.iter().any(|p| name.starts_with(p)))
-        .filter(|name| !NOT_LOOPS.contains(name))
-        .map(str::to_string)
-        .collect()
+    let mut out = BTreeSet::new();
+    for i in 1..tokens.len() {
+        let name = &tokens[i];
+        if !(tokens[i - 1].is(".") || tokens[i - 1].is("::")) || !name.is_ident() {
+            continue;
+        }
+        if !is_call_after(&tokens, i + 1) {
+            continue;
+        }
+        let name = name.text.as_str();
+        if LOOP_PREFIXES.iter().any(|p| name.starts_with(p)) && !NOT_LOOPS.contains(&name) {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// Whether the tokens from `at` open a call: `(`, or `::<…>` then `(`.
+/// Angle brackets are counted per character, so `>>` closes two levels.
+fn is_call_after(tokens: &[intentd_test_support::source_lint::Token], at: usize) -> bool {
+    match tokens.get(at) {
+        Some(t) if t.is("(") => true,
+        Some(t) if t.is("::") => {
+            if !tokens.get(at + 1).is_some_and(|t| t.text.starts_with('<')) {
+                return false;
+            }
+            let mut depth = 0usize;
+            let mut j = at + 1;
+            while let Some(t) = tokens.get(j) {
+                j += 1;
+                for c in t.text.chars() {
+                    match c {
+                        '<' => depth += 1,
+                        '>' if depth == 0 => return false,
+                        '>' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth == 0 {
+                    break;
+                }
+            }
+            depth == 0 && tokens.get(j).is_some_and(|t| t.is("("))
+        }
+        _ => false,
+    }
 }
 
 /// Names in `code` with no row, and rows naming nothing in `code`.
@@ -219,7 +258,10 @@ fn drift(what: &str, code: &BTreeSet<String>, rows: &[&Row], hint: &str) -> Vec<
     let mut out = Vec::new();
     let mut listed = BTreeSet::new();
     for row in rows {
-        let name = row.get("name").unwrap_or_default();
+        // A row without a name already fails `row_errors`; no drift noise.
+        let Some(name) = row.get("name").filter(|name| !name.is_empty()) else {
+            continue;
+        };
         if !listed.insert(name.to_string()) {
             out.push(format!(
                 "{INVENTORY}:{}: duplicate {what} row `{name}`",
@@ -364,6 +406,20 @@ fn finds_tenant_loop_calls() {
 }
 
 #[test]
+fn finds_tenant_loop_calls_with_a_turbofish() {
+    let tenant = r"
+fn start(services: &Services) {
+    services.refresh_typed::<Vec<Option<u8>>>(cx);
+    Self::heal_generic::<T>();
+    let f = services.spawn_not_called::<T>;
+    services.sweep_ordered::<A, B>(1 << 2);
+}
+";
+    let loops: Vec<String> = tenant_loops(tenant).into_iter().collect();
+    assert_eq!(loops, ["heal_generic", "refresh_typed", "sweep_ordered"]);
+}
+
+#[test]
 fn sample_inventory_passes() {
     assert_eq!(
         check(SAMPLE_INVENTORY, SAMPLE_SERVICES, SAMPLE_TENANT),
@@ -406,6 +462,22 @@ fn an_added_loop_fails() {
     let problems = check(SAMPLE_INVENTORY, SAMPLE_SERVICES, &tenant);
     assert!(
         problems.len() == 1 && problems[0].contains("loop `spawn_new_loop`"),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn a_row_without_a_name_fails_once() {
+    let unnamed = format!(
+        "{SAMPLE_INVENTORY}\n[[field]]\nclass = \"config\"\nnote = \"No name.\"\n\n[[field]]\nclass = \"config\"\nnote = \"No name either.\"\n"
+    );
+    let problems = check(&unnamed, SAMPLE_SERVICES, SAMPLE_TENANT);
+    assert_eq!(problems.len(), 2, "one error per unnamed row: {problems:?}");
+    assert!(problems.iter().all(|p| p.contains("name")), "{problems:?}");
+    assert!(
+        !problems
+            .iter()
+            .any(|p| p.contains("no longer exists") || p.contains("duplicate")),
         "{problems:?}"
     );
 }

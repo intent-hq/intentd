@@ -211,8 +211,10 @@ note = "Completion-watch and delegation-group registry. Rows persist (completion
 
 [[field]]
 name = "group_persist_lane"
-class = "owner"
-note = "Single worker that applies delegation_group writes in enqueue order (intent-hq/intent#4460)."
+class = "gate"
+invariant = "delegation_group writes apply in enqueue order (intent-hq/intent#4460)."
+writer_lock = "no"
+note = "Single worker per process. The writer lock serializes each transaction but not the enqueue order; with two replicas each has its own lane and writes for one group can interleave across processes."
 
 [[field]]
 name = "completion_watch_registration_gate"
