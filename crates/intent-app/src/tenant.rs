@@ -459,11 +459,17 @@ pub struct TenantRuntime {
 
 /// The tenant's loops, stopped by a graceful stop or the self-fence.
 #[derive(Clone, Default)]
-struct Loops(Arc<Mutex<Vec<JoinHandle<()>>>>);
+struct Loops {
+    running: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Held while a stop joins the loops: a stop that overlaps it waits
+    /// for the same joins.
+    joining: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl Loops {
     async fn stop(&self) {
-        let loops = std::mem::take(&mut *lock(&self.0));
+        let _joining = self.joining.lock().await;
+        let loops = std::mem::take(&mut *lock(&self.running));
         for handle in loops {
             handle.abort();
             let _ = handle.await;
@@ -477,6 +483,9 @@ impl Loops {
 struct Recovery {
     stop: Arc<tokio::sync::watch::Sender<bool>>,
     running: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Held while a drain joins the reconcile: a drain that overlaps it
+    /// (a graceful stop and the fence) waits for the same join.
+    joining: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for Recovery {
@@ -484,6 +493,7 @@ impl Default for Recovery {
         Self {
             stop: Arc::new(tokio::sync::watch::channel(false).0),
             running: Arc::default(),
+            joining: Arc::default(),
         }
     }
 }
@@ -499,6 +509,7 @@ impl Recovery {
 
     async fn drain(&self) {
         self.stop.send_replace(true);
+        let _joining = self.joining.lock().await;
         let running = lock(&self.running).take();
         if let Some(running) = running {
             let _ = running.await;
@@ -571,8 +582,11 @@ impl TenantRuntime {
             .collect();
         // The loops stay with the runtime, so a graceful stop can end them
         // before it drains the store writers (`Self::stop_loops`).
-        let running = Loops(Arc::new(Mutex::new(std::mem::take(&mut background.loops))));
-        let mut tasks: Vec<AbortHandle> = lock(&running.0)
+        let running = Loops {
+            running: Arc::new(Mutex::new(std::mem::take(&mut background.loops))),
+            joining: Arc::default(),
+        };
+        let mut tasks: Vec<AbortHandle> = lock(&running.running)
             .iter()
             .map(JoinHandle::abort_handle)
             .collect();
@@ -687,6 +701,49 @@ mod tests {
             "the drain joined the reconcile"
         );
         // Draining again (nothing held) returns at once.
+        recovery.drain().await;
+    }
+
+    /// A graceful drain and the fence's drain overlap: the fence's waits
+    /// for the same reconcile, so its tasks step cannot report a clean stop
+    /// while the reconcile still runs; past its budget it records an
+    /// overrun.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_drains_wait_for_the_same_reconcile() {
+        use intent_core::tenant_fence::{FenceStep, SelfFence, TenantFence};
+
+        let recovery = Recovery::default();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        recovery.hold(tokio::spawn(async move {
+            let _ = held.await;
+        }));
+        let graceful = tokio::spawn({
+            let recovery = recovery.clone();
+            async move { recovery.drain().await }
+        });
+        // The graceful drain has taken the reconcile and waits for it.
+        tokio::task::yield_now().await;
+        let second = recovery.clone();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second.drain())
+                .await
+                .is_err(),
+            "a second drain waits for the held reconcile"
+        );
+
+        let fence = TenantFence::new();
+        let mut runner = SelfFence::new(fence.clone()).with_step_budget(Duration::from_millis(100));
+        let draining = recovery.clone();
+        runner.on_tasks(move || async move { draining.drain().await });
+        fence.fire("lease lost");
+        let report = runner.run().await;
+        assert!(
+            report.overran.contains(&FenceStep::Tasks),
+            "the fence's tasks step overran while the reconcile ran: {report:?}"
+        );
+
+        let _ = release.send(());
+        graceful.await.unwrap();
         recovery.drain().await;
     }
 }
