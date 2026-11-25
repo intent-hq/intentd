@@ -294,7 +294,9 @@ python3 -I -B scripts/check-rdeps-parity.py  # (from packages/intentd) changed-t
 
 `make test-changed` falls back to `make test` on manifest/lockfile/nextest-config changes.
 An intent-core change also selects every crate depending on it, and an intent-js change
-the library unit tests of its direct dependents. It also runs the end-to-end and library
+the library unit tests of its direct dependents. Any `crates/*/src` change also runs every
+source lint binary (`*_lint`, the CI "Source lints" step) but not the rest of its crate
+(intentd#3742). It also runs the end-to-end and library
 unit-test modules `.config/e2e-test-map.txt` maps changed source to — add an entry when an
 end-to-end test or another crate's unit test exercises a crate's source (`<crate>::lib
 <module>` names unit tests); `scripts/changed-tests.sh --check-map` validates it.
