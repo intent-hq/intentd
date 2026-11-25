@@ -259,6 +259,9 @@ async fn try_serve_tenant_with(
     if let Some(reap) = spawn_idle_reap(&services, &recovered.agents, &admission) {
         runner.adopt_task(reap);
     }
+    if !fence.is_fenced() {
+        crate::mcp::start_tenant_mcp(&services, &mut runner);
+    }
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be

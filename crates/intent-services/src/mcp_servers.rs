@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +48,9 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on a caller-supplied tool-call timeout, kept below the 60s hook
 /// budget so a forwarded call always resolves within one hook run.
 const TOOL_TIMEOUT_CAP: Duration = Duration::from_secs(55);
+/// Why a stdio server is refused on an orchestrator, which starts no
+/// process for a tenant.
+const STDIO_REFUSED: &str = "stdio MCP servers are not supported on this backend: it runs no local processes for MCP servers. Use an http or sse server instead.";
 /// The built-in workspace server's name, never given to a user server.
 const RESERVED_SERVER_NAME: &str = "workspace-mcp";
 /// Bound on a remote agent's proxied `tools/call` (nodeProtocol 11), longer
@@ -409,6 +412,8 @@ struct HubInner {
     oauth_store: Option<Store>,
     next_generation: AtomicU64,
     background_stop: tokio::sync::watch::Sender<bool>,
+    /// Set on an orchestrator: stdio servers are refused ([`STDIO_REFUSED`]).
+    stdio_refused: AtomicBool,
     #[cfg(test)]
     before_reap: Mutex<Option<Arc<crate::CompletionClassifyPark>>>,
 }
@@ -447,6 +452,7 @@ impl McpHub {
                 oauth_store,
                 next_generation: AtomicU64::new(1),
                 background_stop: tokio::sync::watch::channel(false).0,
+                stdio_refused: AtomicBool::new(false),
                 #[cfg(test)]
                 before_reap: Mutex::new(None),
             }),
@@ -461,6 +467,17 @@ impl McpHub {
     #[must_use]
     pub fn background_stopping(&self) -> bool {
         *self.inner.background_stop.borrow()
+    }
+
+    /// Refuse stdio servers from now on: definitions are rejected and a
+    /// stored one is never spawned (an orchestrator, which runs no process
+    /// for a tenant).
+    pub(crate) fn refuse_stdio(&self) {
+        self.inner.stdio_refused.store(true, Ordering::Relaxed);
+    }
+
+    fn stdio_refused(&self) -> bool {
+        self.inner.stdio_refused.load(Ordering::Relaxed)
     }
 
     fn next_generation(&self) -> u64 {
@@ -570,7 +587,12 @@ impl McpHub {
         if transport != "stdio" {
             return self.start_remote(id, config).await;
         }
-        match spawn_stdio(&config).await {
+        let spawned = if self.stdio_refused() {
+            Err(Error::InvalidParams(STDIO_REFUSED.to_owned()))
+        } else {
+            spawn_stdio(&config).await
+        };
+        match spawned {
             Ok((child, pid, conn, tool_count)) => {
                 let status =
                     status_value(&id, "running", pid, tool_count, None, Some(now_millis()));
@@ -1646,6 +1668,16 @@ impl<'a> McpServersService<'a> {
         }
     }
 
+    /// Refuse a stdio definition when the hub refuses stdio servers.
+    fn reject_refused_transport(&self, config: &Value) -> Result<()> {
+        if self.hub.stdio_refused()
+            && config.get("transport").and_then(Value::as_str) == Some("stdio")
+        {
+            return Err(Error::InvalidParams(STDIO_REFUSED.to_owned()));
+        }
+        Ok(())
+    }
+
     /// The effective typed settings; schema defaults when no registry is wired.
     fn effective(&self) -> SettingsFile {
         self.registry
@@ -1718,6 +1750,7 @@ impl<'a> McpServersService<'a> {
     /// with `InvalidParams` — there is no stored secret to keep.
     pub(crate) async fn create(&self, config: Value) -> Result<Value> {
         let normalized = normalize_config(config, None)?;
+        self.reject_refused_transport(&normalized)?;
         reject_redacted_secrets(&normalized)?;
         let id = config_id(&normalized);
         reject_plugin_server(&id)?;
@@ -1749,6 +1782,7 @@ impl<'a> McpServersService<'a> {
             )));
         };
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
+        self.reject_refused_transport(&normalized)?;
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
         // Apply the saved definition using configured eligibility, not the
@@ -2058,7 +2092,7 @@ impl<'a> McpServersService<'a> {
             let usable = match text("transport").unwrap_or("stdio") {
                 "http" => text("url").is_some(),
                 "sse" => false,
-                _ => text("command").is_some(),
+                _ => !self.hub.stdio_refused() && text("command").is_some(),
             };
             if !usable
                 || !obj.get("enabled").and_then(Value::as_bool).unwrap_or(false)
@@ -2559,6 +2593,24 @@ mod tests {
         assert_eq!(status, status_stopped("s1"));
         // Server is never registered when the gate is off.
         assert_eq!(h.status("s1"), status_stopped("s1"));
+    }
+
+    /// An orchestrator's hub spawns no stdio server, even a stored or
+    /// plugin one that would start: it reports why instead.
+    #[tokio::test]
+    async fn a_hub_that_refuses_stdio_spawns_nothing_and_says_why() {
+        let h = McpHub::new();
+        h.refuse_stdio();
+        let status = h.start(stdio_cfg("cat", "/bin/cat"), true).await;
+        assert_eq!(status["state"], json!("error"), "{status}");
+        assert!(status["pid"].is_null(), "{status}");
+        assert!(
+            status["lastError"]
+                .as_str()
+                .is_some_and(|e| e.contains(STDIO_REFUSED)),
+            "{status}"
+        );
+        assert!(!h.is_running("cat"));
     }
 
     #[tokio::test]
