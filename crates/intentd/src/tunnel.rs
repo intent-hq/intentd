@@ -32,34 +32,9 @@ const DEFAULT_ADDRESS_TIMEOUT: Duration = Duration::from_secs(60);
 const RESTART_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Resolve the tailcat binary: `INTENTD_TAILCAT_BIN` env override (dev seam)
-/// → `libexec/tailcat` next to the daemon binary (release archive layout) →
-/// `tailcat` next to the daemon binary → bare `tailcat` (PATH lookup).
-pub fn resolve_tailcat_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("INTENTD_TAILCAT_BIN") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    let name = if cfg!(windows) {
-        "tailcat.exe"
-    } else {
-        "tailcat"
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let libexec = dir.join("libexec").join(name);
-            if libexec.exists() {
-                return libexec;
-            }
-            let sibling = dir.join(name);
-            if sibling.exists() {
-                return sibling;
-            }
-        }
-    }
-    PathBuf::from(name)
-}
+/// Resolve the tailcat binary ([`intent_core::tailcat::resolve_tailcat_bin`],
+/// shared with the orchestrator).
+pub use intent_core::tailcat::resolve_tailcat_bin;
 
 /// Map a tailcat spawn failure into an actionable error. `NotFound` means the
 /// sidecar binary is missing entirely (`resolve_tailcat_bin` already probed
