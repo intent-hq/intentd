@@ -14,6 +14,10 @@
 //! `env_clear()` that skip [`apply_test_egress`]; and `git` under an
 //! `http.proxy` config setting, which wins over these vars.
 //!
+//! npm and npx would retry the dead proxy for minutes, so the guard also sets
+//! [`TEST_NPM_ENV`]: a forgotten registry fetch (a bundled CLI install, an
+//! adapter `npx`) fails at once instead of timing the test out.
+//!
 //! A live opt-in test (e.g. `INTENTD_GH_LIVE_TEST`) runs with
 //! [`ALLOW_TEST_EGRESS_ENV`]` = 1`, which turns the guard off.
 
@@ -34,6 +38,9 @@ pub const TEST_EGRESS_ENV: [(&str, &str); 8] = [
     ("NO_PROXY", LOOPBACK),
     ("no_proxy", LOOPBACK),
 ];
+
+/// No npm fetch retries, so a blocked registry fetch fails at once.
+pub const TEST_NPM_ENV: (&str, &str) = ("npm_config_fetch_retries", "0");
 
 /// Set to `1` to let a live test reach the real network.
 pub const ALLOW_TEST_EGRESS_ENV: &str = "INTENTD_TEST_ALLOW_EGRESS";
@@ -57,7 +64,7 @@ pub fn block_test_egress() {
     if test_egress_allowed() {
         return;
     }
-    for (key, value) in TEST_EGRESS_ENV {
+    for (key, value) in TEST_EGRESS_ENV.into_iter().chain([TEST_NPM_ENV]) {
         std::env::set_var(key, value);
     }
 }
@@ -68,6 +75,13 @@ pub fn block_test_egress() {
 pub fn apply_test_egress(cmd: &mut Command) {
     if test_egress_allowed() {
         return;
+    }
+    let (npm_key, npm_value) = TEST_NPM_ENV;
+    if !cmd
+        .get_envs()
+        .any(|(k, _)| k.eq_ignore_ascii_case(OsStr::new(npm_key)))
+    {
+        cmd.env(npm_key, npm_value);
     }
     for pair in TEST_EGRESS_ENV.chunks_exact(2) {
         let [(upper, value), (lower, _)] = [pair[0], pair[1]];
@@ -141,5 +155,16 @@ mod tests {
         assert_eq!(explicit(&removed, "no_proxy"), Setting::Removed);
         assert_eq!(explicit(&removed, "NO_PROXY"), Setting::Removed);
         assert_eq!(explicit(&removed, "http_proxy"), Setting::Set(DEAD_PROXY));
+        assert_eq!(
+            explicit(&cleared, "npm_config_fetch_retries"),
+            Setting::Set("0")
+        );
+        let mut retrying = Command::new("never-executed");
+        retrying.env("NPM_CONFIG_FETCH_RETRIES", "2");
+        apply_test_egress(&mut retrying);
+        assert_eq!(
+            explicit(&retrying, "npm_config_fetch_retries"),
+            Setting::Inherited
+        );
     }
 }

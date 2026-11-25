@@ -69,7 +69,7 @@ mod timeout;
 pub use barrier::{Barrier, DEFAULT_HOLD_DEADLINE};
 pub use egress::{
     apply_test_egress, block_test_egress, test_egress_allowed, ALLOW_TEST_EGRESS_ENV,
-    TEST_EGRESS_ENV,
+    TEST_EGRESS_ENV, TEST_NPM_ENV,
 };
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
