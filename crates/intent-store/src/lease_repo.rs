@@ -348,7 +348,9 @@ impl crate::SqliteStore {
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
         self.guard_lease(lease)?;
-        tx.commit().await.map_err(|e| Error::Internal(e.to_string()))
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))
     }
 }
 
@@ -379,7 +381,11 @@ mod tests {
         assert_eq!((held.scope(), held.key(), held.token()), ("scan", "", 1));
         assert!(store.lease_is_held(&held).await.unwrap());
         assert!(
-            store.acquire_lease("scan", "", TTL).await.unwrap().is_none(),
+            store
+                .acquire_lease("scan", "", TTL)
+                .await
+                .unwrap()
+                .is_none(),
             "not re-entrant, even in the holding process"
         );
         let other = store.acquire_lease("scan", "other", TTL).await.unwrap();
@@ -410,7 +416,11 @@ mod tests {
         let (store, _dir) = paused_store().await;
         let mut old = store.acquire_lease("scan", "", TTL).await.unwrap().unwrap();
         tokio::time::advance(TTL / 2).await;
-        assert!(store.acquire_lease("scan", "", TTL).await.unwrap().is_none());
+        assert!(store
+            .acquire_lease("scan", "", TTL)
+            .await
+            .unwrap()
+            .is_none());
         tokio::time::advance(TTL).await;
         assert_eq!(old.remaining(), Duration::ZERO);
         assert!(
@@ -449,7 +459,11 @@ mod tests {
         assert!(!held.needs_renewal());
         tokio::time::advance(TTL * 3 / 2).await;
         assert!(
-            store.acquire_lease("scan", "", TTL).await.unwrap().is_none(),
+            store
+                .acquire_lease("scan", "", TTL)
+                .await
+                .unwrap()
+                .is_none(),
             "renewed past the first TTL"
         );
         // Lapsed but untaken: still this lease, so it renews (same token).
@@ -457,7 +471,11 @@ mod tests {
         assert!(store.renew_lease(&mut held, TTL).await.unwrap());
         assert_eq!(held.token(), 1);
         assert!(store.lease_is_held(&held).await.unwrap());
-        assert!(store.acquire_lease("scan", "", TTL).await.unwrap().is_none());
+        assert!(store
+            .acquire_lease("scan", "", TTL)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -472,7 +490,10 @@ mod tests {
             won.extend(t.await.unwrap());
         }
         assert_eq!(won.len(), 1);
-        store.write_guarded_by_lease_for_tests(&won[0]).await.unwrap();
+        store
+            .write_guarded_by_lease_for_tests(&won[0])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

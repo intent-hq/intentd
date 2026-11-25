@@ -58,6 +58,8 @@ mod homes;
 mod hooks;
 #[path = "postgres_backend/idempotency.rs"]
 mod idempotency;
+#[path = "postgres_backend/leases.rs"]
+mod leases;
 #[path = "postgres_backend/mcp_oauth.rs"]
 mod mcp_oauth;
 #[path = "postgres_backend/nodes.rs"]
@@ -96,8 +98,6 @@ mod tenant_lease;
 mod tenant_secrets;
 #[path = "postgres_backend/usage_metrics.rs"]
 mod usage_metrics;
-#[path = "postgres_backend/leases.rs"]
-mod leases;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
 #[path = "postgres_backend/writer_lock.rs"]

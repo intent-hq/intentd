@@ -79,6 +79,7 @@ mod homes;
 mod hooks;
 mod idempotency;
 mod lease;
+mod leases;
 mod mcp_oauth;
 mod neki_topology;
 mod nodes;
@@ -97,7 +98,6 @@ mod settings;
 mod tenant_config;
 mod tenant_registry;
 mod usage_metrics;
-mod leases;
 mod workspaces;
 
 /// Test seams for the bounded workspace and agent deletes.

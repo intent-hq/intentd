@@ -55,14 +55,24 @@ async fn two_processes_race_one_key_and_release_frees_it() {
     let (holder, other) = if side == 0 { (&a, &b) } else { (&b, &a) };
 
     assert!(
-        holder.acquire_lease(SCOPE, "", TTL).await.unwrap().is_none(),
+        holder
+            .acquire_lease(SCOPE, "", TTL)
+            .await
+            .unwrap()
+            .is_none(),
         "not re-entrant"
     );
     assert!(other.acquire_lease(SCOPE, "", TTL).await.unwrap().is_none());
     assert!(holder.renew_lease(&mut held, TTL).await.unwrap());
     assert!(holder.lease_is_held(&held).await.unwrap());
-    assert!(other.lease_is_held(&held).await.unwrap(), "any process can read");
-    holder.write_guarded_by_lease_for_tests(&held).await.unwrap();
+    assert!(
+        other.lease_is_held(&held).await.unwrap(),
+        "any process can read"
+    );
+    holder
+        .write_guarded_by_lease_for_tests(&held)
+        .await
+        .unwrap();
 
     let elsewhere = other.acquire_lease(SCOPE, "other-key", TTL).await.unwrap();
     assert!(elsewhere.is_some(), "another key is other work");
@@ -82,9 +92,17 @@ async fn two_processes_race_one_key_and_release_frees_it() {
         .await
         .expect("acquire")
         .expect("release frees the key at once");
-    assert_eq!(taken.token(), 2, "release keeps the token, reacquire bumps it");
+    assert_eq!(
+        taken.token(),
+        2,
+        "release keeps the token, reacquire bumps it"
+    );
     assert!(other.renew_lease(&mut taken, TTL).await.unwrap());
-    assert!(holder.acquire_lease(SCOPE, "", TTL).await.unwrap().is_none());
+    assert!(holder
+        .acquire_lease(SCOPE, "", TTL)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// A holder that stops renewing (crashed, or work that outlived its TTL)
@@ -101,7 +119,11 @@ async fn expiry_hands_the_lease_over_with_a_higher_token() {
     let a = open_as_process(&db, tenant, "process-a").await;
     let b = open_as_process(&db, tenant, "process-b").await;
 
-    let mut lapsed = a.acquire_lease(SCOPE, "", SHORT_TTL).await.unwrap().unwrap();
+    let mut lapsed = a
+        .acquire_lease(SCOPE, "", SHORT_TTL)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(b.acquire_lease(SCOPE, "", TTL).await.unwrap().is_none());
     // timing-guard: outlive the short lease's TTL
     tokio::time::sleep(SHORT_TTL * 2).await;
@@ -128,7 +150,10 @@ async fn expiry_hands_the_lease_over_with_a_higher_token() {
         .await
         .unwrap()
         .expect("expiry hands the lease over");
-    assert!(taken.token() > lapsed.token(), "the new holder's token is higher");
+    assert!(
+        taken.token() > lapsed.token(),
+        "the new holder's token is higher"
+    );
     assert!(
         !a.renew_lease(&mut lapsed, TTL).await.unwrap(),
         "the old holder lost it"
