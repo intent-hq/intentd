@@ -1,8 +1,8 @@
 //! A spawned daemon carries the dead test proxy
 //! (`intentd_test_support::block_test_egress` in the suite ctor and
 //! `apply_test_egress` in `common::hermetic_fixture_identity`): its forge
-//! request to a real public host fails on the proxy, while the same request
-//! to a loopback fixture answers. Before this guard a daemon fixture that
+//! request to a host outside `NO_PROXY` never connects, while the same
+//! request to a loopback fixture answers. Before this guard a daemon fixture that
 //! forgot its mock sent the fake token to api.github.com (intentd#3743,
 //! intentd#3758). Both legs boot with `env_clear()`, so the command, not the
 //! inherited test env, has to carry the guard.
@@ -103,16 +103,27 @@ async fn spawned_daemon_reaches_loopback_fixture_but_not_a_public_forge() {
     let reply = get_user(&github_user_fixture().await).await;
     assert_eq!(reply["result"]["user"]["login"], FIXTURE_LOGIN, "{reply}");
 
+    // Offline proof: 127.0.0.2 is reachable but outside `NO_PROXY`, so only
+    // the dead proxy keeps the daemon from connecting to this listener.
+    #[cfg(target_os = "linux")]
+    {
+        let outside = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        outside.set_nonblocking(true).unwrap();
+        let port = outside.local_addr().unwrap().port();
+        let reply = get_user(&format!("https://127.0.0.2:{port}")).await;
+        assert!(reply.get("result").is_none(), "{reply}");
+        match outside.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            accepted => panic!("the daemon bypassed the dead proxy: {accepted:?}"),
+        }
+    }
+
+    // The incident: online, an unguarded daemon got `Bad credentials` here.
     let reply = get_user("https://api.github.com").await;
     let error = reply["error"].to_string();
     assert!(reply.get("result").is_none(), "{reply}");
     assert!(
         !error.contains("Bad credentials") && !error.contains("401"),
         "the fake token reached the real GitHub: {reply}"
-    );
-    // The dead proxy refuses the tunnel before any TLS or HTTP exchange.
-    assert!(
-        error.contains("(Connect)"),
-        "not refused by the dead proxy: {reply}"
     );
 }

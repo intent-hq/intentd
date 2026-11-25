@@ -62,16 +62,35 @@ pub fn block_test_egress() {
     }
 }
 
-/// Put the dead proxy on `cmd`, also after `env_clear()`. A key the command
-/// already sets or removes stays the caller's, so a test can aim a child at
-/// its own proxy.
+/// Put the dead proxy on `cmd`, also after `env_clear()`. A variable the
+/// command already sets or removes, in either case, stays the caller's for
+/// both spellings, so a test can aim a child at its own proxy.
 pub fn apply_test_egress(cmd: &mut Command) {
     if test_egress_allowed() {
         return;
     }
-    for (key, value) in TEST_EGRESS_ENV {
-        if !cmd.get_envs().any(|(k, _)| k == OsStr::new(key)) {
-            cmd.env(key, value);
+    for pair in TEST_EGRESS_ENV.chunks_exact(2) {
+        let [(upper, value), (lower, _)] = [pair[0], pair[1]];
+        let explicit = |key: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == OsStr::new(key))
+                .map(|(_, v)| v.map(ToOwned::to_owned))
+        };
+        let (upper_set, lower_set) = (explicit(upper), explicit(lower));
+        let Some(choice) = upper_set.clone().or_else(|| lower_set.clone()) else {
+            cmd.env(upper, value).env(lower, value);
+            continue;
+        };
+        for (key, set) in [(upper, upper_set), (lower, lower_set)] {
+            match (&choice, set) {
+                (_, Some(_)) => {}
+                (Some(caller), None) => {
+                    cmd.env(key, caller);
+                }
+                (None, None) => {
+                    cmd.env_remove(key);
+                }
+            }
         }
     }
 }
@@ -111,10 +130,16 @@ mod tests {
             explicit(&cleared, "HTTPS_PROXY"),
             Setting::Set("http://127.0.0.1:9")
         );
-        assert_eq!(explicit(&cleared, "https_proxy"), Setting::Set(DEAD_PROXY));
+        // curl and git read the lower-case name first, so a caller's choice
+        // covers both spellings.
+        assert_eq!(
+            explicit(&cleared, "https_proxy"),
+            Setting::Set("http://127.0.0.1:9")
+        );
         assert_eq!(explicit(&cleared, "ALL_PROXY"), Setting::Set(DEAD_PROXY));
         assert_eq!(explicit(&cleared, "NO_PROXY"), Setting::Set(LOOPBACK));
         assert_eq!(explicit(&removed, "no_proxy"), Setting::Removed);
-        assert_eq!(explicit(&removed, "NO_PROXY"), Setting::Set(LOOPBACK));
+        assert_eq!(explicit(&removed, "NO_PROXY"), Setting::Removed);
+        assert_eq!(explicit(&removed, "http_proxy"), Setting::Set(DEAD_PROXY));
     }
 }

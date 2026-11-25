@@ -2215,10 +2215,11 @@ builds and the desktop-bundled daemon are distinct from this installed launcher;
 start/restart are launcher commands. Check the installed launcher's help when its
 version differs from this guide; do not infer launcher support from daemon version.
 
-Behind an HTTP proxy, set `HTTPS_PROXY` (and `NO_PROXY` for hosts to reach directly)
-in the daemon's environment before `intentd start`: GitHub, GitLab and `git` requests
-then go through it. The GitHub sign-in step (device code) still connects directly.
-Older versions may differ: their GitHub requests ignored proxy settings.
+Behind a proxy, set `HTTPS_PROXY` (and `NO_PROXY` for hosts to reach directly) in the
+daemon's environment before `intentd start`: GitHub and GitLab requests and the `git`
+command then go through it. `http://`, `https://` and `socks5://` proxy addresses work.
+The GitHub sign-in step (device code) and some built-in push and checkout steps still
+connect directly. Older versions may differ: their GitHub requests ignored proxy settings.
 
 `intentd agents` lists the daemon's running agents: name, workspace, provider and
 model, owner, memory and process count, then the total and sample time. `--json`
