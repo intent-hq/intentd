@@ -80,11 +80,11 @@ async fn wait_for_expiry(admin: &PgPool, tenant: &str) {
     .expect("the lease expires");
 }
 
-fn stored(body: &str, revision: u64) -> Option<StoredConfig> {
-    Some(StoredConfig {
+fn stored(body: &str, revision: u64) -> StoredConfig {
+    StoredConfig {
         body: body.to_owned(),
         revision,
-    })
+    }
 }
 
 #[track_caller]
@@ -111,7 +111,7 @@ async fn each_write_raises_the_revision_and_a_stale_one_conflicts() {
         config.compare_and_set(1, "a = 2\n").await.unwrap(),
         ConfigWrite::Written(2)
     );
-    assert_eq!(config.load().await.unwrap(), stored("a = 2\n", 2));
+    assert_eq!(config.load().await.unwrap(), Some(stored("a = 2\n", 2)));
     // A writer still at an older revision (or at none) writes nothing.
     assert_eq!(
         config.compare_and_set(1, "stale\n").await.unwrap(),
@@ -121,7 +121,7 @@ async fn each_write_raises_the_revision_and_a_stale_one_conflicts() {
         config.compare_and_set(0, "stale\n").await.unwrap(),
         ConfigWrite::Conflict(2)
     );
-    assert_eq!(config.load().await.unwrap(), stored("a = 2\n", 2));
+    assert_eq!(config.load().await.unwrap(), Some(stored("a = 2\n", 2)));
 }
 
 /// Two processes read the same revision and both write: one wins, the
@@ -184,12 +184,12 @@ async fn the_document_follows_the_tenant_and_the_old_owner_cannot_write() {
     wait_for_expiry(&db.admin, tenant).await;
     let new =
         TenantConfigStore::new(&open_owned(&db.app, tenant, "proc-b", LONG_TTL).await).unwrap();
-    assert_eq!(new.load().await.unwrap(), stored("x = 1\n", 1));
+    assert_eq!(new.load().await.unwrap(), Some(stored("x = 1\n", 1)));
     assert_not_owner(
         old.compare_and_set(1, "x = 2\n").await,
         "the old owner's write",
     );
-    assert_eq!(new.load().await.unwrap(), stored("x = 1\n", 1));
+    assert_eq!(new.load().await.unwrap(), Some(stored("x = 1\n", 1)));
     assert_eq!(
         new.compare_and_set(1, "x = 3\n").await.unwrap(),
         ConfigWrite::Written(2)
@@ -209,7 +209,7 @@ async fn a_fired_self_fence_refuses_config_writes() {
         .expect("claimed")
         .fire("test: stop serving"));
     assert_not_owner(config.compare_and_set(1, "x = 2\n").await, "a fenced write");
-    assert_eq!(config.load().await.unwrap(), stored("x = 1\n", 1));
+    assert_eq!(config.load().await.unwrap(), Some(stored("x = 1\n", 1)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -227,7 +227,7 @@ async fn the_blocking_methods_work_on_and_off_the_runtime() {
     let loaded = std::thread::spawn(move || outside.load_blocking().unwrap())
         .join()
         .unwrap();
-    assert_eq!(loaded, stored("a = 1\n", 1));
+    assert_eq!(loaded, Some(stored("a = 1\n", 1)));
 }
 
 /// Every statement is scoped to its tenant: on the leak-trap database, a
@@ -255,8 +255,8 @@ async fn config_statements_never_touch_another_tenants_row() {
         b.compare_and_set(2, "nope\n").await.unwrap(),
         ConfigWrite::Conflict(1)
     );
-    assert_eq!(a.load().await.unwrap(), stored("a2\n", 2));
-    assert_eq!(b.load().await.unwrap(), stored("b\n", 1));
+    assert_eq!(a.load().await.unwrap(), Some(stored("a2\n", 2)));
+    assert_eq!(b.load().await.unwrap(), Some(stored("b\n", 1)));
 }
 
 #[tokio::test]
