@@ -187,8 +187,8 @@ pub use agent_repo::{
     PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
     ReviewContextEnrollment, ReviewContextEnrollmentIntent, ReviewContextOwnerKey,
     SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem, UserMessageIndexPage,
-    UserMessageIndexPageRequest, CREATED_BY_PRINCIPAL_METADATA_KEY, MANUAL_CHOICE_METADATA_KEY,
-    PROJECTION_TEXT_BLOCK_CAP, PROVIDER_RETURN_METADATA_KEY,
+    UserMessageIndexPageRequest, CREATED_BY_PRINCIPAL_METADATA_KEY, DAEMON_OWNED_METADATA_KEYS,
+    MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP, PROVIDER_RETURN_METADATA_KEY,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;

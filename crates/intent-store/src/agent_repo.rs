@@ -831,13 +831,19 @@ pub const CREATED_BY_PRINCIPAL_METADATA_KEY: &str = "createdByPrincipalId";
 /// [`Store::update_agent_session_metadata`]) never set or clear them, so a
 /// caller's stale snapshot cannot erase a newer value or bring back an old
 /// one (PROTOCOL §5.54 shared quota state, §5.56 secret-request
-/// resolutions).
-pub(crate) const DAEMON_OWNED_METADATA_KEYS: [&str; 5] = [
+/// resolutions, workspace proposals). The manual-choice token stays first:
+/// the writers keep it only while their `keep_choice` condition holds.
+/// `tests/daemon_owned_metadata_key_lint.rs` fails when a key written with
+/// [`Store::set_agent_session_metadata_key_json`] is missing here.
+pub const DAEMON_OWNED_METADATA_KEYS: [&str; 8] = [
     MANUAL_CHOICE_METADATA_KEY,
     PROVIDER_RETURN_METADATA_KEY,
     intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
     CREATED_BY_PRINCIPAL_METADATA_KEY,
     intent_core::SECRET_REQUEST_RESOLUTIONS_KEY,
+    intent_core::PENDING_PROPOSALS_KEY,
+    intent_core::PROPOSAL_RESOLUTIONS_KEY,
+    intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
 ];
 
 /// The two binds a whole-document `metadata` write needs (see
@@ -882,22 +888,23 @@ fn daemon_owned_preserving_metadata(
     raw_doc: &str,
     keep_choice_if: &str,
 ) -> String {
-    let [choice, ret, remote, creator, secrets] = DAEMON_OWNED_METADATA_KEYS;
+    let [choice, rest @ ..] = DAEMON_OWNED_METADATA_KEYS;
+    let present = DAEMON_OWNED_METADATA_KEYS
+        .iter()
+        .map(|key| format!("json_type(metadata, '$.{key}') IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let kept = rest.iter().fold(String::new(), |mut sql, key| {
+        use std::fmt::Write as _;
+        let _ = write!(sql, ", '{key}', json(metadata -> '$.{key}')");
+        sql
+    });
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
-              AND json_type(metadata) = 'object' \
-              AND (json_type(metadata, '$.{choice}') IS NOT NULL \
-                   OR json_type(metadata, '$.{ret}') IS NOT NULL \
-                   OR json_type(metadata, '$.{remote}') IS NOT NULL \
-                   OR json_type(metadata, '$.{creator}') IS NOT NULL \
-                   OR json_type(metadata, '$.{secrets}') IS NOT NULL) \
+              AND json_type(metadata) = 'object' AND ({present}) \
              THEN json_patch({object_doc}, json_object(\
                  '{choice}', CASE WHEN ({keep_choice_if}) \
-                                  THEN json(metadata -> '$.{choice}') END, \
-                 '{ret}', json(metadata -> '$.{ret}'), \
-                 '{remote}', json(metadata -> '$.{remote}'), \
-                 '{creator}', json(metadata -> '$.{creator}'), \
-                 '{secrets}', json(metadata -> '$.{secrets}'))) \
+                                  THEN json(metadata -> '$.{choice}') END{kept})) \
          ELSE {raw_doc} END"
     )
 }
