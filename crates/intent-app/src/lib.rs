@@ -17,6 +17,7 @@ use std::future::Future;
 use intent_services::Services;
 
 pub mod agents;
+pub mod resume;
 pub mod shutdown;
 pub mod tenant;
 

@@ -3376,7 +3376,7 @@ async fn cmd_serve_owned(
                     .await;
             }
             if let Some(candidates) = startup_candidates {
-                run_startup_resume_sweep(&services, candidates, stopping).await;
+                intent_app::resume::run_startup_resume_sweep(&services, candidates, stopping).await;
             }
         })
     };
@@ -8357,79 +8357,6 @@ fn should_resume_on_start(
     }
 }
 
-/// Run recovery off the listener path. Shutdown stops between operations;
-/// an admitted operation drains so its durable claim cannot be stranded by
-/// cancellation. Provider turns themselves remain owned by `AgentManager`.
-async fn run_startup_resume_sweep(
-    services: &Services,
-    candidates: intent_services::StartupResumeCandidates,
-    stopping: tokio::sync::watch::Receiver<bool>,
-) {
-    #[cfg(unix)]
-    let mut stopping = stopping;
-    let ids = candidates.ids().to_vec();
-    tracing::info!(
-        count = ids.len(),
-        "resume-on-start: resuming interrupted agents"
-    );
-    // Deterministic e2e seam, including release-mode tests. Holding a provider
-    // handshake would not hold the sweep, since provider turns are background.
-    #[cfg(unix)]
-    if let Some(path) = std::env::var_os("INTENTD_TEST_STARTUP_RESUME_GATE") {
-        use tokio::io::AsyncReadExt;
-        tokio::select! {
-            biased;
-            _ = stopping.wait_for(|stop| *stop) => return,
-            () = async {
-                let mut gate = tokio::net::UnixStream::connect(path).await.expect("resume test gate");
-                let _ = gate.read_u8().await;
-            } => {},
-        }
-    }
-    let candidates = &candidates;
-    resume_startup_candidates(ids, &stopping, |agent_id| async move {
-        services
-            .resume_startup_candidate(candidates, &agent_id)
-            .await
-    })
-    .await;
-}
-
-/// Never cancel the callback after admitting a candidate: it may already have
-/// claimed the interruption or persisted its continuation. A stop skips every
-/// later candidate, while the caller joins this loop before manager teardown.
-async fn resume_startup_candidates<F, Fut>(
-    ids: Vec<intent_core::AgentId>,
-    stopping: &tokio::sync::watch::Receiver<bool>,
-    mut resume: F,
-) where
-    F: FnMut(intent_core::AgentId) -> Fut,
-    Fut: std::future::Future<Output = intent_core::Result<()>>,
-{
-    let mut resumed = 0;
-    let mut failed = 0;
-    for agent_id in ids {
-        if *stopping.borrow() {
-            break;
-        }
-        match resume(agent_id.clone()).await {
-            Ok(()) => {
-                tracing::info!(%agent_id, "resume-on-start: resumed agent");
-                resumed += 1;
-            }
-            Err(error) => {
-                tracing::warn!(%agent_id, %error, "resume-on-start: failed to resume agent");
-                failed += 1;
-            }
-        }
-    }
-    tracing::info!(
-        resumed,
-        failed,
-        "resume-on-start: auto-resume sweep complete"
-    );
-}
-
 /// §5.7 / §12.3 host capabilities: display availability + derived locality. The
 /// local UDS control path is `local`; remote WSS clients are `remote` (the live
 /// value is reported per-connection by `intentd status`).
@@ -10957,52 +10884,6 @@ for line in sys.stdin:
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
-    }
-
-    #[tokio::test]
-    async fn startup_recovery_shutdown_drains_admitted_operation_and_skips_next() {
-        let (stop, stopping) = tokio::sync::watch::channel(false);
-        let (arrived, arrival) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = calls.clone();
-        let sweep = tokio::spawn(async move {
-            let mut barriers = Some((arrived, released));
-            resume_startup_candidates(
-                vec![
-                    intent_core::AgentId::from("first"),
-                    intent_core::AgentId::from("second"),
-                ],
-                &stopping,
-                move |_| {
-                    let (arrived, released) =
-                        barriers.take().expect("no second admission after stop");
-                    let calls = calls.clone();
-                    async move {
-                        arrived.send(()).unwrap();
-                        released.await.unwrap();
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        });
-        arrival.await.unwrap();
-        stop.send(true).unwrap();
-        assert!(
-            !sweep.is_finished(),
-            "the admitted operation is still owned and draining"
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(1)),
-            sweep,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
