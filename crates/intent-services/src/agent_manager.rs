@@ -9243,16 +9243,11 @@ impl AgentManager {
     /// Register the worker that runs `admission`'s turn. Its caller checked
     /// the admission under the closure locks; a teardown that released the
     /// slot since then wins, and the worker is aborted unregistered.
-    fn register_worker(
-        &self,
-        agent_id: &AgentId,
-        admission: TurnAdmission,
-        worker: JoinHandle<()>,
-    ) {
+    fn register_worker(&self, agent_id: AgentId, admission: TurnAdmission, worker: JoinHandle<()>) {
         match self.slots.register_worker(agent_id, admission, worker) {
             Ok(Some(previous)) => self.retain_finishing_worker(previous),
             Ok(None) => {}
-            Err(stale) => {
+            Err((agent_id, stale)) => {
                 tracing::debug!(agent = %agent_id, "turn released before its worker registered");
                 stale.abort();
                 self.retain_finishing_worker(stale);
@@ -11246,7 +11241,7 @@ impl AgentManager {
                 .await;
             },
         ));
-        self.register_worker(&agent_id, admission, handle);
+        self.register_worker(agent_id, admission, handle);
     }
 
     /// Claim the in-flight slot for a delivery-driven turn. Companion to
@@ -11555,7 +11550,7 @@ impl AgentManager {
                 mgr.clone().try_drain_queue(id, ws).await;
             }
         });
-        self.register_worker(agent_id, admission, drive);
+        self.register_worker(agent_id.clone(), admission, drive);
         true
     }
 

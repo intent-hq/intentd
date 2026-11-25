@@ -34,17 +34,6 @@ impl Action {
         Self::Stop,
     ];
 
-    /// The points where this action can be overtaken.
-    fn steps(self) -> &'static [TurnStep] {
-        match self {
-            Self::Send(_) => &[TurnStep::UserPersist],
-            Self::Retry => &[TurnStep::RetryChecked, TurnStep::RetryLifted],
-            Self::Redrive => &[TurnStep::RedriveChecked],
-            Self::Interrupt => &[TurnStep::InterruptReleasing],
-            Self::Stop => &[TurnStep::DetachReleasing],
-        }
-    }
-
     fn cancels(self) -> bool {
         matches!(self, Self::Interrupt | Self::Stop)
     }
@@ -249,32 +238,32 @@ async fn run_case(case: &Case, n: usize) {
         tokio::select! {
             () = pause.reached.notified() => parked = Some(pause),
             done = &mut first => {
-                record_sent(&mut sent, case.first, done.unwrap());
+                record_sent(&mut sent, case.first, &done.unwrap());
                 actor.mgr.turn_schedule.disarm(case.at.unwrap());
             }
         }
     } else {
-        record_sent(&mut sent, case.first, (&mut first).await.unwrap());
+        record_sent(&mut sent, case.first, &(&mut first).await.unwrap());
     }
     actor.settle(&label).await;
 
     for &then in &case.then {
         let done = actor.clone().act(then).await;
-        record_sent(&mut sent, then, done);
+        record_sent(&mut sent, then, &done);
         actor.settle(&label).await;
     }
 
     if let Some(pause) = parked {
         pause.resume.notify_one();
-        record_sent(&mut sent, case.first, first.await.unwrap());
+        record_sent(&mut sent, case.first, &first.await.unwrap());
         actor.settle(&label).await;
     }
 
     finish(&actor, &label, case.cancels(), &mut sent).await;
 }
 
-fn record_sent(sent: &mut Vec<&'static str>, action: Action, done: intent_core::Result<Value>) {
-    if let (Action::Send(text), Ok(_)) = (action, &done) {
+fn record_sent(sent: &mut Vec<&'static str>, action: Action, done: &intent_core::Result<Value>) {
+    if let (Action::Send(text), Ok(_)) = (action, done) {
         sent.push(text);
     }
 }
@@ -287,7 +276,7 @@ async fn finish(actor: &Actor, label: &str, cancels: bool, sent: &mut Vec<&'stat
     }
     actor.settle(label).await;
     let done = actor.clone().act(Action::Send(FINAL_MESSAGE)).await;
-    record_sent(sent, Action::Send(FINAL_MESSAGE), done);
+    record_sent(sent, Action::Send(FINAL_MESSAGE), &done);
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {

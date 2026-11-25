@@ -196,24 +196,20 @@ impl TurnSlots {
         }
     }
 
-    /// Register the worker for `admission`. Refused (the handle is given
-    /// back) when the admission is stale. Returns any handle it replaced.
+    /// Register the worker for `admission`. Refused (the agent and handle
+    /// are given back) when the admission is stale. Returns any handle it
+    /// replaced.
     pub(crate) fn register_worker(
         &self,
-        agent_id: &AgentId,
+        agent_id: AgentId,
         admission: TurnAdmission,
         worker: JoinHandle<()>,
-    ) -> Result<Option<JoinHandle<()>>, JoinHandle<()>> {
+    ) -> Result<Option<JoinHandle<()>>, (AgentId, JoinHandle<()>)> {
         let held = self.lock();
-        if held.held.get(agent_id).map(|held| held.admission) != Some(admission) {
-            return Err(worker);
+        if held.held.get(&agent_id).map(|held| held.admission) != Some(admission) {
+            return Err((agent_id, worker));
         }
-        let previous = self
-            .0
-            .workers
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), worker);
+        let previous = self.0.workers.lock().unwrap().insert(agent_id, worker);
         drop(held);
         Ok(previous)
     }
