@@ -36,8 +36,9 @@ const SQLITE_BASELINE_LAST: u32 = 196;
 const GIN_EXCEPTIONS: &[&str] = &["agent_message_search_tsv", "note_search_tsv"];
 
 /// Tables keyed by the tenant alone (`PRIMARY KEY (tenant_id)`): one row
-/// per tenant. Every other table's key leads with `tenant_id` and has more.
-const ONE_ROW_PER_TENANT: &[&str] = &["tenant_lease", "tenant_writer"];
+/// per tenant (`tenant_config`: the tenant's one settings document).
+/// Every other table's key leads with `tenant_id` and has more.
+const ONE_ROW_PER_TENANT: &[&str] = &["tenant_config", "tenant_lease", "tenant_writer"];
 
 fn store_dir() -> PathBuf {
     intentd_test_support::source_lint::package_dir()
