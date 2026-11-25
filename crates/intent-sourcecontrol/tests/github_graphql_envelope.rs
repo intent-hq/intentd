@@ -19,6 +19,13 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Dead local proxy for this test binary: see
+/// [`intentd_test_support::block_test_egress`].
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}
+
 /// A mock GitHub API host that answers every `POST /graphql` with `body`.
 struct MockGraphql {
     base_uri: String,

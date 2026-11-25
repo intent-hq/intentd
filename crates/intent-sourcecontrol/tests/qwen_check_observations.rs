@@ -7,6 +7,13 @@ mod qwen;
 use intent_sourcecontrol::{RepoRef, SourceControl};
 use qwen::{CheckFault, MockQwen, ReadMode};
 
+/// Dead local proxy for this test binary: see
+/// [`intentd_test_support::block_test_egress`].
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}
+
 #[tokio::test]
 async fn qwen_40_records_survive_both_graphql_reads_and_rest_reordering() {
     let mock = MockQwen::start(10978).await;

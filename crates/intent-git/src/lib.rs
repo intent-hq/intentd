@@ -88,3 +88,11 @@ pub(crate) fn is_conflict_error(e: &git2::Error) -> bool {
     matches!(e.code(), ErrorCode::Conflict | ErrorCode::MergeConflict)
         || e.message().to_lowercase().contains("conflict")
 }
+
+/// Dead local proxy for every lib test: see
+/// [`intentd_test_support::block_test_egress`].
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}

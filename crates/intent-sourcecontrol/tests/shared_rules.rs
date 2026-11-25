@@ -11,6 +11,13 @@ use intent_sourcecontrol::{BranchRules, Error, GitHubSourceControl, RepoRef, Sou
 use qwen::MockQwen;
 use serde_json::json;
 
+/// Dead local proxy for this test binary: see
+/// [`intentd_test_support::block_test_egress`].
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}
+
 // Authorization generation is process-wide, including under cargo test.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

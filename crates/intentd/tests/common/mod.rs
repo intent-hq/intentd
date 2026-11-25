@@ -121,6 +121,10 @@ fn force_hermetic_root_guard() {
     // jiti honors this boolean env (`_booleanEnv("JITI_FS_CACHE", ...)`), so
     // disabling the fs cache keeps the TMPDIR root clean after e2e suites.
     std::env::set_var("JITI_FS_CACHE", "false");
+    // In-process forge clients and every child the suite spawns go through a
+    // dead proxy; `hermetic_fixture_identity` re-applies it to daemon
+    // commands built with `env_clear()`.
+    intentd_test_support::block_test_egress();
 }
 
 /// Apply the timeout multiplier from the environment for coverage
@@ -690,6 +694,10 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
 /// truncated (restarts must retain it); symlinks and non-files are rejected.
 /// Intentional identity tests can layer private mock configuration afterwards.
 ///
+/// Routes the daemon through the dead test proxy
+/// ([`intentd_test_support::apply_test_egress`]), also after `env_clear()`;
+/// a proxy key the command already sets or removes stays the caller's.
+///
 /// Also pins startup resume off ([`RESUME_ON_START_TEST_DEFAULT_ENV`] =
 /// `off`) unless the command already sets a value for it (an
 /// [`opt_into_resume_on_start`] opt-in survives a later reset; an
@@ -703,6 +711,7 @@ pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Pat
     if !resume_is_caller_owned {
         cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "off");
     }
+    intentd_test_support::apply_test_egress(cmd);
     let gh_config_dir = data_dir.join("gh-config");
     match std::fs::create_dir(&gh_config_dir) {
         Ok(()) => {}

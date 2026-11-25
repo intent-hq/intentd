@@ -2,6 +2,14 @@
 //! Provider canonicalization is an explicit fixture lookup, not a new parser.
 #[path = "../src/repository_context_reader.rs"]
 mod repository_context_reader;
+
+/// Dead local proxy for this test binary: see
+/// [`intentd_test_support::block_test_egress`].
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}
+
 #[path = "../src/test_support/scratch.rs"]
 #[expect(
     dead_code,

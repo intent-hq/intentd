@@ -5,6 +5,13 @@ use intent_sourcecontrol::remote_project::{
 };
 use intent_sourcecontrol::GitlabInstance;
 
+/// Dead local proxy for this test binary: see
+/// [`intentd_test_support::block_test_egress`].
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}
+
 fn gitlab(root: &str) -> RemoteInstance {
     RemoteInstance::gitlab(GitlabInstance::parse(root).unwrap())
 }

@@ -2405,6 +2405,7 @@ dependencies = [
 name = "intent-git"
 version = "0.11.299"
 dependencies = [
+ "ctor",
  "git2",
  "intent-core",
  "intentd-test-support",
@@ -2632,6 +2633,7 @@ version = "0.11.299"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "ctor",
  "http",
  "http-body-util",
  "hyper-rustls",

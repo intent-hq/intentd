@@ -9,8 +9,12 @@ use crate::{
 use http::{HeaderValue, Uri};
 use http_body_util::BodyExt;
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
+    client::legacy::{
+        connect::{proxy::Tunnel, HttpConnector},
+        Client,
+    },
+    client::proxy::matcher::Matcher,
+    rt::{TokioExecutor, TokioIo},
 };
 use octocrab::{
     service::middleware::{
@@ -19,11 +23,55 @@ use octocrab::{
     },
     OctoBody,
 };
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc, task::Poll};
 use tower::{Layer, Service, ServiceExt};
 
 type Pool =
-    Client<hyper_timeout::TimeoutConnector<hyper_rustls::HttpsConnector<HttpConnector>>, OctoBody>;
+    Client<hyper_timeout::TimeoutConnector<hyper_rustls::HttpsConnector<ProxyConnector>>, OctoBody>;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// TCP connector that honors the standard proxy env (`HTTPS_PROXY`,
+/// `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`, read when the transport is built)
+/// like reqwest and `git` do. A proxied host gets an HTTP `CONNECT` tunnel, so
+/// TLS and the bearer token stay end to end.
+#[derive(Clone)]
+struct ProxyConnector {
+    direct: HttpConnector,
+    proxies: Arc<Matcher>,
+}
+
+impl Service<Uri> for ProxyConnector {
+    type Response = TokioIo<tokio::net::TcpStream>;
+    type Error = BoxError;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), BoxError>> {
+        self.direct.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let Some(proxy) = self.proxies.intercept(&dst) else {
+            let connecting = self.direct.call(dst);
+            return Box::pin(async move { connecting.await.map_err(Into::into) });
+        };
+        let mut tunnel = Tunnel::new(proxy.uri().clone(), self.direct.clone());
+        if let Some(auth) = proxy.basic_auth() {
+            tunnel = tunnel.with_auth(auth.clone());
+        }
+        // `Tunnel` defaults a portless target to 443; keep plain HTTP on 80.
+        let dst = match (dst.scheme_str(), dst.port(), dst.host()) {
+            (Some("http"), None, Some(host)) => format!("http://{host}:80").parse().unwrap_or(dst),
+            _ => dst,
+        };
+        let connecting = tunnel.call(dst);
+        Box::pin(async move { connecting.await.map_err(Into::into) })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum AttemptError {
@@ -97,7 +145,13 @@ pub(crate) struct Transport {
 
 impl Transport {
     pub fn new(token: Option<&str>, base: Option<&str>) -> Result<Self> {
-        Self::with_timeouts(token, base, CONNECT_TIMEOUT, READ_WRITE_TIMEOUT)
+        Self::with_timeouts(
+            token,
+            base,
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            Matcher::from_env(),
+        )
     }
 
     fn with_timeouts(
@@ -105,6 +159,7 @@ impl Transport {
         base: Option<&str>,
         connect_timeout: std::time::Duration,
         read_write_timeout: std::time::Duration,
+        proxies: Matcher,
     ) -> Result<Self> {
         let base: Uri = base
             .unwrap_or("https://api.github.com")
@@ -114,12 +169,17 @@ impl Transport {
             .map(|t| HeaderValue::from_str(&format!("Bearer {t}")))
             .transpose()
             .map_err(|_| Error::Config("invalid github credential header".into()))?;
+        let mut direct = HttpConnector::new();
+        direct.enforce_http(false);
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
             .map_err(|_| Error::Config("cannot load TLS roots".into()))?
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(ProxyConnector {
+                direct,
+                proxies: Arc::new(proxies),
+            });
         let mut connector = hyper_timeout::TimeoutConnector::new(connector);
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_read_timeout(Some(read_write_timeout));
@@ -612,6 +672,7 @@ mod tests {
             Some(&base),
             Duration::from_secs(1),
             Duration::from_millis(25),
+            Matcher::builder().build(),
         )
         .unwrap();
         let traffic = Traffic::default();
@@ -656,6 +717,7 @@ mod tests {
             Some(&base),
             Duration::from_secs(1),
             Duration::from_millis(50),
+            Matcher::builder().build(),
         )
         .unwrap();
         let traffic = Traffic::default();
@@ -710,5 +772,97 @@ mod tests {
     #[tokio::test]
     async fn traffic_stalled_body_counts_one_error_without_retrying() {
         body_failure_keeps_captured_context(true).await;
+    }
+
+    /// The pool honors the standard proxy env like reqwest and `git`: a forge
+    /// host is tunnelled through the proxy (so a test's dead proxy stops a
+    /// forgotten fake server, and a corporate proxy reaches GitHub), while a
+    /// `NO_PROXY` host connects directly.
+    #[tokio::test]
+    async fn proxied_hosts_tunnel_through_the_proxy_and_no_proxy_hosts_connect_directly() {
+        let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_uri = format!("http://{}", proxy.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let head = request(&mut stream).await.unwrap_or_default();
+            let _ = seen_tx.send(head);
+            let _ = stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+        let fixture = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fixture_base = format!("http://{}", fixture.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = fixture.accept().await {
+                tokio::spawn(async move {
+                    while request(&mut stream).await.is_some() {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n[]")
+                            .await;
+                    }
+                });
+            }
+        });
+        let proxies = || {
+            hyper_util::client::proxy::matcher::Matcher::builder()
+                .all(proxy_uri.clone())
+                .no("127.0.0.1")
+                .build()
+        };
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(10));
+
+        let direct = Transport::with_timeouts(
+            Some("test-secret"),
+            Some(&fixture_base),
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            proxies(),
+        )
+        .unwrap();
+        let listed: serde_json::Value = tokio::time::timeout(
+            budget,
+            direct
+                .client(false, None)
+                .get("/repos/o/r/pulls", None::<&()>),
+        )
+        .await
+        .expect("NO_PROXY fixture answers in time")
+        .expect("NO_PROXY host connects directly");
+        assert_eq!(listed, serde_json::json!([]));
+
+        let proxied = Transport::with_timeouts(
+            Some("test-secret"),
+            Some("https://api.github.com"),
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            proxies(),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            budget,
+            proxied
+                .comparison_client()
+                .get::<serde_json::Value, _, _>("/user", None::<&()>),
+        )
+        .await
+        .expect("a refused tunnel fails in time");
+        assert!(result.is_err(), "the proxy refused the tunnel: {result:?}");
+        let head = tokio::time::timeout(budget, seen_rx)
+            .await
+            .expect("the proxy saw the request")
+            .unwrap();
+        assert!(
+            head.starts_with("CONNECT api.github.com:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            !head.contains("test-secret"),
+            "the token stays inside the tunnel: {head}"
+        );
     }
 }

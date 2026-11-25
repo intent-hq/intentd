@@ -466,3 +466,11 @@ pub trait SourceControl: Send + Sync {
     /// through `GET /search/issues`. Backs `github.issues.list/search`.
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>>;
 }
+
+/// Dead local proxy for every lib test: see
+/// [`intentd_test_support::block_test_egress`].
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn block_test_egress() {
+    intentd_test_support::block_test_egress();
+}

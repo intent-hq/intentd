@@ -9359,7 +9359,11 @@ mod genuine_native_startup {
         ]
         .into_iter()
         // crate::tests::block_test_egress sets these before test threads.
-        .chain(crate::tests::TEST_EGRESS_ENV)
+        .chain(
+            intentd_test_support::TEST_EGRESS_ENV
+                .into_iter()
+                .filter(|_| !intentd_test_support::test_egress_allowed()),
+        )
         .map(|(key, value)| (key.into(), value.into()))
         .collect()
     }

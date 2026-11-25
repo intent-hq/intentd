@@ -2215,6 +2215,11 @@ builds and the desktop-bundled daemon are distinct from this installed launcher;
 start/restart are launcher commands. Check the installed launcher's help when its
 version differs from this guide; do not infer launcher support from daemon version.
 
+Behind an HTTP proxy, set `HTTPS_PROXY` (and `NO_PROXY` for hosts to reach directly)
+in the daemon's environment before `intentd start`: GitHub, GitLab and `git` requests
+then go through it. The GitHub sign-in step (device code) still connects directly.
+Older versions may differ: their GitHub requests ignored proxy settings.
+
 `intentd agents` lists the daemon's running agents: name, workspace, provider and
 model, owner, memory and process count, then the total and sample time. `--json`
 prints the raw data, with secret values in process command lines replaced by
@@ -2228,7 +2233,7 @@ If note or chat writes fail with a code 267 error ("database disk image is malfo
 without changing them. If doctor reports damage outside the search indexes, stop and
 copy the whole data folder before any recovery.
 
-<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Agents, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/agents_cmd.rs; packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs. -->
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Agents, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/agents_cmd.rs; packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs; packages/intentd/crates/intent-sourcecontrol/src/github_transport.rs. -->
 
 ## Memory limits on Linux
 
