@@ -60,6 +60,38 @@ pub fn setup(data_dir: &Path, ceiling: Ceiling) {
     }
 }
 
+/// How often [`spawn_leaf_sweeper`] polls the workload leaves.
+const LEAF_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sweep the workload leaves for the process's life, as `intentd`'s memory
+/// sampler does: report new OOM kills and remove empty leaves nobody holds.
+/// A pinned leaf (an archive script's) is released only here, so without it
+/// every finished one keeps its empty cgroup. A no-op without containment.
+pub fn spawn_leaf_sweeper() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(sweep_leaves(
+        LEAF_SWEEP_PERIOD,
+        intent_core::workload::poll_oom_kills,
+    ))
+}
+
+async fn sweep_leaves(
+    period: std::time::Duration,
+    poll: impl Fn() -> Vec<intent_core::workload::OomKillReport>,
+) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        for report in poll() {
+            tracing::warn!(
+                workload = %report.label,
+                oom_kills = report.new_kills,
+                "workload memory limit killed a process in this agent's tree"
+            );
+        }
+    }
+}
+
 /// Probe `workspaces` (a tenant's workspaces root) for copy-on-write
 /// support off the async runtime, so its first workspace checkout reads
 /// the cached result. Best-effort: a failure is retried on first use.
@@ -92,5 +124,37 @@ mod tests {
             let error = ceiling_from_env(Some(bad)).unwrap_err();
             assert!(error.contains(WORKLOAD_MEMORY_ENV), "{bad}: {error}");
         }
+    }
+
+    /// Pinned leaves (archive scripts) are released only by a sweep: it
+    /// must keep running for the process's life, not once at start.
+    #[tokio::test(start_paused = true)]
+    async fn the_leaf_sweep_recurs_for_the_process_life() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let period = std::time::Duration::from_secs(10);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counted = polls.clone();
+        let sweeper = tokio::spawn(sweep_leaves(period, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            vec![intent_core::workload::OomKillReport {
+                kind: intent_core::workload::WorkloadKind::Agent,
+                label: "agent A".into(),
+                new_kills: 1,
+            }]
+        }));
+        // Checked between ticks, so no check races a poll.
+        tokio::time::sleep(period / 2).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "the first poll is one period out"
+        );
+        for expected in 1..=3 {
+            tokio::time::sleep(period).await;
+            assert_eq!(polls.load(Ordering::SeqCst), expected);
+        }
+        assert!(!sweeper.is_finished(), "the sweep never stops on its own");
+        sweeper.abort();
     }
 }

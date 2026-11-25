@@ -122,6 +122,9 @@ fn main() -> ExitCode {
 }
 
 async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, String> {
+    // Process-owned, like the containment it cleans up after: every tenant's
+    // finished workloads leave leaves only this releases.
+    let _leaf_sweeper = intentd_orchestrator::process::spawn_leaf_sweeper();
     // Unset serves the default tenant; set but not UTF-8 is an error, never
     // the default.
     let raw = match std::env::var(TENANTS_ENV) {
