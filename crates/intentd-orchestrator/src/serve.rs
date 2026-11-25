@@ -255,6 +255,9 @@ async fn try_serve_tenant_with(
         sweeps,
     )
     .await;
+    if let Some(reap) = spawn_idle_reap(&services, &recovered.agents, &admission) {
+        runner.adopt_task(reap);
+    }
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be
@@ -429,6 +432,23 @@ async fn prepare_resume(
     }
 }
 
+/// The tenant's idle agent reap loop (`agents.idleReapMinutes` of its
+/// `config.toml`), as `intentd` reaps its own, for the fence to stop; `None`
+/// when reaping is off or the fence fired. An orchestrator runs no agent
+/// itself, so there is no memory budget to drain: this reaps agents idle on
+/// machines.
+fn spawn_idle_reap(
+    services: &Services,
+    agents: &Arc<AgentManager>,
+    admission: &impl Admission,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !admission.allowed() {
+        return None;
+    }
+    let minutes = services.effective_settings().agents.idle_reap_minutes;
+    intent_app::agents::spawn_idle_reap_loop(agents.clone(), minutes, false)
+}
+
 /// The tenant's chief cwd, as [`tenant_services`] configures it.
 fn chief_cwd_root(dir: &Path) -> PathBuf {
     intent_core::chief_cwd_root(dir)
@@ -468,12 +488,14 @@ fn tenant_services(
     secrets: Arc<dyn intent_services::SecretStore>,
 ) -> Result<Services> {
     let registry = SettingsRegistry::load(dir.join("config.toml"))?;
+    let hooks_max_per_agent = registry.snapshot().effective.hooks.max_per_agent;
     let gitlab_pair = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
     Ok(intent_app::compose(
         Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
             .with_settings_registry(Arc::new(registry))
+            .with_hooks_max_per_agent(hooks_max_per_agent)
             .with_secret_store(secrets)
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
@@ -832,12 +854,11 @@ mod tests {
         }
     }
 
-    /// `host.exec` of `true` in `cwd` over `ws`: the reply.
+    /// `host.exec` of `true` over `ws`: the reply.
     #[cfg(unix)]
     async fn host_exec<S>(
         ws: &mut tokio_tungstenite::WebSocketStream<S>,
         id: u64,
-        cwd: &Path,
     ) -> serde_json::Value
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -849,7 +870,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": id,
             "method": "host.exec",
-            "params": { "command": "true", "cwd": cwd },
+            "params": { "command": "true" },
         });
         ws.send(Message::Text(request.to_string().into()))
             .await
@@ -878,7 +899,15 @@ mod tests {
     #[tokio::test]
     async fn client_host_commands_stop_with_the_tenant_runtime() {
         let root = tempfile::tempdir().unwrap();
-        let (services, dir) = tenant(root.path(), "t").await;
+        let dir = root.path().join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("db.sqlite")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let reverse = Arc::new(PrimaryReverseRegistry::new());
+        let secrets = Arc::new(intent_core::FileSecretStore::with_path(
+            dir.join("secrets.json"),
+        ));
+        let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets).unwrap();
         let connections = intent_app::tenant::ClientConnections::default();
         let config = crate::listen::ListenConfig {
             socket_path: dir.join("o.sock"),
@@ -887,8 +916,6 @@ mod tests {
             tls_dir: dir.join("tls"),
             insecure: true,
         };
-        let reverse = services.feature_reverse_dispatch().cloned().unwrap();
-        let bus = EventBus::new(services.store().clone());
         let listeners =
             crate::listen::start_client_listeners(&config, &services, &bus, reverse, &connections)
                 .await
@@ -897,10 +924,10 @@ mod tests {
             tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", listeners.ws_port()))
                 .await
                 .unwrap();
-        let ran = host_exec(&mut ws, 1, &dir).await;
+        let ran = host_exec(&mut ws, 1).await;
         assert!(ran.get("error").is_none(), "{ran}");
         services.host_exec_runtime().begin_shutdown();
-        let refused = host_exec(&mut ws, 2, &dir).await;
+        let refused = host_exec(&mut ws, 2).await;
         assert!(
             refused["error"]["message"]
                 .as_str()
@@ -948,17 +975,19 @@ mod tests {
             })
             .await
             .unwrap();
-        let hook = |name: &str| {
-            json!({ "name": name, "code": "return { dispatch: false };", "delayMs": 10_000 })
-        };
-        services
-            .hook_schedule(workspace.clone(), owner.clone(), hook("first"))
-            .await
-            .expect("the first hook is under the limit");
-        let refused = services
-            .hook_schedule(workspace, owner, hook("second"))
-            .await
-            .unwrap_err();
+        let hook = |name: &str| json!({ "name": name, "code": "return { dispatch: false };", "delayMs": 10_000 });
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            services.hook_schedule(workspace.clone(), owner.clone(), hook("first")),
+        )
+        .await
+        .expect("the first hook is under the limit");
+        let refused = intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            services.hook_schedule(workspace, owner, hook("second")),
+        )
+        .await
+        .unwrap_err();
         assert!(refused.to_string().contains("max 1"), "{refused}");
     }
 
