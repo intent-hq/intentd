@@ -28525,6 +28525,36 @@ mod usage_stats_recording {
             .all(|r| r.model == "Opus 4.8" && r.provider == "auggie"));
     }
 
+    /// Turn exits that skip the turn-end bookkeeping (wake turns,
+    /// suspend-interrupted turns, append failures) still record their
+    /// terminal tool calls through the detached flush; a zero tally writes
+    /// nothing.
+    #[tokio::test]
+    async fn detached_tool_tally_flush_records_tools_only() {
+        let (_t, svc, ws) = setup().await;
+        let agent = AgentId(create_agent(&svc, &ws, Some("claude-opus-4-8")).await);
+        let before = svc.store().list_usage_stats_hourly().await.expect("list");
+        svc.flush_tool_tally_detached(&agent, &ws, crate::agent_session::ToolCallTally::default());
+        svc.flush_tool_tally_detached(
+            &agent,
+            &ws,
+            crate::agent_session::ToolCallTally {
+                total: 4,
+                failed: 2,
+            },
+        );
+        svc.store_tasks.drain_finite().await;
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls).await, 4);
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls_failed).await, 2);
+        assert_eq!(sum_rows(&svc, |r| r.runs).await, 0);
+        assert_eq!(sum_rows(&svc, |r| r.total_run_ms).await, 0);
+        let after = svc.store().list_usage_stats_hourly().await.expect("list");
+        let sessions = |rows: &[intent_store::UsageStatsRow]| -> u64 {
+            rows.iter().map(|r| r.sessions_started).sum()
+        };
+        assert_eq!(sessions(&after), sessions(&before));
+    }
+
     /// A usage-stats store failure is logged and never fails `agent.create`
     /// or the turn-end recorder.
     #[tokio::test]

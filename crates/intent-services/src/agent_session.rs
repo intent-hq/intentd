@@ -4592,6 +4592,9 @@ impl Services {
         if suspend_interrupt {
             // `matches!` above guarantees the `Err` arm.
             let err = result.expect_err("suspend_interrupt implies Err");
+            // The turn exits before the bookkeeping below: its terminal tool
+            // calls still count (§5.36).
+            self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally);
             return self
                 .enroll_suspend_interrupted_turn(
                     agent_id,
@@ -4768,6 +4771,9 @@ impl Services {
                             "failed to reap prestaged payloads after append failure (#3884)"
                         );
                     }
+                    // Exits before the bookkeeping below: still count the
+                    // turn's terminal tool calls (§5.36).
+                    self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally);
                     return Err(e);
                 }
             };
@@ -5816,28 +5822,8 @@ impl Services {
                 .await;
         }
         // A wake turn records no run, but its terminal tool calls still
-        // count toward usage stats (§5.36). Detached and best-effort like
-        // the prompt-turn bookkeeping.
-        let tool_tally = transcript.tool_call_tally;
-        if !tool_tally.is_zero() {
-            let services = self.clone();
-            let agent_id_task = agent_id.clone();
-            let workspace_id_task = workspace_id.clone();
-            let turn_end = time::OffsetDateTime::now_utc();
-            let _ = self.store_tasks.spawn_draining(async move {
-                services
-                    .record_turn_usage_stats_with_tools(
-                        &agent_id_task,
-                        &workspace_id_task,
-                        None,
-                        std::time::Duration::ZERO,
-                        turn_end,
-                        false,
-                        tool_tally,
-                    )
-                    .await;
-            });
-        }
+        // count toward usage stats (§5.36).
+        self.flush_tool_tally_detached(agent_id, workspace_id, transcript.tool_call_tally);
         let blocks = transcript.into_blocks();
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
@@ -6452,6 +6438,38 @@ impl Services {
             ToolCallTally::default(),
         )
         .await;
+    }
+
+    /// Record a turn's terminal tool calls on their own (§5.36), detached
+    /// and best-effort, for turn exits that skip the turn-end bookkeeping
+    /// (wake turns, suspend-interrupted turns, append failures). A zero
+    /// tally writes nothing.
+    pub(crate) fn flush_tool_tally_detached(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        tally: ToolCallTally,
+    ) {
+        if tally.is_zero() {
+            return;
+        }
+        let services = self.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        let turn_end = time::OffsetDateTime::now_utc();
+        let _ = self.store_tasks.spawn_draining(async move {
+            services
+                .record_turn_usage_stats_with_tools(
+                    &agent_id,
+                    &workspace_id,
+                    None,
+                    std::time::Duration::ZERO,
+                    turn_end,
+                    false,
+                    tally,
+                )
+                .await;
+        });
     }
 
     /// [`Self::record_turn_usage_stats`] plus the turn's terminal tool-call
