@@ -295,6 +295,7 @@ fn provider(id: &str, status: ProviderStatus, models: Vec<String>) -> ProviderCa
         visible: true,
         status,
         models,
+        model_labels: Default::default(),
         models_stale: false,
     }
 }

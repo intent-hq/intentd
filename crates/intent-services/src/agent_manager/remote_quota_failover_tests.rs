@@ -1152,6 +1152,7 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
                     visible: true,
                     status: ProviderStatus::SignedIn,
                     models: models.iter().map(|m| (*m).to_owned()).collect(),
+                    model_labels: Default::default(),
                     models_stale: false,
                 }],
                 disabled_providers: vec![],

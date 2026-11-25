@@ -252,6 +252,7 @@ impl MachineReport for FixedReport {
             } else {
                 vec!["mock-model".into()]
             },
+            model_labels: Default::default(),
             models_stale: primed,
         }]
     }
@@ -1476,6 +1477,7 @@ fn capability(id: &str, status: ProviderStatus) -> ProviderCapability {
         visible: true,
         status,
         models: Vec::new(),
+        model_labels: Default::default(),
         models_stale: false,
     }
 }
@@ -2590,6 +2592,7 @@ fn observed(id: &str, status: ProviderStatus, models: &[&str]) -> ProviderCapabi
         visible: true,
         status,
         models: models.iter().map(|m| (*m).to_owned()).collect(),
+        model_labels: Default::default(),
         models_stale: models.is_empty(),
     }
 }

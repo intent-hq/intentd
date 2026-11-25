@@ -399,6 +399,7 @@ async fn exposed_machine_state_routes_and_capabilities_are_cached() {
         visible: true,
         status: ProviderStatus::SignedIn,
         models: vec!["opus".into(), "sonnet".into()],
+        model_labels: Default::default(),
         models_stale: false,
     });
     assert!(store

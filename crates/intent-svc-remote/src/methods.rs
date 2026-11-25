@@ -373,6 +373,7 @@ fn machine_models_json(
                 "id": entry.id,
                 "status": entry.status,
                 "models": entry.models,
+                "modelLabels": entry.model_labels,
                 "modelsStale": entry.models_stale,
             })
         })

@@ -111,6 +111,7 @@ fn capabilities(running: u32) -> MachineCapabilities {
             visible: true,
             status: intent_core::node_link::ProviderStatus::SignedIn,
             models: vec!["mock-model".into()],
+            model_labels: Default::default(),
             models_stale: false,
         });
     capabilities

@@ -283,6 +283,7 @@ mod tests {
             visible: true,
             status,
             models: models.iter().map(|m| (*m).to_owned()).collect(),
+            model_labels: Default::default(),
             models_stale: false,
         });
         row.platform = Some(platform);
