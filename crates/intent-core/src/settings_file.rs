@@ -15,7 +15,8 @@
 //!   live in `.secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
-//!   `workspaceInitializer.state`, `hardwareConsole.state`, `repos.known`,
+//!   `workspaceInitializer.state`, `hardwareConsole.state`,
+//!   `providerSwitch.state`, `repos.known`,
 //!   `endUserRules`, `permissions.rules`, `userRules`, `workspaceRules`) —
 //!   high-churn state that stays SQLite-backed.
 //!
