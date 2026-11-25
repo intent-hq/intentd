@@ -108,6 +108,8 @@ impl OriginalTurn {
 
 mod monitor_wake;
 mod repository_origin;
+#[cfg(test)]
+mod turn_schedule;
 pub(crate) mod scratch_adapter;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
 pub(crate) use monitor_wake::QueuedMonitorTurn;
@@ -3403,25 +3405,9 @@ pub struct AgentManager {
     /// [`HandbackGate`].
     #[cfg(test)]
     send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
+    /// Named pause points and store faults for interleaving tests.
     #[cfg(test)]
-    turn_start_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    /// Parks `agent_retry` after its unlocked Error check.
-    #[cfg(test)]
-    retry_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    /// Fails the next status read of a send's failed-turn redrive.
-    #[cfg(test)]
-    redrive_store_fault: std::sync::atomic::AtomicBool,
-    /// Fails the next turn start's `Active` write.
-    #[cfg(test)]
-    active_write_fault: std::sync::atomic::AtomicBool,
+    turn_schedule: turn_schedule::TurnSchedule,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3561,21 +3547,7 @@ impl AgentManager {
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
-            turn_start_pause: Mutex::new(None),
-            #[cfg(test)]
-            shutdown_persist_pause: Mutex::new(None),
-            #[cfg(test)]
-            user_persist_pause: Mutex::new(None),
-            #[cfg(test)]
-            worker_finish_pause: Mutex::new(None),
-            #[cfg(test)]
-            failed_wake_disposal_pause: Mutex::new(None),
-            #[cfg(test)]
-            retry_pause: Mutex::new(None),
-            #[cfg(test)]
-            redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            active_write_fault: std::sync::atomic::AtomicBool::new(false),
+            turn_schedule: turn_schedule::TurnSchedule::default(),
         }
     }
 
@@ -7463,6 +7435,10 @@ impl AgentManager {
         if sync_store {
             self.sync_stop_redelivery(agent_id).await;
         }
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::DetachReleasing)
+            .await;
         self.end_turn(agent_id).await;
         let handle = original.as_ref().and_then(|original| {
             repository_origin::take(&self.handles, agent_id, original, Some(&self.registry))
@@ -7814,6 +7790,10 @@ impl AgentManager {
         // an interrupt between turns (slot already released by the worker,
         // whose release already woke) then wakes nobody a second time.
         self.registry.mark_idle_slot_held(agent_id);
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::InterruptReleasing)
+            .await;
         self.end_turn(agent_id).await;
         // Emit the single terminal `agent:stream:end` on stop (parity #14): the
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
@@ -8155,6 +8135,17 @@ impl AgentManager {
         removed
     }
 
+    /// Registered turn workers whose task has not finished.
+    #[cfg(test)]
+    pub(crate) fn live_worker_count_for_test(&self) -> usize {
+        self.workers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|worker| !worker.is_finished())
+            .count()
+    }
+
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
     /// `agent.sendMessage` to decide queue-vs-stream).
     pub(crate) fn is_busy(&self, agent_id: &AgentId) -> bool {
@@ -8480,13 +8471,7 @@ impl AgentManager {
         admission: TurnAdmission,
     ) -> bool {
         #[cfg(test)]
-        {
-            let pause = self.turn_start_pause.lock().unwrap().take();
-            if let Some(pause) = pause {
-                pause.reached.notify_one();
-                pause.resume.notified().await;
-            }
-        }
+        self.turn_schedule.reach(turn_schedule::TurnStep::TurnStarting).await;
         {
             // A real turn is starting: if the workspace is Archived, flip it
             // back to Active and emit the stamped §6.5 delta (auto-unarchive
@@ -8595,8 +8580,8 @@ impl AgentManager {
             self.services.agent_activity_begin(workspace_id).await;
             #[cfg(test)]
             let faulted = self
-                .active_write_fault
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
+                .turn_schedule
+                .take_fault(turn_schedule::TurnFault::ActiveWrite);
             #[cfg(not(test))]
             let faulted = false;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
@@ -10499,13 +10484,7 @@ impl AgentManager {
         // already names that row.
         if !entry.persisted {
             #[cfg(test)]
-            {
-                let pause = self.user_persist_pause.lock().unwrap().take();
-                if let Some(pause) = pause {
-                    pause.reached.notify_one();
-                    pause.resume.notified().await;
-                }
-            }
+            self.turn_schedule.reach(turn_schedule::TurnStep::UserPersist).await;
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -11484,13 +11463,7 @@ impl AgentManager {
                 // and the durable queue intact, dispose of the hung provider,
                 // and never publish a successful idle to completion watchers.
                 #[cfg(test)]
-                {
-                    let pause = mgr.failed_wake_disposal_pause.lock().unwrap().take();
-                    if let Some(pause) = pause {
-                        pause.reached.notify_one();
-                        pause.resume.notified().await;
-                    }
-                }
+                mgr.turn_schedule.reach(turn_schedule::TurnStep::FailedWakeDisposal).await;
                 mgr.kill_child_only(&id).await;
                 mgr.clear_worker(&id);
                 mgr.release_in_flight_slot(&id);
@@ -11577,13 +11550,7 @@ impl AgentManager {
             return Ok(json!({ "ok": false }));
         }
         #[cfg(test)]
-        {
-            let pause = self.retry_pause.lock().unwrap().take();
-            if let Some(pause) = pause {
-                pause.reached.notify_one();
-                pause.resume.notified().await;
-            }
-        }
+        self.turn_schedule.reach(turn_schedule::TurnStep::RetryChecked).await;
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = session.workspace_id.clone();
@@ -11625,6 +11592,10 @@ impl AgentManager {
         if let Some(child) = stale {
             child.kill_tree().await;
         }
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RetryLifted)
+            .await;
 
         // Start the drain loop to redrive the requeued message. Peek the
         // head entry's turn correlation id BEFORE the drain pops it so the
@@ -11758,13 +11729,17 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RedriveChecked)
+            .await;
         {
             let gate = self.turn_start_gates.for_agent(agent_id);
             let _starting = gate.lock().await;
             #[cfg(test)]
             if self
-                .redrive_store_fault
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                .turn_schedule
+                .take_fault(turn_schedule::TurnFault::RedriveStore)
             {
                 return Err(Error::Internal("injected redrive store fault".into()));
             }
@@ -13704,13 +13679,7 @@ impl AgentManager {
             let gate = self.turn_start_gates.for_agent(id);
             let _starting = gate.lock().await;
             #[cfg(test)]
-            {
-                let pause = self.shutdown_persist_pause.lock().unwrap().take();
-                if let Some(pause) = pause {
-                    pause.reached.notify_one();
-                    pause.resume.notified().await;
-                }
-            }
+            self.turn_schedule.reach(turn_schedule::TurnStep::ShutdownPersist).await;
             // Best-effort: persist any partial in-flight assistant content from
             // the pinned slot so the transcript keeps the streamed-so-far
             // output across the restart. Runs before the status guards below so
@@ -17612,13 +17581,7 @@ async fn run_message_worker(
         break 'outer;
     }
     #[cfg(test)]
-    {
-        let pause = mgr.worker_finish_pause.lock().unwrap().take();
-        if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
-        }
-    }
+    mgr.turn_schedule.reach(turn_schedule::TurnStep::WorkerFinish).await;
     mgr.clear_worker(&agent_id);
     // Parked recovery send (intent-hq/intent#4962): a `send_message` that
     // lost `try_begin` to THIS worker while it was parking the session in
@@ -17981,13 +17944,7 @@ async fn persist_user(
     user_origin: bool,
 ) -> bool {
     #[cfg(test)]
-    {
-        let pause = mgr.user_persist_pause.lock().unwrap().take();
-        if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
-        }
-    }
+    mgr.turn_schedule.reach(turn_schedule::TurnStep::UserPersist).await;
     if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.

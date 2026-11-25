@@ -2436,7 +2436,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .unwrap()
         .align_with_mock_for_test();
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::WorkerFinish, pause.clone());
     mgr.send_message(
         id.clone(),
         ws.clone(),
@@ -11094,7 +11094,7 @@ async fn cancel_caller_after_slot_claim(door: CancelledFrontDoor) -> CancelledCl
             .id
     });
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::TurnStarting, pause.clone());
     let caller = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
@@ -11234,7 +11234,7 @@ async fn send_queued_messages_now_cancelled_after_slot_claim_during_append_failu
         .await
         .unwrap();
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::UserPersist, pause.clone());
     let caller = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
@@ -11402,7 +11402,7 @@ async fn shutdown_checkpoint_joins_detached_send_of_cancelled_caller() {
     let id = AgentId::from("cancelled-shutdown");
     seed_agent(&mgr, &ws, &id).await;
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::TurnStarting, pause.clone());
     let caller = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
@@ -11474,7 +11474,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     seed_agent(&mgr, &ws, &id).await;
     seed_top_level_peer(&mgr, &id).await;
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::TurnStarting, pause.clone());
     let starting = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move { mgr.try_begin_turn(&id, &ws).await }
@@ -16010,7 +16010,7 @@ async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
         .unwrap();
     assert_eq!(queued["queued"], true, "held slot queues the follow-up");
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::UserPersist, pause.clone());
     release.send(()).unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -25257,7 +25257,7 @@ mod harness_wake_tests {
             .editing = true;
         mgr.services.persist_queue_snapshot(&id).await;
         let pause = Arc::new(super::super::TurnStartPause::default());
-        *mgr.failed_wake_disposal_pause.lock().unwrap() = Some(pause.clone());
+        mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::FailedWakeDisposal, pause.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         note_tx.send(compaction_note("in_progress")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
@@ -29737,7 +29737,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
         AgentId::from("startup-later"),
     ];
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist, pause.clone());
     let mut senders = Vec::new();
     let mut completions = Vec::new();
     for id in &ids {
@@ -29834,7 +29834,7 @@ async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
     seed_agent(&mgr, &idle_ws, &idle).await;
     assert!(mgr.try_begin(&busy, &ws).await);
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist, pause.clone());
     let shutdown = {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
@@ -29871,7 +29871,7 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
     seed_agent(&mgr, &ws, &id).await;
     let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.shutdown_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist, pause.clone());
     let shutdown = {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
@@ -29971,7 +29971,7 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
     let id = AgentId::from("shutdown-start-write");
     seed_agent(&mgr, &ws, &id).await;
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::TurnStarting, pause.clone());
     let start = {
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         intent_core::spawn_daemon(async move { mgr.try_begin_turn(&id, &ws).await })
@@ -30276,7 +30276,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     // batch handback order as well as the shared terminal-failure handler.
     entries[0].persisted = true;
     let pause = Arc::new(super::TurnStartPause::default());
-    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::UserPersist, pause.clone());
     let worker_mgr = mgr.clone();
     let worker_id = id.clone();
     let worker_ws = ws.clone();
@@ -30406,7 +30406,7 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
         enqueue("b2", "b", "barrier");
         sqlx::query("CREATE TRIGGER fail_pending_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
         let pause = Arc::new(super::TurnStartPause::default());
-        *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+        mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::UserPersist, pause.clone());
         let worker_mgr = mgr.clone();
         let worker_id = id.clone();
         let worker_ws = ws.clone();
