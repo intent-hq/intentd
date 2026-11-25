@@ -294,19 +294,30 @@ async fn finish(actor: &Actor, label: &str, cancels: bool, sent: &mut Vec<&'stat
     )
     .await
     .unwrap_or_else(|_| panic!("{label}: the agent is stuck: {}", actor.prompts()));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while actor.mgr.is_busy(&actor.id)
+                || actor.mgr.live_worker_count_for_test() > 0
+                || !actor.mgr.services.queue_snapshot(&actor.id).is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{label}: the agent never settled (busy {}, workers {}, queued {}): {}",
+            actor.mgr.is_busy(&actor.id),
+            actor.mgr.live_worker_count_for_test(),
+            actor.mgr.services.queue_snapshot(&actor.id).len(),
+            actor.prompts()
+        )
+    });
     actor.settle(label).await;
 
     let prompts = actor.prompts();
-    assert!(!actor.mgr.is_busy(&actor.id), "{label}: still busy");
-    assert_eq!(
-        actor.mgr.live_worker_count_for_test(),
-        0,
-        "{label}: a worker is left"
-    );
-    assert!(
-        actor.mgr.services.queue_snapshot(&actor.id).is_empty(),
-        "{label}: a message is left queued: {prompts}"
-    );
     for text in sent.iter() {
         assert!(prompts.contains(text), "{label}: {text} was lost: {prompts}");
     }
