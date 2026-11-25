@@ -371,6 +371,26 @@ struct RunningTurn {
     _dir: tempfile::TempDir,
 }
 
+/// Write `config` as `tenant`'s first settings document, before any
+/// process claims the tenant.
+async fn seed_tenant_settings(pool: &PgPool, tenant: &str, config: &str) {
+    use intent_services::{SettingsDocumentStore as _, SettingsWrite};
+    let store = Store::open_postgres(
+        pool.clone(),
+        postgres::TenantId::new(tenant).unwrap(),
+        postgres::PostgresOptions::default(),
+        OrchestratorOnly::for_tests(),
+    )
+    .await
+    .unwrap();
+    let settings = intentd_orchestrator::settings::TenantSettings::new(&store).unwrap();
+    let written = settings.compare_and_set(0, config).unwrap();
+    assert!(
+        matches!(written, SettingsWrite::Written(_)),
+        "the tenant's settings row is seeded: {written:?}"
+    );
+}
+
 impl RunningTurn {
     /// Serve `tenant`, add its machine, create an agent on it over the
     /// tenant's local socket and message it, until the machine has the
@@ -379,7 +399,9 @@ impl RunningTurn {
         Self::start_with(pool, tenant, "").await
     }
 
-    /// [`Self::start`], with `config` as the tenant's `config.toml`.
+    /// [`Self::start`], with `config` as the tenant's settings document:
+    /// its Postgres `tenant_config` row, which serving reads (never a
+    /// `config.toml`). An empty `config` writes no row.
     async fn start_with(pool: PgPool, tenant: &str, config: &str) -> Option<Self> {
         if intent_providers_missing_git() {
             return None;
@@ -387,7 +409,9 @@ impl RunningTurn {
         let dir = tempfile::tempdir().unwrap();
         let tenant_dir = intentd_orchestrator::tenant_dir(dir.path(), tenant);
         std::fs::create_dir_all(&tenant_dir).unwrap();
-        std::fs::write(tenant_dir.join("config.toml"), config).unwrap();
+        if !config.is_empty() {
+            seed_tenant_settings(&pool, tenant, config).await;
+        }
         let served = serve_tenant(
             pool,
             tenant,
