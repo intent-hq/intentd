@@ -7,6 +7,10 @@
 //! keeping a replace at O(1) statements for any plausible queue size. Rows
 //! cascade with their `agent_session` row (workspace/agent delete needs no
 //! explicit cleanup).
+//!
+//! Several processes may share one Postgres tenant: [`Store::sync_agent_queue`]
+//! and [`Store::refresh_agent_queue`] keep each process's in-memory queue a
+//! cache of the stored one (see `agent_queue_merge`).
 
 use intent_core::{AgentId, Error, Result};
 use sqlx::{Row, Sqlite, Transaction};
@@ -89,6 +93,20 @@ pub struct AgentQueueRow {
     pub turn_id: String,
 }
 
+/// The outcome of [`Store::sync_agent_queue`].
+#[derive(Debug, Clone, Default)]
+pub struct AgentQueueSync {
+    /// The queue written when another process had changed the stored queue
+    /// since this process last read or wrote it: this process's change
+    /// merged onto the stored queue ([`crate::merge_agent_queue`]). The
+    /// caller's memory must be refreshed from it. `None` when `rows` were
+    /// written as given.
+    pub merged: Option<Vec<AgentQueueRow>>,
+    /// The claimed ids another process removed from the stored queue first
+    /// ([`crate::lost_agent_queue_claims`]): the caller must not deliver them.
+    pub lost: Vec<String>,
+}
+
 impl Store {
     /// Replace the persisted queue for one agent with the given snapshot
     /// (delete-then-bulk-insert in a single transaction, O(1) statements).
@@ -112,6 +130,82 @@ impl Store {
         rows: &[AgentQueueRow],
     ) -> Result<()> {
         dispatch!(self, backend => backend.replace_agent_queue(agent_id, rows).await)
+    }
+
+    /// Write this process's queue for one agent so that no other process's
+    /// change is overwritten. Where [`Store::replace_agent_queue`] refuses an
+    /// out-of-date snapshot, this merges it: one write transaction (under the
+    /// tenant writer lock on Postgres) reads the stored queue version; when
+    /// it is the version this process last read or wrote, `rows` replace the
+    /// queue as is; otherwise this process's change since then is merged
+    /// onto the stored rows ([`crate::merge_agent_queue`]) and the result,
+    /// written, comes back in [`AgentQueueSync::merged`].
+    ///
+    /// `claims` are ids the caller removed from `rows` to deliver them (a
+    /// drain). Any of them another process removed from the stored queue
+    /// first comes back in [`AgentQueueSync::lost`]; exactly one of two
+    /// processes draining one entry keeps it.
+    ///
+    /// `SQLite` has one writer, so this is [`Store::replace_agent_queue`]:
+    /// never merged, nothing lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// recorded then, so the next sync applies the same change.
+    pub async fn sync_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+        claims: &[String],
+    ) -> Result<AgentQueueSync> {
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                let _ = claims;
+                backend.replace_agent_queue(agent_id, rows).await?;
+                Ok(AgentQueueSync::default())
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                backend.sync_agent_queue(agent_id, rows, claims).await
+            }
+        }
+    }
+
+    /// Read-only refresh of this process's view of one agent's queue: when
+    /// another process wrote the queue since this process last read or wrote
+    /// it, returns `local` (this process's queue now) with the stored change
+    /// merged in ([`crate::merge_agent_queue`]), and remembers the stored
+    /// queue as read. `None` when nothing changed, and always on `SQLite`
+    /// (one writer: memory is current).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn refresh_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        local: &[AgentQueueRow],
+    ) -> Result<Option<Vec<AgentQueueRow>>> {
+        match &self.backend {
+            crate::Backend::Sqlite(_) => {
+                let _ = (agent_id, local);
+                Ok(None)
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => backend.refresh_agent_queue(agent_id, local).await,
+        }
+    }
+
+    /// Whether other processes may write this store's agent queues
+    /// (Postgres), so a queue read or drain must consult the store first.
+    #[must_use]
+    pub fn agent_queues_shared(&self) -> bool {
+        match &self.backend {
+            crate::Backend::Sqlite(_) => false,
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(_) => true,
+        }
     }
 
     /// Atomically move the persisted queue between two agents: ONE write
