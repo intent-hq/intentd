@@ -12501,3 +12501,62 @@ async fn wake_writer_consumes_the_tally_before_an_interrupt_flush() {
     assert_eq!(sum(|r| r.runs), 0);
     assert_eq!(sum(|r| r.total_run_ms), 0);
 }
+
+/// Usage stats (§5.36): the concurrent overlap — a stop snapshots the live
+/// slot (nonzero tally) BEFORE a still-running wake schedules its writer,
+/// then wins the envelope append. Both writers claim the one tally from the
+/// slot atomically, so only the first claim records it.
+#[tokio::test]
+async fn interrupt_snapshot_before_wake_claim_records_one_tally() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-race".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-race", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    services.pin_live_turn(&agent_id);
+    // The stop copies the slot (tally included) first…
+    let snapshot = services.live_turn(&agent_id).expect("pinned slot");
+    assert_eq!(snapshot.tool_tally.total, 2);
+    // …the aborted wake still finishes scheduling its writer…
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_call_tally);
+    drop(transcript);
+    // …then the stop appends the row with its earlier copy.
+    let outcome = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            snapshot,
+            super::InterruptReason::UserStop,
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        super::InterruptFlushOutcome::Appended("m-race".to_string())
+    );
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(sum(|r| r.tool_calls), 2, "one claim, not two writes");
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0);
+}

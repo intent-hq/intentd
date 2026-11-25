@@ -4876,6 +4876,7 @@ impl Services {
         // including a `_meta`-only bill (grok), which the task below resolves
         // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
         let run_completed = result.is_ok() && !spurious_cancel;
+        let tool_tally = self.claim_tool_tally(agent_id, tool_tally);
         if turn_usage.is_some()
             || turn_cost.is_some()
             || turn_meta.is_some()
@@ -6456,6 +6457,23 @@ impl Services {
         .await;
     }
 
+    /// Claim a turn's tool-call tally for exactly one writer (§5.36). While
+    /// the agent's live-turn slot exists it owns the tally: the slot's value
+    /// is swapped out for zero under the slot lock and returned, and the
+    /// caller's own copy is ignored, so a wake writer and an interrupt flush
+    /// that each hold a copy record it once between them. With no slot (it
+    /// was already cleared, or never opened) the caller's copy is the only
+    /// one and is returned as is.
+    pub(crate) fn claim_tool_tally(&self, agent_id: &AgentId, own: ToolCallTally) -> ToolCallTally {
+        match self.live_turns.lock() {
+            Ok(mut slots) => match slots.get_mut(agent_id) {
+                Some(slot) => std::mem::take(&mut slot.tool_tally),
+                None => own,
+            },
+            Err(_) => own,
+        }
+    }
+
     /// Record a turn's terminal tool calls on their own (§5.36), detached
     /// and best-effort, for turn exits that skip the turn-end bookkeeping
     /// (wake turns, append failures, interrupt flushes). A zero
@@ -6466,16 +6484,9 @@ impl Services {
         workspace_id: &WorkspaceId,
         tally: ToolCallTally,
     ) {
+        let tally = self.claim_tool_tally(agent_id, tally);
         if tally.is_zero() {
             return;
-        }
-        // Consume-once: this write owns the tally now. Clear it from the
-        // live slot so an interrupt flush that later appends the row (the
-        // worker aborted after scheduling this write) records nothing.
-        if let Ok(mut slots) = self.live_turns.lock() {
-            if let Some(slot) = slots.get_mut(agent_id) {
-                slot.tool_tally = ToolCallTally::default();
-            }
         }
         let services = self.clone();
         let agent_id = agent_id.clone();
