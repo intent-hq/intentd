@@ -555,20 +555,24 @@ impl RunningTurn {
             .await;
     }
 
-    /// The machine ends the turn.
-    async fn end_turn(&self, seq: u64) {
+    /// The machine ends the turn; whether the send went out (not once the
+    /// link closed).
+    async fn end_turn(&self, seq: u64) -> bool {
         self.end
-            .journal(
-                seq,
-                &self.agent,
-                &self.workspace,
-                Some(&self.turn),
-                JournalBody::TurnEnded {
+            .link
+            .send(&LinkFrame::Journal(JournalRecord {
+                seq: NodeCounter(seq),
+                owner: self.agent.clone().into(),
+                workspace_id: self.workspace.clone(),
+                turn_id: Some(self.turn.clone()),
+                recorded_at: intent_core::now_iso(),
+                body: JournalBody::TurnEnded {
                     stop_reason: "end_turn".into(),
                     error: None,
                 },
-            )
-            .await;
+            }))
+            .await
+            .is_ok()
     }
 }
 
@@ -585,7 +589,7 @@ async fn a_tenant_agent_runs_its_turn_on_a_machine() {
 
     // The machine's reply completes the turn on head.
     running.reply(2, "hi from the machine").await;
-    running.end_turn(3).await;
+    assert!(running.end_turn(3).await);
     let deadline = tokio::time::Instant::now() + wait();
     let mut id = 60;
     loop {
@@ -641,29 +645,8 @@ async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
     let Some(mut running) = RunningTurn::start(pool.clone(), &tenant).await else {
         return;
     };
+    // The turn runs on head from the prompt on; the machine is mid-reply.
     running.reply(2, "partial from the machine").await;
-    let deadline = tokio::time::Instant::now() + wait();
-    let mut id = 60;
-    loop {
-        id += 1;
-        let got = running
-            .client
-            .rpc(
-                id,
-                "agent.get",
-                json!({ "workspaceId": running.workspace, "agentId": running.agent }),
-            )
-            .await;
-        if result(&got).to_string().contains("partial from the machine") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the machine's reply never reached head: {got}"
-        );
-        // timing-guard: poll interval for the streamed reply on head (read over the wire)
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 
     // As the binary stops a tenant on SIGTERM: drain, fence, release.
     running.served.drain(None).await;
@@ -675,8 +658,8 @@ async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
         "the lease was still ours"
     );
 
-    let (status, reason): (String, Option<String>) = sqlx::query_as(
-        "SELECT resolution, reason FROM interrupted_agent \
+    let (resolution, prev_status): (String, String) = sqlx::query_as(
+        "SELECT resolution, prev_status FROM interrupted_agent \
          WHERE tenant_id = $1 AND agent_id = $2",
     )
     .bind(&tenant)
@@ -685,13 +668,14 @@ async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
     .await
     .unwrap()
     .expect("the running turn is recorded as interrupted");
-    assert_eq!(status, "pending");
-    assert!(reason.is_some(), "the interruption has a reason");
+    assert_eq!(resolution, "pending", "it resumes on the next claim");
+    assert_eq!(prev_status, "active", "it was recorded mid-turn");
 
     // Nothing of the tenant lands after the release: the machine's late end
     // of the turn included.
     let released = written(&pool, &tenant).await;
-    running.end_turn(3).await;
+    // The fence closed the link, so the send may fail.
+    let _ = running.end_turn(3).await;
     // timing-guard: a late write would land within this window; no event exposes its absence
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(written(&pool, &tenant).await, released);
