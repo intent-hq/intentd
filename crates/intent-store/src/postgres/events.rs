@@ -19,8 +19,9 @@ use super::agent_messages::nul_free;
 use super::{db, PgStore};
 use crate::enum_to_db;
 use crate::event_repo::{
-    escape_like, prefix_upper_bound, EventQuery, NewEvent, EPHEMERAL_EVENT_TYPES,
-    EPHEMERAL_TYPE_PREFIXES, EVENT_COLUMNS, RETENTION_DELETE_CHUNK,
+    escape_like, persisted_event, prefix_upper_bound, seq_from_db, seq_to_db, EventQuery, EventSeq,
+    NewEvent, EPHEMERAL_EVENT_TYPES, EPHEMERAL_TYPE_PREFIXES, EVENT_COLUMNS,
+    RETENTION_DELETE_CHUNK,
 };
 use crate::event_subscription_repo::PersistedEventSubscription;
 
@@ -125,21 +126,6 @@ fn encode(ev: &NewEvent) -> Result<Encoded> {
     })
 }
 
-fn persisted(ev: &NewEvent, id: String) -> Event {
-    Event {
-        id,
-        workspace_id: ev.workspace_id.clone(),
-        timestamp: ev.timestamp.clone(),
-        event_type: ev.event_type.clone(),
-        actor: ev.actor.clone(),
-        session_id: ev.session_id.clone(),
-        correlation_id: ev.correlation_id.clone(),
-        parent_event_id: ev.parent_event_id.clone(),
-        metadata: ev.metadata.clone(),
-        data: ev.data.clone(),
-    }
-}
-
 fn decode_subscription_row(row: &PgRow) -> Result<PersistedEventSubscription> {
     let event_types_raw: String = row
         .try_get("event_types")
@@ -168,13 +154,17 @@ fn decode_subscription_row(row: &PgRow) -> Result<PersistedEventSubscription> {
 
 impl PgStore {
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
+        Ok(self.insert_event_seq(ev).await?.0)
+    }
+
+    pub async fn insert_event_seq(&self, ev: &NewEvent) -> Result<(Event, EventSeq)> {
         let enc = encode(ev)?;
         let sql = format!(
             "INSERT INTO event (tenant_id, {EVENT_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING row_seq"
         );
         let mut tx = self.begin_write().await?;
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        let row_seq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(self.tenant())
             .bind(&enc.id)
             .bind(&ev.workspace_id.0)
@@ -186,14 +176,26 @@ impl PgStore {
             .bind(&ev.parent_event_id)
             .bind(&enc.metadata)
             .bind(&enc.data)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
         tx.commit().await.map_err(db)?;
-        Ok(persisted(ev, enc.id))
+        Ok((persisted_event(ev, enc.id), seq_from_db(row_seq)?))
     }
 
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
+        Ok(self
+            .insert_events_seq(events)
+            .await?
+            .into_iter()
+            .map(|(ev, _)| ev)
+            .collect())
+    }
+
+    /// The `row_seq` trigger numbers the rows in `ORDER BY u.ord` order, so
+    /// seqs follow the input; `RETURNING` order is unspecified, so they are
+    /// paired back up by id.
+    pub async fn insert_events_seq(&self, events: &[NewEvent]) -> Result<Vec<(Event, EventSeq)>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -204,7 +206,7 @@ impl PgStore {
             events.iter().map(|e| f(e).as_deref()).collect::<Vec<_>>()
         };
         let mut tx = self.begin_write().await?;
-        sqlx::query(
+        let rows = sqlx::query(
             "INSERT INTO event (tenant_id, id, workspace_id, timestamp, event_type, actor, \
                  session_id, correlation_id, parent_event_id, metadata_json, data_json) \
              SELECT $1, u.id, u.workspace_id, u.timestamp, u.event_type, u.actor, \
@@ -213,7 +215,8 @@ impl PgStore {
                  $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]) WITH ORDINALITY \
                  AS u(id, workspace_id, timestamp, event_type, actor, session_id, \
                      correlation_id, parent_event_id, metadata_json, data_json, ord) \
-             ORDER BY u.ord",
+             ORDER BY u.ord \
+             RETURNING id, row_seq",
         )
         .bind(self.tenant())
         .bind(encoded.iter().map(|e| e.id.as_str()).collect::<Vec<_>>())
@@ -236,17 +239,70 @@ impl PgStore {
                 .collect::<Vec<_>>(),
         )
         .bind(encoded.iter().map(|e| e.data.as_str()).collect::<Vec<_>>())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("insert events failed: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("commit failed: {e}")))?;
-        Ok(events
+        let mut seqs = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            seqs.insert(
+                col::<String>(row, "id")?,
+                seq_from_db(col::<i64>(row, "row_seq")?)?,
+            );
+        }
+        events
             .iter()
             .zip(encoded)
-            .map(|(ev, enc)| persisted(ev, enc.id))
-            .collect())
+            .map(|(ev, enc)| {
+                let seq = seqs.get(&enc.id).copied().ok_or_else(|| {
+                    Error::Internal(format!("insert events: no row_seq returned for {}", enc.id))
+                })?;
+                Ok((persisted_event(ev, enc.id), seq))
+            })
+            .collect()
+    }
+
+    /// Served by `idx_event_row_seq`.
+    pub async fn events_after(
+        &self,
+        after: EventSeq,
+        limit: i64,
+    ) -> Result<Vec<(Event, EventSeq)>> {
+        let sql = format!(
+            "SELECT row_seq, {EVENT_COLUMNS} FROM event WHERE tenant_id = $1 AND row_seq > $2 \
+             ORDER BY row_seq LIMIT CASE WHEN $3 < 0 THEN NULL ELSE $3 END"
+        );
+        let mut tx = self.begin().await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(self.tenant())
+            .bind(seq_to_db(after))
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("events after seq failed: {e}")))?;
+        tx.commit().await.map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    map_event_row(row)?,
+                    seq_from_db(col::<i64>(row, "row_seq")?)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn max_event_seq(&self) -> Result<EventSeq> {
+        let mut tx = self.begin().await?;
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT max(row_seq) FROM event WHERE tenant_id = $1")
+                .bind(self.tenant())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("max event seq failed: {e}")))?;
+        tx.commit().await.map_err(db)?;
+        max.map_or(Ok(0), seq_from_db)
     }
 
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {

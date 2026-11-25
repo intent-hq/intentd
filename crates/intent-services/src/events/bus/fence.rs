@@ -1,63 +1,9 @@
 //! Private raw-delivery receipts. Controls never occupy the broadcast ring.
-use super::{BroadcastEvent, Delivery, Event};
-use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use super::{Delivery, Event};
+use std::sync::{Mutex, Weak};
+use tokio::sync::{mpsc, oneshot};
 
-/// Publication and subscription registration share one short synchronous lock.
-/// A captured cursor counts raw deliveries, including filtered transient events.
-#[derive(Clone)]
-pub(crate) struct RawBus {
-    pub(super) sender: broadcast::Sender<Arc<BroadcastEvent>>,
-    tail: Arc<Mutex<u128>>,
-}
-
-impl From<broadcast::Sender<Arc<BroadcastEvent>>> for RawBus {
-    fn from(sender: broadcast::Sender<Arc<BroadcastEvent>>) -> Self {
-        Self {
-            sender,
-            tail: Arc::new(Mutex::new(0)),
-        }
-    }
-}
-
-impl std::ops::Deref for RawBus {
-    type Target = broadcast::Sender<Arc<BroadcastEvent>>;
-    fn deref(&self) -> &Self::Target {
-        &self.sender
-    }
-}
-
-impl RawBus {
-    pub(super) fn send(&self, event: Arc<BroadcastEvent>) {
-        let mut tail = self.tail.lock().expect("raw bus cursor");
-        *tail += 1;
-        let _ = self.sender.send(event);
-    }
-
-    pub(super) fn receiver(
-        &self,
-    ) -> (
-        broadcast::Receiver<Arc<BroadcastEvent>>,
-        u128,
-        FenceHandle,
-        mpsc::Receiver<FenceRequest>,
-    ) {
-        let tail = self.tail.lock().expect("raw bus cursor");
-        let receiver = self.sender.subscribe();
-        let (tx, rx) = mpsc::channel(64);
-        (
-            receiver,
-            *tail,
-            FenceHandle {
-                tail: Arc::downgrade(&self.tail),
-                tx,
-            },
-            rx,
-        )
-    }
-}
-
-pub(super) struct FenceRequest {
+pub(crate) struct FenceRequest {
     pub(super) boundary: u128,
     pub(super) ack: oneshot::Sender<()>,
 }
@@ -72,6 +18,11 @@ pub struct FenceHandle {
 }
 
 impl FenceHandle {
+    /// A handle over a fabric's raw cursor and one subscription's control queue.
+    pub(super) fn new(tail: Weak<Mutex<u128>>, tx: mpsc::Sender<FenceRequest>) -> Self {
+        Self { tail, tx }
+    }
+
     /// Capture the current raw tail and request an in-band receipt.
     ///
     /// # Errors
@@ -111,10 +62,13 @@ pub(super) async fn flush_fence(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BroadcastEvent, RawBus};
     use super::*;
     use std::future::Future as _;
+    use std::sync::Arc;
     use std::task::{Context, Waker};
     use std::time::Duration;
+    use tokio::sync::broadcast;
 
     #[tokio::test(start_paused = true)]
     async fn recovery_cancelled_fence_preserves_batch_deadline() {

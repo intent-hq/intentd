@@ -456,6 +456,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
+        work_claims: crate::work_claim_repo::LocalWorkClaims::default(),
         _daemon_owner: None,
         write_pool: pool.into(),
         read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),

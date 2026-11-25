@@ -81,6 +81,27 @@ pub struct NewEvent {
     pub data: serde_json::Value,
 }
 
+/// A durable event's position in its tenant's event log: never 0, with
+/// gaps allowed. On Postgres it strictly increases in commit order. On
+/// `SQLite` it increases only while the newest row is not deleted (see
+/// below); a consumer must handle reuse before relying on it as a cursor.
+///
+/// - Postgres: the row's `row_seq`, taken from the tenant's row counter
+///   under the tenant writer lock, so seq order is commit order across every
+///   writer of the tenant (the counter is shared by all of the tenant's
+///   tables, hence the gaps).
+/// - `SQLite`: the row's `rowid`; the single write connection serializes
+///   writers. `SQLite` reuses a deleted maximum `rowid`, even within one
+///   process: retention deletes by timestamp, so it can remove the newest
+///   row, and the next insert then takes that row's seq again. A consumer
+///   whose cursor equals the reused seq skips that event. A full `VACUUM`
+///   may also renumber rows. So a `SQLite` seq is safe as a cursor only
+///   while no delete can remove the newest row between reads; a durable
+///   cursor needs an `AUTOINCREMENT` seq first.
+///
+/// The seq stays inside the daemon: it is not part of [`Event`] or the wire.
+pub type EventSeq = u64;
+
 /// Filter for [`Store::query_events`]. All set fields are AND-combined; unset
 /// fields are ignored. Results are ordered newest-first (`timestamp` DESC).
 #[derive(Debug, Clone, Default)]
@@ -132,6 +153,56 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
         dispatch!(self, backend => backend.insert_events(events).await)
+    }
+
+    /// [`Store::insert_event`], also returning the event's [`EventSeq`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_event_seq(&self, ev: &NewEvent) -> Result<(Event, EventSeq)> {
+        dispatch!(self, backend => backend.insert_event_seq(ev).await)
+    }
+
+    /// [`Store::insert_events`], also returning each event's [`EventSeq`]
+    /// (in insertion order, so the seqs strictly increase along the vec).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_events_seq(&self, events: &[NewEvent]) -> Result<Vec<(Event, EventSeq)>> {
+        dispatch!(self, backend => backend.insert_events_seq(events).await)
+    }
+
+    /// Up to `limit` events with a seq strictly greater than `after`, in seq
+    /// (commit) order, each with its seq: the backfill read for a consumer
+    /// that last saw `after`. `after = 0` reads from the start of the log; a
+    /// negative `limit` means no limit. Rows the retention sweeps removed are
+    /// simply absent (seqs have gaps).
+    ///
+    /// Unlike [`Store::query_events`] this applies no caller-bound
+    /// visibility filter: it is a daemon-internal cursor read, and the caller
+    /// filters before anything reaches a client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
+    pub async fn events_after(
+        &self,
+        after: EventSeq,
+        limit: i64,
+    ) -> Result<Vec<(Event, EventSeq)>> {
+        dispatch!(self, backend => backend.events_after(after, limit).await)
+    }
+
+    /// The highest seq in the event log (0 when it is empty): the watermark
+    /// a consumer resumes [`Store::events_after`] from.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
+    pub async fn max_event_seq(&self) -> Result<EventSeq> {
+        dispatch!(self, backend => backend.max_event_seq().await)
     }
 
     /// Run a filtered event query (newest-first). See [`EventQuery`].
@@ -214,6 +285,10 @@ impl Store {
 
 impl crate::SqliteStore {
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
+        Ok(self.insert_event_seq(ev).await?.0)
+    }
+
+    pub async fn insert_event_seq(&self, ev: &NewEvent) -> Result<(Event, EventSeq)> {
         let id = Uuid::now_v7().to_string();
         let actor_json = serde_json::to_string(&ev.actor)
             .map_err(|e| Error::Internal(format!("encode actor failed: {e}")))?;
@@ -225,8 +300,10 @@ impl crate::SqliteStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| Error::Internal(format!("encode metadata_json failed: {e}")))?;
-        let sql = format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)");
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        let sql = format!(
+            "INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING rowid"
+        );
+        let rowid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id)
             .bind(&ev.workspace_id.0)
             .bind(&ev.timestamp)
@@ -237,24 +314,22 @@ impl crate::SqliteStore {
             .bind(&ev.parent_event_id)
             .bind(&metadata_json)
             .bind(&data_json)
-            .execute(self.write_pool())
+            .fetch_one(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
-        Ok(Event {
-            id,
-            workspace_id: ev.workspace_id.clone(),
-            timestamp: ev.timestamp.clone(),
-            event_type: ev.event_type.clone(),
-            actor: ev.actor.clone(),
-            session_id: ev.session_id.clone(),
-            correlation_id: ev.correlation_id.clone(),
-            parent_event_id: ev.parent_event_id.clone(),
-            metadata: ev.metadata.clone(),
-            data: ev.data.clone(),
-        })
+        Ok((persisted_event(ev, id), seq_from_db(rowid)?))
     }
 
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
+        Ok(self
+            .insert_events_seq(events)
+            .await?
+            .into_iter()
+            .map(|(ev, _)| ev)
+            .collect())
+    }
+
+    pub async fn insert_events_seq(&self, events: &[NewEvent]) -> Result<Vec<(Event, EventSeq)>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -313,8 +388,9 @@ impl crate::SqliteStore {
                     .push_bind(&prep.2); // data_json
             });
 
+            qb.push(" RETURNING id, rowid");
             qb.build()
-                .execute(&mut *conn)
+                .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("insert events failed: {e}")))
         }
@@ -324,25 +400,53 @@ impl crate::SqliteStore {
         // failure, if the COMMIT itself fails — monorepo#670) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
-        crate::commit_with_rollback_guard(conn, result, "commit failed").await?;
+        let rows = crate::commit_with_rollback_guard(conn, result, "commit failed").await?;
 
-        // Reconstruct Event structs in insertion order.
-        let mut result = Vec::with_capacity(events.len());
-        for (ev, prep) in events.iter().zip(&prepared) {
-            result.push(Event {
-                id: prep.0.clone(),
-                workspace_id: ev.workspace_id.clone(),
-                timestamp: ev.timestamp.clone(),
-                event_type: ev.event_type.clone(),
-                actor: ev.actor.clone(),
-                session_id: ev.session_id.clone(),
-                correlation_id: ev.correlation_id.clone(),
-                parent_event_id: ev.parent_event_id.clone(),
-                metadata: ev.metadata.clone(),
-                data: ev.data.clone(),
-            });
+        // RETURNING row order is unspecified: pair seqs back up by id.
+        let mut seqs = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            seqs.insert(
+                col::<String>(row, "id")?,
+                seq_from_db(col::<i64>(row, "rowid")?)?,
+            );
         }
-        Ok(result)
+        events
+            .iter()
+            .zip(prepared)
+            .map(|(ev, prep)| {
+                let seq = seqs.get(&prep.0).copied().ok_or_else(|| {
+                    Error::Internal(format!("insert events: no rowid returned for {}", prep.0))
+                })?;
+                Ok((persisted_event(ev, prep.0), seq))
+            })
+            .collect()
+    }
+
+    pub async fn events_after(
+        &self,
+        after: EventSeq,
+        limit: i64,
+    ) -> Result<Vec<(Event, EventSeq)>> {
+        let sql = format!(
+            "SELECT rowid, {EVENT_COLUMNS} FROM event WHERE rowid > ? ORDER BY rowid LIMIT ?"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(seq_to_db(after))
+            .bind(limit)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("events after seq failed: {e}")))?;
+        rows.iter()
+            .map(|row| Ok((map_event_row(row)?, seq_from_db(col::<i64>(row, "rowid")?)?)))
+            .collect()
+    }
+
+    pub async fn max_event_seq(&self) -> Result<EventSeq> {
+        let max: Option<i64> = sqlx::query_scalar("SELECT max(rowid) FROM event")
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("max event seq failed: {e}")))?;
+        max.map_or(Ok(0), seq_from_db)
     }
 
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
@@ -598,6 +702,35 @@ impl crate::SqliteStore {
     }
 }
 
+/// The [`Event`] an insert of `ev` under `id` persisted.
+pub(crate) fn persisted_event(ev: &NewEvent, id: String) -> Event {
+    Event {
+        id,
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data: ev.data.clone(),
+    }
+}
+
+/// A stored seq (`rowid` / `row_seq`, always positive) as an [`EventSeq`].
+pub(crate) fn seq_from_db(raw: i64) -> Result<EventSeq> {
+    match EventSeq::try_from(raw) {
+        Ok(seq) if seq > 0 => Ok(seq),
+        _ => Err(Error::Internal(format!("event seq out of range: {raw}"))),
+    }
+}
+
+/// An [`EventSeq`] cursor as a bind value; past `i64::MAX` nothing follows it.
+pub(crate) fn seq_to_db(seq: EventSeq) -> i64 {
+    i64::try_from(seq).unwrap_or(i64::MAX)
+}
+
 /// Smallest string strictly greater than every string starting with `prefix`,
 /// for half-open `[prefix, upper)` index ranges over `event_type`. Increments
 /// the final byte. Returns `None` when no valid bound exists — empty or
@@ -702,6 +835,43 @@ mod tests {
             metadata: None,
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_event_seq_increases_and_pages_by_cursor() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        assert_eq!(store.max_event_seq().await.expect("max"), 0);
+
+        let (first, first_seq) = store
+            .insert_event_seq(&new_event("test:a", json!({})))
+            .await
+            .expect("insert one");
+        let batch = store
+            .insert_events_seq(&[
+                new_event("test:b", json!({})),
+                new_event("test:c", json!({})),
+            ])
+            .await
+            .expect("insert batch");
+
+        assert!(first_seq > 0);
+        assert!(batch[0].1 > first_seq && batch[1].1 > batch[0].1);
+        assert_eq!(store.max_event_seq().await.expect("max"), batch[1].1);
+
+        let page = store.events_after(0, 2).await.expect("page 1");
+        assert_eq!(
+            page.iter().map(|(e, _)| e.id.as_str()).collect::<Vec<_>>(),
+            [first.id.as_str(), batch[0].0.id.as_str()]
+        );
+        let rest = store.events_after(page[1].1, -1).await.expect("page 2");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].0.id, batch[1].0.id);
+        assert!(store
+            .events_after(batch[1].1, -1)
+            .await
+            .expect("past max")
+            .is_empty());
     }
 
     #[tokio::test]

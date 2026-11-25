@@ -10357,10 +10357,27 @@ impl AgentManager {
             // its combined turn FIFO instead of being bypassed
             // (intent-hq/intent#3883). A single eligible entry falls through
             // to the existing single-entry path unchanged.
-            if let Some((batch, draining)) =
-                self.services
-                    .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
-            {
+            // On a shared store the pop is also a claim: entries another
+            // process drained or removed first are released, not delivered.
+            let flush = self
+                .services
+                .claim_queue_pop(
+                    &agent_id,
+                    || {
+                        self.services
+                            .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
+                    },
+                    |(batch, _)| batch.clone(),
+                )
+                .await
+                .and_then(|((mut batch, mut draining), lost)| {
+                    if !lost.is_empty() {
+                        draining.release(&lost);
+                        batch.retain(|m| !lost.contains(&m.id));
+                    }
+                    (!batch.is_empty()).then_some((batch, draining))
+                });
+            if let Some((batch, draining)) = flush {
                 match self
                     .prepare_admitted_flush_turn(
                         &agent_id,
@@ -10383,12 +10400,23 @@ impl AgentManager {
                 }
                 return;
             }
-            if archived_drain {
-                self.services
-                    .dequeue_user_origin_message_draining(&agent_id)
-            } else {
-                self.services.dequeue_message_draining(&agent_id)
-            }
+            self.services
+                .claim_queue_pop(
+                    &agent_id,
+                    || {
+                        if archived_drain {
+                            self.services
+                                .dequeue_user_origin_message_draining(&agent_id)
+                        } else {
+                            self.services.dequeue_message_draining(&agent_id)
+                        }
+                    },
+                    |(next, _)| vec![next.clone()],
+                )
+                .await
+                // Lost: another process drained or removed it first.
+                .filter(|(_, lost)| lost.is_empty())
+                .map(|(popped, _)| popped)
         };
         let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the

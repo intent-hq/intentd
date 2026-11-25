@@ -29,7 +29,10 @@ use sqlx::Row;
 
 use super::{db, PgStore, WriteTx};
 use crate::agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
-use crate::agent_queue_repo::AgentQueueRow;
+use crate::agent_queue_merge::{
+    agent_queue_base, lost_agent_queue_claims, merge_agent_queue, AgentQueueBase,
+};
+use crate::agent_queue_repo::{AgentQueueRow, AgentQueueSync};
 use crate::agent_repo::prepared_monitor_message::{draft_monitor_message, MonitorMessageDraft};
 use crate::agent_repo::UsageMessageOrigin;
 use crate::agent_repo::{
@@ -3050,13 +3053,13 @@ impl PgStore {
     /// other process writes between the check and the bump). Returns the
     /// new version to record once `tx` commits, or `None` when the agent has
     /// no session row (nothing to version; its queue rows cannot exist).
-    async fn bump_queue_version(
+    /// The stored queue version of `agent_id` (0 when never written), or
+    /// `None` when the agent has no session row (nothing to version).
+    async fn stored_queue_version(
         &self,
-        tx: &mut WriteTx,
+        conn: &mut PgConnection,
         agent_id: &AgentId,
-        write_id: &str,
     ) -> Result<Option<i64>> {
-        let seen = self.queue_versions.seen(agent_id);
         let row: Option<(bool, Option<i64>)> = sqlx::query_as(
             "SELECT TRUE, (SELECT v.version FROM agent_queue_version v \
                  WHERE v.tenant_id = $1 AND v.agent_id = $2) \
@@ -3064,13 +3067,47 @@ impl PgStore {
         )
         .bind(self.tenant())
         .bind(&agent_id.0)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(conn)
         .await
         .map_err(db)?;
-        let Some((_, stored)) = row else {
+        Ok(row.map(|(_, stored)| stored.unwrap_or(0)))
+    }
+
+    async fn set_queue_version(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+        version: i64,
+        write_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_queue_version (tenant_id, agent_id, version, write_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (tenant_id, agent_id) DO UPDATE SET \
+             version = excluded.version, write_id = excluded.write_id",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .bind(version)
+        .bind(write_id)
+        .execute(conn)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Compare-and-swap bump: `Conflict` when another process wrote the
+    /// queue since this process last read or wrote it.
+    async fn bump_queue_version(
+        &self,
+        tx: &mut WriteTx,
+        agent_id: &AgentId,
+        write_id: &str,
+    ) -> Result<Option<i64>> {
+        let seen = self.queue_versions.seen(agent_id);
+        let Some(current) = self.stored_queue_version(tx, agent_id).await? else {
             return Ok(None);
         };
-        let current = stored.unwrap_or(0);
         if current != seen {
             return Err(Error::Conflict {
                 current: serde_json::json!({
@@ -3081,20 +3118,38 @@ impl PgStore {
             });
         }
         let next = current + 1;
-        sqlx::query(
-            "INSERT INTO agent_queue_version (tenant_id, agent_id, version, write_id) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (tenant_id, agent_id) DO UPDATE SET \
-             version = excluded.version, write_id = excluded.write_id",
+        self.set_queue_version(tx, agent_id, next, write_id).await?;
+        Ok(Some(next))
+    }
+
+    /// One agent's stored queue rows (no admission rows), in queue order.
+    async fn agent_queue_rows_in(
+        &self,
+        conn: &mut PgConnection,
+        agent_id: &AgentId,
+    ) -> Result<Vec<AgentQueueRow>> {
+        let rows = sqlx::query(
+            "SELECT id, position, payload, created_at, COALESCE(turn_id, id) AS turn_id \
+             FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2 ORDER BY position",
         )
         .bind(self.tenant())
         .bind(&agent_id.0)
-        .bind(next)
-        .bind(write_id)
-        .execute(&mut **tx)
+        .fetch_all(conn)
         .await
         .map_err(db)?;
-        Ok(Some(next))
+        rows.iter()
+            .map(|row| {
+                let payload_raw: String = col(row, "payload")?;
+                Ok(AgentQueueRow {
+                    id: col(row, "id")?,
+                    agent_id: agent_id.clone(),
+                    position: col(row, "position")?,
+                    payload: serde_json::from_str(&payload_raw).unwrap_or(Value::Null),
+                    created_at: col(row, "created_at")?,
+                    turn_id: col(row, "turn_id")?,
+                })
+            })
+            .collect()
     }
 
     /// Commits a queue write whose version bumps are `bumped`, recording them
@@ -3113,7 +3168,7 @@ impl PgStore {
         tx: WriteTx,
         queue_write: tokio::sync::OwnedMutexGuard<()>,
         write_id: String,
-        bumped: Vec<(AgentId, Option<i64>)>,
+        bumped: Vec<QueueBump>,
     ) -> Result<()> {
         // Commit and recovery run on their own task, so a caller that is
         // cancelled meanwhile (a worker aborted at shutdown) cannot leave the
@@ -3132,19 +3187,21 @@ impl PgStore {
         &self,
         tx: WriteTx,
         write_id: &str,
-        bumped: &[(AgentId, Option<i64>)],
+        bumped: &[QueueBump],
     ) -> Result<()> {
-        let previous: Vec<(&AgentId, i64)> = bumped
+        let previous: Vec<(&AgentId, (i64, Option<AgentQueueBase>))> = bumped
             .iter()
-            .filter_map(|(agent, next)| next.map(|_| (agent, self.queue_versions.seen(agent))))
+            .filter_map(|(agent, next, _)| {
+                next.map(|_| (agent, self.queue_versions.snapshot(agent)))
+            })
             .collect();
-        for (agent, next) in bumped {
+        for (agent, next, base) in bumped {
             if let Some(next) = next {
-                self.queue_versions.record(agent, *next);
+                self.queue_versions.record(agent, *next, base.clone());
             }
         }
         if let Err(e) = tx.commit().await {
-            for (agent, version) in previous {
+            for (agent, (version, base)) in previous {
                 let landed = self
                     .stored_queue_write_id(agent)
                     .await
@@ -3152,7 +3209,7 @@ impl PgStore {
                     .flatten()
                     .is_some_and(|stored| stored == write_id);
                 if !landed {
-                    self.queue_versions.record(agent, version);
+                    self.queue_versions.restore(agent, version, base);
                 }
             }
             return Err(db(e));
@@ -3235,8 +3292,99 @@ impl PgStore {
             .await
             .map_err(db)?;
         self.insert_queue_rows(&mut tx, agent_id, rows).await?;
-        self.commit_queue_write(tx, queue_write, write_id, vec![(agent_id.clone(), next)])
+        self.commit_queue_write(
+            tx,
+            queue_write,
+            write_id,
+            vec![(agent_id.clone(), next, agent_queue_base(rows))],
+        )
+        .await
+    }
+
+    pub async fn sync_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+        claims: &[String],
+    ) -> Result<AgentQueueSync> {
+        if let Some(row) = rows.iter().find(|r| r.agent_id != *agent_id) {
+            return Err(Error::Internal(format!(
+                "sync agent queue row {} belongs to agent {}, not {}",
+                row.id, row.agent_id.0, agent_id.0
+            )));
+        }
+        // Held through the commit and its recovery: see `QueueVersions`.
+        let queue_write = self.queue_versions.write_lock().await;
+        let write_id = uuid::Uuid::new_v4().to_string();
+        // The tenant writer lock orders this read-merge-write against every
+        // other process's queue write.
+        let mut tx = self.begin_write().await?;
+        let seen = self.queue_versions.seen(agent_id);
+        let stored_version = self.stored_queue_version(&mut tx, agent_id).await?;
+        let mut sync = AgentQueueSync::default();
+        let next = match stored_version {
+            Some(current) if current != seen => {
+                let stored = self.agent_queue_rows_in(&mut tx, agent_id).await?;
+                let base = self.queue_versions.base(agent_id);
+                sync.lost = lost_agent_queue_claims(&base, &stored, claims);
+                sync.merged = Some(merge_agent_queue(agent_id, &base, rows, &stored));
+                Some(current + 1)
+            }
+            Some(current) => Some(current + 1),
+            None => None,
+        };
+        if let Some(next) = next {
+            self.set_queue_version(&mut tx, agent_id, next, &write_id)
+                .await?;
+        }
+        let written = sync.merged.as_deref().unwrap_or(rows);
+        sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2")
+            .bind(self.tenant())
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
             .await
+            .map_err(db)?;
+        self.insert_queue_rows(&mut tx, agent_id, written).await?;
+        let base = agent_queue_base(written);
+        self.commit_queue_write(
+            tx,
+            queue_write,
+            write_id,
+            vec![(agent_id.clone(), next, base)],
+        )
+        .await?;
+        Ok(sync)
+    }
+
+    pub async fn refresh_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        local: &[AgentQueueRow],
+    ) -> Result<Option<Vec<AgentQueueRow>>> {
+        // No write of this process is in flight while the view is replaced.
+        let _queue_write = self.queue_versions.write_lock().await;
+        let seen = self.queue_versions.seen(agent_id);
+        let mut tx = self.begin_read_snapshot().await?;
+        let version: Option<i64> = sqlx::query_scalar(
+            "SELECT version FROM agent_queue_version WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let version = version.unwrap_or(0);
+        if version == seen {
+            tx.commit().await.map_err(db)?;
+            return Ok(None);
+        }
+        let stored = self.agent_queue_rows_in(&mut tx, agent_id).await?;
+        tx.commit().await.map_err(db)?;
+        let base = self.queue_versions.base(agent_id);
+        let merged = merge_agent_queue(agent_id, &base, local, &stored);
+        self.queue_versions
+            .record(agent_id, version, agent_queue_base(&stored));
+        Ok(Some(merged))
     }
 
     pub async fn move_agent_queue(
@@ -3270,14 +3418,22 @@ impl PgStore {
         self.insert_queue_rows(&mut tx, to, rows).await?;
         if from == to {
             return self
-                .commit_queue_write(tx, queue_write, write_id, vec![(to.clone(), to_next)])
+                .commit_queue_write(
+                    tx,
+                    queue_write,
+                    write_id,
+                    vec![(to.clone(), to_next, agent_queue_base(rows))],
+                )
                 .await;
         }
         self.commit_queue_write(
             tx,
             queue_write,
             write_id,
-            vec![(from.clone(), from_next), (to.clone(), to_next)],
+            vec![
+                (from.clone(), from_next, AgentQueueBase::new()),
+                (to.clone(), to_next, agent_queue_base(rows)),
+            ],
         )
         .await
     }
@@ -3317,8 +3473,8 @@ impl PgStore {
         .await
         .map_err(db)?;
         tx.commit().await.map_err(db)?;
-        self.queue_versions.adopt_once(versions);
-        rows.iter()
+        let rows = rows
+            .iter()
             .map(|row| {
                 let payload_raw: String = col(row, "payload")?;
                 Ok(AgentQueueRow {
@@ -3330,7 +3486,24 @@ impl PgStore {
                     turn_id: col(row, "turn_id")?,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // The base of each agent is its `agent_queue` rows (admission rows,
+        // position -1, are not stored there).
+        let mut bases: HashMap<String, Vec<AgentQueueRow>> = HashMap::new();
+        for row in rows.iter().filter(|row| row.position >= 0) {
+            bases
+                .entry(row.agent_id.0.clone())
+                .or_default()
+                .push(row.clone());
+        }
+        self.queue_versions.adopt_once(
+            versions,
+            bases
+                .into_iter()
+                .map(|(agent, rows)| (agent, agent_queue_base(&rows)))
+                .collect(),
+        );
+        Ok(rows)
     }
 
     // ---- task agent links -------------------------------------------------------
@@ -4011,7 +4184,14 @@ pub(crate) struct QueueVersions {
 struct VersionMap {
     loaded: bool,
     versions: HashMap<String, i64>,
+    /// The queue as of `versions` (what this process last read or wrote),
+    /// the base of [`merge_agent_queue`]. Missing means empty.
+    bases: HashMap<String, AgentQueueBase>,
 }
+
+/// One agent's queue write: the agent, its new version (`None` when it has
+/// no session row) and the queue written.
+type QueueBump = (AgentId, Option<i64>, AgentQueueBase);
 
 impl QueueVersions {
     fn map(&self) -> std::sync::MutexGuard<'_, VersionMap> {
@@ -4030,12 +4210,40 @@ impl QueueVersions {
         self.map().versions.get(&agent_id.0).copied().unwrap_or(0)
     }
 
-    fn record(&self, agent_id: &AgentId, version: i64) {
-        self.map().versions.insert(agent_id.0.clone(), version);
+    fn base(&self, agent_id: &AgentId) -> AgentQueueBase {
+        self.map()
+            .bases
+            .get(&agent_id.0)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// Adopts the stored versions on the process's first load only.
-    fn adopt_once(&self, versions: Vec<(String, i64)>) {
+    fn snapshot(&self, agent_id: &AgentId) -> (i64, Option<AgentQueueBase>) {
+        let map = self.map();
+        (
+            map.versions.get(&agent_id.0).copied().unwrap_or(0),
+            map.bases.get(&agent_id.0).cloned(),
+        )
+    }
+
+    fn record(&self, agent_id: &AgentId, version: i64, base: AgentQueueBase) {
+        let mut map = self.map();
+        map.versions.insert(agent_id.0.clone(), version);
+        map.bases.insert(agent_id.0.clone(), base);
+    }
+
+    fn restore(&self, agent_id: &AgentId, version: i64, base: Option<AgentQueueBase>) {
+        let mut map = self.map();
+        map.versions.insert(agent_id.0.clone(), version);
+        match base {
+            Some(base) => map.bases.insert(agent_id.0.clone(), base),
+            None => map.bases.remove(&agent_id.0),
+        };
+    }
+
+    /// Adopts the stored versions, and the queues read with them, on the
+    /// process's first load only.
+    fn adopt_once(&self, versions: Vec<(String, i64)>, bases: HashMap<String, AgentQueueBase>) {
         let mut map = self.map();
         if map.loaded {
             return;
@@ -4043,6 +4251,9 @@ impl QueueVersions {
         map.loaded = true;
         for (agent, version) in versions {
             map.versions.entry(agent).or_insert(version);
+        }
+        for (agent, base) in bases {
+            map.bases.entry(agent).or_insert(base);
         }
     }
 

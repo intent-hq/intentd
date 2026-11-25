@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 /// How the orchestrator handles one of `intentd`'s startup steps.
 enum Step {
     /// The orchestrator does it too: this call must appear (as `name(`) in
-    /// the orchestrator's sources or the shared startup code in
-    /// `intent-app`, outside tests.
+    /// the orchestrator's sources, the shared startup code in `intent-app`
+    /// or the tenant self-fence in `intent-services`, outside tests.
     Wired(&'static str),
     /// Never in orchestrator mode, and why.
     Refused(&'static str),
@@ -350,30 +350,23 @@ const STEPS: &[(&str, Step)] = &[
         "spawn_config_watcher_init",
         Gap("a tenant's `config.toml` is not reloaded when edited"),
     ),
-    // External MCP servers.
-    (
-        "services.mcp_hub",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
-    ),
-    (
-        "mcp_hub.spawn_health_monitor",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
-    ),
+    // External MCP servers: a tenant's hub refuses stdio (it starts no
+    // process); agents get the tools of its http servers. The tenant's
+    // self-fence stops them.
+    ("services.mcp_hub", Wired("mcp_hub")),
+    ("mcp_hub.spawn_health_monitor", Wired("spawn_health_monitor")),
     (
         "services.start_enabled_mcp_servers",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+        Wired("start_enabled_mcp_servers"),
     ),
     (
         "mcp_hub.begin_background_shutdown",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+        Wired("begin_background_shutdown"),
     ),
-    (
-        "mcp_hub.shutdown",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
-    ),
+    ("mcp_hub.shutdown", Wired("mcp.shutdown")),
     (
         "settle_mcp_background",
-        Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
+        Plumbing, // The self-fence cancels the two tasks before its MCP step.
     ),
     (".with_host_exec", Wired("with_host_exec")),
     // `SQLite` only.
@@ -691,6 +684,7 @@ fn orchestrator_sources() -> String {
     let files = [
         "intentd-orchestrator/src/lib.rs",
         "intentd-orchestrator/src/main.rs",
+        "intentd-orchestrator/src/mcp.rs",
         "intentd-orchestrator/src/serve.rs",
         "intentd-orchestrator/src/listen.rs",
         "intentd-orchestrator/src/process.rs",
@@ -699,6 +693,7 @@ fn orchestrator_sources() -> String {
         "intent-app/src/tenant.rs",
         "intent-app/src/agents.rs",
         "intent-app/src/shutdown.rs",
+        "intent-services/src/self_fence.rs",
     ];
     files
         .iter()

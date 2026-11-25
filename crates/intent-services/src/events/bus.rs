@@ -15,6 +15,9 @@
 //! (they feed `event.agentActivity` / `event.workspaceSummary`); watcher-observed
 //! changes attributed to the system/user are broadcast-only, since they are
 //! high-volume noise that no read path queries back out of the log.
+//!
+//! The raw ring under all of this is an [`EventFabric`]; [`LocalFabric`] is
+//! the in-process `tokio::broadcast` implementation every build uses.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,10 +33,15 @@ use uuid::Uuid;
 use super::filter::{event_matches, SubscriptionFilter};
 use super::monitor_delivery::{BroadcastEvent, MonitorEvent, PrivateEventDelivery, Recipient};
 
+mod fabric;
+pub(crate) use fabric::{EventFabric, LocalFabric};
 mod fence;
 pub use fence::FenceHandle;
 use fence::FenceRequest;
-pub(crate) use fence::RawBus;
+
+/// Former name of [`LocalFabric`], kept for the writer tests.
+#[cfg(test)]
+pub(crate) type RawBus = LocalFabric;
 
 mod task_push;
 
@@ -125,12 +133,13 @@ const TOOL_CALL_FIELD_PREVIEW_BYTES: usize = 2 * 1024;
 /// return the result (or error).
 pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 
-/// In-process broadcast bus layered over the durable event [`Store`]. Cheap to
-/// clone (the store handle, broadcast sender, and writer channel are all shared).
+/// Event bus layered over the durable event [`Store`], publishing through an
+/// [`EventFabric`] ([`LocalFabric`] in every build today). Cheap to clone
+/// (the store handle, fabric, and writer channel are all shared).
 #[derive(Clone)]
 pub struct EventBus {
     store: Store,
-    tx: RawBus,
+    tx: Arc<dyn EventFabric>,
     writer_tx: Arc<Mutex<Option<mpsc::Sender<WriterRequest>>>>,
     writer: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Attribution names by principal, each with its load time; entries
@@ -157,9 +166,13 @@ impl EventBus {
     #[doc(hidden)]
     #[must_use]
     pub fn with_broadcast_capacity(store: Store, capacity: usize) -> Self {
+        Self::with_fabric(store, Arc::new(LocalFabric::with_capacity(capacity)))
+    }
+
+    /// Wire a bus over `fabric` and spawn the writer task. The writer, the
+    /// transient and monitor lanes, and every subscription share it.
+    pub(crate) fn with_fabric(store: Store, tx: Arc<dyn EventFabric>) -> Self {
         let task_event_baselines = store.task_event_baselines();
-        let (tx, _rx) = broadcast::channel(capacity);
-        let tx = RawBus::from(tx);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         // Spawn the writer task that drains events and batch-persists them.
         let writer = intent_core::spawn_daemon(writer_task(store.clone(), writer_rx, tx.clone()));
@@ -234,7 +247,7 @@ impl EventBus {
     /// Broadcast values not yet read by every live subscriber's delivery task.
     #[cfg(test)]
     pub(super) fn undelivered_broadcasts(&self) -> usize {
-        self.tx.len()
+        self.tx.undelivered()
     }
 
     /// Append `ev` to the durable log, then broadcast the persisted event to
@@ -389,7 +402,7 @@ impl EventBus {
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
         self.tx
-            .send(Arc::new(BroadcastEvent::Public(event.clone())));
+            .publish(Arc::new(BroadcastEvent::Public(event.clone())));
         event
     }
 
@@ -474,7 +487,7 @@ impl EventBus {
     /// Called only after the original qualified message commit. Generic event
     /// subscriptions never receive this notification, even as a public marker.
     pub(crate) fn notify_monitor_history(&self, agent_id: &str) {
-        self.tx.send(Arc::new(BroadcastEvent::HistoryChanged(
+        self.tx.publish(Arc::new(BroadcastEvent::HistoryChanged(
             agent_id.to_owned(),
         )));
     }
@@ -493,7 +506,7 @@ impl EventBus {
         }));
         fence.with_current(&mut || {
             if let Some(envelope) = envelope.take() {
-                self.tx.send(Arc::new(envelope));
+                self.tx.publish(Arc::new(envelope));
             }
             Ok(())
         })
@@ -606,7 +619,11 @@ impl Drop for Subscription {
 /// iteration flushes `pending` before looping, and `recv()` keeps returning
 /// buffered events after the channel closes (before yielding `None`), so no
 /// event is dropped at shutdown.
-async fn writer_task(store: Store, rx: mpsc::Receiver<WriterRequest>, broadcast_tx: RawBus) {
+async fn writer_task(
+    store: Store,
+    rx: mpsc::Receiver<WriterRequest>,
+    broadcast_tx: Arc<dyn EventFabric>,
+) {
     let fence_store = store.clone();
     writer_loop(
         move |events: Arc<[NewEvent]>| {
@@ -625,12 +642,13 @@ async fn writer_task(store: Store, rx: mpsc::Receiver<WriterRequest>, broadcast_
 /// shape as [`flush_prepared`]). The loop contains no timer wait: an idle
 /// publish flushes as soon as it is received. The prepared batch is shared as
 /// an `Arc<[NewEvent]>` so each retry attempt's future owns its input.
-pub(crate) async fn writer_loop<F, Fut>(
+pub(crate) async fn writer_loop<F, Fut, B>(
     insert: F,
     mut rx: mpsc::Receiver<WriterRequest>,
-    broadcast_tx: RawBus,
+    broadcast_tx: B,
     own_refusal: impl Fn(&Error) -> bool,
 ) where
+    B: EventFabric,
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
@@ -662,12 +680,13 @@ pub(crate) async fn writer_loop<F, Fut>(
 /// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
 /// returned event) keeps the original full payload so live consumers (§7.1
 /// tool-block synthesis) are unaffected.
-async fn flush_batch<F, Fut>(
+async fn flush_batch<F, Fut, B>(
     insert: &F,
     pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &RawBus,
+    broadcast_tx: &B,
     own_refusal: &impl Fn(&Error) -> bool,
 ) where
+    B: EventFabric + ?Sized,
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
@@ -720,12 +739,13 @@ async fn flush_batch<F, Fut>(
 /// minting is ever hoisted out of `insert_events` (e.g. into the bus), a
 /// retry after an ambiguous commit failure could double-insert — revisit
 /// this retry loop then.
-pub(crate) async fn flush_prepared<F, Fut>(
+pub(crate) async fn flush_prepared<F, Fut, B>(
     mut insert: F,
     pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &RawBus,
+    broadcast_tx: &B,
     own_refusal: impl Fn(&Error) -> bool,
 ) where
+    B: EventFabric + ?Sized,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
@@ -769,7 +789,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
                 // ordering `publish_transient` documents (an agent's closing
                 // text overtook a parallel `tool_result`,
                 // intent-hq/intent#7296).
-                broadcast_tx.send(Arc::new(BroadcastEvent::Public(evt.clone())));
+                broadcast_tx.publish(Arc::new(BroadcastEvent::Public(evt.clone())));
                 let _ = tx.send(Ok(evt));
             }
         }

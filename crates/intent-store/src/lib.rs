@@ -67,6 +67,7 @@ macro_rules! sqlite_only {
 
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
+mod agent_queue_merge;
 mod agent_queue_repo;
 mod agent_repo;
 mod agent_session_summary;
@@ -164,9 +165,11 @@ mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_home_repo;
 pub use workspace_home_repo::{backup_warning_in, BACKUP_WARNING_AFTER};
+mod work_claim_repo;
 mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
+pub use work_claim_repo::WorkClaim;
 
 pub use repository_lifecycle::{
     RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
@@ -179,7 +182,11 @@ pub use repository_lifecycle::{
 };
 
 pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
-pub use agent_queue_repo::AgentQueueRow;
+pub use agent_queue_merge::{
+    agent_queue_base, agent_queue_row_digest, lost_agent_queue_claims, merge_agent_queue,
+    AgentQueueBase,
+};
+pub use agent_queue_repo::{AgentQueueRow, AgentQueueSync};
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, project_user_message_index_metadata, AgentTurnEffort,
@@ -197,7 +204,7 @@ pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
 pub use discussion_activity_repo::DiscussionActivityReceipt;
 pub use discussion_agent_repo::DiscussionDelivery;
-pub use event_repo::{EventQuery, NewEvent};
+pub use event_repo::{EventQuery, EventSeq, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use executor_repo::ExecutorRevocation;
 pub use hook_repo::ActiveHookMetadata;
@@ -572,6 +579,8 @@ pub(crate) struct SqliteStore {
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-note content-write locks; see `note_write_lock`.
     note_write_lanes: std::sync::Arc<note_write_lock::NoteWriteLanes>,
+    /// This process's work claims; see `work_claim_repo`.
+    work_claims: work_claim_repo::LocalWorkClaims,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -804,6 +813,7 @@ impl crate::SqliteStore {
             task_event_baselines: std::sync::Arc::default(),
             task_events_enabled: std::sync::Arc::default(),
             note_write_lanes: std::sync::Arc::default(),
+            work_claims: crate::work_claim_repo::LocalWorkClaims::default(),
             write_pool: StorePool::new(write_pool, owner.is_some()),
             read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,

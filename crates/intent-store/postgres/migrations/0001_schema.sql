@@ -619,6 +619,26 @@ CREATE TABLE IF NOT EXISTS delete_grace (
     CHECK (subject_kind IN ('workspace', 'agent'))
 );
 
+-- Postgres only (orchestrator mode): work claims. A periodic job that
+-- several processes of one tenant run (for example the token-usage scan)
+-- claims its work (kind, work_key) here and skips the run when another
+-- holder has it. The claim names its own id, the claiming process (a token
+-- per process) and the tenant epoch it was taken at; it lapses at
+-- expires_at by the database clock unless renewed, and a newer epoch (a
+-- takeover) makes it stale at once. Release deletes the row. SQLite
+-- (desktop) keeps work claims in its single process.
+CREATE TABLE IF NOT EXISTS work_claim (
+    tenant_id text NOT NULL,
+    kind text NOT NULL,
+    work_key text NOT NULL,
+    claim_id text NOT NULL,
+    claim_token text NOT NULL,
+    claim_epoch bigint NOT NULL,
+    expires_at timestamptz NOT NULL,
+    claimed_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, kind, work_key)
+);
+
 -- Postgres only: bounded, resumable workspace and agent deletes. A delete
 -- first records itself here in a short writer transaction, then drains the
 -- heavy child tables in bounded batches (each its own writer transaction,
@@ -1869,6 +1889,8 @@ CREATE INDEX IF NOT EXISTS idx_event_type_time ON event (tenant_id, event_type, 
 CREATE INDEX IF NOT EXISTS idx_event_session ON event (tenant_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_event_type ON event (tenant_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_event_ws_time ON event (tenant_id, workspace_id, timestamp);
+-- The seq cursor (event_repo.rs EventSeq): events_after and max_event_seq.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_row_seq ON event (tenant_id, row_seq);
 CREATE INDEX IF NOT EXISTS idx_event_subscription_agent ON event_subscription (tenant_id, subscriber_agent_id);
 CREATE INDEX IF NOT EXISTS executor_credential_active ON executor_credential (tenant_id, created_at, id) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS home_move_node ON home_move (tenant_id, node_id);
