@@ -207,10 +207,10 @@ impl Services {
                         model_labels(&response),
                         response.get("stale").and_then(Value::as_bool) == Some(true),
                     ),
-                    Err(_) => (Vec::new(), Default::default(), true),
+                    Err(_) => (Vec::new(), std::collections::BTreeMap::new(), true),
                 }
             } else {
-                (Vec::new(), Default::default(), false)
+                (Vec::new(), std::collections::BTreeMap::new(), false)
             };
             providers.push(ProviderCapability {
                 id: provider.id.to_owned(),
