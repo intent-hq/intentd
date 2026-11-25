@@ -29,6 +29,9 @@ pub(crate) enum TurnStep {
     RetryLifted,
     /// `redrive_failed_turn` is about to take the turn-start gate.
     RedriveChecked,
+    /// `interrupt_inner` read the session after choosing its turn, before
+    /// it re-checks the slot.
+    InterruptObserved,
     /// `interrupt_inner` cancelled the turn and is about to free its slot.
     InterruptReleasing,
     /// A hard stop aborted the worker and is about to free its slot.

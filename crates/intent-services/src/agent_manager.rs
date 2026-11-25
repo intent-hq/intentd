@@ -7520,7 +7520,7 @@ impl AgentManager {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The turn this interrupt cuts short (`None`: no turn in flight).
         // Every teardown below acts on it alone.
-        let target = self.slots.holder(agent_id);
+        let mut target = self.slots.holder(agent_id);
         // The live runtime is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume. It also
         // names the session to cancel: the one its turns prompt on.
@@ -7548,6 +7548,10 @@ impl AgentManager {
             .get_agent_session_summary(agent_id)
             .await
             .ok();
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::InterruptObserved)
+            .await;
         if !repository_origin::is_current(&self.handles, agent_id, &repository_origin) {
             repository_origin.retire();
             return InterruptOutcome {
@@ -7556,14 +7560,20 @@ impl AgentManager {
                 interrupted_row_id: None,
             };
         }
-        if self.slots.holder(agent_id) != target {
-            // The turn this interrupt was for ended during the read above,
-            // and another may have started: leave that one alone.
-            return InterruptOutcome {
-                agent_found: true,
-                preempted: false,
-                interrupted_row_id: None,
-            };
+        let current = self.slots.holder(agent_id);
+        if current != target {
+            // The turn chosen above ended during the read, and the worker
+            // may have started the next queued message. A preempting message
+            // was for that turn alone: it queues instead. A user stop is for
+            // whatever runs now, so it targets the current turn.
+            if reason == InterruptReason::PreemptedByMessage {
+                return InterruptOutcome {
+                    agent_found: true,
+                    preempted: false,
+                    interrupted_row_id: None,
+                };
+            }
+            target = current;
         }
         // Pin the live-turn slot BEFORE aborting the worker: the abort drops
         // the worker future and with it the LiveTurnGuard, so an UNPINNED slot

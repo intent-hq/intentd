@@ -395,6 +395,7 @@ interleavings! {
     failed_turn_then_retry_to_its_end: FailedPark, None, Action::Retry, None;
     failed_turn_then_redrive_at_redrive_checked: FailedPark, None, Action::Redrive, Some(TurnStep::RedriveChecked);
     failed_turn_then_redrive_to_its_end: FailedPark, None, Action::Redrive, None;
+    failed_turn_then_interrupt_at_interrupt_observed: FailedPark, None, Action::Interrupt, Some(TurnStep::InterruptObserved);
     failed_turn_then_interrupt_at_interrupt_releasing: FailedPark, None, Action::Interrupt, Some(TurnStep::InterruptReleasing);
     failed_turn_then_interrupt_to_its_end: FailedPark, None, Action::Interrupt, None;
     failed_turn_then_stop_at_detach_releasing: FailedPark, None, Action::Stop, Some(TurnStep::DetachReleasing);
@@ -410,6 +411,7 @@ interleavings! {
     failed_active_write_then_retry_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Retry, None;
     failed_active_write_then_redrive_at_redrive_checked: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Redrive, Some(TurnStep::RedriveChecked);
     failed_active_write_then_redrive_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Redrive, None;
+    failed_active_write_then_interrupt_at_interrupt_observed: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt, Some(TurnStep::InterruptObserved);
     failed_active_write_then_interrupt_at_interrupt_releasing: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt, Some(TurnStep::InterruptReleasing);
     failed_active_write_then_interrupt_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt, None;
     failed_active_write_then_stop_at_detach_releasing: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Stop, Some(TurnStep::DetachReleasing);
@@ -421,6 +423,7 @@ interleavings! {
     running_turn_then_retry_to_its_end: Running, None, Action::Retry, None;
     running_turn_then_redrive_at_redrive_checked: Running, None, Action::Redrive, Some(TurnStep::RedriveChecked);
     running_turn_then_redrive_to_its_end: Running, None, Action::Redrive, None;
+    running_turn_then_interrupt_at_interrupt_observed: Running, None, Action::Interrupt, Some(TurnStep::InterruptObserved);
     running_turn_then_interrupt_at_interrupt_releasing: Running, None, Action::Interrupt, Some(TurnStep::InterruptReleasing);
     running_turn_then_interrupt_to_its_end: Running, None, Action::Interrupt, None;
     running_turn_then_stop_at_detach_releasing: Running, None, Action::Stop, Some(TurnStep::DetachReleasing);
@@ -458,4 +461,38 @@ async fn running_turn_two_stops_then_a_new_message() {
         });
     }
     run_cases(cases).await;
+}
+
+/// Review of intentd#3772: a Stop that chose turn A while the worker ended A
+/// and started the next queued message (B) still stops the agent: B is
+/// cancelled and the agent settles, instead of the Stop being dropped.
+#[intent_test_macros::daemon_test]
+async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
+    let (_tmp, actor, _sent) = fixture(Scenario::Running, "stop-across-boundary").await;
+    send(&actor.mgr, &actor.id, &actor.ws, BETA).await;
+
+    let pause = actor.mgr.turn_schedule.pause(TurnStep::InterruptObserved);
+    let interrupt = tokio::spawn(actor.clone().act(Action::Interrupt));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("the stop reaches its pause");
+    let run = &actor.runs[0];
+    run.finish.add_permits(1);
+    run.wait_prompts(2).await;
+    assert!(all_prompts(run).contains(BETA), "{}", all_prompts(run));
+
+    pause.resume.notify_one();
+    interrupt.await.unwrap().unwrap();
+    actor.settle("stop across a turn boundary").await;
+
+    assert_eq!(
+        run.cancels.load(Ordering::SeqCst),
+        1,
+        "the stop cancelled the turn running when it acted: {}",
+        all_prompts(run)
+    );
+    assert!(!actor.mgr.is_busy(&actor.id), "the stop ended the turn");
 }
