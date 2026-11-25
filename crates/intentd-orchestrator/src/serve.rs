@@ -11,6 +11,7 @@ use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
 use intent_services::host_exec_stream::HostExecStreamRegistry;
 use intent_services::retention::TenantSweepTiming;
+use intent_services::settings_store_follower::{StoreSettingsFollower, DEFAULT_POLL_INTERVAL};
 use intent_services::{
     AgentManager, EventBus, Services, SettingsRegistry, StartupCompletionRecovery,
 };
@@ -69,9 +70,10 @@ impl Admission for Unfenced {
 }
 
 /// Open tenant `tenant` on `pool` as `instance` and start serving it, with
-/// its files under [`crate::tenant_dir`] of `data_dir` and its secrets in
-/// its Postgres rows, sealed with `keyring` ([`crate::secrets`]). Call it
-/// on the multi-thread runtime: the secret store needs it.
+/// its files under [`crate::tenant_dir`] of `data_dir`, its secrets in its
+/// Postgres rows, sealed with `keyring` ([`crate::secrets`]), and its
+/// settings in its Postgres row ([`crate::settings`]). Call it on the
+/// multi-thread runtime: the secret and settings stores need it.
 ///
 /// # Errors
 /// For an invalid tenant id; `Error::SchemaMismatch` when the schema does
@@ -220,7 +222,18 @@ async fn try_serve_tenant_with(
     let bus = EventBus::new(store.clone());
     let reverse = Arc::new(PrimaryReverseRegistry::new());
     let secrets = Arc::new(crate::secrets::TenantSecrets::new(&store, keyring)?);
-    let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets.clone())?;
+    let settings = Arc::new(SettingsRegistry::load_from_store(Arc::new(
+        crate::settings::TenantSettings::new(&store)?,
+    ))?);
+    let services = tenant_services(
+        store,
+        bus.clone(),
+        &dir,
+        reverse.clone(),
+        secrets.clone(),
+        settings,
+    )?;
+    follow_settings(&services, &fence);
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -418,26 +431,43 @@ fn install_receive_hooks(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Follow the tenant's settings for other processes' writes until its
+/// fence fires ([`intent_services::settings_store_follower`]).
+fn follow_settings(services: &Services, fence: &TenantFence) {
+    let mut follower = StoreSettingsFollower::start(services.clone(), DEFAULT_POLL_INTERVAL);
+    let fence = fence.clone();
+    tokio::spawn(async move {
+        fence.fenced().await;
+        follower.shutdown().await;
+    });
+}
+
 /// The tenant's `Services` over `bus`: every path under `dir`, in
 /// orchestrator mode, dispatching to clients through `reverse`, with
-/// `secrets` as the store every secret reader and writer uses (the tenant's
-/// Postgres rows in [`serve_tenant`]). The GitLab credential pair is the one
-/// exception: `Services` keeps it in a concrete file store, here the
-/// tenant's own `secrets.json`, never the process-wide default.
+/// `settings` as its settings registry (the tenant's Postgres row in
+/// [`serve_tenant`]) and `secrets` as the store every secret reader and
+/// writer uses (the tenant's Postgres rows in [`serve_tenant`]). The GitLab
+/// credential pair, which `Services` keeps in a concrete
+/// `FileSecretStore` handle, goes to `secrets` too (`with_backend`): never
+/// a file, and never the process-wide default.
 fn tenant_services(
     store: Store,
     bus: EventBus,
     dir: &Path,
     reverse: Arc<PrimaryReverseRegistry>,
     secrets: Arc<dyn intent_services::SecretStore>,
+    settings: Arc<SettingsRegistry>,
 ) -> Result<Services> {
-    let registry = SettingsRegistry::load(dir.join("config.toml"))?;
-    let gitlab_pair = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
+    // The handle's identity only: nothing reads or writes this path.
+    let gitlab_pair = intent_core::FileSecretStore::with_backend(
+        dir.join("gitlab-pair (tenant secrets)"),
+        secrets.clone(),
+    );
     Ok(intent_app::compose(
         Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
-            .with_settings_registry(Arc::new(registry))
+            .with_settings_registry(settings)
             .with_secret_store(secrets)
             .with_workspaces_root(dir.join("workspaces"))
             .with_assets_root(dir.join("assets"))
@@ -659,8 +689,9 @@ mod tests {
         let secrets = Arc::new(intent_core::FileSecretStore::with_path(
             dir.join("secrets.json"),
         ));
+        let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
         (
-            tenant_services(store, bus, &dir, reverse, secrets).unwrap(),
+            tenant_services(store, bus, &dir, reverse, secrets, settings).unwrap(),
             dir,
         )
     }
@@ -683,7 +714,9 @@ mod tests {
         let secrets = Arc::new(intent_core::FileSecretStore::with_path(
             dir.join("secrets.json"),
         ));
-        let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets).unwrap();
+        let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
+        let services =
+            tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets, settings).unwrap();
         let earlier = services.clone();
         let dispatch = earlier
             .feature_reverse_dispatch()
@@ -745,8 +778,8 @@ mod tests {
 
     /// Every credential a tenant saves — including the GitLab token, which
     /// goes through the paired GitLab source — lands in, and resolves from,
-    /// that tenant's own `secrets.json`; the process-wide default file is
-    /// neither read nor written.
+    /// that tenant's own secret store (here a file standing in for its
+    /// rows); the process-wide default file is neither read nor written.
     #[tokio::test]
     async fn tenants_keep_credentials_in_their_own_secrets_file() {
         let root = tempfile::tempdir().unwrap();

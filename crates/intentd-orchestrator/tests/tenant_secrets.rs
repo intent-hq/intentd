@@ -1,7 +1,8 @@
 //! Tenant secrets through the orchestrator's `Services`: they live in the
-//! tenant's Postgres rows, encrypted, so the instance that takes a tenant
-//! over reads what the previous one wrote; a fenced instance cannot write;
-//! no `secrets.json` is written; a wrong key fails closed.
+//! tenant's Postgres rows, encrypted (the GitLab credential pair included),
+//! so the instance that takes a tenant over reads what the previous one
+//! wrote; a fenced instance cannot write; no `secrets.json` is written; a
+//! wrong key fails closed.
 //!
 //! Needs `--features postgres` and `INTENT_STORE_TEST_PG_URL` (the
 //! `store-postgres` CI job sets both); skipped without the URL unless
@@ -264,14 +265,15 @@ async fn serving_on_a_current_thread_runtime_is_refused() {
 
 /// The credentials #3705 routed through the tenant's store, in Postgres
 /// mode: each lands in the tenant's own encrypted rows and resolves from
-/// them (`secret_source`, what the GitHub/Linear/voice token chains read),
-/// never from or into the process-wide default file. The GitLab token is
-/// the documented exception: its credential pair stays in the tenant's own
-/// `secrets.json` (never the host file).
+/// them (`secret_source`, what the GitHub/GitLab/Linear/voice token chains
+/// read), never from or into the process-wide default file. The GitLab
+/// token, whose credential pair `Services` keeps in its own handle, lands
+/// in the rows too: no tenant writes a `secrets.json`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_credentials_live_in_their_rows_not_the_host_file() {
     const IN_ROWS: &[&str] = &[
         "sourceControl.github.token",
+        "sourceControl.gitlab.token",
         "linear.token",
         "voice.elevenlabs.apiKey",
         "voice.openai.apiKey",
@@ -281,7 +283,7 @@ async fn tenant_credentials_live_in_their_rows_not_the_host_file() {
     let root = tempfile::tempdir().unwrap();
     let host_file = root.path().join("host.secrets.json");
     let host = intent_core::FileSecretStore::with_path(&host_file);
-    for account in IN_ROWS.iter().chain(["sourceControl.gitlab.token"].iter()) {
+    for account in IN_ROWS {
         host.store(account, "host-value").unwrap();
     }
     let host_before = std::fs::read(&host_file).unwrap();

@@ -314,8 +314,9 @@ impl Services {
             .or_insert_with(|| {
                 let mut directory = self.gitlab_secret_store.path().as_os_str().to_os_string();
                 directory.push(".collaboration");
-                let store = FileSecretStore::with_path(
+                let store = self.gitlab_secret_store.derived(
                     std::path::PathBuf::from(directory).join(format!("{digest}.json")),
+                    &format!("collaboration/{digest}"),
                 );
                 Arc::new(Credential {
                     secrets: Arc::new(crate::settings::AsyncSecretStore::new(Arc::new(

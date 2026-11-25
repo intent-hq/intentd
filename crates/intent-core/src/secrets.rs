@@ -14,6 +14,14 @@
 //! warning is logged). Stores built via [`FileSecretStore::with_path`] or an
 //! [`INTENTD_SECRETS_FILE`](SECRETS_FILE_ENV) override never migrate.
 //!
+//! **Another backend.** [`FileSecretStore::with_backend`] keeps the same
+//! handle type (and so every caller that takes one: the GitLab credential
+//! pair, its device flow, the child-Git policy and the collaboration
+//! credentials) but sends every read and write to another
+//! [`SecretStore`] instead of a file: an orchestrator tenant's encrypted
+//! Postgres rows. Its [`FileSecretStore::path`] is then only an identity
+//! (the pair's provenance compares it), never a file anything writes.
+//!
 //! Semantics follow the [`SecretStore`] trait: `load` returns `None` for unset **or
 //! empty-string** values, `store` replaces, and `delete` of an absent account
 //! is an idempotent success.
@@ -106,10 +114,54 @@ fn home_dir() -> PathBuf {
 }
 
 /// File-backed secret store (see the module docs for path resolution, atomic
-/// write, and corrupt-file semantics).
-#[derive(Debug, Clone)]
+/// write, and corrupt-file semantics), or a handle of the same type over
+/// another backend ([`FileSecretStore::with_backend`]).
+#[derive(Clone)]
 pub struct FileSecretStore {
     path: PathBuf,
+    /// Where reads and writes go instead of `path`, when set.
+    backend: Option<SharedSecretStore>,
+}
+
+impl std::fmt::Debug for FileSecretStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSecretStore")
+            .field("path", &self.path)
+            .field("backend", &self.backend.as_ref().map(|_| "external"))
+            .finish()
+    }
+}
+
+/// A view of a [`SecretStore`] under an account prefix: what a derived
+/// store ([`FileSecretStore::derived`]) over a backend reads and writes, so
+/// its accounts never collide with its parent's.
+struct PrefixedSecretStore {
+    prefix: String,
+    inner: SharedSecretStore,
+}
+
+impl PrefixedSecretStore {
+    fn account(&self, account: &str) -> String {
+        format!("{}{account}", self.prefix)
+    }
+}
+
+impl SecretStore for PrefixedSecretStore {
+    fn load(&self, account: &str) -> Result<Option<String>> {
+        self.inner.load(&self.account(account))
+    }
+
+    fn store(&self, account: &str, value: &str) -> Result<()> {
+        self.inner.store(&self.account(account), value)
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        self.inner.delete(&self.account(account))
+    }
+
+    fn allows_host_credentials(&self) -> bool {
+        self.inner.allows_host_credentials()
+    }
 }
 
 /// Abstraction over secret persistence, shared by every crate that reads or
@@ -188,6 +240,12 @@ impl SecretStore for FileSecretStore {
     fn delete(&self, account: &str) -> Result<()> {
         FileSecretStore::delete(self, account)
     }
+
+    fn allows_host_credentials(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_none_or(|backend| backend.allows_host_credentials())
+    }
 }
 
 /// In-memory [`SecretStore`] for tests — never touches a secrets file.
@@ -260,13 +318,50 @@ impl FileSecretStore {
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         crate::test_isolation::assert_outside_forbidden_home(&path, "FileSecretStore::with_path");
-        Self { path }
+        Self {
+            path,
+            backend: None,
+        }
     }
 
-    /// The backing file path.
+    /// A handle whose reads and writes go to `backend` instead of a file
+    /// (see the module docs). `identity` is what [`Self::path`] returns: a
+    /// name that tells this store apart from others, never written to.
+    pub fn with_backend(identity: impl Into<PathBuf>, backend: SharedSecretStore) -> Self {
+        Self {
+            path: identity.into(),
+            backend: Some(backend),
+        }
+    }
+
+    /// A separate store derived from this one: the file at `path` for a
+    /// file store, or for a backend store the same backend with every
+    /// account under `scope` (so its accounts never collide with this
+    /// store's). [`Self::path`] of the result is `path` either way.
+    #[must_use]
+    pub fn derived(&self, path: impl Into<PathBuf>, scope: &str) -> Self {
+        match &self.backend {
+            None => Self::with_path(path),
+            Some(backend) => Self::with_backend(
+                path,
+                std::sync::Arc::new(PrefixedSecretStore {
+                    prefix: format!("{scope}/"),
+                    inner: backend.clone(),
+                }),
+            ),
+        }
+    }
+
+    /// The backing file path; for a backend store, its identity (no file).
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this store keeps its secrets in a file (not a backend).
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.backend.is_none()
     }
 
     /// Return the stored secret for `account`: `Ok(Some(value))` if present,
@@ -277,6 +372,9 @@ impl FileSecretStore {
     ///
     /// Returns `Error::Internal` if the backing file is unreadable or corrupt.
     pub fn load(&self, account: &str) -> Result<Option<String>> {
+        if let Some(backend) = &self.backend {
+            return backend.load(account);
+        }
         self.read_map_strict().map(|mut map| map.remove(account))
     }
 
@@ -286,6 +384,15 @@ impl FileSecretStore {
     /// # Errors
     /// Returns the same IO or parse error as [`Self::load`].
     pub fn load_many(&self, accounts: &[&str]) -> Result<Vec<Option<String>>> {
+        if let Some(backend) = &self.backend {
+            // One read per account: a backend has no file snapshot. Writes
+            // of a pair are separate calls on either backend, so a pair was
+            // never written atomically.
+            return accounts
+                .iter()
+                .map(|account| backend.load(account))
+                .collect();
+        }
         let map = self.read_map_strict()?;
         Ok(accounts
             .iter()
@@ -299,6 +406,9 @@ impl FileSecretStore {
     ///
     /// Returns `Error::Internal` if creating the secrets directory, serializing, or writing the file fails.
     pub fn store(&self, account: &str, value: &str) -> Result<()> {
+        if let Some(backend) = &self.backend {
+            return backend.store(account, value);
+        }
         let mut map = self.read_map();
         map.insert(account.to_string(), value.to_string());
         self.persist(&map)
@@ -311,6 +421,9 @@ impl FileSecretStore {
     ///
     /// Returns `Error::Internal` if rewriting the secrets file fails.
     pub fn delete(&self, account: &str) -> Result<()> {
+        if let Some(backend) = &self.backend {
+            return backend.delete(account);
+        }
         let mut map = self.read_map();
         if map.remove(account).is_none() {
             return Ok(());

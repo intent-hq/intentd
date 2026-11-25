@@ -15,8 +15,11 @@
 //! 2. `LeaseHeartbeat::spawn`: renews the lease and fires the claim's fence
 //!    once it cannot;
 //! 3. the tenant's `Services`, with every on-disk path under
-//!    [`tenant_dir`], in orchestrator mode, and its secrets in its
-//!    Postgres rows, encrypted with the process keyring (`secrets`);
+//!    [`tenant_dir`], in orchestrator mode, its secrets (the GitLab
+//!    credential pair included) in its Postgres rows, encrypted with the
+//!    process keyring (`secrets`), and its settings in its Postgres row,
+//!    followed for other processes' writes (`settings`): no `config.toml`
+//!    or `secrets.json` under the tenant directory;
 //! 4. `tenant_self_fence` and `TenantRuntime::start` (`intent_app::tenant`):
 //!    the tenant's restores, sweeps and loops (event retention and the
 //!    idempotency reaper included), its client connections, machine links,
@@ -41,6 +44,8 @@ pub mod listen;
 pub mod secrets;
 #[cfg(feature = "postgres")]
 pub mod serve;
+#[cfg(feature = "postgres")]
+pub mod settings;
 
 /// The Postgres URL the orchestrator connects to (may carry a password).
 pub const POSTGRES_URL_ENV: &str = "INTENTD_POSTGRES_URL";
