@@ -356,6 +356,14 @@ pub enum Error {
     #[error("not the tenant owner: {0}")]
     NotOwner(String),
 
+    /// A write guarded by a store lease (`Store::acquire_lease`) found the
+    /// lease no longer held: it expired by the database clock, another
+    /// holder took it, or it was released. The write was rolled back; the
+    /// work that held the lease must stop. Unlike [`Self::NotOwner`] it
+    /// says nothing about the tenant. Surfaces as `-32603`.
+    #[error("lease lost: {0}")]
+    LeaseLost(String),
+
     /// A request forwarded to an agent's provider adapter failed (JSON-RPC
     /// error, timeout, or the connection ended before or during the request),
     /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
@@ -852,6 +860,7 @@ impl Error {
             | Error::StoreBusy(_)
             | Error::SchemaMismatch(_)
             | Error::NotOwner(_)
+            | Error::LeaseLost(_)
             | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }

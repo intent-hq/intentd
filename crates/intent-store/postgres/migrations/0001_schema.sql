@@ -619,24 +619,26 @@ CREATE TABLE IF NOT EXISTS delete_grace (
     CHECK (subject_kind IN ('workspace', 'agent'))
 );
 
--- Postgres only (orchestrator mode): work claims. A periodic job that
--- several processes of one tenant run (for example the token-usage scan)
--- claims its work (kind, work_key) here and skips the run when another
--- holder has it. The claim names its own id, the claiming process (a token
--- per process) and the tenant epoch it was taken at; it lapses at
--- expires_at by the database clock unless renewed, and a newer epoch (a
--- takeover) makes it stale at once. Release deletes the row. SQLite
--- (desktop) keeps work claims in its single process.
-CREATE TABLE IF NOT EXISTS work_claim (
+-- Postgres only (orchestrator mode): leases. Any process of a tenant may
+-- hold the lease on one unit of work (scope, lease_key) alone, for a TTL.
+-- `holder` is the holding process (a token per process) and `lease_id` the
+-- holding lease; both are NULL once released. `token` is the fencing token:
+-- every new holder sets it one higher, and release keeps the row so it never
+-- goes back. `expires_at` and `acquired_at` come from the database clock
+-- alone. A lease does not depend on the tenant epoch. SQLite (desktop) keeps
+-- leases in its single process.
+CREATE TABLE IF NOT EXISTS lease (
     tenant_id text NOT NULL,
-    kind text NOT NULL,
-    work_key text NOT NULL,
-    claim_id text NOT NULL,
-    claim_token text NOT NULL,
-    claim_epoch bigint NOT NULL,
+    scope text NOT NULL,
+    lease_key text NOT NULL,
+    holder text,
+    lease_id text,
+    token bigint NOT NULL,
     expires_at timestamptz NOT NULL,
-    claimed_at timestamptz NOT NULL,
-    PRIMARY KEY (tenant_id, kind, work_key)
+    acquired_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, scope, lease_key),
+    CHECK ((holder IS NULL) = (lease_id IS NULL)),
+    CHECK (token >= 1)
 );
 
 -- Postgres only: bounded, resumable workspace and agent deletes. A delete

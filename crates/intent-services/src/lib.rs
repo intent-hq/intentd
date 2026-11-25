@@ -8031,14 +8031,13 @@ impl Services {
         self.scan_all_token_usage_claimed(&mut None).await;
     }
 
-    /// The token-usage sweep under the work claim in `held`
-    /// (see `work_claims`): before each workspace after the first it renews
-    /// the claim once half its TTL has passed, and stops the sweep when the
-    /// claim is lost or cannot be renewed, or once settings shutdown began.
-    /// Returns whether the sweep ran to the end.
+    /// The token-usage sweep under the lease kept in `held` (see
+    /// `lease_keeper`, which renews it in the background): before each
+    /// workspace it stops the sweep once the lease's fence fired or
+    /// settings shutdown began. Returns whether the sweep ran to the end.
     async fn scan_all_token_usage_claimed(
         &self,
-        held: &mut Option<intent_store::WorkClaim>,
+        held: &mut Option<lease_keeper::LeaseKeeper>,
     ) -> bool {
         let workspaces = match self
             .store
@@ -8051,13 +8050,17 @@ impl Services {
                 return false;
             }
         };
-        for (i, ws) in workspaces.into_iter().enumerate() {
+        for ws in workspaces {
             // A settings shutdown ends the sweep here, so the loop reaches
-            // its claim release before the drain aborts it.
+            // its lease release before the drain aborts it.
             if self.settings_tasks.is_closed() {
                 return false;
             }
-            if i > 0 && !self.keep_work_claim(held).await {
+            if held
+                .as_ref()
+                .is_some_and(lease_keeper::LeaseKeeper::is_fired)
+            {
+                tracing::info!("token usage scan: lease lost mid-sweep; stopping");
                 return false;
             }
             if let Err(e) = self.scan_workspace_token_usage(&ws.id).await {
@@ -8074,18 +8077,62 @@ impl Services {
         true
     }
 
-    /// One tick of the token-usage loop: hold the `token-usage-scan` work
-    /// claim (renew it, or take it for `ttl`) and sweep, or skip the tick
-    /// when another process holds the claim. Returns whether it swept.
-    pub(crate) async fn token_usage_scan_tick(
+    /// Before a sweep: keeps the `token-usage-scan` lease in `held` or
+    /// acquires a fresh one for `ttl`. `true` when this process holds it
+    /// and should sweep. A lost lease (its fence fired) is dropped and
+    /// acquired again at once; a failed acquire skips this tick.
+    pub(crate) async fn hold_token_usage_lease(
         &self,
-        held: &mut Option<intent_store::WorkClaim>,
+        held: &mut Option<lease_keeper::LeaseKeeper>,
         ttl: std::time::Duration,
     ) -> bool {
-        if !self
-            .hold_work_claim(held, work_claims::TOKEN_USAGE_SCAN_WORK, ttl)
-            .await
+        if let Some(keeper) = held.as_ref() {
+            if !keeper.is_fired() {
+                return true;
+            }
+            tracing::info!("token usage scan: lease lost; acquiring again");
+            *held = None;
+        }
+        match lease_keeper::LeaseKeeper::acquire(
+            &self.store,
+            lease_keeper::TOKEN_USAGE_SCAN_SCOPE,
+            "",
+            ttl,
+        )
+        .await
         {
+            Ok(Some(keeper)) => {
+                *held = Some(keeper);
+                true
+            }
+            Ok(None) => {
+                tracing::debug!("token usage scan: leased by another process; skipping");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "token usage scan: lease acquire failed; skipping");
+                false
+            }
+        }
+    }
+
+    /// Frees the token-usage lease in `held` at a clean stop, so another
+    /// process can take the work without waiting for the TTL.
+    pub(crate) async fn release_token_usage_lease(&self, held: Option<lease_keeper::LeaseKeeper>) {
+        if let Some(keeper) = held {
+            keeper.release(&self.store).await;
+        }
+    }
+
+    /// One tick of the token-usage loop: hold the `token-usage-scan` lease
+    /// (keep it, or acquire it for `ttl`) and sweep, or skip the tick when
+    /// another process holds it. Returns whether it swept.
+    pub(crate) async fn token_usage_scan_tick(
+        &self,
+        held: &mut Option<lease_keeper::LeaseKeeper>,
+        ttl: std::time::Duration,
+    ) -> bool {
+        if !self.hold_token_usage_lease(held, ttl).await {
             return false;
         }
         self.scan_all_token_usage_claimed(held).await;
@@ -8103,14 +8150,15 @@ impl Services {
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
     /// monopolizes `SQLite` pool slots. The first sweep runs after one
     /// `interval`; missed ticks are skipped (no pile-up). Each tick runs
-    /// under the `token-usage-scan` work claim (TTL two intervals): the
-    /// holder keeps it across ticks and a process without it skips the tick,
-    /// so processes sharing a tenant sweep once per interval between them.
-    /// Settings shutdown (`begin_settings_shutdown`, which a graceful drain
-    /// runs before it aborts the loops) ends a sweep between workspaces and
-    /// the loop then releases the claim. An abort that lands first (mid
-    /// workspace, or during the release) leaves the claim to lapse after its
-    /// TTL or to a takeover's newer epoch. Returns the task handle so the
+    /// under the `token-usage-scan` lease (TTL two intervals, renewed in the
+    /// background at half TTL by its `LeaseKeeper`): the holder keeps it
+    /// across ticks and a process without it skips the tick, so processes
+    /// sharing a tenant sweep once per interval between them. Settings
+    /// shutdown (`begin_settings_shutdown`, which a graceful drain runs
+    /// before it aborts the loops) ends a sweep between workspaces and the
+    /// loop then releases the lease. An abort that lands first (mid
+    /// workspace, or during the release) leaves the lease to lapse after its
+    /// TTL. Returns the task handle so the
     /// composition root can hold/abort it.
     #[must_use]
     pub fn spawn_token_usage_scan_loop(
@@ -8120,7 +8168,7 @@ impl Services {
         self.spawn_token_usage_scan_loop_with_ttl(interval, interval.saturating_mul(2))
     }
 
-    /// [`Services::spawn_token_usage_scan_loop`] with the claim TTL given
+    /// [`Services::spawn_token_usage_scan_loop`] with the lease TTL given
     /// apart from the interval (tests tick fast under a long claim).
     pub(crate) fn spawn_token_usage_scan_loop_with_ttl(
         &self,
@@ -8142,7 +8190,7 @@ impl Services {
                 }
                 services.token_usage_scan_tick(&mut held, ttl).await;
             }
-            services.release_held_work_claim(held).await;
+            services.release_token_usage_lease(held).await;
         })
     }
 
@@ -38965,13 +39013,13 @@ mod accept_changes;
 pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
+pub mod lease_keeper;
 pub mod metrics;
 #[cfg(test)]
 mod node_mode_tests;
 #[cfg(test)]
 mod settings_store_tests;
 mod tracked_changes_sweep;
-mod work_claims;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;

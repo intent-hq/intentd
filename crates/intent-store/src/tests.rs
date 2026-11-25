@@ -7599,7 +7599,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
-        work_claims: crate::work_claim_repo::LocalWorkClaims::default(),
+        leases: crate::lease_repo::LocalLeases::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
