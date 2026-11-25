@@ -1937,7 +1937,7 @@ impl ProcessRegistry {
                 last_active_ms: now_ms(),
                 is_active: true,
                 kill,
-                remote: true,
+                remote: false,
             },
         );
         Ok(())
