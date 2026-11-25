@@ -2710,6 +2710,9 @@ async fn cmd_serve_owned(
             }
             Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
         }
+        // Usage-stats activity counters (§5.36) start at this daemon's first
+        // start: stamp the tracked-since date when absent. Best-effort.
+        services.ensure_usage_activity_tracked_since().await;
     }
 
     // Exposed machines (daemon-to-daemon remote agents) are dialed on

@@ -1606,6 +1606,11 @@ CREATE TABLE IF NOT EXISTS usage_stats_hourly (
     local_hour bigint,
     thought_tokens bigint NOT NULL DEFAULT 0,
     row_seq bigint NOT NULL,
+    -- sqlite: 0201_usage_stats_activity.sql
+    tool_calls bigint NOT NULL DEFAULT 0,
+    tool_calls_failed bigint NOT NULL DEFAULT 0,
+    total_run_ms bigint NOT NULL DEFAULT 0,
+    sub_agent_sessions_started bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, bucket_utc, model, provider)
 );
 

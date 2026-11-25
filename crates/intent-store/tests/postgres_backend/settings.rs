@@ -25,6 +25,27 @@ parity_test!(settings_round_trip, |store, tenant| {
     assert!(store.delete_setting("other").await.unwrap());
 });
 
+// Each tenant keeps its own first value: the decoy's insert never blocks
+// the subject's, and a second insert never replaces the first.
+parity_test!(set_setting_if_absent_keeps_first_writer, |store, tenant| {
+    let first = format!("\"{tenant}\"");
+    assert!(store
+        .set_setting_if_absent("usageStats.activityTrackedSince", &first)
+        .await
+        .unwrap());
+    assert!(!store
+        .set_setting_if_absent("usageStats.activityTrackedSince", "\"later\"")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .get_setting("usageStats.activityTrackedSince")
+            .await
+            .unwrap(),
+        Some(first)
+    );
+});
+
 parity_test!(daemon_id_is_minted_once, |store| {
     let id = store.daemon_id().await.unwrap();
     assert!(!id.is_empty());

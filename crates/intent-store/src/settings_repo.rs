@@ -33,6 +33,17 @@ impl Store {
         dispatch!(self, backend => backend.set_setting(key, value).await)
     }
 
+    /// Insert the raw JSON-encoded `value` for `key` only when `key` is
+    /// unset; an existing value is kept (first writer wins). Returns `true`
+    /// when this call stored the value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn set_setting_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.set_setting_if_absent(key, value).await)
+    }
+
     /// Delete the persisted value for `key` (used by `settings.reset`). Returns
     /// `true` when a row was removed; absence is an idempotent no-op success.
     ///
@@ -65,6 +76,18 @@ impl crate::SqliteStore {
         .await
         .map_err(|e| Error::Internal(format!("set setting failed: {e}")))?;
         Ok(())
+    }
+
+    pub async fn set_setting_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set setting if absent failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn delete_setting(&self, key: &str) -> Result<bool> {

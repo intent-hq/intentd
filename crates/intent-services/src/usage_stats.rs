@@ -16,6 +16,52 @@ use time::{OffsetDateTime, UtcOffset};
 
 use crate::token_usage::{UNKNOWN_MODEL, UNKNOWN_PROVIDER};
 
+/// `settings` state key holding the UTC instant (a JSON RFC 3339 string)
+/// this store started recording the §5.36 activity counters. Written once,
+/// first writer wins; never part of the public settings registry.
+pub(crate) const ACTIVITY_TRACKED_SINCE_KEY: &str = "usageStats.activityTrackedSince";
+
+impl crate::Services {
+    /// Store the activity tracked-since stamp when it is absent (§5.36
+    /// `activityTrackedSince`). Runs at daemon start and before each
+    /// activity-counter write; after the first success this process skips
+    /// the write. Best-effort: a store error is logged and retried on the
+    /// next call.
+    pub async fn ensure_usage_activity_tracked_since(&self) {
+        use std::sync::atomic::Ordering;
+        if self.usage_activity_stamped.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = OffsetDateTime::now_utc();
+        let Ok(stamp) = now.format(&time::format_description::well_known::Rfc3339) else {
+            return;
+        };
+        let value = serde_json::Value::String(stamp).to_string();
+        match self
+            .store
+            .set_setting_if_absent(ACTIVITY_TRACKED_SINCE_KEY, &value)
+            .await
+        {
+            Ok(_) => self.usage_activity_stamped.store(true, Ordering::Relaxed),
+            Err(e) => tracing::warn!(error = %e, "record usage-stats tracked-since failed"),
+        }
+    }
+}
+
+/// The stored activity tracked-since instant, or `None` when unset,
+/// unreadable or malformed (the read never fails on it).
+pub(crate) async fn read_activity_tracked_since(store: &Store) -> Option<OffsetDateTime> {
+    let raw = match store.get_setting(ACTIVITY_TRACKED_SINCE_KEY).await {
+        Ok(raw) => raw?,
+        Err(e) => {
+            tracing::warn!(error = %e, "read usage-stats tracked-since failed");
+            return None;
+        }
+    };
+    let text: String = serde_json::from_str(&raw).ok()?;
+    OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339).ok()
+}
+
 /// Floor `t` to its UTC hour and render the bucket key used by
 /// `usage_stats_hourly.bucket_utc`: `"YYYY-MM-DDTHH:00:00Z"`. Buckets are
 /// stored in UTC; local wall-clock grouping uses the [`LocalStamp`] recorded
@@ -281,13 +327,15 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// precedence (provider field → `configured_default`, the settings-derived
 /// default the create seam passes through). An unresolvable provider falls
 /// to the `"unknown"` stats tail (monorepo#3044: no positional last resort).
-/// Best-effort: errors are logged, never propagated — stats bookkeeping must
-/// not fail `agent.create`.
+/// `sub_agent` marks a session created with a parent agent (§5.36
+/// `subAgentSessions`). Best-effort: errors are logged, never propagated —
+/// stats bookkeeping must not fail `agent.create`.
 pub(crate) async fn record_session_started(
     store: &Store,
     raw_model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
+    sub_agent: bool,
 ) {
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
@@ -299,6 +347,7 @@ pub(crate) async fn record_session_started(
     let provider_key = stats_provider_key(provider_id.as_deref());
     let delta = UsageStatsDelta {
         sessions_started: 1,
+        sub_agent_sessions_started: u64::from(sub_agent),
         ..Default::default()
     };
     if let Err(e) = store

@@ -396,6 +396,9 @@ async fn recover_tenant(
             }
             Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
         }
+        // Usage-stats activity counters (§5.36) start for this tenant now:
+        // stamp its tracked-since date when absent. Best-effort.
+        services.ensure_usage_activity_tracked_since().await;
     }
     // Machines with only a tailcat route are dialed through this binary.
     // Set before the pending-delete sweep, whose deletes send machines

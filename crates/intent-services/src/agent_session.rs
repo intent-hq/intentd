@@ -501,6 +501,68 @@ struct Transcript {
     /// Whether this turn's first provider output was already reported to
     /// the shared quota cache (once per turn, off the per-chunk path).
     provider_output_seen: bool,
+    /// `toolCallId`s that already reached a terminal status this turn, so
+    /// the usage-stats tally (§5.36 `toolCalls`) counts each call once.
+    terminal_tool_calls: HashSet<String>,
+    /// This turn's terminal tool-call tally, shared with the live-turn slot
+    /// and claimed once into the usage-stats bucket (§5.36).
+    pub(crate) tool_tally: ToolTallyCell,
+}
+
+/// Tool calls that reached a terminal status in one turn (§5.36): `total`
+/// counts each call id once, at its first `completed` or `error`; `failed`
+/// is the subset whose first terminal status was `error`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallTally {
+    pub(crate) total: u64,
+    pub(crate) failed: u64,
+}
+
+impl ToolCallTally {
+    pub(crate) fn is_zero(self) -> bool {
+        self.total == 0
+    }
+}
+
+/// One turn's tool-call tally plus whether a writer already claimed it
+/// (§5.36). The turn's `Transcript` and its live-turn slot hold clones of
+/// the same cell, so the claim outlives either one: whichever writer claims
+/// first (turn end, wake, append failure, interrupt flush) records the
+/// tally, and every later claim — even after the slot is removed — gets
+/// zero.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolTallyCell(Arc<std::sync::Mutex<(ToolCallTally, bool)>>);
+
+impl ToolTallyCell {
+    /// Count one call's first terminal status; ignored once claimed.
+    fn add(&self, failed: bool) {
+        if let Ok(mut state) = self.0.lock() {
+            if !state.1 {
+                state.0.total += 1;
+                if failed {
+                    state.0.failed += 1;
+                }
+            }
+        }
+    }
+
+    /// The tally so far, without claiming it.
+    #[cfg(test)]
+    pub(crate) fn peek(&self) -> ToolCallTally {
+        self.0.lock().map(|state| state.0).unwrap_or_default()
+    }
+
+    /// Take the tally for the one writer that records it: the first call
+    /// returns it, every later call returns zero.
+    pub(crate) fn claim(&self) -> ToolCallTally {
+        match self.0.lock() {
+            Ok(mut state) if !state.1 => {
+                state.1 = true;
+                state.0
+            }
+            _ => ToolCallTally::default(),
+        }
+    }
 }
 
 /// Cap on Markdown image references examined per text block — bounds both
@@ -544,6 +606,8 @@ impl Transcript {
             media_scan_pos: 0,
             media_refs_seen: 0,
             provider_output_seen: false,
+            terminal_tool_calls: HashSet::new(),
+            tool_tally: ToolTallyCell::default(),
         }
     }
 
@@ -835,6 +899,12 @@ impl Transcript {
         // can never leak into the set.
         if completed {
             self.open_tool_calls.remove(&tc.tool_call_id);
+            // Usage stats (§5.36): count the call at its FIRST terminal
+            // status only — a repeated `completed`, or `error` then
+            // `completed`, never counts again.
+            if self.terminal_tool_calls.insert(tc.tool_call_id.clone()) {
+                self.tool_tally.add(tc.status == "error");
+            }
         } else {
             self.open_tool_calls.insert(tc.tool_call_id.clone());
         }
@@ -1170,6 +1240,12 @@ pub(crate) struct LiveTurn {
     /// Reset by [`pin_live_turn`](Services::pin_live_turn): a fresh pin means a
     /// fresh flush attempt is in flight.
     pub(crate) flush_failed: bool,
+    /// The turn's terminal tool-call tally (§5.36) as of the last
+    /// [`update_live_turn`](Services::update_live_turn). Survives the
+    /// `worker.abort()` that drops the `Transcript`, so the interrupt flush
+    /// that persists the interrupted row can record it — once, only when
+    /// that flush is the one that appended the row.
+    pub(crate) tool_tally: ToolTallyCell,
 }
 
 /// What [`flush_pinned_turn_on_interruption`](Services::flush_pinned_turn_on_interruption)
@@ -2313,6 +2389,7 @@ impl Services {
                     last_activity_emit: None,
                     flush_pending: false,
                     flush_failed: false,
+                    tool_tally: ToolTallyCell::default(),
                 },
             );
         }
@@ -2326,6 +2403,7 @@ impl Services {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
                 slot.final_text_block_open = transcript.final_text_block_open();
+                slot.tool_tally = transcript.tool_tally.clone();
                 slot.last_activity_at = now_iso();
             }
         }
@@ -2773,6 +2851,7 @@ impl Services {
         owns_slot: bool,
     ) -> InterruptFlushOutcome {
         let block_count = live.blocks.len();
+        let tool_tally = live.tool_tally.clone();
         // A partial tail can already carry proposal blocks (the interrupt
         // landed after the propose tool call): capture their ids BEFORE the
         // blocks move into the persisted row, so the flushed row feeds the
@@ -2826,6 +2905,14 @@ impl Services {
                 // partial row is a transcript persist like any other, so
                 // preview subscribers converge on its `lastToolUse` too.
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    // This flush appended the interrupted row, so the worker
+                    // never reached its turn-end stats write: record the
+                    // turn's terminal tool calls here (§5.36), once.
+                    self.flush_tool_tally_detached(
+                        agent_id,
+                        &session.workspace_id,
+                        tool_tally.claim(),
+                    );
                     self.invalidate_agent_list_cache(&session.workspace_id);
                     self.publish_agent_message_events(
                         &session.workspace_id,
@@ -4447,6 +4534,9 @@ impl Services {
         // Latest ACP `usage_update` cost of the turn (§5.23), accumulated by
         // `route_notification`; persisted alongside the token snapshot below.
         let turn_cost = transcript.usage_cost.clone();
+        // Terminal tool calls of the turn (§5.36), flushed with the turn-end
+        // stats delta even when the turn failed without a usage report.
+        let tool_tally = transcript.tool_tally.clone();
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let block_count = blocks.len();
@@ -4557,12 +4647,15 @@ impl Services {
         if suspend_interrupt {
             // `matches!` above guarantees the `Err` arm.
             let err = result.expect_err("suspend_interrupt implies Err");
+            // The enrollment's interrupt flush records the turn's terminal
+            // tool calls (§5.36) when it appends the row.
             return self
                 .enroll_suspend_interrupted_turn(
                     agent_id,
                     workspace_id,
                     message_id,
                     blocks,
+                    tool_tally,
                     turn_id,
                     err,
                 )
@@ -4733,6 +4826,9 @@ impl Services {
                             "failed to reap prestaged payloads after append failure (#3884)"
                         );
                     }
+                    // Exits before the bookkeeping below: still count the
+                    // turn's terminal tool calls (§5.36).
+                    self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally.claim());
                     return Err(e);
                 }
             };
@@ -4822,7 +4918,13 @@ impl Services {
         // including a `_meta`-only bill (grok), which the task below resolves
         // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
         let run_completed = result.is_ok() && !spurious_cancel;
-        if turn_usage.is_some() || turn_cost.is_some() || turn_meta.is_some() || run_completed {
+        let tool_tally = tool_tally.claim();
+        if turn_usage.is_some()
+            || turn_cost.is_some()
+            || turn_meta.is_some()
+            || run_completed
+            || !tool_tally.is_zero()
+        {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
@@ -4867,13 +4969,14 @@ impl Services {
                     (turn_usage, turn_cost)
                 };
                 services
-                    .record_turn_usage_stats(
+                    .record_turn_usage_stats_with_tools(
                         &agent_id_task,
                         &workspace_id_task,
                         turn_usage.as_ref(),
                         turn_duration,
                         turn_end,
                         run_completed,
+                        tool_tally,
                     )
                     .await;
                 // A turn with neither report has nothing to persist; either
@@ -5489,12 +5592,14 @@ impl Services {
     ///
     /// Returns the original error wrapped with [`PROMPT_SUSPEND_INTERRUPT_PREFIX`]
     /// so the turn worker suppresses the terminal-failure path.
+    #[expect(clippy::too_many_arguments)]
     async fn enroll_suspend_interrupted_turn(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         message_id: String,
         blocks: Vec<Value>,
+        tool_tally: ToolTallyCell,
         turn_id: Option<&str>,
         err: AcpError,
     ) -> Result<StopReason> {
@@ -5517,6 +5622,7 @@ impl Services {
             last_activity_emit: None,
             flush_pending: false,
             flush_failed: false,
+            tool_tally,
         };
         // A failed flush deliberately does NOT reap the turn's mid-turn
         // staged rows (unlike the turn-end/wake failure arms): this path does
@@ -5774,6 +5880,9 @@ impl Services {
             self.persist_cost_only_ordered(agent_id, workspace_id, cost)
                 .await;
         }
+        // A wake turn records no run, but its terminal tool calls still
+        // count toward usage stats (§5.36).
+        self.flush_tool_tally_detached(agent_id, workspace_id, transcript.tool_tally.claim());
         let blocks = transcript.into_blocks();
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
@@ -6368,6 +6477,7 @@ impl Services {
     /// [`run_prompt_turn`](Self::run_prompt_turn) calls the two in that
     /// order. Best-effort: errors are logged, never propagated — stats
     /// bookkeeping must not fail a turn.
+    #[cfg(test)]
     pub(crate) async fn record_turn_usage_stats(
         &self,
         agent_id: &AgentId,
@@ -6377,8 +6487,67 @@ impl Services {
         turn_end: time::OffsetDateTime,
         run_completed: bool,
     ) {
-        if usage.is_none() && !run_completed {
-            return; // failed turn without a usage report — nothing to record
+        self.record_turn_usage_stats_with_tools(
+            agent_id,
+            workspace_id,
+            usage,
+            turn_duration,
+            turn_end,
+            run_completed,
+            ToolCallTally::default(),
+        )
+        .await;
+    }
+
+    /// Record a turn's terminal tool calls on their own (§5.36), detached
+    /// and best-effort, for turn exits that skip the turn-end bookkeeping
+    /// (wake turns, append failures, interrupt flushes). A zero
+    /// tally writes nothing.
+    pub(crate) fn flush_tool_tally_detached(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        tally: ToolCallTally,
+    ) {
+        if tally.is_zero() {
+            return;
+        }
+        let services = self.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        let turn_end = time::OffsetDateTime::now_utc();
+        let _ = self.store_tasks.spawn_draining(async move {
+            services
+                .record_turn_usage_stats_with_tools(
+                    &agent_id,
+                    &workspace_id,
+                    None,
+                    std::time::Duration::ZERO,
+                    turn_end,
+                    false,
+                    tally,
+                )
+                .await;
+        });
+    }
+
+    /// [`Self::record_turn_usage_stats`] plus the turn's terminal tool-call
+    /// tally (§5.36 `toolCalls` / `toolCallsFailed`), folded into the same
+    /// bucket write. A failed turn without a usage report still records its
+    /// tool calls.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn record_turn_usage_stats_with_tools(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        usage: Option<&session::Usage>,
+        turn_duration: std::time::Duration,
+        turn_end: time::OffsetDateTime,
+        run_completed: bool,
+        tools: ToolCallTally,
+    ) {
+        if usage.is_none() && !run_completed && tools.is_zero() {
+            return; // failed turn without a usage report or tool calls — nothing to record
         }
         let (model, resolved_model, provider, prev, prev_readable) = match self
             .store
@@ -6429,6 +6598,11 @@ impl Services {
             }
             _ => intent_core::TokenUsageTotals::default(),
         };
+        let run_ms = if run_completed {
+            u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
         let delta = intent_store::UsageStatsDelta {
             input_tokens: tokens.input_tokens,
             output_tokens: tokens.output_tokens,
@@ -6436,13 +6610,13 @@ impl Services {
             cache_creation_tokens: tokens.cache_creation_tokens,
             thought_tokens: tokens.thought_tokens,
             runs: u64::from(run_completed),
-            longest_run_ms: if run_completed {
-                u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
+            longest_run_ms: run_ms,
+            total_run_ms: run_ms,
+            tool_calls: tools.total,
+            tool_calls_failed: tools.failed,
             ..Default::default()
         };
+        self.ensure_usage_activity_tracked_since().await;
         // `turn_end` is captured at the same instant as `turn_duration` at the
         // call site, before this task is spawned/awaited — reading the clock
         // here instead would drift the hourly bucket and the per-minute spread

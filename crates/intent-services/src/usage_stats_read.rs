@@ -109,6 +109,60 @@ fn local_parts(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) ->
     (local.year(), u8::from(local.month()), local.hour())
 }
 
+/// The local calendar date (`"YYYY-MM-DD"`) a row belongs to for `byDay`:
+/// the recorded stamp when well-formed (D12), else the UTC bucket shifted by
+/// the client offset — the same rule as [`local_parts`].
+fn local_day(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) -> String {
+    if let (Some(date), Some(hour)) = (row.local_date.as_deref(), row.local_hour) {
+        if hour < 24 && parse_local_date(date).is_some() {
+            return date.to_string();
+        }
+    }
+    let local = utc.to_offset(tz);
+    format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day()
+    )
+}
+
+/// `activityTrackedSince` (§5.36): the stored UTC instant as a local date
+/// under the client offset, or `null` when unset. An out-of-range offset
+/// (rejected earlier by [`aggregate_usage`]) falls back to UTC.
+pub(crate) fn local_date_json(since: Option<OffsetDateTime>, tz_offset_minutes: i64) -> Value {
+    let Some(since) = since else {
+        return Value::Null;
+    };
+    let tz = i32::try_from(tz_offset_minutes)
+        .ok()
+        .and_then(|m| m.checked_mul(60))
+        .and_then(|s| time::UtcOffset::from_whole_seconds(s).ok())
+        .unwrap_or(time::UtcOffset::UTC);
+    let local = since.to_offset(tz);
+    json!(format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day()
+    ))
+}
+
+/// Whether a row carries any recorded counter (drives `byDay` inclusion).
+fn has_activity(r: &UsageStatsRow) -> bool {
+    r.input_tokens
+        + r.output_tokens
+        + r.cache_read_tokens
+        + r.cache_creation_tokens
+        + r.thought_tokens
+        + r.runs
+        + r.sessions_started
+        + r.lines_added
+        + r.lines_deleted
+        + r.tool_calls
+        > 0
+}
+
 /// The separate token counters (D6) for one aggregation cell: the four
 /// always-present counters plus reasoning ("thought") tokens, which follow
 /// the §5.23 `TokenUsageTotals` convention — omitted from the wire when zero,
@@ -172,7 +226,9 @@ fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
 ///
 /// Result shape (all periods): `totals` (4 counters plus `thoughtTokens`
 /// when non-zero), `runs`, `sessions`, `longestRunMs`, `linesAdded`,
-/// `linesDeleted`, `byModel` (sorted desc by
+/// `linesDeleted`, the activity counters `toolCalls`, `toolCallsFailed`,
+/// `totalRunMs`, `subAgentSessions`, `byDay` (local days with activity,
+/// ascending; empty for 24h), `byModel` (sorted desc by
 /// total tokens), `byProvider` (raw provider ids, same sorting), `byHourOfDay`
 /// (24 entries), `byMonth` (12 entries, the period's local year; zeroed for
 /// 24h), and `availablePeriods` computed over ALL rows regardless of the
@@ -203,6 +259,11 @@ pub(crate) fn aggregate_usage(
     let mut longest_run_ms = 0u64;
     let mut lines_added = 0u64;
     let mut lines_deleted = 0u64;
+    let mut tool_calls = 0u64;
+    let mut tool_calls_failed = 0u64;
+    let mut total_run_ms = 0u64;
+    let mut sub_agent_sessions = 0u64;
+    let mut by_day: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
     let mut by_model: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
     let mut by_provider: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
     let mut by_hour = [TokenCell::default(); 24];
@@ -257,6 +318,15 @@ pub(crate) fn aggregate_usage(
         longest_run_ms = longest_run_ms.max(row.longest_run_ms);
         lines_added += row.lines_added;
         lines_deleted += row.lines_deleted;
+        tool_calls += row.tool_calls;
+        tool_calls_failed += row.tool_calls_failed;
+        total_run_ms += row.total_run_ms;
+        sub_agent_sessions += row.sub_agent_sessions_started;
+        if !matches!(period, UsagePeriod::Last24h) && has_activity(row) {
+            let entry = by_day.entry(local_day(row, utc, tz)).or_default();
+            entry.0.add(row);
+            entry.1 += row.runs;
+        }
         by_hour[hour_slot].add(row);
         let entry = by_model.entry(row.model.clone()).or_default();
         entry.0.add(row);
@@ -326,6 +396,18 @@ pub(crate) fn aggregate_usage(
         })
         .collect();
 
+    // byDay: local calendar days with any activity, ascending (month/year
+    // only; always empty for 24h).
+    let by_day_json: Vec<Value> = by_day
+        .into_iter()
+        .map(|(date, (cell, runs))| {
+            let mut v = cell.json();
+            v["date"] = json!(date);
+            v["runs"] = json!(runs);
+            v
+        })
+        .collect();
+
     Ok(json!({
         "totals": totals.json(),
         "runs": runs,
@@ -333,10 +415,15 @@ pub(crate) fn aggregate_usage(
         "longestRunMs": longest_run_ms,
         "linesAdded": lines_added,
         "linesDeleted": lines_deleted,
+        "toolCalls": tool_calls,
+        "toolCallsFailed": tool_calls_failed,
+        "totalRunMs": total_run_ms,
+        "subAgentSessions": sub_agent_sessions,
         "byModel": by_model_json,
         "byProvider": by_provider_json,
         "byHourOfDay": by_hour_json,
         "byMonth": by_month_json,
+        "byDay": by_day_json,
         "availablePeriods": {
             "months": months.into_iter().collect::<Vec<_>>(),
             "years": years.into_iter().collect::<Vec<_>>(),
@@ -860,5 +947,103 @@ mod tests {
             .unwrap()
             .iter()
             .all(|m| m["inputTokens"] == 0));
+    }
+
+    /// §5.36 activity counters sum over the period like `runs`.
+    #[test]
+    fn activity_counters_roll_up_within_the_period() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let mut a = row("2026-07-10T14:00:00Z", "Opus 4.8", 0, 0);
+        a.tool_calls = 5;
+        a.tool_calls_failed = 1;
+        a.total_run_ms = 4_000;
+        a.sessions_started = 2;
+        a.sub_agent_sessions_started = 1;
+        let mut b = row("2026-07-11T14:00:00Z", "Sonnet 5", 0, 0);
+        b.tool_calls = 3;
+        b.total_run_ms = 1_000;
+        let mut june = row("2026-06-30T12:00:00Z", "Opus 4.8", 0, 0);
+        june.tool_calls = 99;
+        let v = aggregate_usage(
+            &[a, b, june],
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(v["toolCalls"], 8);
+        assert_eq!(v["toolCallsFailed"], 1);
+        assert_eq!(v["totalRunMs"], 5_000);
+        assert_eq!(v["sessions"], 2);
+        assert_eq!(v["subAgentSessions"], 1);
+    }
+
+    /// `byDay` groups by the recorded local date, falls back to the
+    /// `tzOffsetMinutes` shift for unstamped rows, lists only days with
+    /// activity in ascending order, and is empty for 24h.
+    #[test]
+    fn by_day_groups_by_local_date_with_offset_fallback() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let mut first = stamped("2026-07-10T23:00:00Z", "Opus 4.8", 10, "2026-07-11", 1);
+        first.runs = 1;
+        let second = stamped("2026-07-11T08:00:00Z", "Sonnet 5", 5, "2026-07-11", 10);
+        // Unstamped: 2026-07-12T22:00Z at +120 min is 2026-07-13 local.
+        let mut unstamped = row("2026-07-12T22:00:00Z", "Opus 4.8", 7, 0);
+        unstamped.runs = 2;
+        let mut lines_only = stamped("2026-07-20T08:00:00Z", "Opus 4.8", 0, "2026-07-20", 10);
+        lines_only.lines_added = 4;
+        let empty = stamped("2026-07-21T08:00:00Z", "Opus 4.8", 0, "2026-07-21", 10);
+        let other_month = stamped("2026-06-30T08:00:00Z", "Opus 4.8", 9, "2026-06-30", 10);
+        let rows = vec![first, second, unstamped, lines_only, empty, other_month];
+
+        let month = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            120,
+            now,
+        )
+        .unwrap();
+        let days: Vec<(&str, u64, u64)> = month["byDay"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["date"].as_str().unwrap(),
+                    d["inputTokens"].as_u64().unwrap(),
+                    d["runs"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            days,
+            vec![
+                ("2026-07-11", 15, 1),
+                ("2026-07-13", 7, 2),
+                ("2026-07-20", 0, 0),
+            ]
+        );
+
+        let year = aggregate_usage(&rows, UsagePeriod::Year { year: 2026 }, 120, now).unwrap();
+        assert_eq!(year["byDay"].as_array().unwrap().len(), 4, "June joins");
+        assert_eq!(year["byDay"][0]["date"], "2026-06-30");
+
+        let day = aggregate_usage(&rows, UsagePeriod::Last24h, 120, now).unwrap();
+        assert_eq!(day["byDay"], json!([]));
+    }
+
+    #[test]
+    fn tracked_since_renders_local_date_or_null() {
+        let since = parse("2026-12-31T23:30:00Z");
+        assert_eq!(local_date_json(Some(since), 0), json!("2026-12-31"));
+        assert_eq!(local_date_json(Some(since), 60), json!("2027-01-01"));
+        assert_eq!(local_date_json(Some(since), -300), json!("2026-12-31"));
+        assert_eq!(local_date_json(None, 0), Value::Null);
     }
 }

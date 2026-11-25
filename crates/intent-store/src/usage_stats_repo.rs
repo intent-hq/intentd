@@ -39,6 +39,14 @@ pub struct UsageStatsDelta {
     pub longest_run_ms: u64,
     pub lines_added: u64,
     pub lines_deleted: u64,
+    /// Tool calls that reached a terminal status (§5.36 `toolCalls`).
+    pub tool_calls: u64,
+    /// The subset of `tool_calls` that ended in `error`.
+    pub tool_calls_failed: u64,
+    /// Sum of completed-turn durations (additive, unlike `longest_run_ms`).
+    pub total_run_ms: u64,
+    /// The subset of `sessions_started` created with a parent agent.
+    pub sub_agent_sessions_started: u64,
 }
 
 /// The daemon's local wall-clock at recording time (D12): calendar date
@@ -74,11 +82,16 @@ pub struct UsageStatsRow {
     pub longest_run_ms: u64,
     pub lines_added: u64,
     pub lines_deleted: u64,
+    pub tool_calls: u64,
+    pub tool_calls_failed: u64,
+    pub total_run_ms: u64,
+    pub sub_agent_sessions_started: u64,
 }
 
 const COUNTER_COLUMNS: &str = "input_tokens, output_tokens, cache_read_tokens, \
     cache_creation_tokens, thought_tokens, runs, sessions_started, longest_run_ms, \
-    lines_added, lines_deleted";
+    lines_added, lines_deleted, tool_calls, tool_calls_failed, total_run_ms, \
+    sub_agent_sessions_started";
 
 impl Store {
     /// Fold one [`UsageStatsDelta`] into the `(bucket_utc, model, provider)`
@@ -131,8 +144,9 @@ impl crate::SqliteStore {
             "INSERT INTO usage_stats_hourly (
                 bucket_utc, model, provider, local_date, local_hour, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, thought_tokens, runs, sessions_started,
-                longest_run_ms, lines_added, lines_deleted
-             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                longest_run_ms, lines_added, lines_deleted, tool_calls, tool_calls_failed,
+                total_run_ms, sub_agent_sessions_started
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(bucket_utc, model, provider) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
@@ -143,7 +157,12 @@ impl crate::SqliteStore {
                 sessions_started = sessions_started + excluded.sessions_started,
                 longest_run_ms = MAX(longest_run_ms, excluded.longest_run_ms),
                 lines_added = lines_added + excluded.lines_added,
-                lines_deleted = lines_deleted + excluded.lines_deleted",
+                lines_deleted = lines_deleted + excluded.lines_deleted,
+                tool_calls = tool_calls + excluded.tool_calls,
+                tool_calls_failed = tool_calls_failed + excluded.tool_calls_failed,
+                total_run_ms = total_run_ms + excluded.total_run_ms,
+                sub_agent_sessions_started =
+                    sub_agent_sessions_started + excluded.sub_agent_sessions_started",
         )
         .bind(bucket_utc)
         .bind(model)
@@ -160,6 +179,10 @@ impl crate::SqliteStore {
         .bind(delta.longest_run_ms.cast_signed())
         .bind(delta.lines_added.cast_signed())
         .bind(delta.lines_deleted.cast_signed())
+        .bind(delta.tool_calls.cast_signed())
+        .bind(delta.tool_calls_failed.cast_signed())
+        .bind(delta.total_run_ms.cast_signed())
+        .bind(delta.sub_agent_sessions_started.cast_signed())
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage stats failed: {e}")))?;
@@ -196,6 +219,12 @@ impl crate::SqliteStore {
                 longest_run_ms: row.get::<i64, _>("longest_run_ms").cast_unsigned(),
                 lines_added: row.get::<i64, _>("lines_added").cast_unsigned(),
                 lines_deleted: row.get::<i64, _>("lines_deleted").cast_unsigned(),
+                tool_calls: row.get::<i64, _>("tool_calls").cast_unsigned(),
+                tool_calls_failed: row.get::<i64, _>("tool_calls_failed").cast_unsigned(),
+                total_run_ms: row.get::<i64, _>("total_run_ms").cast_unsigned(),
+                sub_agent_sessions_started: row
+                    .get::<i64, _>("sub_agent_sessions_started")
+                    .cast_unsigned(),
             })
             .collect())
     }
@@ -379,6 +408,53 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|r| r.input_tokens == 1 && r.runs == 1));
+    }
+
+    /// The §5.36 activity counters are additive like `runs`.
+    #[tokio::test]
+    async fn activity_counters_accumulate() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let delta = UsageStatsDelta {
+            tool_calls: 3,
+            tool_calls_failed: 1,
+            total_run_ms: 2_000,
+            sub_agent_sessions_started: 1,
+            sessions_started: 1,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            store
+                .add_usage_stats("2026-07-25T14:00:00Z", "Opus 4.8", "codex", None, &delta)
+                .await
+                .expect("add");
+        }
+        let rows = store.list_usage_stats_hourly().await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool_calls, 6);
+        assert_eq!(rows[0].tool_calls_failed, 2);
+        assert_eq!(rows[0].total_run_ms, 4_000);
+        assert_eq!(rows[0].sub_agent_sessions_started, 2);
+        assert_eq!(rows[0].sessions_started, 2);
+    }
+
+    /// `set_setting_if_absent` keeps the first value.
+    #[tokio::test]
+    async fn set_setting_if_absent_keeps_first_writer() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        assert!(store
+            .set_setting_if_absent("k", "\"a\"")
+            .await
+            .expect("first"));
+        assert!(!store
+            .set_setting_if_absent("k", "\"b\"")
+            .await
+            .expect("second"));
+        assert_eq!(
+            store.get_setting("k").await.expect("get").as_deref(),
+            Some("\"a\"")
+        );
     }
 
     /// The local wall-clock stamp is written on INSERT only: a later delta
@@ -626,30 +702,41 @@ mod tests {
                 .await
                 .expect("run migration statement");
         }
-        // The rebuild recreated the pre-thought_tokens shape; replay the
-        // shipped ALTER (single-statement migration, pulled from MIGRATOR so
-        // it can never drift from the real file) so the reads below see the
-        // current schema.
-        let thought_migration = crate::MIGRATOR
+        // The rebuild recreated the pre-thought_tokens shape; replay every
+        // later shipped `ADD COLUMN` migration on the table (pulled from
+        // MIGRATOR so they can never drift from the real files) so the reads
+        // below see the current schema.
+        let column_migrations: Vec<_> = crate::MIGRATOR
             .migrations
             .iter()
-            .find(|m| {
-                m.sql
-                    .as_str()
-                    .contains("ALTER TABLE usage_stats_hourly ADD COLUMN thought_tokens")
+            .filter(|m| {
+                m.version > 59
+                    && m.sql
+                        .as_str()
+                        .contains("ALTER TABLE usage_stats_hourly ADD COLUMN")
             })
-            .expect("usage_stats_hourly thought_tokens migration present");
-        let alter: String = thought_migration
-            .sql
-            .as_str()
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        sqlx::query(sqlx::AssertSqlSafe(alter.trim().trim_end_matches(';')))
-            .execute(store.write_pool())
-            .await
-            .expect("re-apply thought_tokens ALTER");
+            .collect();
+        assert!(
+            column_migrations
+                .iter()
+                .any(|m| m.sql.as_str().contains("ADD COLUMN thought_tokens")),
+            "usage_stats_hourly thought_tokens migration present"
+        );
+        for migration in column_migrations {
+            let sql: String = migration
+                .sql
+                .as_str()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(store.write_pool())
+                    .await
+                    .expect("re-apply usage_stats_hourly ADD COLUMN");
+            }
+        }
 
         let rows = store.list_usage_stats_hourly().await.expect("list");
         assert_eq!(rows.len(), 2);

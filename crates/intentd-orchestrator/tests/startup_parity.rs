@@ -98,6 +98,10 @@ const STEPS: &[(&str, Step)] = &[
         Wired("heal_stale_agent_sessions"),
     ),
     (
+        "services.ensure_usage_activity_tracked_since",
+        Wired("ensure_usage_activity_tracked_since"),
+    ),
+    (
         "services.configure_remote_machines",
         Wired("configure_remote_machines"),
     ),

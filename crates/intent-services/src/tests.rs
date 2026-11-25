@@ -28537,6 +28537,219 @@ mod usage_stats_recording {
         assert_eq!(lines_for(&svc, "unknown").await, (3, 1));
         assert_eq!(providers_for(&svc, "unknown").await, vec!["unknown"]);
     }
+
+    /// Create an agent with an optional parent, pinned to auggie like
+    /// [`create_agent`].
+    async fn create_child(svc: &Services, ws: &WorkspaceId, parent: Option<&str>) -> String {
+        let created = svc
+            .agent_create_op(
+                ws.clone(),
+                Some("Stats child".into()),
+                None,
+                None,
+                parent.map(|p| AgentId(p.to_string())),
+                None,
+                false,
+                intent_core::AgentCreateExtra {
+                    provider: Some("auggie".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create agent");
+        created["agent"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// Sum one counter across every `usage_stats_hourly` row.
+    async fn sum_rows(svc: &Services, f: fn(&intent_store::UsageStatsRow) -> u64) -> u64 {
+        svc.store()
+            .list_usage_stats_hourly()
+            .await
+            .expect("list usage stats")
+            .iter()
+            .map(f)
+            .sum()
+    }
+
+    /// §5.36 `subAgentSessions`: an agent created with a parent counts
+    /// toward `sessions` and `subAgentSessions`; one without a parent (a
+    /// top-level agent, even when another agent asked for it) counts toward
+    /// `sessions` only.
+    #[tokio::test]
+    async fn sub_agent_sessions_count_only_agents_with_a_parent() {
+        let (_t, svc, ws) = setup().await;
+        let parent = create_child(&svc, &ws, None).await;
+        create_child(&svc, &ws, Some(&parent)).await;
+        create_child(&svc, &ws, None).await;
+        assert_eq!(sum_rows(&svc, |r| r.sessions_started).await, 3);
+        assert_eq!(sum_rows(&svc, |r| r.sub_agent_sessions_started).await, 1);
+    }
+
+    /// §5.36 activity counters at turn end: `totalRunMs` only grows for
+    /// completed turns, and a failed or cancelled turn without a usage
+    /// report still records its terminal tool calls.
+    #[tokio::test]
+    async fn turn_end_records_tool_calls_and_completed_run_time() {
+        let (_t, svc, ws) = setup().await;
+        let agent = AgentId(create_agent(&svc, &ws, Some("claude-opus-4-8")).await);
+        let now = time::OffsetDateTime::now_utc();
+        let tally = |total, failed| crate::agent_session::ToolCallTally { total, failed };
+        // Completed turn: run, run time and tools.
+        svc.record_turn_usage_stats_with_tools(
+            &agent,
+            &ws,
+            None,
+            std::time::Duration::from_secs(3),
+            now,
+            true,
+            tally(2, 1),
+        )
+        .await;
+        // Failed turn without a usage report: tools only.
+        svc.record_turn_usage_stats_with_tools(
+            &agent,
+            &ws,
+            None,
+            std::time::Duration::from_secs(5),
+            now,
+            false,
+            tally(1, 0),
+        )
+        .await;
+        // Failed turn with nothing to record: no write at all.
+        svc.record_turn_usage_stats_with_tools(
+            &agent,
+            &ws,
+            None,
+            std::time::Duration::from_secs(7),
+            now,
+            false,
+            tally(0, 0),
+        )
+        .await;
+        assert_eq!(sum_rows(&svc, |r| r.runs).await, 1);
+        assert_eq!(sum_rows(&svc, |r| r.total_run_ms).await, 3_000);
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls).await, 3);
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls_failed).await, 1);
+        // The tool calls land under the agent's model key, like its tokens.
+        let rows = svc.store().list_usage_stats_hourly().await.expect("list");
+        assert!(rows
+            .iter()
+            .filter(|r| r.tool_calls > 0)
+            .all(|r| r.model == "Opus 4.8" && r.provider == "auggie"));
+    }
+
+    /// Turn exits that skip the turn-end bookkeeping (wake turns,
+    /// suspend-interrupted turns, append failures) still record their
+    /// terminal tool calls through the detached flush; a zero tally writes
+    /// nothing.
+    #[tokio::test]
+    async fn detached_tool_tally_flush_records_tools_only() {
+        let (_t, svc, ws) = setup().await;
+        let agent = AgentId(create_agent(&svc, &ws, Some("claude-opus-4-8")).await);
+        let before = svc.store().list_usage_stats_hourly().await.expect("list");
+        svc.flush_tool_tally_detached(&agent, &ws, crate::agent_session::ToolCallTally::default());
+        svc.flush_tool_tally_detached(
+            &agent,
+            &ws,
+            crate::agent_session::ToolCallTally {
+                total: 4,
+                failed: 2,
+            },
+        );
+        svc.store_tasks.drain_finite().await;
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls).await, 4);
+        assert_eq!(sum_rows(&svc, |r| r.tool_calls_failed).await, 2);
+        assert_eq!(sum_rows(&svc, |r| r.runs).await, 0);
+        assert_eq!(sum_rows(&svc, |r| r.total_run_ms).await, 0);
+        let after = svc.store().list_usage_stats_hourly().await.expect("list");
+        let sessions = |rows: &[intent_store::UsageStatsRow]| -> u64 {
+            rows.iter().map(|r| r.sessions_started).sum()
+        };
+        assert_eq!(sessions(&after), sessions(&before));
+    }
+
+    /// A usage-stats store failure is logged and never fails `agent.create`
+    /// or the turn-end recorder.
+    #[tokio::test]
+    async fn activity_recorders_survive_a_stats_store_error() {
+        let (_t, svc, ws) = setup().await;
+        sqlx::query("DROP TABLE usage_stats_hourly")
+            .execute(svc.store().write_pool())
+            .await
+            .expect("drop usage_stats_hourly");
+        let parent = create_child(&svc, &ws, None).await;
+        let child = create_child(&svc, &ws, Some(&parent)).await;
+        svc.record_turn_usage_stats_with_tools(
+            &AgentId(child),
+            &ws,
+            None,
+            std::time::Duration::from_secs(1),
+            time::OffsetDateTime::now_utc(),
+            false,
+            crate::agent_session::ToolCallTally {
+                total: 1,
+                failed: 1,
+            },
+        )
+        .await;
+    }
+
+    /// §5.36 `activityTrackedSince`: the first stamp wins, later recorders
+    /// never move it, and the read renders it as a local date under
+    /// `tzOffsetMinutes`. A store without a stamp reads `null`.
+    #[tokio::test]
+    async fn activity_tracked_since_keeps_first_stamp_and_reads_as_local_date() {
+        let (_t, svc, ws) = setup().await;
+        let usage = svc
+            .stats_get_usage("24h".into(), None, 0)
+            .await
+            .expect("get usage");
+        assert_eq!(usage["activityTrackedSince"], serde_json::Value::Null);
+        assert_eq!(usage["toolCalls"], 0);
+        assert_eq!(usage["byDay"], serde_json::json!([]));
+
+        svc.store()
+            .set_setting(
+                crate::usage_stats::ACTIVITY_TRACKED_SINCE_KEY,
+                "\"2026-01-01T23:30:00Z\"",
+            )
+            .await
+            .expect("seed stamp");
+        create_child(&svc, &ws, None).await;
+        svc.ensure_usage_activity_tracked_since().await;
+        let read = |tz: i64| {
+            let svc = svc.clone();
+            async move {
+                svc.stats_get_usage("year".into(), Some("2026".into()), tz)
+                    .await
+                    .expect("get usage")["activityTrackedSince"]
+                    .clone()
+            }
+        };
+        assert_eq!(read(0).await, "2026-01-01");
+        assert_eq!(read(60).await, "2026-01-02", "east of UTC rolls forward");
+
+        // A fresh store gets its stamp from the first recorder.
+        let (_t2, fresh, ws2) = setup().await;
+        create_child(&fresh, &ws2, None).await;
+        let stored = fresh
+            .store()
+            .get_setting(crate::usage_stats::ACTIVITY_TRACKED_SINCE_KEY)
+            .await
+            .expect("read stamp")
+            .expect("stamp written");
+        let stored: String = serde_json::from_str(&stored).expect("JSON string");
+        let stamped =
+            time::OffsetDateTime::parse(&stored, &time::format_description::well_known::Rfc3339)
+                .expect("RFC 3339 stamp");
+        let age = time::OffsetDateTime::now_utc() - stamped;
+        assert!(
+            age >= time::Duration::ZERO && age < time::Duration::minutes(5),
+            "stamp is the recording instant in UTC: {stored}"
+        );
+        assert_eq!(stamped.offset(), time::UtcOffset::UTC);
+    }
 }
 
 /// `search.*` wire glue (§5.15): requestId mint/echo, the worktree-rooted

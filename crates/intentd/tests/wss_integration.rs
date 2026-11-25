@@ -11883,7 +11883,18 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         longest_run_ms: 5_000,
         lines_added: 12,
         lines_deleted: 3,
+        tool_calls: 9,
+        tool_calls_failed: 2,
+        total_run_ms: 8_000,
+        sub_agent_sessions_started: 1,
     };
+    srv.store
+        .set_setting(
+            "usageStats.activityTrackedSince",
+            "\"2026-01-01T00:00:00Z\"",
+        )
+        .await
+        .expect("seed tracked-since stamp");
     srv.store
         .add_usage_stats(
             &bucket_now,
@@ -11927,6 +11938,13 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(r["longestRunMs"], 5_000);
     assert_eq!(r["linesAdded"], 12);
     assert_eq!(r["linesDeleted"], 3);
+    // §5.36 activity counters ride the same wire result.
+    assert_eq!(r["toolCalls"], 9);
+    assert_eq!(r["toolCallsFailed"], 2);
+    assert_eq!(r["totalRunMs"], 8_000);
+    assert_eq!(r["subAgentSessions"], 1);
+    assert_eq!(r["byDay"], serde_json::json!([]), "24h has no byDay");
+    assert_eq!(r["activityTrackedSince"], "2026-01-01");
     let by_model = r["byModel"].as_array().expect("byModel");
     assert_eq!(by_model.len(), 1, "{resp}");
     assert_eq!(by_model[0]["model"], "Opus 4.8");
@@ -11996,6 +12014,15 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         100,
         "{resp}"
     );
+    // byDay lists the current bucket's recorded local date.
+    let today = stamp(now, divergent_hour).date;
+    let by_day = resp["result"]["byDay"].as_array().expect("byDay");
+    let day = by_day
+        .iter()
+        .find(|d| d["date"] == today.as_str())
+        .expect("current day in byDay");
+    assert_eq!(day["inputTokens"], 100, "{resp}");
+    assert_eq!(day["runs"], 2);
 
     // Malformed params surface as -32602 over the wire.
     let frame =

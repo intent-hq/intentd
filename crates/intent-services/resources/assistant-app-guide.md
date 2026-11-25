@@ -406,6 +406,24 @@ opens them again in the window the user is viewing.
 
 <!-- Sources: packages/cloudlands-fe/src/features/release-notes/main/release-notes.ipc.ts; packages/cloudlands-fe/src/store/renderer/slices/release-notes/sagas/release-notes-saga.ts. -->
 
+## Usage stats
+
+Open usage stats from the command palette (**Open usage stats**) or with Cmd+Shift+U
+(Ctrl+Shift+U on Windows and Linux). Pick **24H**, **Month** or **Year** and a period;
+**Cached tokens** adds cache reads and writes to the token numbers. The cards are Agent
+Passport, Models, Providers, Tokens by Hour, Tokens by Month, Code Written, Tool Calls,
+Agent Team and Activity Streak; Tokens by Month and Activity Streak are hidden in 24H.
+Hover a card and choose **PNG** to save it as a 1080×1920 image.
+
+Stats count agent work on this machine's daemon across all workspaces. Code Written counts
+only lines agents changed. Tool calls, sub-agents and agent-hours start counting when the
+upgraded daemon first runs, with no backfill, so earlier periods show "Tracked since" and
+may read low. Agent-hours add up parallel agents, so they can exceed clock time. Older app
+versions show only the first five cards; with an older daemon, Tool Calls, Agent Team and
+Activity Streak show an upgrade note.
+
+<!-- Sources: packages/cloudlands-fe/src/features/stats/; packages/intentd/crates/intent-services/src/{usage_stats.rs,usage_stats_read.rs}. -->
+
 ## Mac update availability
 
 Mac update availability can differ by architecture. Intel Macs stay on their last

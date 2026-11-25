@@ -6186,6 +6186,7 @@ async fn suspend_late_enrollment_persists_after_early_close() {
             &workspace_id,
             uuid::Uuid::new_v4().to_string(),
             vec![json!({"type":"text","text":"retained partial"})],
+            super::ToolTallyCell::default(),
             None,
             intent_acp::AcpError::Transport("Connection reset by peer".into()),
         )
@@ -10211,6 +10212,7 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         last_activity_emit: None,
         flush_pending: false,
         flush_failed: false,
+        tool_tally: super::ToolTallyCell::default(),
     };
     let enrolled = services
         .flush_partial_turn_on_interruption(
@@ -10306,6 +10308,7 @@ async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
         last_activity_emit: None,
         flush_pending: false,
         flush_failed: false,
+        tool_tally: super::ToolTallyCell::default(),
     };
     let flushed = services
         .flush_partial_turn_on_interruption(
@@ -12344,4 +12347,269 @@ mod profile_native_session_tests {
             assert!(!p.resumes().await, "{base}: no recorded settings, no load");
         }
     }
+}
+
+/// Usage stats (§5.36): a tool call counts once, at its first terminal
+/// status. Repeated terminal updates, `error` then `completed`, and calls
+/// still open at turn end never add to the tally.
+#[tokio::test]
+async fn tool_call_tally_counts_each_call_once_at_first_terminal_status() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    let updates = [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "in_progress" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "ok", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "ok", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "in_progress" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bad", "status": "failed" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bad", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "instant", "title": "Glob",
+                "kind": "search", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "open", "title": "Bash",
+                "kind": "execute", "status": "in_progress" }),
+    ];
+    for update in &updates {
+        services
+            .route_notification(
+                &tool_call_notification(update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    assert_eq!(
+        transcript.tool_tally.peek(),
+        super::ToolCallTally {
+            total: 3,
+            failed: 1
+        }
+    );
+}
+
+/// Usage stats (§5.36): an agent stopped (or preempted) while its prompt is
+/// still pending loses its worker — and with it the turn `Transcript` — so
+/// the terminal tool-call tally rides the live-turn slot and is recorded by
+/// the interrupt flush that persists the interrupted row. It counts exactly
+/// once: a second flush of the same turn (the suspend enrollment racing a
+/// teardown) adds nothing, and a cancelled turn adds no run or run time.
+#[tokio::test]
+async fn interrupted_turn_records_its_tool_tally_exactly_once() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-stop".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "open", "title": "Bash",
+                "kind": "execute", "status": "in_progress" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-stop", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    services.pin_live_turn(&agent_id);
+    // The worker is gone; only the pinned slot remains.
+    drop(transcript);
+
+    // A suspend enrollment flushing the same turn first, then the teardown.
+    let enrolled = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            services.live_turn(&agent_id).expect("pinned slot"),
+            super::InterruptReason::SystemSuspend,
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(
+        enrolled,
+        super::InterruptFlushOutcome::Appended("m-stop".to_string())
+    );
+    services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("pinned slot flushed");
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(sum(|r| r.tool_calls), 2, "counted once, open call excluded");
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0, "a cancelled turn is not a run");
+    assert_eq!(sum(|r| r.total_run_ms), 0);
+}
+
+/// Usage stats (§5.36): a wake turn schedules its tools-only write before
+/// it appends the envelope. A stop that aborts the worker in that gap must
+/// not let the interrupt flush record the same tally again — scheduling
+/// the write consumes the live slot's tally.
+#[tokio::test]
+async fn wake_writer_consumes_the_tally_before_an_interrupt_flush() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-wake".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-wake", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    // The wake worker schedules its write, then is aborted before it
+    // appends the envelope; a stop flushes the pinned slot.
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
+    drop(transcript);
+    services.pin_live_turn(&agent_id);
+    services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("pinned slot flushed");
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(sum(|r| r.tool_calls), 2, "one tally, not two");
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0);
+    assert_eq!(sum(|r| r.total_run_ms), 0);
+}
+
+/// Usage stats (§5.36): the concurrent overlap — a stop snapshots the live
+/// slot (nonzero tally) BEFORE a still-running wake schedules its writer,
+/// then wins the envelope append. Both writers claim the one tally from the
+/// slot atomically, so only the first claim records it.
+#[tokio::test]
+async fn interrupt_snapshot_before_wake_claim_records_one_tally() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-race".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-race", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    services.pin_live_turn(&agent_id);
+    // The stop copies the slot (tally included) first…
+    let snapshot = services.live_turn(&agent_id).expect("pinned slot");
+    assert_eq!(snapshot.tool_tally.peek().total, 2);
+    // …the aborted wake still finishes scheduling its writer…
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
+    drop(transcript);
+    // …then the stop appends the row with its earlier copy.
+    let outcome = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            snapshot,
+            super::InterruptReason::UserStop,
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        super::InterruptFlushOutcome::Appended("m-race".to_string())
+    );
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(sum(|r| r.tool_calls), 2, "one claim, not two writes");
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0);
+}
+
+/// Usage stats (§5.36): the reverse cleanup order — the stop appends the
+/// interrupted row, claims the tally and removes the live slot BEFORE the
+/// already-running wake reaches its writer. The claim lives in a per-turn
+/// cell shared by the transcript and the slot, so it survives the slot's
+/// removal and the wake's late claim takes nothing.
+#[tokio::test]
+async fn interrupt_claim_and_cleanup_before_wake_claim_records_one_tally() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-rev".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-rev", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    services.pin_live_turn(&agent_id);
+    // The stop flushes first: appends, claims, and removes the slot.
+    services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("pinned slot flushed");
+    assert!(services.live_turn(&agent_id).is_none(), "slot removed");
+    // The aborted wake's final poll then reaches its writer.
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(
+        sum(|r| r.tool_calls),
+        2,
+        "the late wake claim takes nothing"
+    );
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0);
+    assert_eq!(sum(|r| r.total_run_ms), 0);
 }
