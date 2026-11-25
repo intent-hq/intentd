@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.292] - 2026-11-25
+
+### 🐛 Bug Fixes
+
+- *(agent)* Try again no longer cancels a turn whose Active write failed ([#3749](https://github.com/intent-hq/intentd/pull/3749))
+
+### 📚 Documentation
+
+- *(guide)* Hidden sidebar icons apply to the collapsed rail only ([#3757](https://github.com/intent-hq/intentd/pull/3757))
+- *(guide)* Full screen for browser pages on Intent OS ([#3756](https://github.com/intent-hq/intentd/pull/3756))
+
+
 ## [0.11.291] - 2026-11-24
 
 ### 🐛 Bug Fixes
