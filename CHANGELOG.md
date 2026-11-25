@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.298] - 2026-11-25
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* Status extras, Assistant ws.rpc and public-address invite links ([#3769](https://github.com/intent-hq/intentd/pull/3769))
+- *(orchestrator)* Restore repository context and file watchers per tenant ([#3766](https://github.com/intent-hq/intentd/pull/3766))
+
+
 ## [0.11.297] - 2026-11-25
 
 ### 🚀 Features
