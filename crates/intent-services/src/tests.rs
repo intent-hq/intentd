@@ -18521,10 +18521,19 @@ pub(crate) mod pr {
         assert_eq!(v["user"]["login"], "octocat", "{v}");
     }
 
+    fn is_loopback_origin(base: &str) -> bool {
+        let host = base
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or_default();
+        matches!(host, "127.0.0.1" | "localhost")
+    }
+
     /// Test services that forget the API-base override must fail locally,
     /// never send a fake token to api.github.com (intentd#3725 found one such
     /// leak only because GitHub answered "Bad credentials"). Every test
-    /// constructor must resolve GitHub to loopback.
+    /// constructor must resolve the GitHub API and login hosts and the GitLab
+    /// API to loopback.
     #[intent_test_macros::daemon_test]
     async fn isolated_services_without_a_mock_never_reach_a_non_loopback_github() {
         let tmp = TempDb::new();
@@ -18553,6 +18562,39 @@ pub(crate) mod pr {
                 matches!(host, "127.0.0.1" | "localhost"),
                 "{name}: GitHub API base must be loopback, got {base}"
             );
+            let login = crate::github_auth_ops::resolve_login_base_uri(
+                svc.github_login_base_uri.as_deref(),
+            );
+            assert!(
+                is_loopback_origin(&login),
+                "{name}: GitHub login base must be loopback, got {login}"
+            );
+            let override_base = svc
+                .gitlab_api_base_override()
+                .unwrap_or_else(|| panic!("{name}: no GitLab API base, so gitlab.com"));
+            assert!(
+                is_loopback_origin(&override_base),
+                "{name}: GitLab API base must be loopback, got {override_base}"
+            );
+            for (path, target) in [
+                (
+                    "sourceControl",
+                    svc.resolve_source_control_target("gitlab", None),
+                ),
+                (
+                    "collaboration",
+                    svc.collaboration_connect_target("gitlab", None),
+                ),
+            ] {
+                let Ok(crate::source_control_auth_ops::Target::Gitlab { host }) = target else {
+                    panic!("{name}: {path} GitLab target did not resolve: {target:?}");
+                };
+                assert!(
+                    is_loopback_origin(host.base_url()),
+                    "{name}: {path} GitLab target must be loopback, got {}",
+                    host.base_url()
+                );
+            }
         }
 
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());

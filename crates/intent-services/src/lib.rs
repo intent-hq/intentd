@@ -1438,6 +1438,11 @@ pub struct Services {
     /// (`invite.prove`, the primary's `GET /user` refresh) talk to (`None` →
     /// `$INTENTD_GITHUB_API_BASE_URI` → api.github.com).
     github_api_base_uri: Option<String>,
+    /// Test-only override for the GitLab API origin every
+    /// `$INTENTD_GITLAB_API_BASE_URI` reader honors (`None` → that env →
+    /// the instance's own origin). The test constructors start it at
+    /// `ISOLATED_GITHUB_API_BASE_URI` so gitlab.com is never reached.
+    gitlab_api_base_uri: Option<String>,
     /// Per-workspace disk-usage cache backing the on-demand
     /// `workspace.diskUsage` method (§5.1) — never the list/get emit path:
     /// TTL'd stale-while-revalidate entries whose walks run detached on the
@@ -1749,8 +1754,9 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// already bound — so it is deliberately not wrapped in this timeout.
 pub(crate) const PR_REFRESH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The GitHub API base [`Services::new_isolated`] starts with: loopback port
-/// 0, which nothing can listen on, so an unmocked forge read fails locally.
+/// The forge base every test constructor starts with — the GitHub API, the
+/// GitHub login (device flow) and the GitLab API origin: loopback port 0,
+/// which nothing can listen on, so an unmocked forge call fails locally.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
 pub const ISOLATED_GITHUB_API_BASE_URI: &str = "http://127.0.0.1:0";
@@ -1779,10 +1785,12 @@ impl Services {
     /// Test constructor: [`Services::new`] over a per-instance scratch
     /// secrets file instead of the home default, so a test can never read,
     /// write or migrate the developer's real `~/intent/.secrets.json` (or its
-    /// `.collaboration` sibling). The GitHub API base defaults to
-    /// [`ISOLATED_GITHUB_API_BASE_URI`], so a test that forgets
-    /// [`Services::with_github_api_base_uri`] gets a local connection error
-    /// instead of sending its token to api.github.com. The scratch dir lives
+    /// `.collaboration` sibling). The GitHub API, GitHub login and GitLab API
+    /// bases default to [`ISOLATED_GITHUB_API_BASE_URI`], so a test that
+    /// forgets [`Services::with_github_api_base_uri`],
+    /// [`Services::with_github_login_base_uri`] or
+    /// [`Services::with_gitlab_api_base_uri`] gets a local connection error
+    /// instead of reaching api.github.com, github.com or gitlab.com. The scratch dir lives
     /// until the last clone drops. Use this in every test: under nextest the
     /// default constructor only avoids the real home by falling back to one
     /// scratch store shared by the whole test process (see
@@ -1803,14 +1811,18 @@ impl Services {
         let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
         let mut services = Self::new_with_repository_sources(store, secrets, None);
         services.isolated_secrets_dir = Some(Arc::new(dir));
-        services.with_isolated_github_api_base()
+        services.with_isolated_forge_bases()
     }
 
-    /// Every test constructor starts at [`ISOLATED_GITHUB_API_BASE_URI`];
-    /// [`Services::with_github_api_base_uri`] replaces it with a mock.
+    /// Every test constructor starts each forge base at
+    /// [`ISOLATED_GITHUB_API_BASE_URI`]; the matching `with_*_base_uri`
+    /// builder replaces it with a mock. Explicit per-`Services` overrides win
+    /// over the `INTENTD_*` env seams, which only spawned daemons use.
     #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
-    fn with_isolated_github_api_base(mut self) -> Self {
+    fn with_isolated_forge_bases(mut self) -> Self {
         self.github_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
+        self.github_login_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
+        self.gitlab_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
         self
     }
 
@@ -1820,7 +1832,7 @@ impl Services {
         store: Store,
         file_secrets: intent_core::FileSecretStore,
     ) -> Self {
-        Self::new_with_repository_sources(store, file_secrets, None).with_isolated_github_api_base()
+        Self::new_with_repository_sources(store, file_secrets, None).with_isolated_forge_bases()
     }
 
     /// Hidden test support: select disposable original sources before attachment.
@@ -1833,8 +1845,7 @@ impl Services {
         secrets: intent_core::FileSecretStore,
         descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
     ) -> Self {
-        Self::new_with_repository_sources(store, secrets, descriptor)
-            .with_isolated_github_api_base()
+        Self::new_with_repository_sources(store, secrets, descriptor).with_isolated_forge_bases()
     }
 
     fn new_with_repository_sources(
@@ -2043,6 +2054,7 @@ impl Services {
             executor_liveness: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
+            gitlab_api_base_uri: None,
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
@@ -2598,6 +2610,27 @@ impl Services {
     pub fn with_github_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_api_base_uri = Some(base_uri.into());
         self
+    }
+
+    /// Override the GitLab API origin wherever `$INTENTD_GITLAB_API_BASE_URI`
+    /// applies (test seam). Production wiring keeps `None` (env override →
+    /// the instance's own origin); a configured
+    /// `sourceControl.gitlab.apiBaseUrl` still wins.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn with_gitlab_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
+        self.gitlab_api_base_uri = Some(base_uri.into());
+        self
+    }
+
+    /// The GitLab API origin override: this `Services`' own, else
+    /// `$INTENTD_GITLAB_API_BASE_URI`. Blank values count as unset.
+    pub(crate) fn gitlab_api_base_override(&self) -> Option<String> {
+        self.gitlab_api_base_uri
+            .clone()
+            .or_else(|| std::env::var(source_control_auth_ops::GITLAB_API_BASE_URI_ENV).ok())
+            .filter(|s| !s.trim().is_empty())
     }
 
     /// Override the context engine backing `search.codebase` (§8). The

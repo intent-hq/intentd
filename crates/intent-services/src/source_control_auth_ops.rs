@@ -1230,7 +1230,7 @@ impl crate::Services {
         }
         let config = self.effective_settings().source_control.gitlab;
         if parse_gitlab_host(&config.host).is_ok_and(|bound| bound.host() == target.host()) {
-            let env = std::env::var(GITLAB_API_BASE_URI_ENV).ok();
+            let env = self.gitlab_api_base_override();
             if let Some(endpoint) = config
                 .api_base_url
                 .as_deref()
@@ -1254,7 +1254,7 @@ impl crate::Services {
     ) -> Result<Target> {
         let provider = Provider::parse(provider)?;
         let gitlab = self.effective_settings().source_control.gitlab;
-        let env_origin = std::env::var(GITLAB_API_BASE_URI_ENV).ok();
+        let env_origin = self.gitlab_api_base_override();
         let api_origin = gitlab
             .api_base_url
             .as_deref()

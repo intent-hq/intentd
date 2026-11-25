@@ -248,7 +248,11 @@ impl Services {
         repository::resolve_target(kind, host, "gitlab.com", None)
     }
 
-    fn collaboration_connect_target(&self, provider: &str, host: Option<&str>) -> Result<Target> {
+    pub(crate) fn collaboration_connect_target(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+    ) -> Result<Target> {
         let mut target = Self::collaboration_target(provider, host)?;
         if let Target::Gitlab { host } = &mut target {
             // A configured API override belongs only to its bound instance.
@@ -261,7 +265,7 @@ impl Services {
             }
             .or_else(|| {
                 (host.host() == "gitlab.com")
-                    .then(|| std::env::var(repository::GITLAB_API_BASE_URI_ENV).ok())
+                    .then(|| self.gitlab_api_base_override())
                     .flatten()
             });
             if let Some(origin) = origin {
