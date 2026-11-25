@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.291] - 2026-11-24
+
+### 🐛 Bug Fixes
+
+- *(agent)* A message sent while Try again starts still follows the failed one ([#3754](https://github.com/intent-hq/intentd/pull/3754))
+
+### 📚 Documentation
+
+- *(guide)* Intent OS has no Notch dock ([#3752](https://github.com/intent-hq/intentd/pull/3752))
+- *(guide)* Hide sidebar section icons ([#3753](https://github.com/intent-hq/intentd/pull/3753))
+
+
 ## [0.11.290] - 2026-11-24
 
 ### 🚀 Features
