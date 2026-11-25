@@ -51,6 +51,9 @@
 #                                    every crates/intent-svc-* feature crate;
 #                                    that and crates/intent-svc-*/src/** also
 #                                    select crates/intent-app
+#   any crates/ path selected above  also every source lint, each as
+#                                    -p <l> --test <t> for crates/<l>/tests/<t>.rs
+#                                    named *_lint.rs (not under --instrumented)
 #   crates/<c>/benches|examples/**   ignored (nextest does not run them)
 #   crates/<c>/<anything else>       -p <c>  (all test targets of <c>)
 #   crates/intent-core/ (src/** or   also every crate depending on intent-core,
@@ -716,10 +719,12 @@ map_e2e() {
 
 fallback=""
 mapped=""
+# Set when a path under crates/ maps to a test selection (see the source lints).
+crate_changed=""
 seen=""
 e2e_notes=""
 classify() {
-  local path=$1 e2e
+  local path=$1 e2e records
   [[ -n "$path" && "$seen" != *$'\n'"$path"$'\n'* ]] || return 0
   seen+=$'\n'"$path"$'\n'
   # Editing the map runs every module it names (a new entry is exercised by
@@ -743,7 +748,9 @@ classify() {
     # that crate (the "<anything else>" row of the table).
     [[ -z "$instrumented" ]] || mapped+="$(map_path "$path")"$'\n'
   else
-    mapped+="$(map_path "$path")"$'\n'
+    records=$(map_path "$path")
+    mapped+="$records"$'\n'
+    [[ -z "$records" ]] || crate_changed=1
   fi
 }
 
@@ -876,6 +883,30 @@ done <<<"$mapped"
 if [[ -n "$composed_src" && -f crates/intent-app/Cargo.toml ]]; then
   mapped+="intent-app"$'\t'"dependent"$'\n'
   feature_crates+="${feature_crates:+, }intent-app"
+fi
+
+# Source lints: every crates/<c>/tests/*_lint.rs test target scans source text
+# of other crates, src and test code alike (CI's check job runs them all as
+# `cargo test --workspace --test '*_lint'`), so any selected change under
+# crates/ (src, tests or another crate file) also selects each lint binary on
+# its own ("test": a crate selected more broadly already runs it),
+# not the rest of the lint's crate. intentd#3742 moved a queue_snapshot call
+# in intent-services/src into a new fn: test-changed passed, and intent-core's
+# queue_entry_egress_lint failed in CI. Under --instrumented they are left to
+# that check job, which every PR runs uninstrumented.
+lints_added=""
+if [[ -z "$instrumented" && -n "$crate_changed" ]]; then
+  for lint in crates/*/tests/*_lint.rs; do
+    [[ -f "$lint" ]] || continue
+    lint_crate=${lint#crates/}
+    lint_crate=${lint_crate%%/*}
+    lint_name=${lint##*/}
+    lint_name=${lint_name%.rs}
+    is_test_target "$lint_crate" "$lint_name" || continue
+    mapped+="$lint_crate"$'\t'"test"$'\t'"$lint_name"$'\n'
+    lints_added=1
+  done
+  [[ -z "$lints_added" ]] || log "note: crates/ changed; every source lint (*_lint) runs too"
 fi
 
 # Stock macOS ships Bash 3.2, which has no associative arrays: per-crate
