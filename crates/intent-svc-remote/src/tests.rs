@@ -1525,6 +1525,63 @@ async fn a_leased_link_closes_once_its_lease_is_lost_and_releases_it_on_stop() {
     .expect("the stopped connector released the link lease");
 }
 
+/// Credential replacement under leased ownership on a machine with no
+/// running agent: the old connector is not awaited, and the replacement
+/// claims (reusing this process's lease) and binds before the old one's
+/// cleanup runs. That cleanup must not release the lease the replacement
+/// now links under, nor close its link.
+#[tokio::test]
+async fn a_replaced_leased_connector_stopping_late_keeps_the_replacements_link() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let ttl = Duration::from_secs(2);
+    let ownership = Arc::new(intent_node_connections::LeaseLinkOwnership::new(
+        backend.store().clone(),
+        uuid::Uuid::new_v4().to_string().into(),
+        ttl,
+    ));
+    let owned = || {
+        let mut owned = tuning();
+        owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
+        owned
+    };
+    // The old connector is linked, with no agent.
+    let old = backend.bare_with(&machine, owned()).await;
+    let machine_id = old.status().node_id;
+    old.connect().await.unwrap();
+    let mut first = machine.accept().await;
+
+    // Its replacement claims and binds while it still runs.
+    let new = backend.bare_with(&machine, owned()).await;
+    let agent = AgentId::new();
+    let runtime = new.attach(&agent, &workspace());
+    let mut second = machine.accept().await;
+    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    second.replay_complete(0).await;
+    second.journal(note(1, &agent, "one")).await;
+    assert_eq!(texts(&runtime, 1).await, ["one"]);
+    second.acked(1).await;
+
+    // Only now does the old connector stop and run its cleanup.
+    old.shutdown();
+    first.closed_by_head().await;
+    // timing-guard: negative path: give a wrongful release time to close the link
+    tokio::time::sleep(ttl).await;
+
+    second.journal(note(2, &agent, "two")).await;
+    second.acked(2).await;
+    assert!(
+        backend
+            .store()
+            .acquire_lease(intent_node_connections::LINK_LEASE_SCOPE, &machine_id, ttl)
+            .await
+            .unwrap()
+            .is_none(),
+        "the replacement still holds the link lease"
+    );
+    new.shutdown();
+}
+
 /// The head's domain as a recording of what the connector calls back with.
 #[derive(Default)]
 struct Recording {
