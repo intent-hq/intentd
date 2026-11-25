@@ -7445,11 +7445,14 @@ impl Services {
         // falling back to the provider id when no model is resolved yet;
         // "unknown" only when the provider is unknowable too — D13).
         // Best-effort — never fails agent.create.
+        // A session with a parent counts as a sub-agent (§5.36).
+        self.ensure_usage_activity_tracked_since().await;
         crate::usage_stats::record_session_started(
             &self.store,
             session.model.as_deref(),
             session.provider.as_deref(),
             crate::agent_session::derived_default_provider(&settings).as_deref(),
+            session.parent_agent_id.is_some(),
         )
         .await;
         self.publish_agent_mutation_event(

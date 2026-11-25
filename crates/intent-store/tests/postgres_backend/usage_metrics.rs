@@ -393,6 +393,10 @@ parity_test!(usage_stats_round_trip, |store, tenant, db| {
                 longest_run_ms: 5_000,
                 lines_added: 3,
                 lines_deleted: 1,
+                tool_calls: 4,
+                tool_calls_failed: 1,
+                total_run_ms: 5_000,
+                sub_agent_sessions_started: 1,
             },
         )
         .await
@@ -411,6 +415,8 @@ parity_test!(usage_stats_round_trip, |store, tenant, db| {
                 runs: 1,
                 longest_run_ms: 2_000,
                 lines_added: 4,
+                tool_calls: 2,
+                total_run_ms: 2_000,
                 ..Default::default()
             },
         )
@@ -500,6 +506,15 @@ parity_test!(usage_stats_round_trip, |store, tenant, db| {
             folded.lines_deleted,
         ),
         (50, 20, 10, 7, 2, 1, 5_000, 7, 1)
+    );
+    assert_eq!(
+        (
+            folded.tool_calls,
+            folded.tool_calls_failed,
+            folded.total_run_ms,
+            folded.sub_agent_sessions_started,
+        ),
+        (6, 1, 7_000, 1)
     );
     assert_eq!(
         (folded.local_date.as_deref(), folded.local_hour),

@@ -37,6 +37,23 @@ impl PgStore {
         tx.commit().await.map_err(db)
     }
 
+    pub async fn set_setting_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO settings (tenant_id, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, key) DO NOTHING",
+        )
+        .bind(self.tenant())
+        .bind(key)
+        .bind(value)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        tx.commit().await.map_err(db)?;
+        Ok(inserted > 0)
+    }
+
     pub async fn delete_setting(&self, key: &str) -> Result<bool> {
         let mut tx = self.begin_write().await?;
         let removed = sqlx::query("DELETE FROM settings WHERE tenant_id = $1 AND key = $2")

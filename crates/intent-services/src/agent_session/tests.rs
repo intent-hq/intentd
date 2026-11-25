@@ -12345,3 +12345,43 @@ mod profile_native_session_tests {
         }
     }
 }
+
+/// Usage stats (§5.36): a tool call counts once, at its first terminal
+/// status. Repeated terminal updates, `error` then `completed`, and calls
+/// still open at turn end never add to the tally.
+#[tokio::test]
+async fn tool_call_tally_counts_each_call_once_at_first_terminal_status() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    let updates = [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "in_progress" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "ok", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "ok", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "in_progress" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bad", "status": "failed" }),
+        json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bad", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "instant", "title": "Glob",
+                "kind": "search", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "open", "title": "Bash",
+                "kind": "execute", "status": "in_progress" }),
+    ];
+    for update in &updates {
+        services
+            .route_notification(
+                &tool_call_notification(update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    assert_eq!(
+        transcript.tool_call_tally,
+        super::ToolCallTally {
+            total: 3,
+            failed: 1
+        }
+    );
+}

@@ -1186,6 +1186,10 @@ pub struct Services {
     /// (monorepo#738): see [`agent_session::TurnBookkeeping`]. Shared across
     /// clones so consecutive turns of one agent chain onto the same handle.
     turn_bookkeeping: agent_session::TurnBookkeeping,
+    /// Set once this process has confirmed the usage-stats activity
+    /// tracked-since stamp exists (§5.36 `activityTrackedSince`), so the
+    /// recorders write it at most once per process.
+    usage_activity_stamped: Arc<std::sync::atomic::AtomicBool>,
     /// Per-agent silent tail of the most recently ended turn
     /// (intent-hq/monorepo#2669): see [`agent_session::LastTurnSilentTails`].
     /// Shared across clones so the turn writer and the `agent.diagnostics`
@@ -1973,6 +1977,7 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             context_usages: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
+            usage_activity_stamped: Arc::default(),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
@@ -32255,12 +32260,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let period = usage_stats_read::parse_period(&period, key.as_deref())?;
             let rows = self.store.list_usage_stats_hourly().await?;
-            usage_stats_read::aggregate_usage(
+            let tracked_since = usage_stats::read_activity_tracked_since(&self.store).await;
+            let mut usage = usage_stats_read::aggregate_usage(
                 &rows,
                 period,
                 tz_offset_minutes,
                 time::OffsetDateTime::now_utc(),
-            )
+            )?;
+            usage["activityTrackedSince"] =
+                usage_stats_read::local_date_json(tracked_since, tz_offset_minutes);
+            Ok(usage)
         })
     }
 

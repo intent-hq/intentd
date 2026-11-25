@@ -256,8 +256,10 @@ impl PgStore {
             "INSERT INTO usage_stats_hourly AS u (
                 tenant_id, bucket_utc, model, provider, local_date, local_hour, input_tokens,
                 output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, runs,
-                sessions_started, longest_run_ms, lines_added, lines_deleted
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                sessions_started, longest_run_ms, lines_added, lines_deleted, tool_calls,
+                tool_calls_failed, total_run_ms, sub_agent_sessions_started
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                       $17, $18, $19, $20)
              ON CONFLICT (tenant_id, bucket_utc, model, provider) DO UPDATE SET
                 input_tokens = u.input_tokens + excluded.input_tokens,
                 output_tokens = u.output_tokens + excluded.output_tokens,
@@ -268,7 +270,12 @@ impl PgStore {
                 sessions_started = u.sessions_started + excluded.sessions_started,
                 longest_run_ms = GREATEST(u.longest_run_ms, excluded.longest_run_ms),
                 lines_added = u.lines_added + excluded.lines_added,
-                lines_deleted = u.lines_deleted + excluded.lines_deleted",
+                lines_deleted = u.lines_deleted + excluded.lines_deleted,
+                tool_calls = u.tool_calls + excluded.tool_calls,
+                tool_calls_failed = u.tool_calls_failed + excluded.tool_calls_failed,
+                total_run_ms = u.total_run_ms + excluded.total_run_ms,
+                sub_agent_sessions_started =
+                    u.sub_agent_sessions_started + excluded.sub_agent_sessions_started",
         )
         .bind(self.tenant())
         .bind(bucket_utc)
@@ -286,6 +293,10 @@ impl PgStore {
         .bind(delta.longest_run_ms.cast_signed())
         .bind(delta.lines_added.cast_signed())
         .bind(delta.lines_deleted.cast_signed())
+        .bind(delta.tool_calls.cast_signed())
+        .bind(delta.tool_calls_failed.cast_signed())
+        .bind(delta.total_run_ms.cast_signed())
+        .bind(delta.sub_agent_sessions_started.cast_signed())
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -297,7 +308,8 @@ impl PgStore {
         let rows = sqlx::query(
             "SELECT bucket_utc, model, provider, local_date, local_hour, input_tokens,
                     output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, runs,
-                    sessions_started, longest_run_ms, lines_added, lines_deleted
+                    sessions_started, longest_run_ms, lines_added, lines_deleted, tool_calls,
+                    tool_calls_failed, total_run_ms, sub_agent_sessions_started
              FROM usage_stats_hourly
              WHERE tenant_id = $1
              ORDER BY bucket_utc COLLATE \"C\" ASC, model COLLATE \"C\" ASC,
@@ -329,6 +341,10 @@ impl PgStore {
                 longest_run_ms: counter(row, "longest_run_ms"),
                 lines_added: counter(row, "lines_added"),
                 lines_deleted: counter(row, "lines_deleted"),
+                tool_calls: counter(row, "tool_calls"),
+                tool_calls_failed: counter(row, "tool_calls_failed"),
+                total_run_ms: counter(row, "total_run_ms"),
+                sub_agent_sessions_started: counter(row, "sub_agent_sessions_started"),
             })
             .collect())
     }
