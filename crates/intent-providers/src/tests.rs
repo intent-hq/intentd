@@ -348,6 +348,7 @@ fn session_mcp_servers_partition() {
         "grok",
         "antigravity",
         "cursor",
+        "dsh",
     ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
@@ -367,7 +368,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor", "dsh"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -397,8 +398,8 @@ fn config_option_model_partition() {
         );
         assert_eq!(
             p.config_option_model_required,
-            matches!(id, "codex" | "antigravity"),
-            "{id}: only codex and antigravity fail setup on a rejected model"
+            matches!(id, "codex" | "antigravity" | "dsh"),
+            "{id}: only codex, antigravity and dsh fail setup on a rejected model"
         );
     }
     // claude-code and pi additionally have no CLI model flag and no

@@ -260,6 +260,20 @@
       }
     },
     {
+      "id": "dsh",
+      "command": "dsh",
+      "fallbackNpxPackage": null,
+      "npxOnlyPackage": null,
+      "npxOnlyHonorsPathOverride": false,
+      "loginCommandHint": "dsh web",
+      "npxLoginCommandHint": null,
+      "requiresSecondaryBinary": null,
+      "installedCli": null,
+      "cliRequirement": null,
+      "cliVersionGate": null,
+      "profile": null
+    },
+    {
       "id": "mock",
       "command": "node",
       "fallbackNpxPackage": null,
