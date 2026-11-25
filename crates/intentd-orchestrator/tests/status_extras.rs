@@ -89,6 +89,7 @@ async fn system_status_reports_the_hostname_and_the_workspaces_disk() {
             tokio::time::Instant::now() < deadline,
             "no workspaces disk in {status}"
         );
+        // timing-guard: poll interval until the sampler's first disk read lands.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
     assert_eq!(
