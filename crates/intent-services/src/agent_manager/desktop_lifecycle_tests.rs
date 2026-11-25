@@ -16,7 +16,7 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
     );
     let manager = Arc::new(manager);
     assert!(manager.try_begin(&h.agent, &h.workspace).await);
-    manager.end_turn(&h.agent).await;
+    manager.end_held_turn_for_test(&h.agent).await;
     assert_eq!(
         h.services
             .store

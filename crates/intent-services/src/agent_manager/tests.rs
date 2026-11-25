@@ -2390,21 +2390,17 @@ async fn stale_worker_cleanup_preserves_replacement_for_interrupt() {
         old_mgr.clear_worker(&old_id);
         old_done.send(()).unwrap();
     });
-    mgr.workers.lock().unwrap().insert(id.clone(), old);
+    mgr.slots.insert_worker_for_test(id.clone(), old);
 
     let replacement = tokio::spawn(std::future::pending::<()>());
     let replacement_id = replacement.id();
     let cancellation = replacement.abort_handle();
-    let previous = mgr
-        .workers
-        .lock()
-        .unwrap()
-        .insert(id.clone(), replacement)
-        .unwrap();
+    let previous = mgr.slots.remove_worker_for_test(&id).unwrap();
+    mgr.slots.insert_worker_for_test(id.clone(), replacement);
     mgr.retain_finishing_worker(previous);
     finish_old.send(()).unwrap();
     old_completed.await.unwrap();
-    let registered = mgr.workers.lock().unwrap().get(&id).map(JoinHandle::id);
+    let registered = mgr.slots.worker_id_for_test(&id);
     // Ensure failure also cleans up the synthetic pending worker.
     cancellation.abort();
     assert_eq!(
@@ -2464,7 +2460,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         "the first turn must finish successfully before the replacement starts"
     );
     assert!(mgr.services.queue_snapshot(&id).is_empty());
-    let old = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
+    let old = mgr.slots.worker_abort_handle_for_test(&id).unwrap();
 
     let (second_provider, gate) = track_mock_agent_prompt_rpc_error_gated(
         &mgr,
@@ -2510,7 +2506,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         user_rows[1].1,
         user_message_blocks("older instruction", None, None)
     );
-    let replacement = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
+    let replacement = mgr.slots.worker_abort_handle_for_test(&id).unwrap();
     pause.resume.notify_one();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -3502,7 +3498,7 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
         .unwrap();
     let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
     assert_eq!(last["text"], json!(super::AUTO_UNARCHIVE_PROMPT_NOTICE));
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 
     // …and the NEXT turn's does not (the flag was consumed).
     assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
@@ -3516,7 +3512,7 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
             .contains("automatically unarchived"),
         "the notice must not replay on later turns"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// A git repo with one commit on `main` plus the kept branch `feat-old`, and
@@ -3590,7 +3586,7 @@ async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
         "no turn starts when the revive fails"
     );
     assert!(
-        !mgr.busy.lock().unwrap().contains(&id),
+        !mgr.slots.is_busy(&id),
         "the claimed slot was released"
     );
     let after = mgr.services.store.get_workspace(&ws).await.unwrap();
@@ -3718,7 +3714,7 @@ async fn winning_try_begin_revives_a_retired_workspace() {
         !text.contains("automatically unarchived"),
         "a revive is not reported as a plain unarchive: {text}"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 
     assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
     let next = mgr
@@ -3731,7 +3727,7 @@ async fn winning_try_begin_revives_a_retired_workspace() {
             .contains("folder was purged"),
         "the notice must not replay on later turns"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert_eq!(
         mgr.services
             .store
@@ -3806,7 +3802,7 @@ async fn purge_notices_in_next_prompt(
         .build_turn_prompt(id, ws, "hello", &super::TurnOptions::default())
         .await
         .unwrap();
-    mgr.end_turn(id).await;
+    mgr.end_held_turn_for_test(id).await;
     serde_json::to_string(&prompt)
         .unwrap()
         .matches(PURGE_NOTICE_PREFIX)
@@ -3909,7 +3905,7 @@ async fn archive_script_notice_reaches_each_agents_next_turn_once() {
             .build_turn_prompt(&agent, &ws, "hello", &super::TurnOptions::default())
             .await
             .unwrap();
-        mgr.end_turn(&agent).await;
+        mgr.end_held_turn_for_test(&agent).await;
         serde_json::to_value(prompt).unwrap()
     };
     let first = next_prompt().await;
@@ -3942,8 +3938,8 @@ async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_ev
         .expect("manual unarchive revives");
     assert_eq!(revived.status, WorkspaceStatus::Active);
     assert!(wt.join("README.md").is_file());
-    assert!(!mgr.busy.lock().unwrap().contains(&a), "no turn started");
-    assert!(!mgr.busy.lock().unwrap().contains(&b), "no turn started");
+    assert!(!mgr.slots.is_busy(&a), "no turn started");
+    assert!(!mgr.slots.is_busy(&b), "no turn started");
 
     for id in [&a, &b] {
         let session = mgr
@@ -3972,7 +3968,7 @@ async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_ev
         .build_turn_prompt(&a, &ws, "hello", &super::TurnOptions::default())
         .await
         .unwrap();
-    mgr.end_turn(&a).await;
+    mgr.end_held_turn_for_test(&a).await;
     let text = serde_json::to_string(&prompt).unwrap();
     assert_eq!(text.matches(PURGE_NOTICE_PREFIX).count(), 1, "{text}");
     assert!(
@@ -4028,7 +4024,7 @@ async fn pending_purge_notice_survives_a_later_ordinary_unarchive() {
         .build_turn_prompt(&b, &ws, "hello", &super::TurnOptions::default())
         .await
         .unwrap();
-    mgr.end_turn(&b).await;
+    mgr.end_held_turn_for_test(&b).await;
     let text = serde_json::to_string(&prompt).unwrap();
     assert!(text.contains("automatically unarchived"), "{text}");
     assert_eq!(text.matches(PURGE_NOTICE_PREFIX).count(), 1, "{text}");
@@ -4103,7 +4099,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
                 .unwrap()
                 .get(&ws)
                 .is_some_and(|lock| Arc::strong_count(lock) >= 3);
-            let claimed = mgr.busy.lock().unwrap().contains(&id);
+            let claimed = mgr.slots.is_busy(&id);
             if parked_on_fence || claimed {
                 break;
             }
@@ -4121,7 +4117,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
     let (won, ()) = tokio::join!(mgr.try_begin(&id, &ws), teardown);
     assert!(won, "the claim wins once the teardown releases the fence");
     assert!(
-        mgr.busy.lock().unwrap().contains(&id),
+        mgr.slots.is_busy(&id),
         "the triggering turn still holds its slot — the teardown did not clear it"
     );
 
@@ -4139,7 +4135,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
         text.starts_with("[SYSTEM NOTICE] This workspace's folder was purged"),
         "the triggering turn carries the revive notice: {text}"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 
     assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
     let next = mgr
@@ -4154,7 +4150,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
             .contains("[SYSTEM NOTICE] This workspace's folder was purged"),
         "the notice is one-shot"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// A claim in a NON-archived workspace persists no `auto_unarchived` notice
@@ -4185,7 +4181,7 @@ async fn winning_try_begin_in_active_workspace_persists_no_notice() {
             .contains("automatically unarchived"),
         "no prompt notice on an active workspace"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// The suppressed re-claim (`auto_unarchive = false`, the worker's raced
@@ -4236,7 +4232,7 @@ async fn suppressed_reclaim_persists_no_notice() {
             .contains("automatically unarchived"),
         "no prompt notice on the suppressed re-claim"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// A stale prompt flag never leaks across a slot release: a claim whose turn
@@ -4258,7 +4254,7 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     // The claim flips the workspace and arms the flag, but the turn ends
     // without ever building a prompt (e.g. a harness wake turn).
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 
     assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
     let prompt = mgr
@@ -4271,7 +4267,7 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
             .contains("automatically unarchived"),
         "the stale flag must not leak into the next turn's prompt"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// The arm-skipped-after-release interleaving: `try_begin_outcome` arms the
@@ -4297,7 +4293,7 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
         mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the arm lands while the claim holds the slot"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert!(
         !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the release clears the armed flag"
@@ -4323,7 +4319,7 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
             .contains("automatically unarchived"),
         "no stale notice leaks into the later, non-triggering turn"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// A winning `try_begin` whose workspace row is MISSING (unarchivable) must
@@ -4342,7 +4338,7 @@ async fn winning_try_begin_survives_auto_unarchive_failure() {
         "a failed auto-unarchive must not block the turn"
     );
     assert!(mgr.is_busy(&id), "the slot is held");
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 #[tokio::test]
@@ -5146,7 +5142,7 @@ async fn reap_over_budget_drains_idle_and_respects_claims() {
 
     // A claim held by another sweep protects its agent too.
     track(&mgr, &idle);
-    mgr.end_turn(&busy).await;
+    mgr.end_held_turn_for_test(&busy).await;
     mgr.registry().mark_idle(&busy);
     mgr.reap_claims.lock().unwrap().insert(busy.clone());
     probe.set(10 * gb);
@@ -6398,7 +6394,7 @@ async fn suspend_enrollment_drains_continuation_parked_behind_held_slot() {
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7422,7 +7418,7 @@ async fn busy_queue_fallback_preserves_prepend_fields() {
         ]))
     );
 
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// Append-failure auto-queue interaction (monorepo#1034 / #1056): when the
@@ -7577,7 +7573,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -7987,7 +7983,7 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -8445,7 +8441,7 @@ async fn stop_redelivery_flush_413_retry(
                 let status = mgr.services.store.get_agent_session_status(&id).await;
                 if status.ok() == Some(AgentStatus::Error)
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -8485,7 +8481,7 @@ async fn stop_redelivery_flush_413_retry(
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                     && !mgr.services.has_ready_to_send(&id)
                 {
                     break;
@@ -9294,7 +9290,7 @@ async fn drain_emits_queue_processing_with_turn_id() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -10896,7 +10892,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
     let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let worker = tokio::spawn(std::future::pending::<()>());
     let aborted = worker.abort_handle();
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     let blocks = vec![json!({ "type": "text", "text": "partial retirement turn" })];
     mgr.services
         .set_live_turn(&id, "retire-partial", blocks.clone());
@@ -10925,7 +10921,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
     assert!(!mgr.is_busy(&id));
     assert!(!mgr.contains(&id));
     assert!(!mgr.registry().is_registered(&id));
-    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    assert!(!mgr.slots.has_worker_for_test(&id));
     let row = mgr
         .services
         .store
@@ -10969,7 +10965,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
         false,
         admission,
     );
-    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    assert!(!mgr.slots.has_worker_for_test(&id));
     mgr.services
         .agent_restore_op(id.clone(), Some(ws.clone()))
         .await
@@ -10978,7 +10974,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
         mgr.try_begin(&id, &ws).await,
         "restore clears runtime fence"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 /// Front door whose caller is cancelled mid-claim in
@@ -11034,7 +11030,7 @@ impl CancelledClaim {
             async {
                 while self.prompts() < prompts
                     || self.mgr.is_busy(&self.id)
-                    || !self.mgr.workers.lock().unwrap().is_empty()
+                    || self.mgr.slots.has_workers()
                 {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -11047,7 +11043,7 @@ impl CancelledClaim {
                  (prompts={}, busy={}, workers={})",
                 self.prompts(),
                 self.mgr.is_busy(&self.id),
-                self.mgr.workers.lock().unwrap().len()
+                self.mgr.slots.worker_count_for_test()
             )
         });
     }
@@ -11530,7 +11526,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
         admission,
     );
     assert!(!mgr.is_busy(&id));
-    assert!(!mgr.workers.lock().unwrap().contains_key(&id));
+    assert!(!mgr.slots.has_worker_for_test(&id));
     assert_eq!(
         mgr.services
             .store
@@ -11569,7 +11565,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
         mgr.try_begin(&id, &ws).await,
         "fresh restored turn can start"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 #[tokio::test]
@@ -11607,7 +11603,7 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
         cancelled.duplicate_for_test(),
     );
     assert!(
-        !mgr.workers.lock().unwrap().contains_key(&id),
+        !mgr.slots.has_worker_for_test(&id),
         "restoring must not revive a cancelled sender's admission"
     );
     assert!(!mgr.is_busy(&id));
@@ -11623,19 +11619,19 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
         cancelled,
     );
     assert!(
-        !mgr.workers.lock().unwrap().contains_key(&id),
+        !mgr.slots.has_worker_for_test(&id),
         "old sender must not register against the fresh restored claim"
     );
     assert!(
         mgr.is_busy(&id),
         "old sender must not release the fresh slot"
     );
-    assert_eq!(mgr.turn_admissions.lock().unwrap().get(&id), Some(&fresh));
+    assert_eq!(mgr.slots.holder(&id), Some(fresh));
     assert_eq!(
         mgr.services.agent_activity.lock().unwrap().get(&ws),
         Some(&1)
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert_eq!(
         mgr.services
             .agent_activity
@@ -11750,7 +11746,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         }
     }
     assert!(mgr.is_busy(&id), "stale cleanup must preserve fresh slot");
-    assert_eq!(mgr.turn_admissions.lock().unwrap().get(&id), Some(&fresh));
+    assert_eq!(mgr.slots.holder(&id), Some(fresh));
     assert_eq!(
         mgr.services.agent_activity.lock().unwrap().get(&ws),
         Some(&1)
@@ -11771,7 +11767,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         !mgr.services.has_ready_to_send(&id),
         "cancelled send is not requeued into new turn"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 }
 
 #[tokio::test]
@@ -11804,7 +11800,7 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
     let aborted = worker.abort_handle();
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     let result = intent_core::with_caller(
         intent_core::Caller::Wire {
             principal_id: intent_core::PrincipalId::new(),
@@ -11851,7 +11847,7 @@ async fn user_retire_stops_the_last_top_level_agent() {
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
     let aborted = worker.abort_handle();
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     let result = intent_core::with_caller(
         intent_core::Caller::Wire {
             principal_id: intent_core::PrincipalId::new(),
@@ -11899,7 +11895,7 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
     let aborted = worker.abort_handle();
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     let result = intent_core::with_caller(
         intent_core::Caller::Agent {
             agent_id: id.clone(),
@@ -12921,7 +12917,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
     let restored = mgr.services.find_queued_message(&id, &entry.id).unwrap();
     crate::human_attribution_tests::assert_preserved_queue_metadata(&entry, &restored);
     assert!(!restored.ready_to_send());
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     mgr.redrive_parked_recovery_send(&id, &ws).await;
     assert!(
         !mgr.is_busy(&id),
@@ -14271,7 +14267,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         // A never-ending worker; `stop` must abort it.
         std::future::pending::<()>().await;
     });
-    mgr.workers.lock().unwrap().insert(busy.clone(), worker);
+    mgr.slots.insert_worker_for_test(busy.clone(), worker);
     assert!(mgr.is_busy(&busy));
     assert!(mgr.contains(&live) && mgr.contains(&busy));
     assert_eq!(mgr.registry().size(), 2);
@@ -14286,7 +14282,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     assert!(!mgr.contains(&busy), "busy handle removed");
     assert_eq!(mgr.registry().size(), 0, "registry emptied");
     assert!(!mgr.is_busy(&busy), "busy flag cleared");
-    assert!(mgr.workers.lock().unwrap().is_empty(), "worker map cleared");
+    assert!(!mgr.slots.has_workers(), "worker map cleared");
     assert!(mgr.agent_ws.lock().unwrap().is_empty(), "agent_ws cleared");
 
     // A same-slug recreate finds zero pre-existing agents.
@@ -14363,7 +14359,7 @@ async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_tear
     mgr.clone().try_drain_queue(agent.clone(), ws.clone()).await;
     assert!(!mgr.is_busy(&agent));
     assert!(!mgr.contains(&agent));
-    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.slots.has_workers());
     assert_eq!(mgr.registry().size(), 0);
     resume.notify_one();
     deleting.await.unwrap();
@@ -14407,7 +14403,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     let worker = tokio::spawn(async {
         std::future::pending::<()>().await;
     });
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
@@ -14457,7 +14453,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     );
     assert!(!mgr.is_busy(&id), "in-flight slot released");
     assert!(
-        mgr.workers.lock().unwrap().is_empty(),
+        !mgr.slots.has_workers(),
         "turn worker aborted"
     );
     mgr.services
@@ -14498,7 +14494,7 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
         let worker = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
-        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+        mgr.slots.insert_worker_for_test(id.clone(), worker);
     }
     let _caller_agent = track_mock_agent(&mgr, &caller, false);
     let _other_agent = track_mock_agent(&mgr, &other, false);
@@ -14538,18 +14534,18 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     // ends normally through its own `end_turn`.
     assert!(mgr.is_busy(&caller), "caller keeps its in-flight slot");
     assert!(
-        mgr.workers.lock().unwrap().contains_key(&caller),
+        mgr.slots.has_worker_for_test(&caller),
         "caller's turn worker survives the sweep"
     );
     assert!(!mgr.is_busy(&other), "other agent's slot released");
     assert!(
-        !mgr.workers.lock().unwrap().contains_key(&other),
+        !mgr.slots.has_worker_for_test(&other),
         "other agent's worker aborted"
     );
 
     // The caller settles normally once its turn completes — no phantom
     // running agent left behind (the delete-time symptom in #1565).
-    mgr.end_turn(&caller).await;
+    mgr.end_held_turn_for_test(&caller).await;
     assert!(!mgr.is_busy(&caller), "caller settles after its turn ends");
     assert!(
         mgr.list_busy().is_empty(),
@@ -15149,7 +15145,7 @@ async fn is_busy_reflects_try_begin_and_end_turn() {
         !mgr.try_begin(&id, &ws).await,
         "single-flight rejects 2nd claim"
     );
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert!(!mgr.is_busy(&id), "release flips busy off");
 }
 
@@ -15167,7 +15163,7 @@ async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
     assert!(mgr.try_begin(&id, &ws).await);
     assert_eq!(mgr.list_busy(), vec![(id.clone(), ws)]);
 
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert!(
         mgr.list_busy().is_empty(),
         "released agent is no longer listed"
@@ -15189,12 +15185,12 @@ async fn idle_since_advances_across_a_turn_between_two_reads() {
     assert!(mgr.try_begin(&a, &ws).await);
     assert!(mgr.idle_since().is_none(), "a claim clears idle_since");
     assert!(mgr.try_begin(&b, &ws).await);
-    mgr.end_turn(&a).await;
+    mgr.end_held_turn_for_test(&a).await;
     assert!(
         mgr.idle_since().is_none(),
         "still busy while another slot is held"
     );
-    mgr.end_turn(&b).await;
+    mgr.end_held_turn_for_test(&b).await;
 
     let after = mgr
         .idle_since()
@@ -15227,8 +15223,8 @@ async fn idle_since_is_none_while_a_claim_is_mid_write() {
 
     // Stage the writer's mid-critical-section state by hand: the slot is
     // visible in `busy`, the timestamp is still the pre-turn `Some`.
-    let mut held = mgr.busy.lock().unwrap();
-    held.insert(id.clone());
+    let mut held = mgr.slots.lock();
+    let admission = held.admit(&id);
     assert!(mgr.idle_since.lock().unwrap().is_some());
 
     let reader = {
@@ -15250,7 +15246,7 @@ async fn idle_since_is_none_while_a_claim_is_mid_write() {
     // The inverse inconsistency (busy empty, timestamp cleared) cannot occur
     // under the busy lock, but with busy drained the reader reports the
     // timestamp as stored.
-    mgr.busy.lock().unwrap().remove(&id);
+    mgr.slots.lock().release(&id, admission);
     assert!(mgr.idle_since().is_some());
 }
 
@@ -15285,7 +15281,7 @@ async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
         "updatedAt is converted to epoch milliseconds: {active}"
     );
 
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert_eq!(
         services.agent_list_active_op().await.unwrap(),
         json!({ "streams": [] }),
@@ -15448,7 +15444,7 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
 
     // Subscribe AFTER `try_begin` so we only capture the `end_turn` emission.
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
 
     let stored = mgr
         .services
@@ -15476,7 +15472,7 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert_eq!(status_event.data["isActive"], json!(false));
 
     // Calling `end_turn` again on an already-idle agent is a no-op.
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert!(!mgr.is_busy(&id));
 }
 
@@ -15700,7 +15696,7 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
     .await
     .expect("end_turn releases the slot before awaiting the writer");
     assert_eq!(
-        mgr.workers.lock().unwrap().len(),
+        mgr.slots.worker_count_for_test(),
         1,
         "worker is still registered while its idle write waits"
     );
@@ -15711,7 +15707,7 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
-            while !mgr.workers.lock().unwrap().is_empty() {
+            while mgr.slots.has_workers() {
                 tokio::task::yield_now().await;
             }
         },
@@ -15829,7 +15825,7 @@ async fn shutdown_finishes_aborted_end_turn_idle_write() {
     let ending = {
         let mgr = mgr.clone();
         let id = id.clone();
-        intent_core::spawn_daemon(async move { mgr.end_turn(&id).await })
+        intent_core::spawn_daemon(async move { mgr.end_held_turn_for_test(&id).await })
     };
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -15890,7 +15886,7 @@ async fn shutdown_pending_idle_write_preserves_later_status() {
     )
     .await
     .expect("end_turn releases before awaiting the writer");
-    let worker = mgr.workers.lock().unwrap().remove(&id).expect("worker");
+    let worker = mgr.slots.remove_worker_for_test(&id).expect("worker");
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     writer.rollback().await.unwrap();
@@ -16052,7 +16048,7 @@ async fn settled_mark_lives_only_with_the_held_slot() {
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.mark_turn_settled_if_slot_held(&id);
     assert!(mgr.turn_settled(&id));
-    mgr.release_in_flight_slot(&id);
+    mgr.release_held_slot_for_test(&id);
     assert!(!mgr.turn_settled(&id), "release retires the mark");
     mgr.mark_turn_settled_if_slot_held(&id);
     assert!(!mgr.turn_settled(&id), "only a slot holder can be marked");
@@ -16088,11 +16084,11 @@ async fn pending_idle_write_is_owned_by_its_end_turn_call() {
     let pending = |mgr: &AgentManager| mgr.pending_idle_writes.lock().unwrap().get(&id).cloned();
 
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     assert_eq!(pending(&mgr), None, "a completed write retires its entry");
 
     assert!(mgr.try_begin(&id, &ws).await);
-    let (_, older) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let (_, older) = mgr.release_slot_sync_inner(&id, mgr.slots.holder(&id).unwrap(), true).unwrap().unwrap();
     let older = older.expect("recorded");
     assert!(pending(&mgr).is_some());
     assert!(mgr.try_begin(&id, &ws).await);
@@ -16101,7 +16097,7 @@ async fn pending_idle_write_is_owned_by_its_end_turn_call() {
         None,
         "a new claim supersedes the pending write"
     );
-    let (_, newer) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let (_, newer) = mgr.release_slot_sync_inner(&id, mgr.slots.holder(&id).unwrap(), true).unwrap().unwrap();
     let newer = newer.expect("recorded");
     mgr.finish_idle_write(&id, older);
     assert_eq!(
@@ -16213,7 +16209,7 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
 
     assert!(!mgr.is_busy(&id), "no slot claim while parked in error");
     assert!(
-        mgr.workers.lock().unwrap().is_empty(),
+        !mgr.slots.has_workers(),
         "no worker spawned for an errored session"
     );
     assert_eq!(
@@ -16274,7 +16270,7 @@ async fn send_message_parks_message_for_poisoned_session() {
 
     assert!(!mgr.is_busy(&id), "no slot claim for a poisoned session");
     assert!(
-        mgr.workers.lock().unwrap().is_empty(),
+        !mgr.slots.has_workers(),
         "no worker spawned for a poisoned session"
     );
     assert_eq!(
@@ -16369,7 +16365,7 @@ async fn send_message_direct_response_and_user_echo_carry_turn_id() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -16455,7 +16451,7 @@ async fn agent_retry_response_carries_redriven_turn_id() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -16544,7 +16540,7 @@ async fn send_message_still_redrives_ordinary_error_session() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -17086,7 +17082,7 @@ async fn send_message_rejects_unknown_agent() {
         "no phantom queue entry for an unknown agent"
     );
     assert!(
-        mgr.workers.lock().unwrap().is_empty(),
+        !mgr.slots.has_workers(),
         "no worker spawned for an unknown agent"
     );
 }
@@ -17182,7 +17178,7 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -17216,7 +17212,7 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
 
     assert!(!mgr.is_busy(&id), "no re-claim of the in-flight slot");
     assert!(
-        mgr.workers.lock().unwrap().is_empty(),
+        !mgr.slots.has_workers(),
         "no re-spawned worker"
     );
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
@@ -17295,7 +17291,7 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
                     .unwrap();
                 if status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -17335,7 +17331,7 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -17414,7 +17410,7 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -17443,7 +17439,7 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -18429,7 +18425,7 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     assert_eq!(queue.len(), 1, "the interrupt parked");
     assert_eq!(queue[0]["content"], json!("automatic interrupt"));
 
-    mgr.end_turn(&target).await;
+    mgr.end_held_turn_for_test(&target).await;
 }
 
 /// #547 regression (fail-closed drain): when the pre-turn `persist_user`
@@ -18499,7 +18495,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
                     .unwrap();
                 if status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -18602,7 +18598,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -18707,7 +18703,7 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -18853,7 +18849,7 @@ async fn pre_output_transport_failure_redrives_silently_once() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19001,7 +18997,7 @@ async fn spurious_cancel_scenario(
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19252,7 +19248,7 @@ async fn spurious_cancel_keeps_meta_only_usage_bill() {
             loop {
                 let rows = store.list_usage_stats_hourly().await.unwrap_or_default();
                 let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
-                if input >= 1000 && !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if input >= 1000 && !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -19419,7 +19415,7 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
                 let status = mgr.services.store.get_agent_session_status(&id).await;
                 if status.ok() == Some(AgentStatus::Error)
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19517,7 +19513,7 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
                 let status = mgr.services.store.get_agent_session_status(&id).await;
                 if status.ok() == Some(AgentStatus::Error)
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19649,7 +19645,7 @@ async fn second_pre_output_transport_failure_scenario() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19766,7 +19762,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
                     .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -19922,7 +19918,7 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
                     .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }
@@ -21439,7 +21435,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                if !mgr.is_busy(&id) && !mgr.workers.lock().unwrap().contains_key(&id) {
+                if !mgr.is_busy(&id) && !mgr.slots.has_worker_for_test(&id) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -21551,7 +21547,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
-                while mgr.is_busy(&id) || mgr.workers.lock().unwrap().contains_key(&id) {
+                while mgr.is_busy(&id) || mgr.slots.has_worker_for_test(&id) {
                     tokio::task::yield_now().await;
                 }
             },
@@ -23205,7 +23201,7 @@ mod stale_redrive_tests {
                         .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                     {
                         break;
                     }
@@ -23301,7 +23297,7 @@ mod stale_redrive_tests {
                         .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                     {
                         break;
                     }
@@ -24465,7 +24461,7 @@ mod draining_overlay_tests {
                         .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && mgr.services.queue_snapshot(&id).is_empty()
                     {
                         break;
@@ -24593,7 +24589,7 @@ mod draining_overlay_tests {
                         .unwrap();
                     if status == AgentStatus::Error
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                     {
                         break;
                     }
@@ -25922,7 +25918,7 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("partial wake output")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         assert!(
-            mgr.workers.lock().unwrap().contains_key(&id),
+            mgr.slots.has_worker_for_test(&id),
             "wake-turn drive registered in workers"
         );
 
@@ -25986,7 +25982,7 @@ mod harness_wake_tests {
         assert_eq!(messages[0].content[0]["text"], json!("partial wake output"));
         assert!(!mgr.is_busy(&id), "interrupt released the slot");
         assert!(
-            mgr.workers.lock().unwrap().get(&id).is_none(),
+            !mgr.slots.has_worker_for_test(&id),
             "aborted drive deregistered from workers"
         );
         assert!(
@@ -26071,7 +26067,7 @@ mod harness_wake_tests {
                 "busy tick leaves the notification for the prompt turn"
             );
         }
-        mgr.end_turn(&id).await;
+        mgr.end_held_turn_for_test(&id).await;
 
         assert!(mgr.stop(&id).await, "stop removes the handle");
         assert!(
@@ -26775,7 +26771,7 @@ mod pending_questions_no_gate {
             async {
                 loop {
                     if !mgr.is_busy(id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(id)
                     {
                         break;
@@ -27183,7 +27179,7 @@ mod archived_flush_gates {
             async {
                 loop {
                     if !mgr.is_busy(id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(id)
                     {
                         break;
@@ -27673,7 +27669,7 @@ mod attention_request_clear_gates {
             async {
                 loop {
                     if !mgr.is_busy(id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(id)
                     {
                         break;
@@ -28233,7 +28229,7 @@ mod flush_queued_messages_tests {
             async {
                 loop {
                     if !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(&id)
                     {
                         break;
@@ -28350,7 +28346,7 @@ mod flush_queued_messages_tests {
             async {
                 loop {
                     if !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(&id)
                     {
                         break;
@@ -28438,7 +28434,7 @@ mod flush_queued_messages_tests {
             async {
                 loop {
                     if !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(&id)
                     {
                         break;
@@ -28512,7 +28508,7 @@ mod flush_queued_messages_tests {
             async {
                 loop {
                     if !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(&id)
                     {
                         break;
@@ -28589,7 +28585,7 @@ mod flush_queued_messages_tests {
                         .unwrap();
                     if status == AgentStatus::Error
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                     {
                         break;
                     }
@@ -28634,7 +28630,7 @@ mod flush_queued_messages_tests {
                         .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
-                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.slots.has_workers()
                         && !mgr.services.has_ready_to_send(&id)
                     {
                         break;
@@ -29434,7 +29430,7 @@ async fn runtime_characterization_idle_reap_resumes_same_session() {
     mgr.registry.set_last_active(&id, 1);
     assert!(mgr.try_begin(&id, &ws).await);
     assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 0);
-    mgr.end_turn(&id).await;
+    mgr.end_held_turn_for_test(&id).await;
     mgr.registry.set_last_active(&id, 1);
     assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
     assert!(!mgr.contains(&id));
@@ -29487,7 +29483,7 @@ async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
                 .unwrap();
         }
     });
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     arrival.await.unwrap();
     mgr.shutdown().await;
     assert!(
@@ -29500,7 +29496,7 @@ async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
         "an admitted recovery turn must survive shutdown even before its provider starts"
     );
     assert!(!mgr.is_busy(&id));
-    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.slots.has_workers());
     assert!(
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(1)),
@@ -29762,10 +29758,10 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
                 &error,
             )
             .await;
-            pending.release_in_flight_slot(&pending_id);
+            pending.release_held_slot_for_test(&pending_id);
             let _ = done.send(());
         });
-        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+        mgr.slots.insert_worker_for_test(id.clone(), worker);
         senders.push(release);
         completions.push(completion);
     }
@@ -29859,7 +29855,7 @@ async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
         "shutdown must reject agents absent from its snapshot"
     );
     assert!(!mgr.is_busy(&idle));
-    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.slots.has_workers());
 }
 
 #[tokio::test]
@@ -29891,7 +29887,7 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
         admission,
     );
     // No await: observe registration before a worker can run, then clean it up.
-    let late_worker = mgr.workers.lock().unwrap().remove(&id);
+    let late_worker = mgr.slots.remove_worker_for_test(&id);
     let registered = late_worker.is_some();
     if let Some(worker) = late_worker {
         worker.abort();
@@ -29947,7 +29943,7 @@ async fn shutdown_admission_parks_late_send_durably_without_provider_failure() {
     assert_eq!(result["queued"], true);
     mgr.shutdown().await;
     assert!(!mgr.contains(&id));
-    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.slots.has_workers());
     assert_ne!(
         mgr.services
             .store
@@ -30004,7 +30000,7 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
         true,
         admission,
     );
-    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert!(!mgr.slots.has_workers());
     assert!(!mgr.is_busy(&id));
     assert!(mgr
         .services
@@ -30183,7 +30179,7 @@ async fn shutdown_durable_cancelled_drain(count: usize, persisted_head: bool) {
         entered.send(()).unwrap();
         std::future::pending::<()>().await;
     });
-    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    mgr.slots.insert_worker_for_test(id.clone(), worker);
     ready.await.unwrap();
     mgr.begin_shutdown();
     mgr.services.enqueue_message_with_id(
@@ -31113,7 +31109,7 @@ async fn submission_correlation_completed_interrupt_replay_is_complete() {
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id) && !mgr.slots.has_workers() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

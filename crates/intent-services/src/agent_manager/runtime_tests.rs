@@ -279,7 +279,7 @@ async fn wait_idle(mgr: &AgentManager, id: &AgentId) {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
-            while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
+            while mgr.is_busy(id) || mgr.slots.has_workers() {
                 tokio::task::yield_now().await;
             }
         },
