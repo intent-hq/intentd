@@ -108,6 +108,11 @@ impl OriginalTurn {
 
 mod monitor_wake;
 mod repository_origin;
+mod turn_lifecycle;
+#[cfg(test)]
+mod turn_schedule;
+pub(crate) use turn_lifecycle::TurnAdmission;
+use turn_lifecycle::{RetryOwnership, TurnSlots};
 pub(crate) mod scratch_adapter;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
 pub(crate) use monitor_wake::QueuedMonitorTurn;
@@ -3035,11 +3040,6 @@ enum TryBeginOutcome {
     ReviveFailed,
 }
 
-/// Identity of a claimed slot. Teardown invalidates it, so an admitted send
-/// cannot register a worker against a later claim after retirement/restore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TurnAdmission(usize);
-
 /// A claimed in-flight slot that no running turn owns yet. Every claim is
 /// handed out as this guard: dropping it without [`Self::hand_off`] (a caller
 /// cancelled between the claim and the worker spawn) releases the slot and
@@ -3206,16 +3206,16 @@ pub struct AgentManager {
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
     chief_cwd_root: Option<PathBuf>,
-    /// Agents with an in-flight turn loop (a worker is draining their stream).
-    /// `agent.sendMessage` consults this to flip a message to the queue while a
-    /// turn is mid-stream (the TS "queue while streaming" semantics).
-    busy: Arc<Mutex<HashSet<AgentId>>>,
-    // Lock order: admission_closed → retired/busy/stopping/workers. Never
-    // held across awaits; claims, worker registration, and closure serialize.
+    /// The in-flight slot of each agent with a turn (a worker is draining
+    /// its stream), the admission that holds it, and its turn worker.
+    /// `agent.sendMessage` consults it to flip a message to the queue while
+    /// a turn is mid-stream. Every release and worker abort names the
+    /// admission it targets (see `turn_lifecycle`).
+    slots: TurnSlots,
+    // Lock order: admission_closed → retired/slots/stopping. Never held
+    // across awaits; claims, worker registration, and closure serialize.
     admission_closed: Mutex<bool>,
     shutdown_retirement: Mutex<()>,
-    turn_admissions: Mutex<HashMap<AgentId, TurnAdmission>>,
-    next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
     turn_start_gates: crate::agent_ops::TurnStartGates,
     active_discussion_turns: Mutex<HashMap<AgentId, String>>,
@@ -3242,9 +3242,6 @@ pub struct AgentManager {
     /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
     /// knows the agent id.
     agent_ws: Arc<Mutex<HashMap<AgentId, WorkspaceId>>>,
-    /// Abortable background turn workers, keyed by agent. `stop` aborts the
-    /// in-flight worker (interrupting the current stream).
-    workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
     /// Workers whose slot is released but whose persistence tail is still live.
     finishing_workers: Mutex<Vec<JoinHandle<()>>>,
     /// Agents whose ACP session was recreated (the resume-impossible fallback in
@@ -3403,25 +3400,9 @@ pub struct AgentManager {
     /// [`HandbackGate`].
     #[cfg(test)]
     send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
+    /// Named pause points and store faults for interleaving tests.
     #[cfg(test)]
-    turn_start_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    #[cfg(test)]
-    failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    /// Parks `agent_retry` after its unlocked Error check.
-    #[cfg(test)]
-    retry_pause: Mutex<Option<Arc<TurnStartPause>>>,
-    /// Fails the next status read of a send's failed-turn redrive.
-    #[cfg(test)]
-    redrive_store_fault: std::sync::atomic::AtomicBool,
-    /// Fails the next turn start's `Active` write.
-    #[cfg(test)]
-    active_write_fault: std::sync::atomic::AtomicBool,
+    turn_schedule: turn_schedule::TurnSchedule,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -3528,17 +3509,14 @@ impl AgentManager {
             agent_config_root: None,
             agent_tmp_root: None,
             chief_cwd_root: None,
-            busy: Arc::new(Mutex::new(HashSet::new())),
+            slots: TurnSlots::default(),
             admission_closed: Mutex::new(false),
             shutdown_retirement: Mutex::new(()),
-            turn_admissions: Mutex::new(HashMap::new()),
-            next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::TurnStartGates::default(),
             active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
-            workers: Arc::new(Mutex::new(HashMap::new())),
             finishing_workers: Mutex::new(Vec::new()),
             recreated: Arc::new(Mutex::new(HashSet::new())),
             remote_machine_sign_in: Arc::new(Mutex::new(HashMap::new())),
@@ -3561,21 +3539,7 @@ impl AgentManager {
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
-            turn_start_pause: Mutex::new(None),
-            #[cfg(test)]
-            shutdown_persist_pause: Mutex::new(None),
-            #[cfg(test)]
-            user_persist_pause: Mutex::new(None),
-            #[cfg(test)]
-            worker_finish_pause: Mutex::new(None),
-            #[cfg(test)]
-            failed_wake_disposal_pause: Mutex::new(None),
-            #[cfg(test)]
-            retry_pause: Mutex::new(None),
-            #[cfg(test)]
-            redrive_store_fault: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            active_write_fault: std::sync::atomic::AtomicBool::new(false),
+            turn_schedule: turn_schedule::TurnSchedule::default(),
         }
     }
 
@@ -7389,7 +7353,10 @@ impl AgentManager {
         // the flush). No-op when the slot is empty or was already flushed by a
         // caller (e.g. shutdown(), which flushes before delegating here).
         self.services.pin_live_turn(agent_id);
-        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+        // The turn this stop ends. A turn that claims the slot during the
+        // awaits below keeps it: only this admission is released.
+        let stopped_turn = self.slots.holder(agent_id);
+        if let Some(worker) = self.slots.take_turn_worker(agent_id, stopped_turn) {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
@@ -7463,7 +7430,13 @@ impl AgentManager {
         if sync_store {
             self.sync_stop_redelivery(agent_id).await;
         }
-        self.end_turn(agent_id).await;
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::DetachReleasing)
+            .await;
+        if let Some(turn) = stopped_turn {
+            self.end_turn(agent_id, turn).await;
+        }
         let handle = original.as_ref().and_then(|original| {
             repository_origin::take(&self.handles, agent_id, original, Some(&self.registry))
         });
@@ -7545,6 +7518,9 @@ impl AgentManager {
         interrupted_by: Option<InterruptedBy>,
     ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
+        // The turn this interrupt cuts short (`None`: no turn in flight).
+        // Every teardown below acts on it alone.
+        let mut target = self.slots.holder(agent_id);
         // The live runtime is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume. It also
         // names the session to cancel: the one its turns prompt on.
@@ -7572,6 +7548,10 @@ impl AgentManager {
             .get_agent_session_summary(agent_id)
             .await
             .ok();
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::InterruptObserved)
+            .await;
         if !repository_origin::is_current(&self.handles, agent_id, &repository_origin) {
             repository_origin.retire();
             return InterruptOutcome {
@@ -7579,6 +7559,21 @@ impl AgentManager {
                 preempted: false,
                 interrupted_row_id: None,
             };
+        }
+        let current = self.slots.holder(agent_id);
+        if current != target {
+            // The turn chosen above ended during the read, and the worker
+            // may have started the next queued message. A preempting message
+            // was for that turn alone: it queues instead. A user stop is for
+            // whatever runs now, so it targets the current turn.
+            if reason == InterruptReason::PreemptedByMessage {
+                return InterruptOutcome {
+                    agent_found: true,
+                    preempted: false,
+                    interrupted_row_id: None,
+                };
+            }
+            target = current;
         }
         // Pin the live-turn slot BEFORE aborting the worker: the abort drops
         // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
@@ -7603,11 +7598,11 @@ impl AgentManager {
                 interrupted_row_id: None,
             };
         }
-        let turn_in_flight = self.is_busy(agent_id);
+        let turn_in_flight = target.is_some();
         repository_origin.interrupt_requests();
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
-        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+        if let Some(worker) = self.slots.take_turn_worker(agent_id, target) {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
@@ -7814,7 +7809,13 @@ impl AgentManager {
         // an interrupt between turns (slot already released by the worker,
         // whose release already woke) then wakes nobody a second time.
         self.registry.mark_idle_slot_held(agent_id);
-        self.end_turn(agent_id).await;
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::InterruptReleasing)
+            .await;
+        if let Some(turn) = target {
+            self.end_turn(agent_id, turn).await;
+        }
         // Emit the single terminal `agent:stream:end` on stop (parity #14): the
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
         // Unlike the normal-completion emit, the interrupt terminal carries
@@ -8155,10 +8156,32 @@ impl AgentManager {
         removed
     }
 
+    /// Registered turn workers whose task has not finished.
+    #[cfg(test)]
+    pub(crate) fn live_worker_count_for_test(&self) -> usize {
+        self.slots.live_worker_count()
+    }
+
+    /// Release whatever turn holds the slot, for tests that staged one.
+    #[cfg(test)]
+    pub(crate) fn release_held_slot_for_test(&self, agent_id: &AgentId) {
+        if let Some(admission) = self.slots.holder(agent_id) {
+            self.release_in_flight_slot(agent_id, admission);
+        }
+    }
+
+    /// [`Self::end_turn`] for whatever turn holds the slot, for tests.
+    #[cfg(test)]
+    pub(crate) async fn end_held_turn_for_test(&self, agent_id: &AgentId) {
+        if let Some(admission) = self.slots.holder(agent_id) {
+            self.end_turn(agent_id, admission).await;
+        }
+    }
+
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
     /// `agent.sendMessage` to decide queue-vs-stream).
     pub(crate) fn is_busy(&self, agent_id: &AgentId) -> bool {
-        self.busy.lock().unwrap().contains(agent_id)
+        self.slots.is_busy(agent_id)
     }
 
     /// Snapshot every agent with a turn currently in flight together with its
@@ -8178,10 +8201,10 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
-        let busy = self.busy.lock().unwrap();
+        let busy = self.slots.lock();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
-            .iter()
+            .agents()
             .filter_map(|agent_id| {
                 agent_ws
                     .get(agent_id)
@@ -8253,7 +8276,6 @@ impl AgentManager {
                         auto_unarchive,
                         fence,
                         origin,
-                        claim.admission(),
                     )
                 })
                 .await
@@ -8263,8 +8285,7 @@ impl AgentManager {
                     // Retired workspace whose revive failed: give the slot
                     // back; the caller treats it as "not started" and keeps
                     // the message queued.
-                    self.release_slot_sync(agent_id);
-                    claim.hand_off();
+                    self.release_slot_sync(agent_id, claim.hand_off());
                     TryBeginOutcome::ReviveFailed
                 }
             }
@@ -8311,7 +8332,6 @@ impl AgentManager {
                         true,
                         fence,
                         TurnOrigin::Delivery,
-                        popped.1.admission(),
                     )
                 })
                 .await
@@ -8321,8 +8341,7 @@ impl AgentManager {
                     // Retired workspace whose revive failed: release the
                     // slot and put the popped entry back at the queue head.
                     let ((message, draining), claim) = popped;
-                    self.release_slot_sync(agent_id);
-                    claim.hand_off();
+                    self.release_slot_sync(agent_id, claim.hand_off());
                     self.services.requeue_front(agent_id, message);
                     drop(draining);
                     None
@@ -8370,7 +8389,7 @@ impl AgentManager {
             // turn. Any delivery that already passed its store check parks.
             return Err(SlotClaimLoss::ReapClaimed);
         }
-        let mut busy = self.busy.lock().unwrap();
+        let mut busy = self.slots.lock();
         // An agent claimed by the idle-reap sweep (monorepo#2118) counts
         // as busy: the sweep is about to (or is mid-way through) killing
         // its child tree, so starting a turn now would hand that turn's
@@ -8415,12 +8434,7 @@ impl AgentManager {
         // A new claim's own end supersedes any earlier release's pending
         // idle write. (`settled_turns` cannot survive a release.)
         self.pending_idle_writes.lock().unwrap().remove(agent_id);
-        busy.insert(agent_id.clone());
-        let admission = TurnAdmission(self.next_admission.fetch_add(1, AtomicOrdering::Relaxed));
-        self.turn_admissions
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), admission);
+        let admission = busy.admit(agent_id);
         if busy.len() == 1 {
             *self.idle_since.lock().unwrap() = None;
         }
@@ -8457,7 +8471,7 @@ impl AgentManager {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn idle_since(&self) -> Option<Instant> {
-        let busy = self.busy.lock().unwrap();
+        let busy = self.slots.lock();
         if !busy.is_empty() {
             return None;
         }
@@ -8477,16 +8491,11 @@ impl AgentManager {
         auto_unarchive: bool,
         archive_fence: Option<crate::ArchiveFenceGuard>,
         origin: TurnOrigin,
-        admission: TurnAdmission,
     ) -> bool {
         #[cfg(test)]
-        {
-            let pause = self.turn_start_pause.lock().unwrap().take();
-            if let Some(pause) = pause {
-                pause.reached.notify_one();
-                pause.resume.notified().await;
-            }
-        }
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::TurnStarting)
+            .await;
         {
             // A real turn is starting: if the workspace is Archived, flip it
             // back to Active and emit the stamped §6.5 delta (auto-unarchive
@@ -8595,25 +8604,23 @@ impl AgentManager {
             self.services.agent_activity_begin(workspace_id).await;
             #[cfg(test)]
             let faulted = self
-                .active_write_fault
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
+                .turn_schedule
+                .take_fault(turn_schedule::TurnFault::ActiveWrite);
             #[cfg(not(test))]
             let faulted = false;
-            // Clear stop_reason when starting a new turn: successful turns leave it cleared.
-            let recorded = !faulted
-                && self
-                    .persist_status_with_stop_reason(
-                        agent_id,
-                        workspace_id,
-                        AgentStatus::Active,
-                        true,
-                        Some(None),
-                        true,
-                    )
-                    .await;
-            if !recorded {
-                self.services
-                    .mark_unrecorded_turn_start(agent_id, admission);
+            // Clear stop_reason when starting a new turn: successful turns
+            // leave it cleared. A failed write leaves an older `Error` saved;
+            // the slot still records that this turn is not the failed one.
+            if !faulted {
+                self.persist_status_with_stop_reason(
+                    agent_id,
+                    workspace_id,
+                    AgentStatus::Active,
+                    true,
+                    Some(None),
+                    true,
+                )
+                .await;
             }
         }
         true
@@ -8622,8 +8629,8 @@ impl AgentManager {
     /// Release the in-flight slot without persisting agent status (used when
     /// terminal spawn failure already persisted Error status and we only need
     /// to release `busy/agent_ws` so a future message can restart the worker).
-    fn release_in_flight_slot(&self, agent_id: &AgentId) {
-        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
+    fn release_in_flight_slot(&self, agent_id: &AgentId, admission: TurnAdmission) {
+        let Some(workspace_id) = self.release_slot_sync(agent_id, admission) else {
             return;
         };
         if let Some(workspace_id) = workspace_id {
@@ -8632,15 +8639,7 @@ impl AgentManager {
     }
 
     fn owns_admission(&self, agent_id: &AgentId, admission: TurnAdmission) -> bool {
-        self.turn_admissions.lock().unwrap().get(agent_id) == Some(&admission)
-    }
-
-    /// Whether the turn holding the slot started without recording `Active`,
-    /// so a persisted `Error` predates it. Call under the turn-start gate.
-    fn holds_unrecorded_turn_start(&self, agent_id: &AgentId) -> bool {
-        self.services
-            .unrecorded_turn_start(agent_id)
-            .is_some_and(|admission| self.owns_admission(agent_id, admission))
+        self.slots.owns(agent_id, admission)
     }
 
     /// Pre-spawn exits belong to the admitted request, not whichever turn
@@ -8658,9 +8657,9 @@ impl AgentManager {
             return;
         }
         if persist_idle {
-            self.end_turn(agent_id).await;
+            self.end_turn(agent_id, admission).await;
         } else {
-            self.release_in_flight_slot(agent_id);
+            self.release_in_flight_slot(agent_id, admission);
         }
     }
 
@@ -8683,7 +8682,7 @@ impl AgentManager {
             .runtime()
             .track_script_monitor_worker(&self.services, agent_id, None);
         self.clear_worker(agent_id);
-        self.end_turn(agent_id).await;
+        self.end_turn(agent_id, admission).await;
         drop(starting);
         self.services.persist_queue_snapshot(agent_id).await;
         self.services
@@ -8739,8 +8738,7 @@ impl AgentManager {
         // A cancelled failure path must not overwrite the `Error` it persists.
         claim.persist_idle = false;
         handle_drain_persist_failure(self, agent_id, workspace_id, content, options).await;
-        self.release_in_flight_slot(agent_id);
-        claim.hand_off();
+        self.release_in_flight_slot(agent_id, claim.hand_off());
     }
 
     async fn prepare_admitted_flush_turn(
@@ -8783,8 +8781,12 @@ impl AgentManager {
     /// re-queue, and only admit on its next timed re-check. Runs AFTER the
     /// `busy` guard is dropped — the registry lock is never nested under it.
     #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
-    fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
-        self.release_slot_sync_inner(agent_id, false)
+    fn release_slot_sync(
+        &self,
+        agent_id: &AgentId,
+        admission: TurnAdmission,
+    ) -> Option<Option<WorkspaceId>> {
+        self.release_slot_sync_inner(agent_id, admission, false)
             .map(|removed| removed.map(|(workspace_id, _)| workspace_id))
     }
 
@@ -8795,16 +8797,15 @@ impl AgentManager {
     fn release_slot_sync_inner(
         &self,
         agent_id: &AgentId,
+        admission: TurnAdmission,
         record_idle_write: bool,
     ) -> Option<Option<(WorkspaceId, Option<u64>)>> {
         let removed = {
-            let mut busy = self.busy.lock().unwrap();
-            if !busy.remove(agent_id) {
+            let mut busy = self.slots.lock();
+            if !busy.release(agent_id, admission) {
                 return None;
             }
             self.settled_turns.lock().unwrap().remove(agent_id);
-            self.turn_admissions.lock().unwrap().remove(agent_id);
-            self.services.clear_unrecorded_turn_start(agent_id);
             if busy.is_empty() {
                 *self.idle_since.lock().unwrap() = Some(Instant::now());
             }
@@ -8842,7 +8843,7 @@ impl AgentManager {
     /// the slot (insert precedes the release's clear) or the slot is gone
     /// (insert is skipped entirely).
     fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId, notice: String) {
-        let busy = self.busy.lock().unwrap();
+        let busy = self.slots.lock();
         if busy.contains(agent_id) {
             self.auto_unarchived
                 .lock()
@@ -8856,7 +8857,7 @@ impl AgentManager {
     /// busy → `settled_turns`, matching [`Self::claim_slot_sync`]); claims and
     /// releases clear it under the same lock, so it never outlives the slot.
     pub(crate) fn mark_turn_settled_if_slot_held(&self, agent_id: &AgentId) {
-        let busy = self.busy.lock().unwrap();
+        let busy = self.slots.lock();
         if busy.contains(agent_id) {
             self.settled_turns.lock().unwrap().insert(agent_id.clone());
         }
@@ -8890,8 +8891,8 @@ impl AgentManager {
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
-    async fn end_turn(&self, agent_id: &AgentId) {
-        let Some(released) = self.release_slot_sync_inner(agent_id, true) else {
+    async fn end_turn(&self, agent_id: &AgentId, admission: TurnAdmission) {
+        let Some(released) = self.release_slot_sync_inner(agent_id, admission, true) else {
             return;
         };
         if let Some((workspace_id, token)) = released {
@@ -9079,6 +9080,22 @@ impl AgentManager {
     /// failures are logged and swallowed: the runtime turn is the source of
     /// truth and a transient store/bus error must not abort the in-flight slot
     /// transition.
+    /// Saved-status bookkeeping for the slot holder. `Error` marks it as the
+    /// failed turn BEFORE the write, so a retry that reads the written
+    /// `Error` finds the mark.
+    fn note_saving_status(&self, agent_id: &AgentId, status: AgentStatus) {
+        if status == AgentStatus::Error {
+            self.slots.mark_failing(agent_id);
+        }
+    }
+
+    /// Any other saved status means the holder is no longer the failed turn.
+    fn note_saved_status(&self, agent_id: &AgentId, status: AgentStatus) {
+        if status != AgentStatus::Error {
+            self.slots.clear_failing(agent_id);
+        }
+    }
+
     async fn persist_status(
         &self,
         agent_id: &AgentId,
@@ -9087,6 +9104,7 @@ impl AgentManager {
         is_active: bool,
     ) {
         let ts = now_iso();
+        self.note_saving_status(agent_id, status);
         if let Err(e) = self
             .services
             .store
@@ -9099,7 +9117,7 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status");
             return;
         }
-        self.services.clear_unrecorded_turn_start(agent_id);
+        self.note_saved_status(agent_id, status);
         let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
             return;
         };
@@ -9157,6 +9175,7 @@ impl AgentManager {
         let ts = now_iso();
         // Clone stop_reason for event emission (we need it after the store call moves it).
         let stop_reason_for_event = stop_reason.clone();
+        self.note_saving_status(agent_id, status);
         if let Err(e) = self
             .services
             .store
@@ -9166,7 +9185,7 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status + stop_reason");
             return false;
         }
-        self.services.clear_unrecorded_turn_start(agent_id);
+        self.note_saved_status(agent_id, status);
         let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
             return true;
         };
@@ -9222,16 +9241,35 @@ impl AgentManager {
 
     /// Release per-agent ownership while retaining the task's persistence tail.
     fn clear_worker(&self, agent_id: &AgentId) {
-        let mut workers = self.workers.lock().unwrap();
         // A finishing worker may already have released its admission, allowing
         // a new send to replace its handle. Only deregister the calling task:
         // removing its replacement would leave that turn unabortable, racing
         // its final append against an interruption flush (intent#6594).
-        if workers
-            .get(agent_id)
-            .is_some_and(|worker| Some(worker.id()) == tokio::task::try_id())
-        {
-            let worker = workers.remove(agent_id).expect("checked worker identity");
+        if let Some(worker) = self.slots.take_own_worker(agent_id) {
+            self.retain_finishing_worker(worker);
+        }
+    }
+
+    /// Register the worker that runs `admission`'s turn. Its caller checked
+    /// the admission under the closure locks; a teardown that released the
+    /// slot since then wins, and the worker is aborted unregistered.
+    fn register_worker(&self, agent_id: AgentId, admission: TurnAdmission, worker: JoinHandle<()>) {
+        match self.slots.register_worker(agent_id, admission, worker) {
+            Ok(Some(previous)) => self.retain_finishing_worker(previous),
+            Ok(None) => {}
+            Err((agent_id, stale)) => {
+                tracing::debug!(agent = %agent_id, "turn released before its worker registered");
+                stale.abort();
+                self.retain_finishing_worker(stale);
+            }
+        }
+    }
+
+    /// Abort the worker of `admission`'s turn; a no-op once that turn has
+    /// released its slot.
+    fn abort_worker(&self, agent_id: &AgentId, admission: TurnAdmission) {
+        if let Some(worker) = self.slots.take_worker(agent_id, admission) {
+            worker.abort();
             self.retain_finishing_worker(worker);
         }
     }
@@ -10499,13 +10537,9 @@ impl AgentManager {
         // already names that row.
         if !entry.persisted {
             #[cfg(test)]
-            {
-                let pause = self.user_persist_pause.lock().unwrap().take();
-                if let Some(pause) = pause {
-                    pause.reached.notify_one();
-                    pause.resume.notified().await;
-                }
-            }
+            self.turn_schedule
+                .reach(turn_schedule::TurnStep::UserPersist)
+                .await;
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -11084,9 +11118,8 @@ impl AgentManager {
                 return;
             }
             self.services.pin_live_turn(agent);
-            if let Some(worker) = self.workers.lock().unwrap().remove(agent) {
-                worker.abort();
-                self.retain_finishing_worker(worker);
+            if let Some(turn) = self.slots.holder(agent) {
+                self.abort_worker(agent, turn);
             }
             active.remove(agent);
         }
@@ -11218,9 +11251,7 @@ impl AgentManager {
                 .await;
             },
         ));
-        if let Some(previous) = self.workers.lock().unwrap().insert(agent_id, handle) {
-            self.retain_finishing_worker(previous);
-        }
+        self.register_worker(agent_id, admission, handle);
     }
 
     /// Claim the in-flight slot for a delivery-driven turn. Companion to
@@ -11305,7 +11336,7 @@ impl AgentManager {
         if gate.load(AtomicOrdering::SeqCst) > 0 {
             return true;
         }
-        if self.busy.lock().unwrap().contains(agent_id) {
+        if self.slots.is_busy(agent_id) {
             return true;
         }
         // Perf (PR review): a non-consuming peek — in-memory, no store
@@ -11484,16 +11515,12 @@ impl AgentManager {
                 // and the durable queue intact, dispose of the hung provider,
                 // and never publish a successful idle to completion watchers.
                 #[cfg(test)]
-                {
-                    let pause = mgr.failed_wake_disposal_pause.lock().unwrap().take();
-                    if let Some(pause) = pause {
-                        pause.reached.notify_one();
-                        pause.resume.notified().await;
-                    }
-                }
+                mgr.turn_schedule
+                    .reach(turn_schedule::TurnStep::FailedWakeDisposal)
+                    .await;
                 mgr.kill_child_only(&id).await;
                 mgr.clear_worker(&id);
-                mgr.release_in_flight_slot(&id);
+                mgr.release_in_flight_slot(&id, admission);
                 // A fresh Send can park after Error is published while
                 // disposal still holds the slot. Complete that handoff only
                 // after deregistering this worker and releasing ownership.
@@ -11521,7 +11548,7 @@ impl AgentManager {
             // no concurrent send can spawn (and register) a prompt worker,
             // so this provably removes only this task's own entry.
             mgr.clear_worker(&id);
-            mgr.end_turn(&id).await;
+            mgr.end_turn(&id, admission).await;
             mgr.services
                 .publish_harness_wake_idle(&id, &ws, &outcome.lifecycle, outcome.empty_response)
                 .await;
@@ -11533,7 +11560,7 @@ impl AgentManager {
                 mgr.clone().try_drain_queue(id, ws).await;
             }
         });
-        self.workers.lock().unwrap().insert(agent_id.clone(), drive);
+        self.register_worker(agent_id.clone(), admission, drive);
         true
     }
 
@@ -11577,25 +11604,19 @@ impl AgentManager {
             return Ok(json!({ "ok": false }));
         }
         #[cfg(test)]
-        {
-            let pause = self.retry_pause.lock().unwrap().take();
-            if let Some(pause) = pause {
-                pause.reached.notify_one();
-                pause.resume.notified().await;
-            }
-        }
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RetryChecked)
+            .await;
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = session.workspace_id.clone();
 
         // The check above ran unlocked: a send's redrive or another retry
-        // may have lifted the park and started a turn since. Every turn
-        // start persists `Active` under the turn-start gate, or, when that
-        // write fails, records its admission as unrecorded. So `Error`
-        // re-read under it, with no unrecorded start holding the slot, means
-        // no turn started since the failure and any worker still holding
-        // the slot is the failed one. Only then does this retry own the
-        // restart and tear down.
+        // may have lifted the park and started a turn since. Under the
+        // turn-start gate no new turn can claim the slot, and the slot says
+        // whether its holder is the failed turn (a turn whose `Active`
+        // write failed is not). Only then does this retry own the restart,
+        // and it tears down that admission alone.
         let owned = {
             let gate = self.turn_start_gates.for_agent(&agent_id);
             let _starting = gate.lock().await;
@@ -11605,11 +11626,12 @@ impl AgentManager {
                 .get_agent_session_summary(&agent_id)
                 .await?;
             Self::check_retry_not_retired(&agent_id, &session)?;
-            if session.status == AgentStatus::Error && !self.holds_unrecorded_turn_start(&agent_id)
-            {
-                Some(self.lift_failed_park(&agent_id, &session).await?)
-            } else {
-                None
+            match self.slots.retry_ownership(&agent_id, session.status) {
+                RetryOwnership::Owned { failed_turn } => Some(
+                    self.lift_failed_park(&agent_id, &session, failed_turn)
+                        .await?,
+                ),
+                RetryOwnership::NotFailed | RetryOwnership::StartedSince => None,
             }
         };
         let Some((redriven, stale)) = owned else {
@@ -11625,6 +11647,10 @@ impl AgentManager {
         if let Some(child) = stale {
             child.kill_tree().await;
         }
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RetryLifted)
+            .await;
 
         // Start the drain loop to redrive the requeued message. Peek the
         // head entry's turn correlation id BEFORE the drain pops it so the
@@ -11659,13 +11685,15 @@ impl AgentManager {
 
     /// The owned half of [`AgentManager::agent_retry`], run under the
     /// turn-start gate with the session still `Error`: clear the failure
-    /// state, flip the status, abort the failed worker and detach its
-    /// child. Returns whether a queued message waits to be redriven and the
-    /// detached child for the caller to kill once the gate is released.
+    /// state, flip the status, abort `failed_turn`'s worker, release its
+    /// slot and detach its child. Returns whether a queued message waits to
+    /// be redriven and the detached child for the caller to kill once the
+    /// gate is released.
     async fn lift_failed_park(
         self: &Arc<Self>,
         agent_id: &AgentId,
         session: &intent_store::AgentSessionSummary,
+        failed_turn: Option<TurnAdmission>,
     ) -> Result<(bool, Option<RuntimeTeardown>)> {
         let original = repository_origin::capture(&self.handles, agent_id);
         if let Some(original) = &original {
@@ -11716,16 +11744,17 @@ impl AgentManager {
         // Any terminal-error context the aborted worker's streaming path
         // stashed (monorepo#2050) is stale on the same terms as the streak
         // cleared above — retry is the clean-slate escape hatch.
-        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
-            worker.abort();
-            self.retain_finishing_worker(worker);
+        if let Some(turn) = failed_turn {
+            self.abort_worker(agent_id, turn);
         }
         self.services.discard_pending_terminal_error(agent_id);
         // Retry is the clean-slate escape hatch for the truncation-redrive
         // episode too (monorepo#2863): drop the streak and any stale arm.
         self.services.clear_truncation_redrives(agent_id);
         self.services.take_truncation_redrive(agent_id);
-        self.release_in_flight_slot(agent_id);
+        if let Some(turn) = failed_turn {
+            self.release_in_flight_slot(agent_id, turn);
+        }
 
         // Close the check-then-flip race: a message enqueued between the queue
         // check above and the status flip had its own drain attempt suppressed
@@ -11758,23 +11787,29 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RedriveChecked)
+            .await;
         {
             let gate = self.turn_start_gates.for_agent(agent_id);
             let _starting = gate.lock().await;
             #[cfg(test)]
             if self
-                .redrive_store_fault
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                .turn_schedule
+                .take_fault(turn_schedule::TurnFault::RedriveStore)
             {
                 return Err(Error::Internal("injected redrive store fault".into()));
             }
-            if !self.is_busy(agent_id)
-                && self
-                    .services
-                    .store
-                    .get_agent_session_status(agent_id)
-                    .await?
-                    == AgentStatus::Error
+            let saved = self
+                .services
+                .store
+                .get_agent_session_status(agent_id)
+                .await?;
+            // Only a free slot: a failed turn still holding it is the
+            // parked recovery send's, and Try again tears it down.
+            if self.slots.retry_ownership(agent_id, saved)
+                == (RetryOwnership::Owned { failed_turn: None })
             {
                 self.services.clear_failure_streak(agent_id);
                 self.services.clear_failure_wake_dedup(agent_id);
@@ -13596,7 +13631,7 @@ impl AgentManager {
                 .map(|handle| handle.repository_origin.clone())
                 .collect::<Vec<_>>()
         };
-        stopping.extend(self.workers.lock().unwrap().keys().cloned());
+        stopping.extend(self.slots.worker_agents());
         drop(stopping);
         drop(closed);
         self.services
@@ -13608,9 +13643,7 @@ impl AgentManager {
         for original in originals {
             original.retire();
         }
-        for worker in self.workers.lock().unwrap().values() {
-            worker.abort();
-        }
+        self.slots.abort_all_workers();
         self.services.delivery_tasks.close();
     }
 
@@ -13656,7 +13689,7 @@ impl AgentManager {
         }
         // begin_shutdown closed registration and armed every cancellation.
         // Await actual drops before flushing pinned content or closing the store.
-        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        let workers = self.slots.take_all_workers();
         for (_, worker) in workers {
             let _ = worker.await;
         }
@@ -13704,13 +13737,9 @@ impl AgentManager {
             let gate = self.turn_start_gates.for_agent(id);
             let _starting = gate.lock().await;
             #[cfg(test)]
-            {
-                let pause = self.shutdown_persist_pause.lock().unwrap().take();
-                if let Some(pause) = pause {
-                    pause.reached.notify_one();
-                    pause.resume.notified().await;
-                }
-            }
+            self.turn_schedule
+                .reach(turn_schedule::TurnStep::ShutdownPersist)
+                .await;
             // Best-effort: persist any partial in-flight assistant content from
             // the pinned slot so the transcript keeps the streamed-so-far
             // output across the restart. Runs before the status guards below so
@@ -13863,7 +13892,7 @@ impl AgentManager {
         self.begin_shutdown();
         let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
         ids.extend(self.list_busy().into_iter().map(|(id, _)| id));
-        ids.extend(self.workers.lock().unwrap().keys().cloned());
+        ids.extend(self.slots.worker_agents());
         self.checkpoint_shutdown().await;
         self.services.shutdown_agent_deliveries().await;
         self.services
@@ -14068,7 +14097,7 @@ impl AgentManager {
     /// The `try_claim` half of the claim-before-kill wiring, shared by
     /// [`Self::reap_claim_fns`] and [`Self::admission_claim_fns`].
     fn try_claim_fn(&self) -> impl Fn(&AgentId) -> bool {
-        let busy = self.busy.clone();
+        let slots = self.slots.clone();
         let claims = self.reap_claims.clone();
         move |id: &AgentId| {
             // Lock order busy → reap_claims, matching `try_begin`, so
@@ -14077,7 +14106,7 @@ impl AgentManager {
             // means an overlapping sweep holds this id — treating that as
             // a win would let its release drop the shared claim while
             // this sweep's kill is still in flight, reopening the window.
-            let busy = busy.lock().unwrap();
+            let busy = slots.lock();
             if busy.contains(id) {
                 return false;
             }
@@ -14232,7 +14261,7 @@ impl AgentManager {
             .map_or_else(Weak::new, |origin| Arc::downgrade(&origin));
         let handles = Arc::downgrade(&self.handles);
         let registry = Arc::downgrade(&self.registry);
-        let busy = Arc::downgrade(&self.busy);
+        let busy = self.slots.downgrade();
         let stderr_dir = self.agent_stderr_log_dir(&agent_id);
         intent_core::spawn_daemon(async move {
             loop {
@@ -14249,7 +14278,7 @@ impl AgentManager {
                 // locking). Losing the race to a just-starting turn is safe:
                 // the removal below only happens when the child is confirmed
                 // dead, and `ensure_started` spawns fresh over a dead child.
-                let is_busy = busy.lock().unwrap().contains(&agent_id);
+                let is_busy = busy.is_busy(&agent_id);
                 let exited = {
                     let mut map = handles.lock().unwrap();
                     // Handle gone: a deliberate teardown (stop / kill /
@@ -14866,7 +14895,7 @@ mod shutdown_writer_tests {
                 .await
                 .unwrap();
         });
-        manager.workers.lock().unwrap().insert(agent, worker);
+        manager.slots.insert_worker_for_test(agent, worker);
         start.send(()).unwrap();
         ready.await.unwrap();
         let shutdown = manager.shutdown();
@@ -16449,7 +16478,7 @@ async fn run_message_worker(
                             )
                         })
                         .await;
-                        mgr.release_in_flight_slot(&agent_id);
+                        mgr.release_in_flight_slot(&agent_id, admission);
                         break 'outer;
                     }
                 };
@@ -16613,7 +16642,7 @@ async fn run_message_worker(
                                     )
                                 })
                                 .await;
-                                mgr.release_in_flight_slot(&agent_id);
+                                mgr.release_in_flight_slot(&agent_id, admission);
                                 break 'outer;
                             }
                             continue 'outer;
@@ -16846,7 +16875,7 @@ async fn run_message_worker(
                                                 )
                                             })
                                             .await;
-                                            mgr.release_in_flight_slot(&agent_id);
+                                            mgr.release_in_flight_slot(&agent_id, admission);
                                             break 'outer;
                                         }
                                     }
@@ -16875,7 +16904,7 @@ async fn run_message_worker(
                                         )
                                     })
                                     .await;
-                                    mgr.release_in_flight_slot(&agent_id);
+                                    mgr.release_in_flight_slot(&agent_id, admission);
                                     break 'outer;
                                 }
                                 continue 'outer;
@@ -16938,7 +16967,7 @@ async fn run_message_worker(
                                 )
                             })
                             .await;
-                            mgr.release_in_flight_slot(&agent_id);
+                            mgr.release_in_flight_slot(&agent_id, admission);
                             break 'outer;
                         } else if suspend_interrupt_error(&e) {
                             // Sleep-induced interruption (Task C):
@@ -17059,7 +17088,7 @@ async fn run_message_worker(
                             // Release the in-flight slot without overwriting the
                             // Error status just persisted, so `agent.retry` (or a
                             // future message) can restart the worker.
-                            mgr.release_in_flight_slot(&agent_id);
+                            mgr.release_in_flight_slot(&agent_id, admission);
                             break 'outer;
                         }
                     }
@@ -17141,7 +17170,7 @@ async fn run_message_worker(
                 // Release the in-flight slot without overwriting the Error status
                 // that handle_terminal_spawn_failure just persisted. This allows
                 // a future message (or agent.retry) to restart the worker.
-                mgr.release_in_flight_slot(&agent_id);
+                mgr.release_in_flight_slot(&agent_id, admission);
                 break 'outer;
             }
         }
@@ -17183,7 +17212,7 @@ async fn run_message_worker(
                     // the turn-end attention raise: the queue parked, the
                     // agent did not finish its work.
                     mgr.clear_worker(&agent_id);
-                    boxed_await(|| mgr.end_turn(&agent_id)).await;
+                    boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
                     boxed_await(|| {
                         mgr.services
                             .redeliver_completion_after_queue_mutation(&agent_id)
@@ -17226,7 +17255,7 @@ async fn run_message_worker(
             .await
             .is_err()
         {
-            mgr.release_in_flight_slot(&agent_id);
+            mgr.release_in_flight_slot(&agent_id, admission);
             break 'outer;
         }
         #[cfg(test)]
@@ -17259,7 +17288,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id);
+                        mgr.release_in_flight_slot(&agent_id, admission);
                         break 'outer;
                     }
                 }
@@ -17360,7 +17389,7 @@ async fn run_message_worker(
                     handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                 })
                 .await;
-                mgr.release_in_flight_slot(&agent_id);
+                mgr.release_in_flight_slot(&agent_id, admission);
                 break 'outer;
             }
             drop(draining);
@@ -17380,7 +17409,7 @@ async fn run_message_worker(
         // hands it back unchanged (`requeue_front_batch`); its draining guard
         // (§6.5 drain ordering) rides in `raced_draining` and retires the
         // entry from queue snapshots at every exit of this arm.
-        boxed_await(|| mgr.end_turn(&agent_id)).await;
+        boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
         // Provisional pop (intent-hq/intent#4962): it precedes the re-claim
         // below and the lost-claim arm hands the entry back undelivered, so
         // a parked recovery-send marker on it is committed only once the
@@ -17454,7 +17483,7 @@ async fn run_message_worker(
                         // same teardown order and rationale as the
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
-                        boxed_await(|| mgr.end_turn(&agent_id)).await;
+                        boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
                         drop(instruction_authority);
                         boxed_await(|| {
                             mgr.clone()
@@ -17502,7 +17531,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id);
+                        mgr.release_in_flight_slot(&agent_id, admission);
                         break 'outer;
                     }
                 }
@@ -17593,7 +17622,7 @@ async fn run_message_worker(
                     handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                 })
                 .await;
-                mgr.release_in_flight_slot(&agent_id);
+                mgr.release_in_flight_slot(&agent_id, admission);
                 break 'outer;
             }
             drop(draining);
@@ -17612,13 +17641,9 @@ async fn run_message_worker(
         break 'outer;
     }
     #[cfg(test)]
-    {
-        let pause = mgr.worker_finish_pause.lock().unwrap().take();
-        if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
-        }
-    }
+    mgr.turn_schedule
+        .reach(turn_schedule::TurnStep::WorkerFinish)
+        .await;
     mgr.clear_worker(&agent_id);
     // Parked recovery send (intent-hq/intent#4962): a `send_message` that
     // lost `try_begin` to THIS worker while it was parking the session in
@@ -17981,13 +18006,9 @@ async fn persist_user(
     user_origin: bool,
 ) -> bool {
     #[cfg(test)]
-    {
-        let pause = mgr.user_persist_pause.lock().unwrap().take();
-        if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
-        }
-    }
+    mgr.turn_schedule
+        .reach(turn_schedule::TurnStep::UserPersist)
+        .await;
     if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.
@@ -18754,6 +18775,11 @@ pub(crate) async fn persist_terminal_error_status_via_services(
     // the bus, so subscribers see the canonical fields immediately via
     // agent.get/getSession.
     let ts = now_iso();
+    // The failing turn holds the slot: mark it before the write so a retry
+    // reading this `Error` tears down this turn (see `turn_lifecycle`).
+    if let Some(mgr) = services.agent_manager() {
+        mgr.note_saving_status(agent_id, AgentStatus::Error);
+    }
     let status_persisted = match services
         .store
         .set_agent_session_status(
@@ -18766,10 +18792,7 @@ pub(crate) async fn persist_terminal_error_status_via_services(
         )
         .await
     {
-        Ok(()) => {
-            services.clear_unrecorded_turn_start(agent_id);
-            true
-        }
+        Ok(()) => true,
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
             false
@@ -18792,6 +18815,7 @@ async fn persist_terminal_error_status(
     workspace_id: &WorkspaceId,
     error_text: &str,
 ) -> PersistedTerminalError {
+    mgr.note_saving_status(agent_id, AgentStatus::Error);
     persist_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, error_text)
         .await
 }
@@ -23639,7 +23663,7 @@ mod startup_preempt_tests {
             mgr.contains(&agent_id),
             "the relaunching child's handle is left alone"
         );
-        mgr.end_turn(&agent_id).await;
+        mgr.end_held_turn_for_test(&agent_id).await;
     }
 
     /// Teardown boundary: `preempt_busy_turn` snapshots the live slot and
@@ -23705,7 +23729,7 @@ mod startup_preempt_tests {
             messages.is_empty(),
             "no interrupted marker row persisted: {messages:?}"
         );
-        mgr.end_turn(&agent_id).await;
+        mgr.end_held_turn_for_test(&agent_id).await;
     }
 
     /// The same no-slot state on the plain `agent.stop` path keeps its bare
@@ -26058,7 +26082,7 @@ mod agent_retry_tests {
         let ws = WorkspaceId::from("monitor-stale-workspace");
         let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
         let old = mgr.try_begin_turn(&agent, &ws).await.unwrap().hand_off();
-        mgr.end_turn(&agent).await;
+        mgr.end_held_turn_for_test(&agent).await;
         let new = mgr.try_begin_turn(&agent, &ws).await.unwrap().hand_off();
         mgr.finish_monitor_worker(&agent, &ws, old).await;
         assert!(mgr.owns_admission(&agent, new));
@@ -26072,7 +26096,7 @@ mod agent_retry_tests {
                 .status,
             AgentStatus::Active
         );
-        mgr.end_turn(&agent).await;
+        mgr.end_held_turn_for_test(&agent).await;
     }
 
     fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
@@ -26108,7 +26132,7 @@ mod agent_retry_tests {
             !mgr.is_busy(&agent),
             "a discarded/deferred wake must release its slot"
         );
-        assert!(!mgr.turn_admissions.lock().unwrap().contains_key(&agent));
+        assert!(mgr.slots.holder(&agent).is_none());
         assert_eq!(
             mgr.services
                 .store
@@ -26254,7 +26278,7 @@ mod agent_retry_tests {
     /// Simulate a worker holding the in-flight slot WITHOUT `try_begin`
     /// (which would persist `Active` and hide the `Error` park under test).
     fn hold_slot(mgr: &AgentManager, agent_id: &AgentId, ws: &WorkspaceId) {
-        mgr.busy.lock().unwrap().insert(agent_id.clone());
+        mgr.slots.lock().admit(agent_id);
         mgr.agent_ws
             .lock()
             .unwrap()
@@ -26304,7 +26328,7 @@ mod agent_retry_tests {
 
         // The worker's terminal-failure exit: release the slot, then the
         // post-`clear_worker` re-check.
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
 
         assert!(
@@ -26371,7 +26395,7 @@ mod agent_retry_tests {
         let recovery_id = result["queuedMessage"]["id"].as_str().unwrap();
         assert_eq!(result["queuedMessage"]["position"], 1, "parked behind A");
 
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
 
         assert!(mgr.is_busy(&agent_id), "recovery send redriven");
@@ -26471,7 +26495,7 @@ mod agent_retry_tests {
         // worker-exit re-check.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
 
         assert!(
@@ -26537,7 +26561,7 @@ mod agent_retry_tests {
             .await
             .expect("send");
         let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
         poll_once_pending(&mut redrive).await;
@@ -26560,7 +26584,7 @@ mod agent_retry_tests {
         // re-check — which honours the marker.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(
             !mgr.services.is_message_queued(&agent_id, &id),
@@ -26597,7 +26621,7 @@ mod agent_retry_tests {
             .await
             .expect("send");
         let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
         poll_once_pending(&mut redrive).await;
@@ -26630,7 +26654,7 @@ mod agent_retry_tests {
         // marker and the gate holds for `agent.retry`.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(
             !mgr.is_busy(&agent_id),
@@ -26663,7 +26687,7 @@ mod agent_retry_tests {
             .await
             .expect("send");
         let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
         poll_once_pending(&mut redrive).await;
@@ -26695,7 +26719,7 @@ mod agent_retry_tests {
             true,
         )
         .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(!mgr.is_busy(&agent_id));
         assert!(mgr.services.is_message_queued(&agent_id, &id));
@@ -26753,7 +26777,7 @@ mod agent_retry_tests {
             .await
             .expect("send");
         let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         let mut redrive = Box::pin(mgr.redrive_parked_recovery_send(&agent_id, &ws));
         poll_once_pending(&mut redrive).await;
@@ -26780,7 +26804,7 @@ mod agent_retry_tests {
 
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(mgr.is_busy(&agent_id));
         assert!(
@@ -26834,7 +26858,7 @@ mod agent_retry_tests {
         // The slot holder fails terminally; its exit redrives the entry.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(
             mgr.is_busy(&agent_id),
@@ -26911,7 +26935,7 @@ mod agent_retry_tests {
         // before the hand-back is visible.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         gate.resume();
         let now = send_now.await.expect("send now");
@@ -26946,7 +26970,7 @@ mod agent_retry_tests {
             .await
             .expect("send");
         let id = sent["queuedMessage"]["id"].as_str().unwrap().to_string();
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
 
         let (entry, draining) = mgr
             .services
@@ -27012,7 +27036,7 @@ mod agent_retry_tests {
         // probe defers, and nothing else is left to probe.
         mgr.persist_status(&agent_id, &ws, AgentStatus::Error, false)
             .await;
-        mgr.release_in_flight_slot(&agent_id);
+        mgr.release_held_slot_for_test(&agent_id);
         mgr.redrive_parked_recovery_send(&agent_id, &ws).await;
         assert!(!mgr.is_busy(&agent_id), "a draft is not dispatched");
         assert_eq!(
@@ -27102,7 +27126,7 @@ mod agent_retry_tests {
             while !mgr.services.has_ready_to_send(agent_id) {
                 tokio::task::yield_now().await;
             }
-            mgr.release_in_flight_slot(agent_id);
+            mgr.release_held_slot_for_test(agent_id);
             if worker_redrives {
                 mgr.redrive_parked_recovery_send(agent_id, ws).await;
             }

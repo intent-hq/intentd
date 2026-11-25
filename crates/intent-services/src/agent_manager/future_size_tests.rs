@@ -60,7 +60,7 @@ async fn turn_start_future_sizes_stay_within_budget() {
         String::new(),
         TurnOptions::default(),
         false,
-        TurnAdmission(0),
+        TurnAdmission::for_test(0),
     ));
 
     let measured = [

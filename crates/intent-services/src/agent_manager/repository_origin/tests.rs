@@ -667,10 +667,8 @@ async fn actual_teardown_retires_the_source_leaf_before_aborting_work() {
                 .serve_task = task;
         } else {
             f.manager
-                .workers
-                .lock()
-                .unwrap()
-                .insert(f.row.id.clone(), task);
+                .slots
+                .insert_worker_for_test(f.row.id.clone(), task);
         }
         if action == "drop" {
             drop(handle);
@@ -685,7 +683,7 @@ async fn actual_teardown_retires_the_source_leaf_before_aborting_work() {
                     f.manager.detach(&f.row.id).await;
                 }
                 "shutdown" => {
-                    f.manager.busy.lock().unwrap().insert(f.row.id.clone());
+                    f.manager.slots.lock().admit(&f.row.id);
                     f.manager
                         .agent_ws
                         .lock()
@@ -838,10 +836,8 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
     });
     started.await.unwrap();
     f.manager
-        .workers
-        .lock()
-        .unwrap()
-        .insert(f.row.id.clone(), worker);
+        .slots
+        .insert_worker_for_test(f.row.id.clone(), worker);
     let (_stage, fence) = held_stage_fence(&f, leaf).await;
     let (entered, inside) = std::sync::mpsc::channel();
     let (release, held) = std::sync::mpsc::channel();
@@ -894,13 +890,13 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
     let retirement_owned = f.manager.shutdown_retirement.try_lock().is_err();
     let first_waiting = first_result.try_recv().is_err();
     let second_waiting = second_result.try_recv().is_err();
-    let worker_retained = !f.manager.workers.lock().unwrap()[&f.row.id].is_finished();
+    let worker_retained = !f.manager.slots.worker_finished_for_test(&f.row.id);
     // Release before assertions so an oracle failure still permits the real joins.
     release.send(()).unwrap();
     assert_eq!(dispatch.join().unwrap(), Ok(()));
     first.join().unwrap();
     second.join().unwrap();
-    let worker = f.manager.workers.lock().unwrap().remove(&f.row.id).unwrap();
+    let worker = f.manager.slots.remove_worker_for_test(&f.row.id).unwrap();
     assert!(worker.await.unwrap_err().is_cancelled());
     assert!(
         result.await.unwrap(),

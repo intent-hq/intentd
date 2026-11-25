@@ -832,11 +832,6 @@ pub struct Services {
     /// only — a daemon restart forgets the streak (the provider-block
     /// classifier still applies via the persisted `stop_reason`).
     agent_failure_streaks: Arc<Mutex<HashMap<AgentId, (String, u32)>>>,
-    /// A turn start whose `Active` write failed, so the store may still say
-    /// `Error`: `agent.retry` must not take that admission for the failed
-    /// turn. Any later status write that lands, or the slot's release,
-    /// retires the entry.
-    unrecorded_turn_starts: Arc<Mutex<HashMap<AgentId, crate::agent_manager::TurnAdmission>>>,
     /// Handoff slot for a terminal error the streaming path already persisted
     /// (monorepo#2050): `agent_id → PersistedTerminalError`. When
     /// `run_prompt_turn` (or the worker's idle-timeout-cap branch) persists
@@ -1919,7 +1914,6 @@ impl Services {
             pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
-            unrecorded_turn_starts: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
@@ -8320,39 +8314,6 @@ impl Services {
     /// hatch), and on agent delete (registry hygiene).
     pub(crate) fn clear_failure_streak(&self, agent_id: &AgentId) {
         self.agent_failure_streaks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(agent_id);
-    }
-
-    /// Record that `admission`'s turn started without persisting `Active`.
-    pub(crate) fn mark_unrecorded_turn_start(
-        &self,
-        agent_id: &AgentId,
-        admission: crate::agent_manager::TurnAdmission,
-    ) {
-        self.unrecorded_turn_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(agent_id.clone(), admission);
-    }
-
-    /// The admission whose turn started without persisting `Active`, if any.
-    pub(crate) fn unrecorded_turn_start(
-        &self,
-        agent_id: &AgentId,
-    ) -> Option<crate::agent_manager::TurnAdmission> {
-        self.unrecorded_turn_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(agent_id)
-            .copied()
-    }
-
-    /// A status write landed or the slot was released: the store no longer
-    /// lags the running turn.
-    pub(crate) fn clear_unrecorded_turn_start(&self, agent_id: &AgentId) {
-        self.unrecorded_turn_starts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);

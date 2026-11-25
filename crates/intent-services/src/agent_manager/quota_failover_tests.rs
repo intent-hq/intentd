@@ -247,7 +247,7 @@ async fn timeout_settled(mgr: &AgentManager, agent: &AgentId) {
                     .status;
                 if matches!(status, AgentStatus::RuntimeIdle | AgentStatus::Error)
                     && !mgr.is_busy(agent)
-                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.slots.has_workers()
                 {
                     break;
                 }

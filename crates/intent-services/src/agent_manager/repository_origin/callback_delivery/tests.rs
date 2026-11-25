@@ -4747,7 +4747,7 @@ mod live_context {
             .unwrap();
         tokio::time::timeout(fixture_wait(), async {
             loop {
-                if !h.f.manager.is_busy(&row.id) && h.f.manager.workers.lock().unwrap().is_empty() {
+                if !h.f.manager.is_busy(&row.id) && !h.f.manager.slots.has_workers() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -5706,7 +5706,7 @@ mod normal_launch {
             tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
-                    || !h.f.manager.workers.lock().unwrap().is_empty()
+                    || h.f.manager.slots.has_workers()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -6305,7 +6305,7 @@ mod normal_launch {
             tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
-                    || !h.f.manager.workers.lock().unwrap().is_empty()
+                    || h.f.manager.slots.has_workers()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -6397,7 +6397,7 @@ mod normal_launch {
         tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
-                || !h.f.manager.workers.lock().unwrap().is_empty()
+                || h.f.manager.slots.has_workers()
             {
                 tokio::task::yield_now().await;
             }
@@ -6678,7 +6678,7 @@ mod normal_launch {
         tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
-                || !h.f.manager.workers.lock().unwrap().is_empty()
+                || h.f.manager.slots.has_workers()
             {
                 tokio::task::yield_now().await;
             }
@@ -8759,9 +8759,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .await
             .unwrap();
         tokio::time::timeout(fixture_wait(), async {
-            while h.f.manager.is_busy(&h.f.row.id)
-                || !h.f.manager.workers.lock().unwrap().is_empty()
-            {
+            while h.f.manager.is_busy(&h.f.row.id) || h.f.manager.slots.has_workers() {
                 tokio::task::yield_now().await;
             }
         })
@@ -8813,7 +8811,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     started.as_ref().err()
                 );
                 assert!(h.f.manager.handles.lock().unwrap().is_empty());
-                assert!(h.f.manager.workers.lock().unwrap().is_empty());
+                assert!(!h.f.manager.slots.has_workers());
                 assert!(!h.scratch.path().join("launches.jsonl").exists());
                 assert_eq!(h.f.writes().await, 0);
                 assert_eq!(h.http.count(), before_http);

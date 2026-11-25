@@ -34,6 +34,17 @@ struct FakeRuntime {
     final_stops: AtomicUsize,
     /// The launch put the instructions in the provider session.
     session_prompt: AtomicBool,
+    /// Prompts whose future is still alive (not returned, not dropped).
+    in_flight: AtomicUsize,
+}
+
+/// Counts a live prompt future; an aborted worker drops it.
+struct InFlightPrompt<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightPrompt<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeRuntime {
@@ -55,6 +66,7 @@ impl FakeRuntime {
             exited: Mutex::new(None),
             final_stops: AtomicUsize::new(0),
             session_prompt: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -116,6 +128,8 @@ impl AgentRuntime for FakeRuntime {
         _activity: &'a ActivityTracker,
     ) -> BoxFuture<'a, std::result::Result<PromptOutcome, AcpError>> {
         Box::pin(async move {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlightPrompt(&self.in_flight);
             self.prompts
                 .lock()
                 .unwrap()
@@ -265,7 +279,7 @@ async fn wait_idle(mgr: &AgentManager, id: &AgentId) {
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
-            while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
+            while mgr.is_busy(id) || mgr.slots.has_workers() {
                 tokio::task::yield_now().await;
             }
         },
