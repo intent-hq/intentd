@@ -22276,16 +22276,19 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
         .update_agent_session(&ws, &template)
         .await
         .unwrap();
+    let proposals = json!([{"body":"proposal".repeat(10000)}]);
     svc.store()
         .set_agent_session_metadata_key_json(
             &ws,
             &first,
             intent_core::PENDING_PROPOSALS_KEY,
-            &json!([{"body":"proposal".repeat(10000)}]).to_string(),
+            &proposals.to_string(),
             &now_iso(),
         )
         .await
         .unwrap();
+    // The batch clones below are inserted, which writes metadata as given.
+    template.metadata = Some(json!({ intent_core::PENDING_PROPOSALS_KEY: proposals }));
     svc.store()
         .append_agent_message(
             &first,
