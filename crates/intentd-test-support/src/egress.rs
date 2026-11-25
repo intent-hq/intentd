@@ -39,6 +39,7 @@ pub const TEST_EGRESS_ENV: [(&str, &str); 8] = [
 pub const ALLOW_TEST_EGRESS_ENV: &str = "INTENTD_TEST_ALLOW_EGRESS";
 
 /// Whether the developer opted out of the guard for a live run.
+#[must_use]
 pub fn test_egress_allowed() -> bool {
     std::env::var_os(ALLOW_TEST_EGRESS_ENV).as_deref() == Some(OsStr::new("1"))
 }
@@ -79,27 +80,41 @@ pub fn apply_test_egress(cmd: &mut Command) {
 mod tests {
     use super::*;
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum Setting<'a> {
+        Inherited,
+        Removed,
+        Set(&'a str),
+    }
+
+    fn explicit<'a>(cmd: &'a Command, key: &str) -> Setting<'a> {
+        match cmd.get_envs().find(|(k, _)| *k == OsStr::new(key)) {
+            None => Setting::Inherited,
+            Some((_, None)) => Setting::Removed,
+            Some((_, Some(v))) => Setting::Set(v.to_str().unwrap()),
+        }
+    }
+
     #[test]
     fn apply_keeps_caller_keys_and_survives_env_clear() {
-        let mut cmd = Command::new("never-executed");
-        cmd.env_clear()
-            .env("HTTPS_PROXY", "http://127.0.0.1:9")
-            .env_remove("no_proxy");
-        apply_test_egress(&mut cmd);
-        let envs: Vec<_> = cmd.get_envs().collect();
-        let get = |key: &str| {
-            envs.iter()
-                .find(|(k, _)| *k == OsStr::new(key))
-                .map(|(_, v)| v.map(|v| v.to_str().unwrap()))
-        };
+        let mut cleared = Command::new("never-executed");
+        cleared.env_clear().env("HTTPS_PROXY", "http://127.0.0.1:9");
+        apply_test_egress(&mut cleared);
+        let mut removed = Command::new("never-executed");
+        removed.env_remove("no_proxy");
+        apply_test_egress(&mut removed);
         if test_egress_allowed() {
-            assert_eq!(get("HTTP_PROXY"), None);
+            assert_eq!(explicit(&cleared, "HTTP_PROXY"), Setting::Inherited);
             return;
         }
-        assert_eq!(get("HTTPS_PROXY"), Some(Some("http://127.0.0.1:9")));
-        assert_eq!(get("no_proxy"), Some(None));
-        assert_eq!(get("https_proxy"), Some(Some(DEAD_PROXY)));
-        assert_eq!(get("ALL_PROXY"), Some(Some(DEAD_PROXY)));
-        assert_eq!(get("NO_PROXY"), Some(Some(LOOPBACK)));
+        assert_eq!(
+            explicit(&cleared, "HTTPS_PROXY"),
+            Setting::Set("http://127.0.0.1:9")
+        );
+        assert_eq!(explicit(&cleared, "https_proxy"), Setting::Set(DEAD_PROXY));
+        assert_eq!(explicit(&cleared, "ALL_PROXY"), Setting::Set(DEAD_PROXY));
+        assert_eq!(explicit(&cleared, "NO_PROXY"), Setting::Set(LOOPBACK));
+        assert_eq!(explicit(&removed, "no_proxy"), Setting::Removed);
+        assert_eq!(explicit(&removed, "NO_PROXY"), Setting::Set(LOOPBACK));
     }
 }

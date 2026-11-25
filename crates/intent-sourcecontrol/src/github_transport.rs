@@ -808,7 +808,7 @@ mod tests {
                 });
             }
         });
-        let proxies = || {
+        let matcher = || {
             hyper_util::client::proxy::matcher::Matcher::builder()
                 .all(proxy_uri.clone())
                 .no("127.0.0.1")
@@ -821,7 +821,7 @@ mod tests {
             Some(&fixture_base),
             CONNECT_TIMEOUT,
             READ_WRITE_TIMEOUT,
-            proxies(),
+            matcher(),
         )
         .unwrap();
         let listed: serde_json::Value = tokio::time::timeout(
@@ -840,7 +840,7 @@ mod tests {
             Some("https://api.github.com"),
             CONNECT_TIMEOUT,
             READ_WRITE_TIMEOUT,
-            proxies(),
+            matcher(),
         )
         .unwrap();
         let result = tokio::time::timeout(
