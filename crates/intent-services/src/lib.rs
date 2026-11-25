@@ -2321,13 +2321,9 @@ impl Services {
 
     /// Run as an orchestrator (nodes.md "Orchestrator mode"): agents only
     /// run on other machines and no provider process starts here. Set once
-    /// by the composition root, before any listener serves. Its MCP hub
-    /// refuses stdio servers: they would be processes on this host.
+    /// by the composition root, before any listener serves.
     #[must_use]
     pub fn with_orchestrator_mode(mut self, orchestrator_mode: bool) -> Self {
-        if orchestrator_mode {
-            self.mcp_hub.refuse_stdio();
-        }
         self.run_mode = if orchestrator_mode {
             intent_core::settings_file::DaemonMode::Orchestrator
         } else {

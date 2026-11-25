@@ -350,8 +350,8 @@ const STEPS: &[(&str, Step)] = &[
         "spawn_config_watcher_init",
         Gap("a tenant's `config.toml` is not reloaded when edited"),
     ),
-    // External MCP servers: http and sse only, stdio is refused in
-    // orchestrator mode (the tenant's hub starts no process); the tenant's
+    // External MCP servers: a tenant's hub refuses stdio (it starts no
+    // process); agents get the tools of its http servers. The tenant's
     // self-fence stops them.
     ("services.mcp_hub", Wired("mcp_hub")),
     ("mcp_hub.spawn_health_monitor", Wired("spawn_health_monitor")),

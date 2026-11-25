@@ -1,8 +1,9 @@
 //! A tenant's external MCP servers: its hub starts the enabled servers in
 //! its settings when the tenant is served, and the health monitor re-probes
 //! them, as `intentd` does at start. Only `http` and `sse` servers run
-//! here: a tenant's `Services` are in orchestrator mode, whose hub refuses
-//! stdio servers (no process starts on this host for a tenant).
+//! here: a tenant's hub refuses stdio servers (`tenant_services`), as no
+//! process starts on this host for a tenant. Agents get the tools of the
+//! `http` ones; the hub only probes an `sse` server, as on a desktop.
 
 use intent_core::tenant_fence::SelfFence;
 use intent_services::Services;

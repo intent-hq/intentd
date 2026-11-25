@@ -50,7 +50,7 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const TOOL_TIMEOUT_CAP: Duration = Duration::from_secs(55);
 /// Why a stdio server is refused on an orchestrator, which starts no
 /// process for a tenant.
-const STDIO_REFUSED: &str = "stdio MCP servers are not supported on this backend: it runs no local processes for MCP servers. Use an http or sse server instead.";
+const STDIO_REFUSED: &str = "stdio MCP servers are not supported on this backend: it runs no local processes for MCP servers. Use an http server instead.";
 /// The built-in workspace server's name, never given to a user server.
 const RESERVED_SERVER_NAME: &str = "workspace-mcp";
 /// Bound on a remote agent's proxied `tools/call` (nodeProtocol 11), longer
@@ -470,9 +470,9 @@ impl McpHub {
     }
 
     /// Refuse stdio servers from now on: definitions are rejected and a
-    /// stored one is never spawned (an orchestrator, which runs no process
-    /// for a tenant).
-    pub(crate) fn refuse_stdio(&self) {
+    /// stored one is never spawned (a multi-tenant orchestrator, which runs
+    /// no process for a tenant).
+    pub fn refuse_stdio(&self) {
         self.inner.stdio_refused.store(true, Ordering::Relaxed);
     }
 
@@ -3813,6 +3813,57 @@ for line in sys.stdin:
         reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
         assert!(s.remote_proxies(&ws_id).await.unwrap().is_empty());
+    }
+
+    /// The single-user daemon keeps stdio servers in orchestrator mode:
+    /// only the multi-tenant orchestrator refuses them, per tenant.
+    #[tokio::test]
+    async fn a_single_user_daemon_in_orchestrator_mode_accepts_stdio_servers() {
+        use intent_core::WorkspaceApi as _;
+
+        let (_tmp, store) = open_store().await;
+        let services = crate::Services::new(store)
+            .with_secret_store(Arc::new(InMemorySecretStore::default()))
+            .with_orchestrator_mode(true);
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            services.mcp_servers_create(json!({
+                "id": "local", "transport": "stdio", "command": BOGUS_CMD, "enabled": false,
+            })),
+        )
+        .await
+        .expect("a stdio server is accepted");
+        assert!(!services.mcp_hub().stdio_refused());
+    }
+
+    /// A hub that refuses stdio is offered no stdio server, even one stored
+    /// before the refusal, and refuses a new stdio definition.
+    #[tokio::test]
+    async fn a_hub_that_refuses_stdio_offers_remote_agents_no_stdio_server() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        h.refuse_stdio();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let mut stored = Map::new();
+        stored.insert(
+            "a".into(),
+            json!({ "id": "a", "name": "Local", "transport": "stdio", "command": "x", "enabled": true }),
+        );
+        stored.insert(
+            "h".into(),
+            json!({ "id": "h", "name": "Alpha", "transport": "http", "url": "http://127.0.0.1:9/mcp", "enabled": true }),
+        );
+        write_configs(&secrets, &stored).await.unwrap();
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        let proxies = s.remote_proxies(&ws_id).await.unwrap();
+        let ids: Vec<&str> = proxies.iter().map(|p| p.server_id.as_str()).collect();
+        assert_eq!(ids, ["h"]);
+        let error = s
+            .create(json!({ "id": "b", "transport": "stdio", "command": "x", "enabled": true }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(STDIO_REFUSED), "{error}");
     }
 
     /// A provider's proxied request is not gated by `agentFeatures.mcpTools`
