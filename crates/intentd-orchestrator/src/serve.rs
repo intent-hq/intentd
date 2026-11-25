@@ -9,6 +9,7 @@ use intent_app::tenant::{Admission, TenantRuntime};
 use intent_app::StartupExt as _;
 use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
+use intent_services::host_exec_stream::HostExecStreamRegistry;
 use intent_services::retention::TenantSweepTiming;
 use intent_services::{
     AgentManager, EventBus, Services, SettingsRegistry, StartupCompletionRecovery,
@@ -540,6 +541,41 @@ impl ServedTenant {
     #[must_use]
     pub fn heartbeat(&self) -> &LeaseHeartbeat {
         &self.heartbeat
+    }
+
+    /// Drain the tenant's work as `intentd` drains its own on shutdown
+    /// ([`intent_app::shutdown`]), while its writes still land: close its
+    /// client connections and admission, join its startup reconcile, stop
+    /// its PTYs and host commands, record its running turns as interrupted,
+    /// stop its agent deliveries, then drain its store writers. Run it
+    /// before firing the fence of a graceful stop; it does nothing once
+    /// the fence fired (every write is refused by then). `streams` are the
+    /// process's host command streams: pass them only when the process
+    /// stops.
+    pub fn drain(
+        &self,
+        streams: Option<&'static HostExecStreamRegistry>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let tenant = self.tenant.clone();
+        let fence = self.fence.clone();
+        let services = self.services.clone();
+        let agents = self.agents.clone();
+        let connections = self.runtime.connections().clone();
+        let reconcile = self.runtime.drain_reconcile();
+        async move {
+            if fence.is_fenced() {
+                return;
+            }
+            let closed = connections.close_all();
+            intent_app::shutdown::close_admission(&services, &agents, streams);
+            // Before the checkpoint: no startup sweep starts work after it.
+            reconcile.await;
+            services.shutdown_pty_sessions().await;
+            intent_app::shutdown::stop_host_commands(&services, streams).await;
+            intent_app::shutdown::checkpoint_agents(&services, &agents).await;
+            services.shutdown_store_writers().await;
+            tracing::info!(tenant, closed, "drained the tenant's work");
+        }
     }
 
     /// Wait until the tenant's fence fired and its work stopped. Once

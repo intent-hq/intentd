@@ -3483,10 +3483,11 @@ async fn cmd_serve_owned(
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
     rpc_limiter.begin_shutdown();
-    services.begin_settings_shutdown();
-    manager.begin_shutdown();
-    host_exec_runtime.begin_shutdown();
-    intent_services::host_exec_stream::registry().begin_shutdown();
+    intent_app::shutdown::close_admission(
+        &services,
+        &manager,
+        Some(intent_services::host_exec_stream::registry()),
+    );
     reverse_registry.begin_shutdown();
     repository_metadata_prewarm.abort();
     let _ = repository_metadata_prewarm.await;
@@ -3528,13 +3529,11 @@ async fn cmd_serve_owned(
 
     let phase = shutdown::Phase::start("request_drain");
     rpc_limiter.drain().await;
-    host_exec_runtime.shutdown().await;
-    if let Err(error) = intent_services::host_exec_stream::registry()
-        .shutdown()
-        .await
-    {
-        tracing::error!(error = %error.message, "host command shutdown failed");
-    }
+    intent_app::shutdown::stop_host_commands(
+        &services,
+        Some(intent_services::host_exec_stream::registry()),
+    )
+    .await;
     phase.complete();
     // Cancelled response futures do not own settings runtime hooks. Join their
     // separate owners before the final tunnel/listener stops below.
@@ -3544,12 +3543,8 @@ async fn cmd_serve_owned(
     if let Some(tunnel_recycler) = tunnel_recycler {
         tunnel_recycler.abort();
     }
-    services.shutdown_settings().await;
     let phase = shutdown::Phase::start("agent_checkpoint");
-    manager.checkpoint_shutdown().await;
-    phase.complete();
-    let phase = shutdown::Phase::start("agent_deliveries");
-    services.shutdown_agent_deliveries().await;
+    intent_app::shutdown::checkpoint_agents(&services, &manager).await;
     phase.complete();
     let phase = shutdown::Phase::start("startup_recovery_join");
     match startup_recovery.await {

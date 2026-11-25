@@ -155,33 +155,28 @@ const STEPS: &[(&str, Step)] = &[
         "manager.shutdown_with_native_outcome",
         Wired("manager.shutdown"),
     ),
+    // A graceful stop drains the tenant first (`ServedTenant::drain`,
+    // through the shared `intent_app::shutdown` steps).
+    ("manager.begin_shutdown", Wired("manager.begin_shutdown")),
     (
-        "manager.begin_shutdown",
-        Gap("the fence stops agents without first refusing new turns"),
+        "intent_app::shutdown::close_admission",
+        Wired("intent_app::shutdown::close_admission"),
     ),
     (
-        "manager.checkpoint_shutdown",
-        Gap("a stopped tenant's in-flight turns are not captured as interrupted"),
+        "intent_app::shutdown::stop_host_commands",
+        Wired("intent_app::shutdown::stop_host_commands"),
     ),
     (
-        "services.shutdown_agent_deliveries",
-        Gap("agent deliveries are cancelled with the tenant, not drained"),
-    ),
-    (
-        "services.begin_settings_shutdown",
-        Gap("settings runtime hooks are not fenced before the tenant stops"),
-    ),
-    (
-        "services.shutdown_settings",
-        Gap("settings runtime hooks are not joined before the tenant stops"),
+        "intent_app::shutdown::checkpoint_agents",
+        Wired("intent_app::shutdown::checkpoint_agents"),
     ),
     (
         "services.shutdown_store_writers",
-        Gap("the tenant's store writers are not drained when it stops"),
+        Wired("shutdown_store_writers"),
     ),
     (
         "intent_services::host_exec_stream::registry",
-        Gap("streamed host commands are process-wide and not stopped per tenant"),
+        Wired("host_exec_stream::registry"),
     ),
     // Client listeners (`crate::listen`).
     ("ensure_tls_certificate", Wired("ensure_tls_certificate")),
@@ -442,7 +437,6 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_transport::listener::StartupLocalListener::bind", Wired("serve_uds_with_connections")),
     ("server.start", Wired("ws.start")),
     ("tenant_background.stop_loops", Wired("adopt_task")),
-    ("host_exec_runtime.shutdown", Wired("host_exec_runtime().shutdown")),
     ("intent_core::FileSecretStore::new", Wired("FileSecretStore::with_path")),
     ("GitStatusRefresher::start_with_presence", Gap("file changes in head's worktrees do not refresh clients")),
     ("git_status_refresher.shutdown", Gap("file changes in head's worktrees do not refresh clients")),
@@ -452,7 +446,7 @@ const STEPS: &[(&str, Step)] = &[
     ("guest_limits.follow", Gap("`sharing.maxGuestConnections` and `maxConnectionsPerGuest` are not enforced")),
     ("intent_transport::InviteLinkResolver::new", Gap("`workspace.invite.list` rows carry no `url`")),
     ("intent_transport::LoopbackAgentRpc::new", Gap("the Assistant's `ws.rpc` has no loopback connection")),
-    ("host_exec_runtime.begin_shutdown", Gap("the fence stops host commands without first refusing new ones")),
+    ("host_exec_runtime.begin_shutdown", Wired("host_exec_runtime().begin_shutdown")),
     ("rpc_limiter.begin_shutdown", Gap("a stopping tenant's in-flight RPCs are not fenced and drained")),
     ("rpc_limiter.drain", Gap("a stopping tenant's in-flight RPCs are not fenced and drained")),
     ("reverse_registry.begin_shutdown", Gap("the tenant's client event publisher is not drained when it stops")),
@@ -711,6 +705,7 @@ fn orchestrator_sources() -> String {
         "intent-app/src/lib.rs",
         "intent-app/src/tenant.rs",
         "intent-app/src/agents.rs",
+        "intent-app/src/shutdown.rs",
     ];
     files
         .iter()

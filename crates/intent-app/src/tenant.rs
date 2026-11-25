@@ -601,6 +601,14 @@ impl TenantRuntime {
         self.recovery.hold(running);
     }
 
+    /// Stop the startup reconcile between operations and join it. A
+    /// graceful stop runs it once admission is closed, before the agent
+    /// checkpoint; the self-fence does it again (a no-op by then).
+    pub fn drain_reconcile(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let recovery = self.recovery.clone();
+        async move { recovery.drain().await }
+    }
+
     /// The tenant's client connections.
     #[must_use]
     pub fn connections(&self) -> &ClientConnections {
