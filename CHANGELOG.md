@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.297] - 2026-11-25
+
+### 🚀 Features
+
+- *(settings)* Add the providerSwitch.state setting ([#3786](https://github.com/intent-hq/intentd/pull/3786))
+- *(orchestrator)* Keep tenant settings and the GitLab pair in Postgres ([#3780](https://github.com/intent-hq/intentd/pull/3780))
+- Report model display labels in machine capabilities ([#3764](https://github.com/intent-hq/intentd/pull/3764))
+- *(stats)* Record tool calls, sub-agents and run time for usage stats cards ([#3785](https://github.com/intent-hq/intentd/pull/3785))
+
+### 🧪 Testing
+
+- *(services)* Block real network egress in intent-services lib tests ([#3787](https://github.com/intent-hq/intentd/pull/3787))
+
+
 ## [0.11.296] - 2026-11-25
 
 ### 🚀 Features
