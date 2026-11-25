@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_app::tenant::{Admission, TenantRuntime};
-use intent_app::StartupExt as _;
+use intent_app::{RuntimeServicesExt as _, StartupExt as _};
 use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
 use intent_services::host_exec_stream::HostExecStreamRegistry;
@@ -275,6 +275,7 @@ async fn try_serve_tenant_with(
                 agents.shutdown().await;
             }
             let _ = runner.stop().await;
+            services.release_machine_runs();
             if let Err(error) = heartbeat.release().await {
                 tracing::warn!(tenant, %error, "could not release the tenant lease");
             }
@@ -304,6 +305,10 @@ async fn try_serve_tenant_with(
         crate::mcp::start_tenant_mcp(&services, &mut runner);
     }
     crate::tenant_watch::start(&services, &bus, &admission, &mut runner);
+    // After the runtime's stops, which still reach the machines: the
+    // machine runs' hooks hold `services`, which hold the machine runs.
+    let release = services.clone();
+    runner.on_tasks(move || async move { release.release_machine_runs() });
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be

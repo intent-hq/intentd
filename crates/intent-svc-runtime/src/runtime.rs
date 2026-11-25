@@ -125,6 +125,10 @@ pub trait RuntimeServicesExt {
     /// Start the loop that republishes the host execution context when its
     /// inputs change.
     fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()>;
+
+    /// Release the machine-run registry's hooks, which hold these
+    /// `Services`: for a tenant that stops while the process lives on.
+    fn release_machine_runs(&self);
 }
 
 impl RuntimeServicesExt for Services {
@@ -138,6 +142,12 @@ impl RuntimeServicesExt for Services {
 
     fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
         HostExecutionExt::spawn_execution_context_loop(self)
+    }
+
+    fn release_machine_runs(&self) {
+        if let Some(runs) = self.runtime().machine_runs.get() {
+            runs.release_hooks();
+        }
     }
 }
 

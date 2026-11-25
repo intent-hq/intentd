@@ -1790,11 +1790,24 @@ impl Services {
         self.store.desktop_invalidate_restart().await?;
         self.desktop_flush_outbox().await;
         let services = self.clone();
+        // An orchestrator tenant's store has a fence: the loop ends with the
+        // tenant, so it does not keep the stopped tenant's `Services` alive.
+        let fence = self.store.tenant_fence();
         intent_core::spawn_daemon(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let fenced = async {
+                match &fence {
+                    Some(fence) => fence.fenced().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(fenced);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    () = &mut fenced => break,
+                }
                 if services
                     .draining_shutdown
                     .load(std::sync::atomic::Ordering::Acquire)

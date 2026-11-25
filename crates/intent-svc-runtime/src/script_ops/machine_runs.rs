@@ -181,7 +181,11 @@ struct Run {
 }
 
 struct Inner {
-    hooks: Hooks,
+    /// `None` once [`MachineRuns::release_hooks`] ran: the hooks hold the
+    /// owner's `Services`, which hold these runs.
+    hooks: Mutex<Option<Arc<Hooks>>>,
+    restart_backoff: Duration,
+    stop_wait: Duration,
     runs: Mutex<HashMap<RunPlace, Run>>,
     /// Bumped whenever a run settles (exit, loss, stop).
     settled: watch::Sender<u64>,
@@ -259,13 +263,26 @@ impl MachineRuns {
     pub(crate) fn new(hooks: Hooks) -> Self {
         Self {
             inner: Arc::new(Inner {
-                hooks,
+                restart_backoff: hooks.restart_backoff,
+                stop_wait: hooks.stop_wait,
+                hooks: Mutex::new(Some(Arc::new(hooks))),
                 runs: Mutex::default(),
                 settled: watch::channel(0).0,
                 ending: Mutex::default(),
                 publishing: tokio::sync::Mutex::default(),
             }),
         }
+    }
+
+    fn hooks(&self) -> Option<Arc<Hooks>> {
+        lock(&self.inner.hooks).clone()
+    }
+
+    /// Drop the hooks, and with them the owner's `Services`: for an owner
+    /// that stops while its process lives on (an orchestrator tenant).
+    /// Later links fail and later publications and wakes are skipped.
+    pub(crate) fn release_hooks(&self) {
+        lock(&self.inner.hooks).take();
     }
 
     fn refuse_if_ending(&self, place: &RunPlace) -> Result<()> {
@@ -276,7 +293,9 @@ impl MachineRuns {
     }
 
     async fn changed(&self, place: &RunPlace) {
-        (self.inner.hooks.changed)(place.workspace_id.clone(), place.script_id.clone()).await;
+        if let Some(hooks) = self.hooks() {
+            (hooks.changed)(place.workspace_id.clone(), place.script_id.clone()).await;
+        }
     }
 
     /// Publish `ended`'s terminal row, then wake its owner.
@@ -286,8 +305,8 @@ impl MachineRuns {
         if let Some(row) = ended.event {
             self.publish_monitor(place, row).await;
         }
-        if let Some(content) = ended.wake {
-            (self.inner.hooks.wake)(
+        if let (Some(content), Some(hooks)) = (ended.wake, self.hooks()) {
+            (hooks.wake)(
                 place.workspace_id.clone(),
                 place.agent_id.clone(),
                 content,
@@ -299,7 +318,9 @@ impl MachineRuns {
         // early. A wake that failed leaves the agent nothing to wait on, so
         // its watch settles.
         if monitor_ended {
-            (self.inner.hooks.ended)(place.agent_id.clone()).await;
+            if let Some(hooks) = self.hooks() {
+                (hooks.ended)(place.agent_id.clone()).await;
+            }
         }
     }
 
@@ -314,7 +335,9 @@ impl MachineRuns {
             Some("active") | None => "registered".to_owned(),
             Some(state) => state.to_owned(),
         };
-        (self.inner.hooks.monitor)(place.workspace_id.clone(), kind, row).await;
+        if let Some(hooks) = self.hooks() {
+            (hooks.monitor)(place.workspace_id.clone(), kind, row).await;
+        }
     }
 
     fn bump(&self) {
@@ -323,7 +346,10 @@ impl MachineRuns {
 
     /// A usable link for a run on `place`'s machine.
     async fn link(&self, place: &RunPlace) -> Result<MachineScriptLink> {
-        let link = (self.inner.hooks.link)(place.agent_id.clone()).await?;
+        let hooks = self
+            .hooks()
+            .ok_or_else(|| Error::Internal("the machine runs were released".to_owned()))?;
+        let link = (hooks.link)(place.agent_id.clone()).await?;
         if link.protocol < SCRIPT_PROTOCOL {
             return Err(Error::MachineUpdateRequired(Box::new(
                 MachineUpdateRequired {
@@ -502,7 +528,7 @@ impl MachineRuns {
         if let (Some(link), Some(spawn_id)) = (link, spawn_id) {
             let mut settled = self.inner.settled.subscribe();
             let _ = (link.send)(stop_frame(place, &spawn_id)).await;
-            let _ = tokio::time::timeout(self.inner.hooks.stop_wait, async {
+            let _ = tokio::time::timeout(self.inner.stop_wait, async {
                 while self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
                     if settled.changed().await.is_err() {
                         return;
@@ -931,7 +957,7 @@ impl MachineRuns {
         if restart {
             let this = self.clone();
             let place = place.clone();
-            let backoff = self.inner.hooks.restart_backoff;
+            let backoff = self.inner.restart_backoff;
             // caller-binding: allow — a machine run's service restart, as the home supervisor's backoff
             tokio::spawn(async move {
                 tokio::time::sleep(backoff).await;
@@ -1359,7 +1385,9 @@ impl MachineRuns {
         };
         self.publish_monitor(place, row).await;
         // A silent cancel wakes nobody: settle what it alone deferred.
-        (self.inner.hooks.ended)(place.agent_id.clone()).await;
+        if let Some(hooks) = self.hooks() {
+            (hooks.ended)(place.agent_id.clone()).await;
+        }
         true
     }
 
