@@ -1,0 +1,1409 @@
+# Process-local state inventory of `intent_services::Services`.
+#
+# One `[[field]]` row per field of `pub struct Services` (crates/intent-services/src/lib.rs)
+# and one `[[loop]]` row per startup restore, sweep and background loop that
+# `intent_app::tenant` starts (crates/intent-app/src/tenant.rs). It records what each
+# piece of state means for running more than one stateless orchestrator replica
+# per tenant. Nothing here changes behavior.
+#
+# The guard test `crates/intent-services/tests/services_state_inventory_lint.rs`
+# fails when a `Services` field or a tenant loop is missing from this file or
+# listed here but gone from the code. Adding a field? Add its row here.
+#
+# Classes:
+#   durable    - the database is the truth; memory holds nothing a replica lacks.
+#   cache      - safe to lose or to differ per replica; `note` says how stale it gets.
+#   gate       - an in-process lock or single-flight guarding an invariant. `invariant`
+#                names it; `writer_lock` says whether the Postgres per-tenant writer
+#                lock (`tenant_writer`) already covers it: `covered`, `partial` or `no`.
+#   volatile   - live process-local state that is neither durable nor a cache: losing
+#                it or splitting it across replicas changes behavior. Must move to the
+#                database or behind an owner before replicas. (Added to the task's
+#                class list: many registries fit none of the other six.)
+#   owner      - owned background work, a long-lived runtime, or a link; needs one
+#                owner per tenant/machine (a claim) when replicas exist.
+#   connection - bound to one client or executor connection.
+#   config     - fixed after start (wiring, overrides, handles to other services).
+#   test       - test parks, probes and test-only overrides; `None`/absent in production.
+
+# ---------------------------------------------------------------------------
+# Services fields, in declaration order
+# ---------------------------------------------------------------------------
+
+[[field]]
+name = "store"
+class = "config"
+note = "Store handle (SQLite or Postgres). Shared by every replica; the database itself is the durable truth."
+
+[[field]]
+name = "assets_root"
+class = "config"
+note = "Note-asset directory on local disk. Replicas need shared object storage (gap F)."
+
+[[field]]
+name = "chief_cwd_root"
+class = "config"
+note = "Assistant workspace root on local disk (gap F)."
+
+[[field]]
+name = "event_subscriptions"
+class = "volatile"
+note = "Deprecated event.subscribe registrations with their running bus-delivery tasks. Rows persist and are rehydrated at startup, but delivery runs in this process; needs one owner per subscription."
+
+[[field]]
+name = "event_bus"
+class = "owner"
+note = "In-process EventBus (store append, then tokio broadcast). Gap C: transient events never leave the process."
+
+[[field]]
+name = "agent_workers"
+class = "volatile"
+note = "Provider worker observations per live agent generation in this daemon."
+
+[[field]]
+name = "agent_queues"
+class = "volatile"
+note = "Per-agent send queues. Memory is the truth today, written through to agent_queue; the 'agent queues DB-authoritative' task moves the truth to the DB."
+
+[[field]]
+name = "queue_submission_order"
+class = "volatile"
+note = "Process-wide monotonic queue submission counter; another replica would allocate overlapping orders."
+
+[[field]]
+name = "draining_queue_entries"
+class = "volatile"
+note = "Popped-but-not-yet-persisted queue entries overlaid on snapshots (PROTOCOL 6.5 drain ordering)."
+
+[[field]]
+name = "draining_shutdown"
+class = "volatile"
+note = "Shutdown flag freezing drained payloads before owners are cancelled."
+
+[[field]]
+name = "parked_recovery_sends"
+class = "volatile"
+note = "Queue-entry ids of recovery sends parked behind a still-held in-flight slot (intent-hq/intent#4962). Never persisted."
+
+[[field]]
+name = "agent_queue_persist_gate"
+class = "gate"
+invariant = "The last agent_queue write reflects the newest in-memory queue (snapshot taken inside the gate)."
+writer_lock = "partial"
+note = "The writer lock orders the writes, but the snapshot is of process memory; another replica's memory would still race."
+
+[[field]]
+name = "agent_queue_publish_gate"
+class = "gate"
+invariant = "agent:queue:updated snapshots are never older than a mutation that completed before the publish."
+writer_lock = "no"
+note = "Orders reads of process memory against the in-process bus write."
+
+[[field]]
+name = "browser_client_pin_gate"
+class = "gate"
+invariant = "workspace.setBrowserClient write and its workspace:updated publish happen in the same order."
+writer_lock = "partial"
+note = "Writes are ordered by the writer lock; publication after commit is not."
+
+[[field]]
+name = "desktop"
+class = "connection"
+note = "Desktop-control authority bound to one admitted execution connection; volatile by design."
+
+[[field]]
+name = "browser_tab_gate"
+class = "gate"
+invariant = "Each browser tab registry mutation and its browser:tab-* events are published atomically (no ghost tabs)."
+writer_lock = "partial"
+note = "Row order is covered; event publication order is not."
+
+[[field]]
+name = "agent_retirement_gates"
+class = "gate"
+invariant = "Per-target retirement cleanup and restore never interleave (lifecycle lock order head)."
+writer_lock = "no"
+note = "Spans several transactions plus process work (stopping sessions)."
+
+[[field]]
+name = "hold_release_timers"
+class = "owner"
+note = "Spawned sleepers releasing debounce holds on queued messages at holdUntil; re-armed at rehydration."
+
+[[field]]
+name = "pending_question_mutation_locks"
+class = "gate"
+invariant = "Per-agent pending-question marker writes and their agent:updated events stay in order."
+writer_lock = "partial"
+note = "Write order is covered; event order is not."
+
+[[field]]
+name = "pending_marker_mutation_park"
+class = "test"
+note = "Deterministic park before a marker mutation."
+
+[[field]]
+name = "session_stats_cache"
+class = "cache"
+note = "Last stats per session, used to emit agent:session-stats-changed only on change. Losing it causes at most one extra event; per-replica copies may duplicate events."
+
+[[field]]
+name = "models_catalog"
+class = "cache"
+note = "models.list cache, 24h staleness, optionally mirrored to a data-dir file; per-provider single-flight inside."
+
+[[field]]
+name = "auggie_bin"
+class = "test"
+note = "Test override for the auggie binary."
+
+[[field]]
+name = "branches_ls_remote_base"
+class = "test"
+note = "Test override for the ls-remote fallback URL base."
+
+[[field]]
+name = "one_shot_npx"
+class = "test"
+note = "Test override for npx discovery."
+
+[[field]]
+name = "auto_commit_timeout_ms"
+class = "test"
+note = "Test override for the auto-commit message timeout."
+
+[[field]]
+name = "auto_commit_cooldown_ms"
+class = "test"
+note = "Test override for the auto-commit cool-down window."
+
+[[field]]
+name = "auto_commit_cooldowns"
+class = "cache"
+note = "Per-workspace generation cool-down after a timeout (intent-hq/intent#5454). Losing it retries generation once more."
+
+[[field]]
+name = "worktree_presence"
+class = "cache"
+note = "Workspaces last seen with a missing checkout folder; re-probed by the watcher. Local disk view (gap F)."
+
+[[field]]
+name = "workspace_setup_states"
+class = "volatile"
+note = "Per-workspace setup stage; absent reads 'unknown'. In-memory only."
+
+[[field]]
+name = "home_setups"
+class = "volatile"
+note = "How far each workspace home's opening on its machine has got. In-memory only."
+
+[[field]]
+name = "archive_script_gates"
+class = "gate"
+invariant = "A workspace delete or purge waits for a running archiveScript before removing the folder."
+writer_lock = "no"
+note = "Guards local process and disk work."
+
+[[field]]
+name = "agent_subscriptions"
+class = "volatile"
+note = "Completion-watch and delegation-group registry. Rows persist (completion_watches with delivery claims), but the live registry and its delivery state are in memory."
+
+[[field]]
+name = "group_persist_lane"
+class = "owner"
+note = "Single worker that applies delegation_group writes in enqueue order (intent-hq/intent#4460)."
+
+[[field]]
+name = "completion_watch_registration_gate"
+class = "gate"
+invariant = "A strict completion-only watch is durably persisted before completion delivery can see it."
+writer_lock = "partial"
+note = "Persistence is covered; visibility to the in-memory registry is not."
+
+[[field]]
+name = "delivery_tasks"
+class = "owner"
+note = "Cancellation and drain ownership of automatic agent delivery tasks."
+
+[[field]]
+name = "store_tasks"
+class = "owner"
+note = "Finite derived-state writer tasks drained at shutdown."
+
+[[field]]
+name = "settings_tasks"
+class = "owner"
+note = "Finite settings writer tasks drained at shutdown."
+
+[[field]]
+name = "primary_auth_admitted"
+class = "config"
+note = "Set only on the clone inside a registered settings/primary-auth owner."
+
+[[field]]
+name = "terminal_tasks"
+class = "owner"
+note = "Terminal-related finite tasks drained at shutdown."
+
+[[field]]
+name = "turn_start_tasks"
+class = "owner"
+note = "Detached claim-to-spawn deliveries (intent-hq/intent#9927), joined at the shutdown checkpoint."
+
+[[field]]
+name = "pending_delete_tasks"
+class = "owner"
+note = "Finite pending-delete tasks drained at shutdown."
+
+[[field]]
+name = "host_exec_runtime"
+class = "owner"
+note = "Owns one-shot host command processes and their reaping."
+
+[[field]]
+name = "provider_preparation"
+class = "owner"
+note = "Bounded provider preparation scheduler."
+
+[[field]]
+name = "completion_delivery_retries"
+class = "owner"
+note = "Per-child terminal-delivery retry tasks with generations (intent-hq/intent#3728). The durable watch stays armed; the retry owner is in memory."
+
+[[field]]
+name = "pending_completion_retries"
+class = "owner"
+note = "Per-child bounded-backoff retry owner for deferred deliveries."
+
+[[field]]
+name = "completion_group_delivery_retries"
+class = "owner"
+note = "Delegation groups with an active aggregated-wake retry task."
+
+[[field]]
+name = "agent_failure_streaks"
+class = "volatile"
+note = "Consecutive identical terminal failures per agent (monorepo#840); feeds session_poisoned. Restart forgets it."
+
+[[field]]
+name = "unrecorded_turn_starts"
+class = "volatile"
+note = "Turn starts whose Active write failed, so agent.retry does not reuse the admission."
+
+[[field]]
+name = "pending_terminal_error"
+class = "volatile"
+note = "Single-shot handoff of an already-persisted terminal error to the turn worker (monorepo#2050)."
+
+[[field]]
+name = "failure_wake_dedup"
+class = "volatile"
+note = "Last agent:failed wake per (parent, child), suppressing repeats. Per-replica copies would let duplicates through."
+
+[[field]]
+name = "interim_skipped_idles"
+class = "volatile"
+note = "Children whose last agent:idle was skipped as interim (monorepo#1280); drives redelivery."
+
+[[field]]
+name = "stale_report_interim_skips"
+class = "volatile"
+note = "Subset of interim_skipped_idles recorded by registration-time deferral (monorepo#2532)."
+
+[[field]]
+name = "advisory_pending_interim_skips"
+class = "volatile"
+note = "Subset of interim_skipped_idles that owes a monitoring-idle advisory (monorepo#1297)."
+
+[[field]]
+name = "completion_deliveries_in_flight"
+class = "gate"
+invariant = "Only one delivery pass delivers a given ungrouped watch's terminal wake (intent-hq/intent#4367)."
+writer_lock = "partial"
+note = "completion_watches already has a DB delivery claim (claim_delivery with ProcessToken + epoch); this in-memory claim also shares consumed flip triggers between passes."
+
+[[field]]
+name = "advisory_wake_periods"
+class = "volatile"
+note = "In-memory mirror of advisory_wake_delivery markers bounding advisories when the store write fails."
+
+[[field]]
+name = "dismissal_notices_sent"
+class = "gate"
+invariant = "No duplicate questions-dismissed notice for concurrent or interleaved dismissals of the same id."
+writer_lock = "no"
+note = "The persisted marker is single-slot; the dedupe set is process memory."
+
+[[field]]
+name = "secret_vault"
+class = "volatile"
+note = "Agent-owned secrets and pending secret requests (PROTOCOL 5.56). Memory only by design; never persisted."
+
+[[field]]
+name = "agent_manager"
+class = "config"
+note = "Weak back-reference to the AgentManager, attached once."
+
+[[field]]
+name = "source_control"
+class = "config"
+note = "Forge override, wired at startup or by tests."
+
+[[field]]
+name = "linear_engine"
+class = "config"
+note = "Linear engine override."
+
+[[field]]
+name = "sentry_engine"
+class = "config"
+note = "Sentry engine override."
+
+[[field]]
+name = "sentry_api_base_url"
+class = "test"
+note = "Test override for the Sentry API base."
+
+[[field]]
+name = "voice_engine"
+class = "config"
+note = "Voice engine override (tests)."
+
+[[field]]
+name = "autocomplete_upstream"
+class = "config"
+note = "Autocomplete upstream endpoints and timeout."
+
+[[field]]
+name = "workspace_vocabulary"
+class = "cache"
+note = "Per-workspace vocabulary, content-hash keyed; recomputed on a miss."
+
+[[field]]
+name = "worktree_locks"
+class = "gate"
+invariant = "Commit/push on one worktree never races other operations on it (withGitWorktreeLock parity)."
+writer_lock = "no"
+note = "Guards a local git worktree."
+
+[[field]]
+name = "workspaces_root"
+class = "config"
+note = "Worktree root on local disk."
+
+[[field]]
+name = "base_refresh_timeout"
+class = "config"
+note = "Base-refresh fetch bound (tests shorten it)."
+
+[[field]]
+name = "warm_in_flight"
+class = "gate"
+invariant = "At most one opportunistic repo.warmCache warm daemon-wide."
+writer_lock = "no"
+note = "Guards local repo-cache disk work; per-replica it becomes one per replica."
+
+[[field]]
+name = "search_cancels"
+class = "connection"
+note = "Per-request cancel registry for search.*; a cancel must reach the process running the walk."
+
+[[field]]
+name = "agent_activity"
+class = "volatile"
+note = "Per-workspace in-flight session count behind the derived activity dot. Never persisted."
+
+[[field]]
+name = "pty"
+class = "owner"
+note = "PTY host backing terminal.* and ACP terminals; processes live here (gap D)."
+
+[[field]]
+name = "script_output_config"
+class = "config"
+note = "Script output log directory on local disk (gap F)."
+
+[[field]]
+name = "script_too_fast_ms"
+class = "config"
+note = "Too-fast-exit floor (tests raise it)."
+
+[[field]]
+name = "pulls"
+class = "owner"
+note = "Serves ws.file.pull pieces from snapshots under a local staging folder."
+
+[[field]]
+name = "pull_transfers"
+class = "connection"
+note = "Which caller opened each ws.file.pull transfer."
+
+[[field]]
+name = "script_parks"
+class = "test"
+note = "Script supervisor pre-registration park."
+
+[[field]]
+name = "completion_classify_park"
+class = "test"
+note = "Completion classify-to-mark park."
+
+[[field]]
+name = "hook_wake_park"
+class = "test"
+note = "Hook wake park (test-hooks)."
+
+[[field]]
+name = "hook_eval_park"
+class = "test"
+note = "Hook eval park (test-hooks)."
+
+[[field]]
+name = "completion_claim_park"
+class = "test"
+note = "Completion claim-to-send park."
+
+[[field]]
+name = "completion_flip_take_park"
+class = "test"
+note = "Flipped-completion take-to-publish park."
+
+[[field]]
+name = "attention_write_park"
+class = "test"
+note = "Attention write park."
+
+[[field]]
+name = "unread_settle_entry_park"
+class = "test"
+note = "Unread settle entry park."
+
+[[field]]
+name = "fold_hit_park"
+class = "test"
+note = "PR cache-hit fold park."
+
+[[field]]
+name = "wake_archived_park"
+class = "test"
+note = "Wake archived-gate park."
+
+[[field]]
+name = "task_update_projection_park"
+class = "test"
+note = "task.update projection park."
+
+[[field]]
+name = "archive_fence"
+class = "gate"
+invariant = "Per-workspace archive and unarchive (and the archive post-commit tail) never interleave."
+writer_lock = "no"
+note = "Held across several commits and event publication."
+
+[[field]]
+name = "archive_tail_park"
+class = "test"
+note = "Archive post-commit tail park."
+
+[[field]]
+name = "archive_predrop_park"
+class = "test"
+note = "Archive pre-drop park."
+
+[[field]]
+name = "queue_mutation_gate_park"
+class = "test"
+note = "Per-id queue mutation park."
+
+[[field]]
+name = "secrets"
+class = "config"
+note = "Secret store for sensitive settings (file-backed by default, gap F); its single-flight cache is safe to lose."
+
+[[field]]
+name = "settings_registry"
+class = "config"
+note = "config.toml registry with a file watcher (gap F); the 'settings off disk' task moves it to Postgres."
+
+[[field]]
+name = "settings_revision"
+class = "volatile"
+note = "Daemon-lifetime monotonic settings revision; replicas would hand out unrelated revisions."
+
+[[field]]
+name = "settings_revision_gate"
+class = "gate"
+invariant = "Settings persistence, revision allocation and settings:changed publication are ordered against snapshots."
+writer_lock = "no"
+note = "Settings live in config.toml, not under the tenant writer lock."
+
+[[field]]
+name = "settings_secret_gates"
+class = "gate"
+invariant = "Readers and writers of one secret setting wait for its whole mutation, including compensation and publication."
+writer_lock = "no"
+note = "Secrets live outside the database."
+
+[[field]]
+name = "provider_profiles"
+class = "volatile"
+note = "Provider profile metadata in <data_dir>/provider-profiles.json with a mutation lock and process-local revision (gap F)."
+
+[[field]]
+name = "profile_activation"
+class = "owner"
+note = "Live provider profile processes, one per agent at most."
+
+[[field]]
+name = "specialists_user_dir"
+class = "config"
+note = "User specialists directory override."
+
+[[field]]
+name = "specialists_bundled_dir"
+class = "config"
+note = "Bundled specialists directory override."
+
+[[field]]
+name = "mcp_hub"
+class = "owner"
+note = "External MCP server processes and their health monitor."
+
+[[field]]
+name = "context_engine"
+class = "config"
+note = "Context engine for search.codebase."
+
+[[field]]
+name = "live_turns"
+class = "volatile"
+note = "Partial assistant message of each streaming turn, merged into chat.subscribe snapshots. Lives with the turn writer."
+
+[[field]]
+name = "context_usages"
+class = "cache"
+note = "Latest context-window occupancy per agent from ACP usage_update; dropped on restart, refreshed by the next update."
+
+[[field]]
+name = "turn_bookkeeping"
+class = "owner"
+note = "Per-agent chain of detached turn-end usage bookkeeping tasks (monorepo#738)."
+
+[[field]]
+name = "last_turn_silent_tails"
+class = "cache"
+note = "Silent tail of each agent's last turn for agent.diagnostics; diagnostic only."
+
+[[field]]
+name = "truncation_redrives"
+class = "volatile"
+note = "Consecutive suspected-truncation auto-redrive counter per agent (monorepo#2863)."
+
+[[field]]
+name = "quota_failover_chains"
+class = "volatile"
+note = "Failover chain of the in-flight user turn; present only while a turn worker owns the turn."
+
+[[field]]
+name = "quota_failover_replays"
+class = "volatile"
+note = "Continue-the-cut-short-turn replay marks."
+
+[[field]]
+name = "pending_remote_failovers"
+class = "volatile"
+note = "Remote agents' quota switches awaiting their node's start (intent-hq/intent#8317)."
+
+[[field]]
+name = "remote_model_switches"
+class = "volatile"
+note = "Accepted agent.setModel switches for remote agents awaiting the next start."
+
+[[field]]
+name = "provider_return_announcements"
+class = "volatile"
+note = "Pending provider_returned announcements; re-armed when the message restarts."
+
+[[field]]
+name = "provider_quota_cache"
+class = "cache"
+note = "Daemon-wide quota health per provider configuration; re-learned from the next attempt."
+
+[[field]]
+name = "pending_truncation_redrive"
+class = "volatile"
+note = "One-shot truncation redrive handoff between run_prompt_turn and the turn worker."
+
+[[field]]
+name = "test_busy"
+class = "test"
+note = "Simulated busy agents; empty in production."
+
+[[field]]
+name = "deferred_attention"
+class = "volatile"
+note = "Attention requests raised mid-turn, surfaced when the agent goes idle. Restart loses the queue."
+
+[[field]]
+name = "attention_mutation_gates"
+class = "gate"
+invariant = "Per-agent attention persistence, deferred surfacing and matching clear events stay ordered."
+writer_lock = "partial"
+note = "Write order is covered; event order is not."
+
+[[field]]
+name = "line_attribution_debouncers"
+class = "owner"
+note = "Per-note debounce timers for attribute_lines recomputes; a replica would recompute twice (harmless) but would not cancel the other's timer."
+
+[[field]]
+name = "last_activity_debouncers"
+class = "owner"
+note = "Per-workspace trailing-edge debounce timers for workspace:updated lastActivity."
+
+[[field]]
+name = "last_activity_debounce_gen"
+class = "owner"
+note = "Generation counter for last_activity_debouncers."
+
+[[field]]
+name = "idle_debouncers"
+class = "owner"
+note = "Per-workspace debounce timers for the busy-to-idle workspace:activity-changed flip."
+
+[[field]]
+name = "idle_debounce_gen"
+class = "owner"
+note = "Generation counter for idle_debouncers."
+
+[[field]]
+name = "last_display_statuses"
+class = "cache"
+note = "Last emitted displayStatus per workspace; per-replica copies may emit duplicate or missed change events."
+
+[[field]]
+name = "last_waiting_statuses"
+class = "cache"
+note = "Last emitted waiting flag per workspace; same staleness as last_display_statuses."
+
+[[field]]
+name = "scripts_running_state"
+class = "gate"
+invariant = "Workspace.scriptsRunning transitions are computed and published in order per workspace."
+writer_lock = "no"
+note = "Derived from local script processes."
+
+[[field]]
+name = "reverse_dispatch"
+class = "connection"
+note = "First-client-sticky server-to-client RPC registry for ws.browser.exec (gap D)."
+
+[[field]]
+name = "server_control"
+class = "config"
+note = "WSS listener runtime control, attached once."
+
+[[field]]
+name = "agent_rpc"
+class = "config"
+note = "Assistant ws.rpc.* surface, attached once."
+
+[[field]]
+name = "rpc_proposals"
+class = "volatile"
+note = "Assistant rpc-call proposals awaiting approval. In memory only; a restart expires them."
+
+[[field]]
+name = "backend_reports"
+class = "volatile"
+note = "Latest backends.report from each owner app."
+
+[[field]]
+name = "invite_links"
+class = "config"
+note = "Invite link builder, attached once."
+
+[[field]]
+name = "token_usage_watermarks"
+class = "cache"
+note = "Incremental token-usage scan watermarks; a restart (or another replica) rescans once."
+
+[[field]]
+name = "github_auth_flow"
+class = "volatile"
+note = "The single GitHub device-flow slot and its poll task."
+
+[[field]]
+name = "collaboration_auth"
+class = "volatile"
+note = "Collaboration credential flows; credentials live in private local files (gap F)."
+
+[[field]]
+name = "github_login_base_uri"
+class = "test"
+note = "Test override for the GitHub login host."
+
+[[field]]
+name = "gitlab_auth"
+class = "volatile"
+note = "GitLab device-grant slot and unsupported-host memory."
+
+[[field]]
+name = "gitlab_secret_store"
+class = "config"
+note = "File-backed GitLab credential pair (secrets.json, gap F); the 'settings off disk' task moves it."
+
+[[field]]
+name = "isolated_secrets_dir"
+class = "test"
+note = "Scratch secrets directory of new_isolated."
+
+[[field]]
+name = "gitlab_credential_gate"
+class = "gate"
+invariant = "Refresh, persist and delete of the GitLab credential pair are serialized."
+writer_lock = "no"
+note = "The pair is in a local file today."
+
+[[field]]
+name = "repository_connection_directory"
+class = "volatile"
+note = "Repository credential directory for this server incarnation, with a fresh private epoch."
+
+[[field]]
+name = "daemon_boot_id"
+class = "config"
+note = "Identity of this server incarnation; each replica has its own."
+
+[[field]]
+name = "repository_wire_owner"
+class = "config"
+note = "Weak back-reference to the owning Services allocation."
+
+[[field]]
+name = "repository_review_capacity"
+class = "gate"
+invariant = "Bounds concurrent repository review reads."
+writer_lock = "no"
+note = "Process-local capacity; replicas multiply the bound."
+
+[[field]]
+name = "repository_resource_capacity"
+class = "gate"
+invariant = "Bounds concurrent repository resource reads."
+writer_lock = "no"
+note = "Process-local capacity."
+
+[[field]]
+name = "repository_child_git_capacity"
+class = "gate"
+invariant = "Bounds concurrent child git helper operations."
+writer_lock = "no"
+note = "Process-local capacity."
+
+[[field]]
+name = "repository_checkout_capacity"
+class = "gate"
+invariant = "Bounds concurrent repository checkout operations."
+writer_lock = "no"
+note = "Process-local capacity."
+
+[[field]]
+name = "repository_selection_capacity"
+class = "gate"
+invariant = "Bounds concurrent repository selection operations."
+writer_lock = "no"
+note = "Process-local capacity."
+
+[[field]]
+name = "repository_lifecycle_registry"
+class = "volatile"
+note = "The one invalidation observer installed in the Store for this Services instance."
+
+[[field]]
+name = "principal_identity_refreshed_at"
+class = "cache"
+note = "Rate-limit instant for the primary's GitHub profile refresh; another replica refreshes once more."
+
+[[field]]
+name = "identity_transition"
+class = "gate"
+invariant = "The primary identity's lock check and write never interleave with invite minting."
+writer_lock = "partial"
+note = "Both sides write rows, but check-then-write spans separate statements."
+
+[[field]]
+name = "identity_rekey_generation"
+class = "volatile"
+note = "Bumped by every identity.provider write; a stale re-key probe is dropped. Process-local counter."
+
+[[field]]
+name = "invite_nonces"
+class = "volatile"
+note = "Outstanding invite.challenge nonces awaiting invite.prove; a prove on another replica would fail."
+
+[[field]]
+name = "invite_nonce_permits"
+class = "gate"
+invariant = "At most MAX_OUTSTANDING_NONCES nonces are outstanding."
+writer_lock = "no"
+note = "Process-local permits."
+
+[[field]]
+name = "principal_revocations"
+class = "connection"
+note = "Feed of revoked principals; the transport closes their connections. Must reach every replica holding them."
+
+[[field]]
+name = "push_relay"
+class = "owner"
+note = "Push relay key, link bookkeeping and publisher wake-up."
+
+[[field]]
+name = "executor_revocations"
+class = "connection"
+note = "Feed of revoked executor credentials; the transport closes their /node/* connections."
+
+[[field]]
+name = "machine_routes"
+class = "config"
+note = "Where the executor link can be dialed, attached once."
+
+[[field]]
+name = "link_traffic"
+class = "owner"
+note = "Capture of executor-link traffic, tapped by the links (gap E)."
+
+[[field]]
+name = "executor_liveness"
+class = "connection"
+note = "Live status of executor credentials from the executor link (gap E)."
+
+[[field]]
+name = "human_instruction_authority"
+class = "gate"
+invariant = "Human instruction authority changes exclude concurrent instruction admissions."
+writer_lock = "no"
+note = "Process-local RwLock."
+
+[[field]]
+name = "discussion_control_gates"
+class = "gate"
+invariant = "Per-agent discussion control mutations are serialized."
+writer_lock = "partial"
+note = "Writes are covered; surrounding reads and publication are not."
+
+[[field]]
+name = "invite_create_commit_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "member_removal_commit_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "invite_join_commit_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "invite_join_admission_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "member_removal_publication_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "queue_drain_commit_pause"
+class = "test"
+note = "Mutation barrier (cfg(test))."
+
+[[field]]
+name = "presence"
+class = "connection"
+note = "Ephemeral workspace and note presence table (gap D)."
+
+[[field]]
+name = "github_api_base_uri"
+class = "test"
+note = "Test override for the GitHub API base."
+
+[[field]]
+name = "disk_usage"
+class = "cache"
+note = "TTL stale-while-revalidate disk-usage cache; local disk walks (gap F)."
+
+[[field]]
+name = "agent_list_cache"
+class = "cache"
+note = "agent.list message projections, invalidated by local writes. A replica would not see another replica's invalidations: needs bus-driven invalidation."
+
+[[field]]
+name = "turn_attachments"
+class = "volatile"
+note = "Turn-attachment registry: MCP dispatch registers, transcript writer claims. Both run with the agent's session."
+
+[[field]]
+name = "periodic_commit_hold"
+class = "test"
+note = "Periodic commit hold (cfg(test))."
+
+[[field]]
+name = "git_diffs_inflight"
+class = "cache"
+note = "Single-flight for identical git.diffs walks; coalescing only."
+
+[[field]]
+name = "git_diffs_slow_warns"
+class = "cache"
+note = "WARN rate limiter; logging only."
+
+[[field]]
+name = "git_diffs_walk_probe"
+class = "test"
+note = "git.diffs walk probe."
+
+[[field]]
+name = "git_status_cache"
+class = "cache"
+note = "Per-worktree status cache invalidated by daemon-observed changes plus a fallback TTL. Invalidations from another replica would not arrive."
+
+[[field]]
+name = "git_status_scan_probe"
+class = "test"
+note = "Status scan probe."
+
+[[field]]
+name = "ac_status_inflight"
+class = "cache"
+note = "Single-flight for accept-changes.getStatus builds; coalescing only."
+
+[[field]]
+name = "hooks_max_per_agent"
+class = "config"
+note = "Hook cap from Config."
+
+[[field]]
+name = "node_mode"
+class = "config"
+note = "Node mode flag, fixed before listeners serve."
+
+[[field]]
+name = "run_mode"
+class = "config"
+note = "Daemon mode (orchestrator or not), fixed before listeners serve."
+
+[[field]]
+name = "hook_eval_timeout"
+class = "config"
+note = "Hook script budget (tests shorten it)."
+
+[[field]]
+name = "hook_clock_skew"
+class = "test"
+note = "Hook TTL clock skew."
+
+[[field]]
+name = "hook_store_retry_base"
+class = "config"
+note = "Hook persistence retry backoff (tests shorten it)."
+
+[[field]]
+name = "hook_store_fault"
+class = "test"
+note = "Hook persistence fault injector (test-hooks)."
+
+[[field]]
+name = "suspend_tracker"
+class = "config"
+note = "Host suspend-overlap query; host-local by nature."
+
+[[field]]
+name = "pr_monitor_queued_wakes"
+class = "volatile"
+note = "Each monitor's last changed wake still queued, so a newer one replaces it."
+
+[[field]]
+name = "pr_monitor_catch_up"
+class = "volatile"
+note = "Monitors whose next poll skips the debounce after a restart; set by rehydration."
+
+[[field]]
+name = "pr_monitor_feed"
+class = "cache"
+note = "Last-seen PR state per monitor and PRs other reads saw move; only speeds up polling."
+
+[[field]]
+name = "pr_monitor_kick"
+class = "owner"
+note = "Wakes the PR-monitor loop for an immediate sweep."
+
+[[field]]
+name = "pr_cache"
+class = "cache"
+note = "Shared PR read cache within prCache.maxAgeSeconds; starts cold."
+
+[[field]]
+name = "automatic_pr_refresh"
+class = "gate"
+invariant = "Automatic PR refreshes are reserved before I/O, bounding retries across reconnects and windows."
+writer_lock = "no"
+note = "Forge-call admission; replicas multiply the budget."
+
+[[field]]
+name = "pr_discovery"
+class = "cache"
+note = "Repository-wide PR discovery single-flight with failure memory for a window."
+
+[[field]]
+name = "created_pr_retries"
+class = "owner"
+note = "Agent-created PRs being linked, so a second report joins the retry."
+
+[[field]]
+name = "issue_cache"
+class = "cache"
+note = "github.issues.get cache within prCache.maxAgeSeconds."
+
+[[field]]
+name = "pr_cache_max_age_seconds"
+class = "test"
+note = "Override for prCache.maxAgeSeconds; production reads settings."
+
+[[field]]
+name = "pr_read_park"
+class = "test"
+note = "On-demand PR read park."
+
+[[field]]
+name = "pr_monitor_poll_seconds"
+class = "test"
+note = "Override for prMonitor.pollSeconds."
+
+[[field]]
+name = "pr_monitor_hourly_request_budget"
+class = "test"
+note = "Override for prMonitor.hourlyRequestBudget."
+
+[[field]]
+name = "pr_monitor_quota_share_percent"
+class = "test"
+note = "Override for prMonitor.quotaSharePercent."
+
+[[field]]
+name = "pr_monitor_logged_interval"
+class = "cache"
+note = "Last logged cadence; logging only."
+
+[[field]]
+name = "pr_monitor_debounce_seconds"
+class = "test"
+note = "Override for prMonitor.debounceSeconds."
+
+[[field]]
+name = "pr_monitors_max_per_agent"
+class = "test"
+note = "Override for prMonitor.maxPerAgent."
+
+[[field]]
+name = "pr_monitor_registration"
+class = "gate"
+invariant = "Per-owner PR-monitor quota admission through persistence, including adoption, is serialized."
+writer_lock = "partial"
+note = "The count-then-insert spans a forge read and separate statements."
+
+[[field]]
+name = "review_monitor_authorities"
+class = "volatile"
+note = "Original qualified registration lifetimes; never rebuilt from stored ids."
+
+[[field]]
+name = "review_monitor_poll_lane"
+class = "gate"
+invariant = "GitLab review-monitor polls never overlap."
+writer_lock = "no"
+note = "Guards forge polling."
+
+[[field]]
+name = "legacy_pr_monitor_poll_lane"
+class = "gate"
+invariant = "The legacy PR-monitor sweep and an agent:idle nudge never poll the same monitors concurrently."
+writer_lock = "no"
+note = "Guards forge polling; becomes an owner claim with replicas."
+
+[[field]]
+name = "review_monitor_controls"
+class = "owner"
+note = "Control channel into the running monitor loop."
+
+[[field]]
+name = "review_monitor_deliveries"
+class = "volatile"
+note = "Current original deliveries; never reconstructed from persisted wake metadata."
+
+[[field]]
+name = "test_review_monitoring_recipient"
+class = "test"
+note = "Fixture receipt (cfg(test))."
+
+[[field]]
+name = "test_review_monitor_write_ready"
+class = "test"
+note = "Write-ready notify (cfg(test))."
+
+[[field]]
+name = "pr_monitor_fetch_timeout"
+class = "config"
+note = "Per-fetch bound in a sweep (tests shorten it)."
+
+[[field]]
+name = "pr_refresh_fetch_timeout"
+class = "config"
+note = "Per-workspace PR refresh bound (tests shorten it)."
+
+[[field]]
+name = "sweep_rate_limit"
+class = "cache"
+note = "Global forge rate-limit pause; re-learned on the first rate-limited call."
+
+[[field]]
+name = "pending_workspace_deletes"
+class = "owner"
+note = "Delete grace-window timers; never persisted, so a restart drops pending deletions."
+
+[[field]]
+name = "workspace_mutations"
+class = "gate"
+invariant = "Admitted creates and sends finish before an incremental workspace deletion stops sessions; later producers fail fast."
+writer_lock = "no"
+note = "Deletion yields the writer between steps, so the writer lock cannot hold it."
+
+[[field]]
+name = "startup_resume_candidates"
+class = "volatile"
+note = "Agents reserved for startup resume."
+
+[[field]]
+name = "interrupted_list_park"
+class = "test"
+note = "Interrupted list park (cfg(test))."
+
+[[field]]
+name = "interrupted_resume_park"
+class = "test"
+note = "Interrupted resume park (cfg(test))."
+
+[[field]]
+name = "workspace_delete_test_gate"
+class = "test"
+note = "Workspace delete gate (cfg(test))."
+
+[[field]]
+name = "pending_delete_test_gate"
+class = "test"
+note = "Pending delete gates (cfg(all(test, unix)))."
+
+[[field]]
+name = "pending_agent_deletes"
+class = "owner"
+note = "Agent delete grace-window timers; never persisted."
+
+[[field]]
+name = "execution_invalidation"
+class = "owner"
+note = "Notify that wakes the execution-context loop on safe-context invalidations."
+
+[[field]]
+name = "execution_readiness"
+class = "cache"
+note = "Bounded provider readiness verdicts; recomputed by the execution-context loop."
+
+[[field]]
+name = "attachment_uploads"
+class = "volatile"
+note = "Staged attachment upload sessions between begin and commit; chunks on another replica would miss the session. Staging dirs are local disk (gap F)."
+
+[[field]]
+name = "attachment_idempotency_inflight"
+class = "gate"
+invariant = "Same-key keyed attachment placements wait and replay instead of racing (intent-hq/intent#4691)."
+writer_lock = "partial"
+note = "The store primary key is the last line of defence; the wait-and-replay is process-local."
+
+[[field]]
+name = "idempotency_inflight"
+class = "gate"
+invariant = "Same-key first-use callers of with_idempotency serialize; one runs, the rest replay."
+writer_lock = "partial"
+note = "The stored result is durable; the in-flight wait is process-local."
+
+[[field]]
+name = "ports"
+class = "config"
+note = "Registered feature ports, frozen once shared."
+
+[[field]]
+name = "features"
+class = "config"
+note = "Feature state objects keyed by type (e.g. transfer sessions); the objects themselves are not inventoried here."
+
+# ---------------------------------------------------------------------------
+# intent_app::tenant startup restores, sweeps and loops
+# `name` is the function tenant.rs calls; `kind` is restore | sweep | loop.
+# ---------------------------------------------------------------------------
+
+[[loop]]
+name = "heal_event_subscriptions_on_startup"
+kind = "restore"
+class = "owner"
+note = "Rehydrates persisted event subscriptions into this process; each replica would deliver them again."
+
+[[loop]]
+name = "hydrate_scripts"
+kind = "restore"
+class = "owner"
+note = "Loads script definitions into the local registry."
+
+[[loop]]
+name = "rehydrate_hooks"
+kind = "restore"
+class = "owner"
+note = "Resumes hook timers in this process; needs per-hook claims."
+
+[[loop]]
+name = "rehydrate_pr_monitors"
+kind = "restore"
+class = "owner"
+note = "Resumes PR monitors and marks catch-up; needs per-monitor claims."
+
+[[loop]]
+name = "refresh_primary_identity_at_startup"
+kind = "restore"
+class = "cache"
+note = "One bounded GitHub identity refresh; harmless to repeat."
+
+[[loop]]
+name = "sweep_orphaned_worktree_trash"
+kind = "sweep"
+class = "owner"
+note = "Removes local worktree trash dirs (gap F)."
+
+[[loop]]
+name = "sweep_stale_export_staging"
+kind = "sweep"
+class = "owner"
+note = "Removes local export staging dirs, assuming every session died with the process."
+
+[[loop]]
+name = "sweep_agent_tmp_root"
+kind = "loop"
+class = "owner"
+note = "Hourly sweep of local agent temp folders."
+
+[[loop]]
+name = "resume_exposed_machines"
+kind = "sweep"
+class = "owner"
+note = "Redials machines that may run this backend's agents (gap E: one owner per machine)."
+
+[[loop]]
+name = "sweep_expired_attachment_idempotency_keys"
+kind = "sweep"
+class = "owner"
+note = "Deletes expired idempotency bindings; idempotent, safe to run on any replica."
+
+[[loop]]
+name = "spawn_pr_refresh_loop"
+kind = "loop"
+class = "owner"
+note = "Background PR refresh every 60 s tick; duplicate runs double forge load."
+
+[[loop]]
+name = "spawn_pr_monitor_loop"
+kind = "loop"
+class = "owner"
+note = "Centralized PR-monitor sweep; needs per-monitor claims."
+
+[[loop]]
+name = "spawn_token_usage_scan_loop"
+kind = "loop"
+class = "owner"
+note = "Token-usage rescan every 300 s; the 'generic work claims' task adopts claims here first."
+
+[[loop]]
+name = "spawn_completion_delivery_loop"
+kind = "loop"
+class = "owner"
+note = "Bus subscriber waking parents on child completion; DB delivery claims exist for watches."
+
+[[loop]]
+name = "spawn_auto_commit_loop"
+kind = "loop"
+class = "owner"
+note = "agent:idle subscriber committing task-linked changes; touches the home worktree."
+
+[[loop]]
+name = "spawn_push_publisher"
+kind = "loop"
+class = "owner"
+note = "Push relay publisher; one per tenant."
+
+[[loop]]
+name = "spawn_idle_pr_refresh_loop"
+kind = "loop"
+class = "owner"
+note = "agent:idle subscriber refreshing that workspace's PRs."
+
+[[loop]]
+name = "spawn_agent_locks_loop"
+kind = "loop"
+class = "owner"
+note = "Recomputes and publishes changes:agent-locks snapshots from bus events."
+
+[[loop]]
+name = "spawn_tracked_changes_sweep_loop"
+kind = "loop"
+class = "owner"
+note = "Deletes stale tracked-change rows after git checks."
+
+[[loop]]
+name = "spawn_script_output_sweep_loop"
+kind = "loop"
+class = "owner"
+note = "Deletes old local script output logs (gap F)."
+
+[[loop]]
+name = "spawn_auto_retire_loop"
+kind = "loop"
+class = "owner"
+note = "Hourly purge of long-archived workspaces."
+
+[[loop]]
+name = "spawn_auto_archive_loop"
+kind = "loop"
+class = "owner"
+note = "Hourly archive of idle workspaces."
+
+[[loop]]
+name = "spawn_execution_context_loop"
+kind = "loop"
+class = "owner"
+note = "Recomputes provider execution readiness (backend upkeep; runs in node mode too)."
+
+[[loop]]
+name = "spawn_tenant_retention_loop"
+kind = "loop"
+class = "owner"
+note = "Event retention store sweep (TenantRuntime only)."
+
+[[loop]]
+name = "spawn_tenant_reap_loop"
+kind = "loop"
+class = "owner"
+note = "Idempotency reaper store sweep (TenantRuntime only)."
