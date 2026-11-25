@@ -207,12 +207,73 @@ pub fn home_has_api_key(dsh_home: &Path) -> bool {
         || read(".env").is_some_and(|doc| dotenv_has_key(&doc, API_KEY_ENV))
 }
 
-/// `.credentials.yaml` is a flat mapping of credential reference to string.
+/// `.credentials.yaml` is `version: 1` with a `refs:` mapping of credential
+/// reference to string (block style as DSH writes it, or a flow mapping).
+/// A document without `version` is the pre-release flat layout, which DSH
+/// migrates on start, so its top-level entries count.
 fn credentials_yaml_has_key(doc: &str, key: &str) -> bool {
-    doc.lines()
-        .filter(|line| !line.starts_with([' ', '\t', '#']))
+    let lines: Vec<&str> = doc
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect();
+    let is_top = |line: &&&str| !line.starts_with([' ', '\t']);
+    let versioned = lines
+        .iter()
+        .filter(is_top)
         .filter_map(|line| line.split_once(':'))
-        .any(|(k, v)| unquote(k.trim()) == key && !unquote(v.trim()).is_empty())
+        .any(|(k, _)| unquote(k.trim()) == "version");
+    if !versioned {
+        return lines
+            .iter()
+            .filter(is_top)
+            .filter_map(|line| line.split_once(':'))
+            .any(|(k, v)| names_key_with_value(k, v, key));
+    }
+    let mut in_refs = false;
+    let mut child_indent = None;
+    for line in lines {
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            in_refs = false;
+            child_indent = None;
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if unquote(k.trim()) != "refs" {
+                continue;
+            }
+            let v = v.trim();
+            if let Some(flow) = v.strip_prefix('{') {
+                let flow = flow.split('}').next().unwrap_or_default();
+                if flow
+                    .split(',')
+                    .filter_map(|pair| pair.split_once(':'))
+                    .any(|(k, v)| names_key_with_value(k, v, key))
+                {
+                    return true;
+                }
+            } else {
+                in_refs = v.is_empty() || v.starts_with('#');
+            }
+            continue;
+        }
+        if !in_refs || *child_indent.get_or_insert(indent) != indent {
+            continue;
+        }
+        if let Some((k, v)) = line.trim_start().split_once(':') {
+            if names_key_with_value(k, v, key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn names_key_with_value(k: &str, v: &str, key: &str) -> bool {
+    unquote(k.trim()) == key && !unquote(v.trim()).is_empty()
 }
 
 fn dotenv_has_key(doc: &str, key: &str) -> bool {
@@ -479,21 +540,37 @@ mod tests {
     #[test]
     fn api_key_presence_in_dsh_home() {
         let home = tempfile::tempdir().unwrap();
+        let has = |doc: &str| {
+            std::fs::write(home.path().join(".credentials.yaml"), doc).unwrap();
+            home_has_api_key(home.path())
+        };
         assert!(!home_has_api_key(home.path()));
-        std::fs::write(home.path().join(".credentials.yaml"), "OTHER_KEY: x\n").unwrap();
-        assert!(!home_has_api_key(home.path()));
-        std::fs::write(
-            home.path().join(".credentials.yaml"),
-            "DEEPSEEK_API_KEY: ''\n",
-        )
-        .unwrap();
-        assert!(!home_has_api_key(home.path()));
-        std::fs::write(
-            home.path().join(".credentials.yaml"),
-            "OTHER: a\nDEEPSEEK_API_KEY: 'sk-test'\n",
-        )
-        .unwrap();
-        assert!(home_has_api_key(home.path()));
+        assert!(has("version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-saved\n"));
+        assert!(has(
+            "# written by dsh web\nversion: 1\nrecords:\n  other: x\nrefs:\n  OTHER: a\n  \"DEEPSEEK_API_KEY\": 'sk-saved' # note\n"
+        ));
+        assert!(has(
+            "version: 1\nrefs: { OTHER: a, DEEPSEEK_API_KEY: sk-saved }\n"
+        ));
+        assert!(!has("version: 1\nrefs:\n  OTHER_KEY: x\n"));
+        assert!(!has("version: 1\nrefs:\n  DEEPSEEK_API_KEY: ''\n"));
+        assert!(
+            !has("version: 1\nrecords:\n  DEEPSEEK_API_KEY: sk\nrefs:\n  OTHER: a\n"),
+            "only refs entries resolve"
+        );
+        assert!(
+            !has("version: 1\nrefs:\n  nested:\n    DEEPSEEK_API_KEY: sk\n"),
+            "only direct refs children resolve"
+        );
+        assert!(
+            !has("version: 1\nDEEPSEEK_API_KEY: sk-top\n"),
+            "a versioned document ignores unknown top-level keys"
+        );
+        assert!(
+            has("OTHER: a\nDEEPSEEK_API_KEY: 'sk-test'\n"),
+            "DSH migrates the pre-release flat layout on start"
+        );
+        assert!(!has("DEEPSEEK_API_KEY: ''\n"));
         std::fs::remove_file(home.path().join(".credentials.yaml")).unwrap();
         std::fs::write(home.path().join(".env"), "export DEEPSEEK_API_KEY=\"sk\"\n").unwrap();
         assert!(home_has_api_key(home.path()));

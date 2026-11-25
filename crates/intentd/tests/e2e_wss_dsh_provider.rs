@@ -546,12 +546,13 @@ async fn dsh_signed_out_and_upload_guard_over_wss() {
         .expect("unavailableReason");
     assert!(reason.contains("session-log-deepseek-v2"), "{reason}");
 
-    // A key saved by `dsh web` counts as signed in.
+    // A key saved by `dsh web` (the versioned `refs` layout) counts as
+    // signed in, so the refusal below is the upload guard, not sign-in.
     let dsh_home = fx.data_dir.join("home/.dsh");
     std::fs::create_dir_all(&dsh_home).unwrap();
     std::fs::write(
         dsh_home.join(".credentials.yaml"),
-        "DEEPSEEK_API_KEY: sk-saved\n",
+        "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-saved\n",
     )
     .unwrap();
     let auth = wss_rpc(

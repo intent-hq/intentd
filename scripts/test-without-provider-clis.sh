@@ -41,6 +41,7 @@ PROVIDER_CLIS=(
   cortex-acp
   cursor-agent
   droid
+  dsh
   grok
   opencode
   pi
@@ -49,7 +50,7 @@ PROVIDER_CLIS=(
 )
 NODE_TOOLS=(node npx npm corepack)
 # Provider home folders: native installers, credentials and adapter state.
-PROVIDER_HOMES=(.augment .claude .codex .cursor .factory .grok .local/share/cursor-agent .opencode .pi .unsloth)
+PROVIDER_HOMES=(.augment .claude .codex .cursor .dsh .factory .grok .local/share/cursor-agent .opencode .pi .unsloth)
 
 die() {
   echo "test-without-provider-clis: $*" >&2
