@@ -8012,8 +8012,8 @@ impl Services {
     /// The token-usage sweep under the work claim in `held`
     /// (see `work_claims`): before each workspace after the first it renews
     /// the claim once half its TTL has passed, and stops the sweep when the
-    /// claim is lost or cannot be renewed. Returns whether the sweep ran to
-    /// the end.
+    /// claim is lost or cannot be renewed, or once settings shutdown began.
+    /// Returns whether the sweep ran to the end.
     async fn scan_all_token_usage_claimed(
         &self,
         held: &mut Option<intent_store::WorkClaim>,
@@ -8030,6 +8030,11 @@ impl Services {
             }
         };
         for (i, ws) in workspaces.into_iter().enumerate() {
+            // A settings shutdown ends the sweep here, so the loop reaches
+            // its claim release before the drain aborts it.
+            if self.settings_tasks.is_closed() {
+                return false;
+            }
             if i > 0 && !self.keep_work_claim(held).await {
                 return false;
             }
@@ -8078,13 +8083,27 @@ impl Services {
     /// `interval`; missed ticks are skipped (no pile-up). Each tick runs
     /// under the `token-usage-scan` work claim (TTL two intervals): the
     /// holder keeps it across ticks and a process without it skips the tick,
-    /// so processes sharing a tenant sweep once per interval between them. A
-    /// clean stop releases the claim; an abort lets it lapse. Returns the
-    /// task handle so the composition root can hold/abort it.
+    /// so processes sharing a tenant sweep once per interval between them.
+    /// Settings shutdown (`begin_settings_shutdown`, which a graceful drain
+    /// runs before it aborts the loops) ends a sweep between workspaces and
+    /// the loop then releases the claim. An abort that lands first (mid
+    /// workspace, or during the release) leaves the claim to lapse after its
+    /// TTL or to a takeover's newer epoch. Returns the task handle so the
+    /// composition root can hold/abort it.
     #[must_use]
     pub fn spawn_token_usage_scan_loop(
         &self,
         interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_token_usage_scan_loop_with_ttl(interval, interval.saturating_mul(2))
+    }
+
+    /// [`Services::spawn_token_usage_scan_loop`] with the claim TTL given
+    /// apart from the interval (tests tick fast under a long claim).
+    pub(crate) fn spawn_token_usage_scan_loop_with_ttl(
+        &self,
+        interval: std::time::Duration,
+        ttl: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         intent_core::spawn_daemon(async move {
@@ -8092,7 +8111,6 @@ impl Services {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
             ticker.tick().await;
-            let ttl = interval.saturating_mul(2);
             let mut held = None;
             loop {
                 tokio::select! {

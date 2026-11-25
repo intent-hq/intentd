@@ -248,4 +248,52 @@ mod tests {
         assert!(svc.keep_work_claim(&mut None).await);
         svc.release_held_work_claim(None).await;
     }
+
+    /// A settings shutdown that lands mid-sweep (as a graceful drain's
+    /// `close_admission` does before it aborts the loops) ends the sweep
+    /// before the next workspace, and the loop ends on its own and releases
+    /// the claim, so another process can take the work at once.
+    #[tokio::test]
+    async fn a_stop_during_a_sweep_releases_the_claim() {
+        let (svc, store, first, _dir) = services().await;
+        let second = WorkspaceId::new();
+        store
+            .insert_workspace(&crate::tests::workspace(&second))
+            .await
+            .unwrap();
+        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "token");
+        let task = svc.spawn_token_usage_scan_loop_with_ttl(Duration::from_millis(1), TTL);
+        // The sweep is in progress: one workspace's tally committed, held.
+        crate::periodic_shutdown_tests::entered(entered).await;
+        assert!(
+            store
+                .claim_work(TOKEN_USAGE_SCAN_WORK, "", TTL)
+                .await
+                .unwrap()
+                .is_none(),
+            "the sweeping loop holds the claim"
+        );
+        svc.begin_settings_shutdown();
+        release.send(()).unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            task,
+        )
+        .await
+        .expect("the loop ends on its own once settings shutdown began")
+        .expect("the loop was not aborted");
+        assert!(
+            store
+                .claim_work(TOKEN_USAGE_SCAN_WORK, "", TTL)
+                .await
+                .unwrap()
+                .is_some(),
+            "the loop released its claim"
+        );
+        let mut scanned = 0;
+        for ws in [&first, &second] {
+            scanned += usize::from(store.get_workspace(ws).await.unwrap().token_usage.is_some());
+        }
+        assert_eq!(scanned, 1, "the sweep stopped before the next workspace");
+    }
 }
