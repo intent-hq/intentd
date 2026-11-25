@@ -634,12 +634,27 @@ impl ServedTenant {
         &self,
         config: &crate::listen::ListenConfig,
     ) -> std::result::Result<crate::listen::ClientListeners, String> {
-        let listeners = crate::listen::start_client_listeners(
+        self.listen_with_public_hosts(config, Vec::new()).await
+    }
+
+    /// [`Self::listen`], with invite links naming `public_hosts`
+    /// ([`crate::listen::PUBLIC_HOSTS_ENV`]).
+    ///
+    /// # Errors
+    /// As [`crate::listen::start_client_listeners`].
+    #[cfg(unix)]
+    pub async fn listen_with_public_hosts(
+        &self,
+        config: &crate::listen::ListenConfig,
+        public_hosts: Vec<String>,
+    ) -> std::result::Result<crate::listen::ClientListeners, String> {
+        let listeners = crate::listen::start_client_listeners_with_public_hosts(
             config,
             &self.services,
             &self.bus,
             self.reverse.clone(),
             self.runtime.connections(),
+            public_hosts,
         )
         .await?;
         let fence = self.fence.clone();

@@ -314,12 +314,11 @@ async fn listen_for_default_tenant(
         );
         return Ok(None);
     };
-    let config = intentd_orchestrator::listen::ListenConfig::from_env(
-        |name| std::env::var(name).ok(),
-        data_dir,
-    )?;
+    let var = |name: &str| std::env::var(name).ok();
+    let config = intentd_orchestrator::listen::ListenConfig::from_env(var, data_dir)?;
+    let public_hosts = intentd_orchestrator::listen::public_hosts_from_env(var)?;
     tenant
-        .listen(&config)
+        .listen_with_public_hosts(&config, public_hosts)
         .await
         .map(Some)
         .map_err(|e| format!("tenant {DEFAULT_TENANT}: client listeners: {e}"))

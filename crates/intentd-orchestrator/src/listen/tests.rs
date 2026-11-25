@@ -92,3 +92,31 @@ fn invalid_values_are_errors_never_defaults() {
     assert!(!config(&[(INSECURE_ENV, "0")]).unwrap().insecure);
     assert!(config(&[(INSECURE_ENV, "true")]).unwrap().insecure);
 }
+
+fn public_hosts(raw: Option<&str>) -> Result<Vec<String>, String> {
+    public_hosts_from_env(|name| {
+        (name == PUBLIC_HOSTS_ENV)
+            .then(|| raw.map(str::to_owned))
+            .flatten()
+    })
+}
+
+#[test]
+fn public_hosts_are_a_trimmed_list_of_bare_names_or_addresses() {
+    for unset in [None, Some(""), Some(" ")] {
+        assert_eq!(public_hosts(unset).unwrap(), Vec::<String>::new());
+    }
+    assert_eq!(
+        public_hosts(Some(" orch.example.com, 203.0.113.7,[2001:db8::1] ,")).unwrap(),
+        ["orch.example.com", "203.0.113.7", "2001:db8::1"]
+    );
+    for invalid in [
+        "https://orch.example.com",
+        "orch.example.com:5191",
+        "orch.example.com/ws",
+        "[not-v6]",
+    ] {
+        let error = public_hosts(Some(invalid)).unwrap_err();
+        assert!(error.contains(PUBLIC_HOSTS_ENV), "{invalid}: {error}");
+    }
+}

@@ -218,25 +218,22 @@ const STEPS: &[(&str, Step)] = &[
         "executor::start_in_daemon",
         Refused("an orchestrator is never a machine: it runs no backend's agents"),
     ),
+    // Attached by the tenant's client listeners (`listen.rs`).
     (
         "services.attach_invite_link_builder",
-        Gap("`workspace.invite.list` rows carry no `url`"),
+        Wired("attach_invite_link_builder"),
     ),
-    (
-        "services.attach_agent_rpc",
-        Gap("the Assistant's `ws.rpc` has no loopback connection"),
-    ),
-    (
-        "spawn_route_info_sampler",
-        Gap("`system.status` reports no local addresses or hostname"),
-    ),
+    ("services.attach_agent_rpc", Wired("attach_agent_rpc")),
+    // `sample_usage` re-reads the addresses, names and workspaces disk.
+    ("spawn_route_info_sampler", Wired("sample_usage")),
     (
         "spawn_workspaces_disk_sampler",
-        Gap("`system.status` reports no workspaces disk space"),
+        Wired("Disks::new_with_refreshed_list"),
     ),
+    // A tenant's workspaces root is its own (`<tenant dir>/workspaces`).
     (
         "intent_services::try_workspaces_provisioning_parent",
-        Gap("`system.status` reports no workspaces disk space"),
+        Wired("configured_workspaces_root"),
     ),
     // Process-wide daemon setup.
     (
@@ -432,8 +429,8 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_services::WatchHealth::default", Gap("`system.status` reports no file watch coverage")),
     ("intent_transport::SharedGuestLimits::new", Gap("`sharing.maxGuestConnections` and `maxConnectionsPerGuest` are not enforced")),
     ("guest_limits.follow", Gap("`sharing.maxGuestConnections` and `maxConnectionsPerGuest` are not enforced")),
-    ("intent_transport::InviteLinkResolver::new", Gap("`workspace.invite.list` rows carry no `url`")),
-    ("intent_transport::LoopbackAgentRpc::new", Gap("the Assistant's `ws.rpc` has no loopback connection")),
+    ("intent_transport::InviteLinkResolver::new", Wired("InviteLinkResolver::new")),
+    ("intent_transport::LoopbackAgentRpc::new", Wired("LoopbackAgentRpc::new")),
     ("host_exec_runtime.begin_shutdown", Wired("host_exec_runtime().begin_shutdown")),
     ("rpc_limiter.begin_shutdown", Gap("a stopping tenant's in-flight RPCs are not fenced and drained")),
     ("rpc_limiter.drain", Gap("a stopping tenant's in-flight RPCs are not fenced and drained")),
@@ -441,7 +438,7 @@ const STEPS: &[(&str, Step)] = &[
     ("reverse_registry.shutdown_publisher", Gap("the tenant's client event publisher is not drained when it stops")),
     ("bus.shutdown", Gap("the tenant's event writer is not drained when it stops")),
     ("ChildTreeUsage::default", Refused("local agent process trees: an orchestrator runs no agent itself")),
-    ("WorkspacesDiskUsage::default", Gap("`system.status` reports no workspaces disk space")),
+    ("WorkspacesDiskUsage::default", Plumbing),
     ("shutdown_store.close", Refused("the Postgres pool is shared by every tenant and closes with the process")),
     ("postgres.unavailable", Refused("intentd refuses Postgres; the orchestrator is the Postgres backend")),
     ("intent_core::process_policy::ProcessPolicy::current", Refused("`INTENTD_PRIVATE_TEST_PROFILE` guards intentd's `--insecure`; the orchestrator's listeners have their own")),

@@ -71,6 +71,31 @@ pub(crate) fn build_invite_uri(
     )
 }
 
+/// Build a direct invite link for a server with public addresses and no
+/// tunnel (the orchestrator):
+/// `intent://invite?v=1&host=<host[,host...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>`.
+/// The hosts are the server's configured public names, never its bind or
+/// LAN addresses.
+pub(crate) fn build_direct_invite_uri(
+    hosts: &[String],
+    port: u16,
+    fingerprint: &str,
+    invite_id: &str,
+    secret: &str,
+) -> String {
+    let hosts = hosts
+        .iter()
+        .map(|h| encode_query_value(h))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "intent://invite?v={INVITE_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&inviteId={}&secret={}",
+        encode_query_value(fingerprint),
+        encode_query_value(invite_id),
+        encode_query_value(secret),
+    )
+}
+
 /// Which invite fast path a frame names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InviteMethod {
@@ -306,27 +331,55 @@ fn opt_u64_param(params: &Value, key: &str) -> Result<Option<u64>> {
     }
 }
 
-/// The link envelope of this listener: port, fingerprint and the tunnel
-/// address every `intent://invite?…` link of the daemon shares. Invite links
-/// are tunnel-only, so the listener's bind addresses are never part of it.
+/// The link envelope of this listener: port, fingerprint and the route
+/// every `intent://invite?…` link of the daemon shares. The listener's bind
+/// addresses are never part of it: the route is the tunnel address, or, on
+/// a server with no tunnel, its public addresses
+/// ([`ServerPairingInfo::invite_hosts`]).
 /// [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`] formats
 /// one invite's link from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkEnvelope {
     pub port: u16,
     pub fingerprint: String,
-    pub tc_address: String,
+    pub route: InviteRoute,
+}
+
+/// How a guest dials the invite link's server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InviteRoute {
+    /// Through the tailcat tunnel (`tc=`).
+    Tunnel(String),
+    /// Directly, to the server's public addresses (`host=`).
+    Public(Vec<String>),
+}
+
+impl LinkEnvelope {
+    fn hosts(&self) -> &[String] {
+        match &self.route {
+            InviteRoute::Tunnel(_) => &[],
+            InviteRoute::Public(hosts) => hosts,
+        }
+    }
+
+    fn tc_address(&self) -> Option<&str> {
+        match &self.route {
+            InviteRoute::Tunnel(tc) => Some(tc),
+            InviteRoute::Public(_) => None,
+        }
+    }
 }
 
 impl InviteLinkEnvelope for LinkEnvelope {
     fn invite_url(&self, invite_id: &str, secret: &str) -> String {
-        build_invite_uri(
-            self.port,
-            &self.fingerprint,
-            invite_id,
-            secret,
-            &self.tc_address,
-        )
+        match &self.route {
+            InviteRoute::Tunnel(tc) => {
+                build_invite_uri(self.port, &self.fingerprint, invite_id, secret, tc)
+            }
+            InviteRoute::Public(hosts) => {
+                build_direct_invite_uri(hosts, self.port, &self.fingerprint, invite_id, secret)
+            }
+        }
     }
 }
 
@@ -334,21 +387,29 @@ impl InviteLinkEnvelope for LinkEnvelope {
 /// this runs BEFORE the invite is minted so a daemon nobody can dial never
 /// stores an invite that cannot be redeemed: no TCP listener is
 /// [`Error::ListenerDown`] (`error.data.code = "listener-down"`, like
-/// `pairing.getInfo`), and no tunnel address is [`Error::TunnelDown`]
-/// (`error.data.code = "tunnel-down"`) — an invite link is tunnel-only, so a
-/// LAN bind address does not make it dialable.
+/// `pairing.getInfo`), and neither a tunnel address nor a public address is
+/// [`Error::TunnelDown`] (`error.data.code = "tunnel-down"`) — a LAN bind
+/// address does not make an invite dialable.
 async fn link_envelope(provider: Option<&Arc<dyn ServerPairingInfo>>) -> Result<LinkEnvelope> {
     let provider = provider.ok_or_else(|| {
         Error::Unsupported("invite links are unavailable on this listener".to_string())
     })?;
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
-    let tc_address = snapshot.tc_address.ok_or(Error::TunnelDown)?;
+    let route = if let Some(tc) = snapshot.tc_address {
+        InviteRoute::Tunnel(tc)
+    } else {
+        let hosts = provider.invite_hosts();
+        if hosts.is_empty() {
+            return Err(Error::TunnelDown);
+        }
+        InviteRoute::Public(hosts)
+    };
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     Ok(LinkEnvelope {
         port,
         fingerprint: cert.fingerprint256,
-        tc_address,
+        route,
     })
 }
 
@@ -383,8 +444,8 @@ impl InviteLinkBuilder for InviteLinkResolver {
 
 /// Handle a classified `workspace.invite.create`: params
 /// `{ workspaceId, pinLogin?, expiresInSecs? }` → the service result
-/// (`{ invite, secret }`) extended with `url`, `hosts` (always `[]`: invite
-/// links are tunnel-only; kept for wire compatibility), `port`,
+/// (`{ invite, secret }`) extended with `url`, `hosts` (`[]` on a tunnel
+/// link; the public addresses on a direct one), `port`,
 /// `fingerprint`, `version` and `tcAddress`. Owner-only in the service layer
 /// (`-32003` otherwise); the secret appears exactly once, here.
 /// The envelope is resolved exactly once per create and the one link it
@@ -470,11 +531,11 @@ async fn create_scoped_json(
         .as_object_mut()
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;
     obj.insert("url".into(), url.into());
-    obj.insert("hosts".into(), json!([]));
+    obj.insert("hosts".into(), json!(envelope.hosts()));
     obj.insert("port".into(), envelope.port.into());
-    obj.insert("fingerprint".into(), envelope.fingerprint.into());
+    obj.insert("fingerprint".into(), envelope.fingerprint.clone().into());
     obj.insert("version".into(), INVITE_PAYLOAD_VERSION.into());
-    obj.insert("tcAddress".into(), envelope.tc_address.into());
+    obj.insert("tcAddress".into(), json!(envelope.tc_address()));
     Ok(result)
 }
 
