@@ -50,7 +50,7 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_app::compose", Wired("intent_app::compose")),
     (
         ".with_hooks_max_per_agent",
-        Gap("`[hooks] maxPerAgent` is the built-in default for every tenant"),
+        Wired("with_hooks_max_per_agent"),
     ),
     (
         ".with_node_mode",
@@ -247,21 +247,12 @@ const STEPS: &[(&str, Step)] = &[
         "apply_startup_pins",
         Refused("a tenant's paths are set explicitly, not pinned from the environment"),
     ),
-    (
-        "fd_limit::raise_at_startup",
-        Gap("the soft descriptor limit is not raised"),
-    ),
-    (
-        "probe_cow_at_startup",
-        Gap("the copy-on-write probe runs on first use, not at start"),
-    ),
-    (
-        "intent_core::workload::init",
-        Gap("scripts, terminals and host commands run without memory containment"),
-    ),
+    ("fd_limit::raise_at_startup", Wired("fd_limit::raise_at_startup")),
+    ("probe_cow_at_startup", Wired("intent_git::cow_probe")),
+    ("intent_core::workload::init", Wired("intent_core::workload::init")),
     (
         "intent_services::workload_memory_ceiling",
-        Gap("scripts, terminals and host commands run without memory containment"),
+        Refused("one ceiling for the whole process: `INTENTD_WORKLOAD_MEMORY_MAX_MB` sets it, no tenant's `agents.workloadMemoryMaxMb`"),
     ),
     (
         "init_adapter_slots",
@@ -305,29 +296,29 @@ const STEPS: &[(&str, Step)] = &[
         Refused("local agent process trees: an orchestrator runs no agent itself"),
     ),
     (
-        "spawn_idle_reap_loop",
-        Gap("idle agents are never evicted from the tenant's agent registry"),
+        "intent_app::agents::spawn_idle_reap_loop",
+        Wired("spawn_idle_reap_loop"),
     ),
     // Resume on start.
     (
         "services.prepare_startup_resume",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Wired("prepare_startup_resume"),
     ),
     (
-        "run_startup_resume_sweep",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        "intent_app::resume::run_startup_resume_sweep",
+        Wired("run_startup_resume_sweep"),
     ),
     (
         "should_resume_on_start",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("`--resume-all`, update restarts and display detection are the desktop daemon's: a claimed tenant resumes unless the setting is `off` (`resume_on_claim`)"),
     ),
     (
         "resolve_resume_setting",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("the desktop daemon's test default for `auto` (an e2e seam)"),
     ),
     (
         "detect_has_display",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("an orchestrator has no display: `auto` resumes, as on a headless daemon"),
     ),
     // Repository context.
     (
@@ -384,10 +375,7 @@ const STEPS: &[(&str, Step)] = &[
         "settle_mcp_background",
         Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
     ),
-    (
-        ".with_host_exec",
-        Gap("the outstanding-RPC limiter does not count streamed host commands"),
-    ),
+    (".with_host_exec", Wired("with_host_exec")),
     // `SQLite` only.
     ("store.activate_incremental_vacuum", Refused("SQLite only")),
     (
@@ -705,6 +693,7 @@ fn orchestrator_sources() -> String {
         "intentd-orchestrator/src/main.rs",
         "intentd-orchestrator/src/serve.rs",
         "intentd-orchestrator/src/listen.rs",
+        "intentd-orchestrator/src/process.rs",
         "intentd-orchestrator/src/secrets.rs",
         "intent-app/src/lib.rs",
         "intent-app/src/tenant.rs",

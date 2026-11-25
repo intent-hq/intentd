@@ -14,6 +14,7 @@ use intent_app::tenant::Admission as _;
 use intent_app::StartupExt as _;
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
+use intent_core::fd_limit;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
     agent_memory_budget_bytes, host_total_memory_bytes, init_adapter_slots, live_adapters,
@@ -2853,7 +2854,11 @@ async fn cmd_serve_owned(
     // largest-first while over budget without waiting for the TTL. Disabled
     // entirely when `agents.idleReapMinutes == 0` AND no budget is installed.
     let reap_task = if startup_work.allowed() {
-        spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled)
+        intent_app::agents::spawn_idle_reap_loop(
+            manager.clone(),
+            config.idle_reap_minutes,
+            budget_enabled,
+        )
     } else {
         None
     };
@@ -3376,7 +3381,7 @@ async fn cmd_serve_owned(
                     .await;
             }
             if let Some(candidates) = startup_candidates {
-                run_startup_resume_sweep(&services, candidates, stopping).await;
+                intent_app::resume::run_startup_resume_sweep(&services, candidates, stopping).await;
             }
         })
     };
@@ -3984,139 +3989,6 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         }
     });
     usage
-}
-
-/// Process descriptor limit (`RLIMIT_NOFILE`) policy for `serve`
-/// (intent-hq/intent#4390): raise the soft limit as far as the OS allows at
-/// startup, log the result, and keep the sampled soft limit readable for
-/// `system.status`. Unix only; every entry point is a no-op elsewhere.
-mod fd_limit {
-    use std::sync::OnceLock;
-
-    /// macOS `setrlimit` rejects a soft `RLIMIT_NOFILE` above
-    /// `kern.maxfilesperproc` even when the hard limit is `RLIM_INFINITY`;
-    /// `OPEN_MAX` (10240) is the portable ceiling that always succeeds there.
-    /// Linux enforces the finite hard limit itself, so no extra cap applies.
-    #[cfg(target_os = "macos")]
-    pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
-    #[cfg(not(target_os = "macos"))]
-    #[cfg_attr(not(unix), expect(dead_code))]
-    pub(crate) const PLATFORM_CAP: Option<u64> = None;
-
-    /// Soft limit in effect after the startup raise (or the untouched value
-    /// when no raise was needed/possible). Set once by `raise_at_startup`.
-    static SOFT_LIMIT: OnceLock<u64> = OnceLock::new();
-
-    /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
-    /// reporting. `None` before `raise_at_startup` ran or when the limit
-    /// could not be read (non-Unix, `getrlimit` failure).
-    pub(crate) fn soft_limit() -> Option<u64> {
-        SOFT_LIMIT.get().copied()
-    }
-
-    /// Pure raise decision: given the current `soft` limit, the `hard` limit
-    /// (`None` = `RLIM_INFINITY`) and the platform cap, return the soft value
-    /// to set, or `None` to leave the limit untouched. The target is the hard
-    /// limit bounded by the cap; an unlimited hard limit with no cap has no
-    /// finite target. The soft limit is never lowered.
-    ///
-    /// `(hard = None, cap = None)` is effectively unreachable on Linux: the
-    /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
-    /// `fs.nr_open`), so the hard limit is always finite there. That branch
-    /// is macOS-without-cap territory only, and macOS always has a cap.
-    #[cfg_attr(all(not(unix), not(test)), expect(dead_code))]
-    pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
-        let target = match (hard, cap) {
-            (Some(hard), Some(cap)) => hard.min(cap),
-            (Some(hard), None) => hard,
-            (None, Some(cap)) => cap,
-            (None, None) => return None,
-        };
-        (target > soft).then_some(target)
-    }
-
-    /// Current `(soft, hard)` `RLIMIT_NOFILE`; `hard == None` means unlimited.
-    #[cfg(unix)]
-    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `lim` is a valid, writable `rlimit` for the call's duration.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok((to_u64(lim.rlim_cur), finite(lim.rlim_max)))
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "RLIMIT_NOFILE is not available on this platform",
-        ))
-    }
-
-    /// Render a hard limit for logs/doctor output.
-    pub(crate) fn fmt_hard(hard: Option<u64>) -> String {
-        hard.map_or_else(|| "unlimited".to_string(), |h| h.to_string())
-    }
-
-    /// Raise the soft limit per `target_soft` and log one INFO line with the
-    /// resulting limits. Failures are WARN-only; the limit is left untouched.
-    #[cfg(unix)]
-    pub(crate) fn raise_at_startup() {
-        let (soft, hard) = match read() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot read fd limit (getrlimit)");
-                return;
-            }
-        };
-        let mut raised_from = None;
-        if let Some(target) = target_soft(soft, hard, PLATFORM_CAP) {
-            let lim = libc::rlimit {
-                rlim_cur: target as libc::rlim_t,
-                rlim_max: hard.map_or(libc::RLIM_INFINITY, |h| h as libc::rlim_t),
-            };
-            // SAFETY: `lim` is a valid, initialized `rlimit` for the call's duration.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) } == 0 {
-                raised_from = Some(soft);
-            } else {
-                tracing::warn!(
-                    error = %std::io::Error::last_os_error(),
-                    soft,
-                    target,
-                    hard = %fmt_hard(hard),
-                    "cannot raise fd limit (setrlimit); leaving it unchanged"
-                );
-            }
-        }
-        // Re-read so the logged/stored value is what the kernel actually applied.
-        let (soft, hard) = read().unwrap_or((soft, hard));
-        let _ = SOFT_LIMIT.set(soft);
-        tracing::info!(
-            soft,
-            hard = %fmt_hard(hard),
-            raised_from = %raised_from.map_or_else(|| "none".to_string(), |s| s.to_string()),
-            "fd limit"
-        );
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn raise_at_startup() {}
-
-    #[cfg(unix)]
-    fn finite(v: libc::rlim_t) -> Option<u64> {
-        (v != libc::RLIM_INFINITY).then(|| to_u64(v))
-    }
-
-    /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
-    #[cfg(unix)]
-    #[expect(clippy::unnecessary_cast)]
-    fn to_u64(v: libc::rlim_t) -> u64 {
-        v as u64
-    }
 }
 
 /// Latest workspaces-root disk sample (`available`, `total` bytes of the
@@ -6768,96 +6640,6 @@ fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock { _lock: lock })
 }
 
-/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
-/// sweep (`idle_reap_minutes == 0` and no memory budget). The sweep interval
-/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep and
-/// short ones do not busy-loop.
-///
-/// With a memory budget installed (monorepo#2063 level 2), every tick also
-/// drains idle agents largest-attributed-first while charged > budget — no
-/// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
-/// keeps the budget drain alive on the interval-clamp floor cadence, and TTL
-/// reaping on caps the shared interval at that same floor so a long TTL
-/// cannot slow the budget drain's reaction time.
-fn spawn_idle_reap_loop(
-    manager: Arc<AgentManager>,
-    idle_reap_minutes: u32,
-    budget_enabled: bool,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let timings = reap_timings(idle_reap_minutes);
-    if timings.is_none() && !budget_enabled {
-        tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
-        return None;
-    }
-    // TTL off but budget on: sweep at the same floor cadence the TTL clamp
-    // uses, running only the budget drain. With BOTH on, cap the shared
-    // interval at that floor — a long TTL may stretch its interval to 300s,
-    // and turning TTL reaping on must not slow the budget drain's reaction
-    // time below the budget-only cadence (an early TTL sweep is harmless: it
-    // just finds nothing old enough).
-    let budget_floor = Duration::from_secs(30);
-    let interval = if let Some((ttl, interval)) = timings {
-        let interval = if budget_enabled {
-            interval.min(budget_floor)
-        } else {
-            interval
-        };
-        tracing::info!(
-            ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
-            interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
-            "idle agent reaping enabled"
-        );
-        interval
-    } else {
-        tracing::info!(
-            interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
-            "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
-        );
-        budget_floor
-    };
-    Some(intent_core::spawn_daemon(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            if let Some((ttl, _)) = timings {
-                let reaped = manager.reap_idle_older_than(ttl).await;
-                if reaped > 0 {
-                    tracing::info!(reaped, "idle agent sweep evicted idle agents");
-                }
-            }
-            if budget_enabled {
-                let reaped = manager.reap_over_budget().await;
-                if reaped > 0 {
-                    tracing::info!(reaped, "over-budget sweep evicted idle agents");
-                }
-            }
-        }
-    }))
-}
-
-/// Compute the idle-reap `(ttl, sweep interval)`, or `None` when disabled
-/// (`idle_reap_minutes == 0`). Production rule: interval ≈ ttl/4, clamped to
-/// `[30s, 300s]`. The `INTENTD_IDLE_REAP_MS` env seam (§13.1 E2E, test-only)
-/// forces a sub-second TTL+interval so the E2E suite can assert reaping without
-/// a ≥30s wait; it is ignored in production deployments.
-fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
-    if let Some(ms) = std::env::var("INTENTD_IDLE_REAP_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&m| m > 0)
-    {
-        let d = Duration::from_millis(ms);
-        return Some((d, d));
-    }
-    if idle_reap_minutes == 0 {
-        return None;
-    }
-    let ttl = Duration::from_secs(u64::from(idle_reap_minutes) * 60);
-    let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
-    Some((ttl, interval))
-}
-
 /// Spawn the periodic retention/compaction sweep (§10.2 / finding F4). When
 /// `stream_retention_hours > 0` each tick deletes high-volume ephemeral
 /// events (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
@@ -8355,79 +8137,6 @@ fn should_resume_on_start(
         ResumeInterruptedOnStart::Off => false,
         ResumeInterruptedOnStart::Auto => !has_display,
     }
-}
-
-/// Run recovery off the listener path. Shutdown stops between operations;
-/// an admitted operation drains so its durable claim cannot be stranded by
-/// cancellation. Provider turns themselves remain owned by `AgentManager`.
-async fn run_startup_resume_sweep(
-    services: &Services,
-    candidates: intent_services::StartupResumeCandidates,
-    stopping: tokio::sync::watch::Receiver<bool>,
-) {
-    #[cfg(unix)]
-    let mut stopping = stopping;
-    let ids = candidates.ids().to_vec();
-    tracing::info!(
-        count = ids.len(),
-        "resume-on-start: resuming interrupted agents"
-    );
-    // Deterministic e2e seam, including release-mode tests. Holding a provider
-    // handshake would not hold the sweep, since provider turns are background.
-    #[cfg(unix)]
-    if let Some(path) = std::env::var_os("INTENTD_TEST_STARTUP_RESUME_GATE") {
-        use tokio::io::AsyncReadExt;
-        tokio::select! {
-            biased;
-            _ = stopping.wait_for(|stop| *stop) => return,
-            () = async {
-                let mut gate = tokio::net::UnixStream::connect(path).await.expect("resume test gate");
-                let _ = gate.read_u8().await;
-            } => {},
-        }
-    }
-    let candidates = &candidates;
-    resume_startup_candidates(ids, &stopping, |agent_id| async move {
-        services
-            .resume_startup_candidate(candidates, &agent_id)
-            .await
-    })
-    .await;
-}
-
-/// Never cancel the callback after admitting a candidate: it may already have
-/// claimed the interruption or persisted its continuation. A stop skips every
-/// later candidate, while the caller joins this loop before manager teardown.
-async fn resume_startup_candidates<F, Fut>(
-    ids: Vec<intent_core::AgentId>,
-    stopping: &tokio::sync::watch::Receiver<bool>,
-    mut resume: F,
-) where
-    F: FnMut(intent_core::AgentId) -> Fut,
-    Fut: std::future::Future<Output = intent_core::Result<()>>,
-{
-    let mut resumed = 0;
-    let mut failed = 0;
-    for agent_id in ids {
-        if *stopping.borrow() {
-            break;
-        }
-        match resume(agent_id.clone()).await {
-            Ok(()) => {
-                tracing::info!(%agent_id, "resume-on-start: resumed agent");
-                resumed += 1;
-            }
-            Err(error) => {
-                tracing::warn!(%agent_id, %error, "resume-on-start: failed to resume agent");
-                failed += 1;
-            }
-        }
-    }
-    tracing::info!(
-        resumed,
-        failed,
-        "resume-on-start: auto-resume sweep complete"
-    );
 }
 
 /// §5.7 / §12.3 host capabilities: display availability + derived locality. The
@@ -10957,52 +10666,6 @@ for line in sys.stdin:
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
-    }
-
-    #[tokio::test]
-    async fn startup_recovery_shutdown_drains_admitted_operation_and_skips_next() {
-        let (stop, stopping) = tokio::sync::watch::channel(false);
-        let (arrived, arrival) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = calls.clone();
-        let sweep = tokio::spawn(async move {
-            let mut barriers = Some((arrived, released));
-            resume_startup_candidates(
-                vec![
-                    intent_core::AgentId::from("first"),
-                    intent_core::AgentId::from("second"),
-                ],
-                &stopping,
-                move |_| {
-                    let (arrived, released) =
-                        barriers.take().expect("no second admission after stop");
-                    let calls = calls.clone();
-                    async move {
-                        arrived.send(()).unwrap();
-                        released.await.unwrap();
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        });
-        arrival.await.unwrap();
-        stop.send(true).unwrap();
-        assert!(
-            !sweep.is_finished(),
-            "the admitted operation is still owned and draining"
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(1)),
-            sweep,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

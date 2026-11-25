@@ -315,7 +315,8 @@ impl StatusControl {
             tcp,
             port,
             clients: ws.map_or(0, WsApiServer::client_count),
-            agents: manager.as_ref().map_or(0, |m| m.registry().size()),
+            // The cap is this host's: agents on machines use theirs.
+            agents: manager.as_ref().map_or(0, |m| m.registry().local_size()),
             fingerprint: ws.and_then(|ws| ws.fingerprint().map(str::to_owned)),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -345,7 +346,7 @@ impl StatusControl {
             workspaces_disk_total_bytes: None,
             file_watch: None,
             fd_count: None,
-            fd_limit: None,
+            fd_limit: intent_core::fd_limit::soft_limit(),
             // No sitter supervises the orchestrator.
             update_supported: false,
             busy_agents: manager.as_ref().map_or(0, |m| m.list_busy().len()),
@@ -357,7 +358,7 @@ impl StatusControl {
                     .remote_feature()
                     .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
             }),
-            workload_containment: None,
+            workload_containment: Some(intent_core::workload::status()),
         }
     }
 }
@@ -509,11 +510,13 @@ pub async fn start_client_listeners(
 ) -> Result<ClientListeners, String> {
     let hook = ConnectionHook::new(Arc::new(TenantConnections(connections.clone())));
     // The tenant's `server.maxOutstandingRpcs` (its own config.toml), across
-    // both listeners, as `intentd` caps its own.
+    // both listeners, as `intentd` caps its own. Client host commands run
+    // under the tenant's host command runtime, which its fence stops.
     let limiter = RpcLimiter::new(services.settings_registry().map_or(
         intent_core::config::DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
         |registry| registry.snapshot().effective.server.max_outstanding_rpcs,
-    ));
+    ))
+    .with_host_exec(services.host_exec_runtime());
     let api_services = Arc::new(services.clone());
     if let Err(error) = api_services.initialize_repository_wire().await {
         tracing::debug!(%error, "native repository context remains unavailable");

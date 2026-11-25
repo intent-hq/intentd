@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.295] - 2026-11-25
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.12.0 ([#3776](https://github.com/intent-hq/intentd/pull/3776))
+- *(orchestrator)* Drain a tenant's agents and writers before its fence fires ([#3770](https://github.com/intent-hq/intentd/pull/3770))
+
+### 🔧 Refactor
+
+- *(agent)* Every turn teardown names the admission it targets ([#3772](https://github.com/intent-hq/intentd/pull/3772))
+
+
 ## [0.11.294] - 2026-11-25
 
 ### 📚 Documentation

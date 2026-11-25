@@ -619,6 +619,8 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
                     agent_cap: 4,
                     charged_memory_bytes: 0,
                     memory_budget_bytes: None,
+                    reclaimable_agents: 0,
+                    host_memory_short: None,
                 },
                 providers,
                 disabled_providers: vec![],

@@ -1481,6 +1481,52 @@ pub struct MachineCapacity {
     /// unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_budget_bytes: Option<u64>,
+    /// Idle local agents whose processes the machine takes back before it
+    /// refuses a launch. An older machine omits it (0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reclaimable_agents: u32,
+    /// Whether the host's available memory is below the machine's reserve:
+    /// the memory budget denies only then. An older machine omits it, and
+    /// the budget is then read as binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_short: Option<bool>,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
+impl MachineCapacity {
+    /// The limit this report says would refuse a launch, after the machine
+    /// takes back its idle local agents: none while any is idle, and the
+    /// memory budget only while the host is short and an agent is running
+    /// (the machine's budget always admits with nothing running).
+    #[must_use]
+    pub fn refusal(&self) -> Option<CapacityRefusal> {
+        if self.reclaimable_agents > 0 {
+            return None;
+        }
+        if self.running_agents >= self.agent_cap {
+            return Some(CapacityRefusal::Count {
+                running_agents: self.running_agents,
+                agent_cap: self.agent_cap,
+            });
+        }
+        self.memory_budget_bytes
+            .filter(|budget| {
+                self.running_agents > 0
+                    && self.charged_memory_bytes >= *budget
+                    && self.host_memory_short != Some(false)
+            })
+            .map(|budget| CapacityRefusal::Memory {
+                charged_memory_bytes: self.charged_memory_bytes,
+                memory_budget_bytes: budget,
+            })
+    }
 }
 
 impl MachineCapabilities {
@@ -1502,6 +1548,8 @@ impl MachineCapabilities {
                 agent_cap,
                 charged_memory_bytes: 0,
                 memory_budget_bytes: None,
+                reclaimable_agents: 0,
+                host_memory_short: None,
             },
             resources: None,
             providers: Vec::new(),
