@@ -486,6 +486,7 @@ async fn host_provider_auth_status_over_wss() {
         "pi",
         "antigravity",
         "cursor",
+        "dsh",
     ];
     assert_eq!(
         providers.len(),
