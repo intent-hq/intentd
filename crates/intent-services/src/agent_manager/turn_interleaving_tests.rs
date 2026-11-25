@@ -318,11 +318,13 @@ async fn finish(actor: &Actor, label: &str, cancels: bool, sent: &mut Vec<&'stat
     actor.settle(label).await;
 
     let prompts = actor.prompts();
-    for text in sent.iter() {
-        assert!(prompts.contains(text), "{label}: {text} was lost: {prompts}");
-    }
+    // A stop drops the message whose turn it ends; only orders without one
+    // must deliver every message.
     if cancels {
         return;
+    }
+    for text in sent.iter() {
+        assert!(prompts.contains(text), "{label}: {text} was lost: {prompts}");
     }
     for (n, run) in actor.runs.iter().enumerate() {
         let run_prompts = all_prompts(run);
