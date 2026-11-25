@@ -49,6 +49,11 @@ const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    // The PTY workload shim: a contained terminal runs as
+    // `/proc/self/exe cgroup-exec …`, which joins its cgroup and execs.
+    if let Some(code) = intent_core::workload::dispatch_shim() {
+        return code;
+    }
     // Before reading any secret from the environment: same-user processes
     // (tenant workloads) must not read this one's environ or memory.
     if let Err(error) = intentd_orchestrator::secrets::harden_process() {
@@ -61,6 +66,13 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    match intent_core::Config::resolve() {
+        Ok(config) => intentd_orchestrator::process::setup(&config.data_dir),
+        Err(error) => {
+            tracing::error!(%error, "data dir");
+            return ExitCode::FAILURE;
+        }
+    }
     // Read and clear the URL (it may carry a password) while this process
     // is still single-threaded, so no child process inherits it.
     let url = std::env::var(POSTGRES_URL_ENV);

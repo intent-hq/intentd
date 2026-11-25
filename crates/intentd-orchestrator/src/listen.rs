@@ -345,7 +345,7 @@ impl StatusControl {
             workspaces_disk_total_bytes: None,
             file_watch: None,
             fd_count: None,
-            fd_limit: None,
+            fd_limit: intent_core::fd_limit::soft_limit(),
             // No sitter supervises the orchestrator.
             update_supported: false,
             busy_agents: manager.as_ref().map_or(0, |m| m.list_busy().len()),
@@ -357,7 +357,7 @@ impl StatusControl {
                     .remote_feature()
                     .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
             }),
-            workload_containment: None,
+            workload_containment: Some(intent_core::workload::status()),
         }
     }
 }

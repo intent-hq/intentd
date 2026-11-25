@@ -35,6 +35,7 @@ pub mod discussion;
 pub mod error;
 pub mod events;
 pub mod execution;
+pub mod fd_limit;
 pub mod git_remote_url;
 pub mod host_membership;
 pub mod human_author;

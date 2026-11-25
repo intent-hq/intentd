@@ -216,6 +216,7 @@ async fn try_serve_tenant_with(
     let dir = crate::tenant_dir(data_dir, tenant);
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: create {}: {e}", dir.display())))?;
+    crate::process::probe_cow(dir.join("workspaces"));
     let bus = EventBus::new(store.clone());
     let reverse = Arc::new(PrimaryReverseRegistry::new());
     let secrets = Arc::new(crate::secrets::TenantSecrets::new(&store, keyring)?);
