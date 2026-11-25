@@ -41,7 +41,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
         note_write_lanes: std::sync::Arc::default(),
-        work_claims: crate::work_claim_repo::LocalWorkClaims::default(),
+        leases: crate::lease_repo::LocalLeases::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)

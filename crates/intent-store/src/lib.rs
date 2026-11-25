@@ -165,11 +165,11 @@ mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_home_repo;
 pub use workspace_home_repo::{backup_warning_in, BACKUP_WARNING_AFTER};
-mod work_claim_repo;
+mod lease_repo;
 mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
-pub use work_claim_repo::WorkClaim;
+pub use lease_repo::Lease;
 
 pub use repository_lifecycle::{
     RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
@@ -579,8 +579,8 @@ pub(crate) struct SqliteStore {
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-note content-write locks; see `note_write_lock`.
     note_write_lanes: std::sync::Arc<note_write_lock::NoteWriteLanes>,
-    /// This process's work claims; see `work_claim_repo`.
-    work_claims: work_claim_repo::LocalWorkClaims,
+    /// This process's leases; see `lease_repo`.
+    leases: lease_repo::LocalLeases,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -813,7 +813,7 @@ impl crate::SqliteStore {
             task_event_baselines: std::sync::Arc::default(),
             task_events_enabled: std::sync::Arc::default(),
             note_write_lanes: std::sync::Arc::default(),
-            work_claims: crate::work_claim_repo::LocalWorkClaims::default(),
+            leases: crate::lease_repo::LocalLeases::default(),
             write_pool: StorePool::new(write_pool, owner.is_some()),
             read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,

@@ -97,7 +97,7 @@ mod settings;
 mod tenant_config;
 mod tenant_registry;
 mod usage_metrics;
-mod work_claims;
+mod leases;
 mod workspaces;
 
 /// Test seams for the bounded workspace and agent deletes.
