@@ -13,7 +13,7 @@
 //! - a restore, sweep or loop that `crates/intent-app/src/tenant.rs` calls
 //!   has no `[[loop]]` row, or a row names no call. A call is a `.name(` or
 //!   `::name(` whose name starts with one of [`LOOP_PREFIXES`], minus
-//!   [`NOT_LOOPS`];
+//!   [`NOT_LOOPS`], or is one of [`NAMED_LOOPS`];
 //! - a row is malformed: unknown class, empty note, a `gate` without
 //!   `invariant` and `writer_lock` (`covered` / `partial` / `no`), or those
 //!   keys on a non-gate row.
@@ -22,7 +22,7 @@
 //! file uses a small TOML subset (`[[field]]` / `[[loop]]` headers, one-line
 //! `key = "value"` pairs, `#` comments) parsed here without a TOML dependency.
 //! There is no opt-out marker. Limit: a tenant loop started through a helper
-//! whose name lacks the prefixes is not seen.
+//! whose name lacks the prefixes is not seen unless it is in [`NAMED_LOOPS`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -58,6 +58,8 @@ const LOOP_PREFIXES: &[&str] = &[
 ];
 /// Calls with a [`LOOP_PREFIXES`] name that start no tenant work of their own.
 const NOT_LOOPS: &[&str] = &["spawn_daemon", "spawn_blocking"];
+/// Tenant work whose name matches no [`LOOP_PREFIXES`] entry.
+const NAMED_LOOPS: &[&str] = &["reconcile_startup_completions"];
 
 #[derive(Debug, Default, Clone)]
 struct Row {
@@ -215,7 +217,8 @@ fn tenant_loops(src: &str) -> BTreeSet<String> {
             continue;
         }
         let name = name.text.as_str();
-        if LOOP_PREFIXES.iter().any(|p| name.starts_with(p)) && !NOT_LOOPS.contains(&name) {
+        let prefixed = LOOP_PREFIXES.iter().any(|p| name.starts_with(p));
+        if (prefixed && !NOT_LOOPS.contains(&name)) || NAMED_LOOPS.contains(&name) {
             out.insert(name.to_string());
         }
     }
@@ -417,6 +420,18 @@ fn start(services: &Services) {
 ";
     let loops: Vec<String> = tenant_loops(tenant).into_iter().collect();
     assert_eq!(loops, ["heal_generic", "refresh_typed", "sweep_ordered"]);
+}
+
+#[test]
+fn finds_named_tenant_loops_outside_the_prefixes() {
+    let tenant = r"
+fn start(services: &Services) {
+    services.reconcile_startup_completions(completions, &stopping).await;
+    services.reconcile_other(x);
+}
+";
+    let loops: Vec<String> = tenant_loops(tenant).into_iter().collect();
+    assert_eq!(loops, ["reconcile_startup_completions"]);
 }
 
 #[test]

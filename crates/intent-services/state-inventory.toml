@@ -1273,6 +1273,12 @@ class = "owner"
 note = "Loads script definitions into the local registry."
 
 [[loop]]
+name = "reconcile_startup_completions"
+kind = "restore"
+class = "owner"
+note = "Delivers completions that finished while no process served the tenant (TenantRuntime::reconcile_completions); a second process would deliver them again."
+
+[[loop]]
 name = "rehydrate_hooks"
 kind = "restore"
 class = "owner"
