@@ -285,6 +285,9 @@ async fn try_serve_tenant_with(
         }
     };
     let resume = prepare_resume(&services, &fence).await;
+    if !fence.is_fenced() {
+        crate::tenant_watch::restore_repository_binding(&services).await;
+    }
     let runtime = TenantRuntime::start_with_sweeps(
         &services,
         &dir,
@@ -300,6 +303,7 @@ async fn try_serve_tenant_with(
     if !fence.is_fenced() {
         crate::mcp::start_tenant_mcp(&services, &mut runner);
     }
+    crate::tenant_watch::start(&services, &bus, &admission, &mut runner);
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be

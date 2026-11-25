@@ -321,34 +321,31 @@ const STEPS: &[(&str, Step)] = &[
         Refused("an orchestrator has no display: `auto` resumes, as on a headless daemon"),
     ),
     // Repository context.
+    // Repository context (`tenant_watch.rs`; the wire on each listener
+    // start, in `listen.rs`).
     (
         "api_services.initialize_repository_wire",
-        Gap("qualified repository reads are unavailable"),
+        Wired("initialize_repository_wire"),
     ),
     (
         "services.initialize_gitlab_repository_binding",
-        Gap("the GitLab repository binding is not restored at start"),
+        Wired("initialize_gitlab_repository_binding"),
     ),
     (
         "services.prewarm_repository_metadata",
-        Gap("repository metadata is read on first use"),
+        Wired("prewarm_repository_metadata"),
     ),
-    // Watchers.
+    // Watchers (`tenant_watch.rs`): head's checkouts. A workspace whose home
+    // is on a machine is watched there; its events arrive as `homeEvents`.
     (
         "spawn_watcher_registry_init",
-        Gap("file changes in head's worktrees do not refresh clients"),
+        Wired("WatcherRegistry::start_with_health"),
     ),
-    (
-        "services.git_status_cache",
-        Gap("file changes in head's worktrees do not refresh clients"),
-    ),
-    (
-        "services.worktree_presence",
-        Gap("file changes in head's worktrees do not refresh clients"),
-    ),
+    ("services.git_status_cache", Wired("git_status_cache")),
+    ("services.worktree_presence", Wired("worktree_presence")),
     (
         "spawn_config_watcher_init",
-        Gap("a tenant's `config.toml` is not reloaded when edited"),
+        Wired("ConfigWatcher::start_prepared_reload"),
     ),
     // External MCP servers: a tenant's hub refuses stdio (it starts no
     // process); agents get the tools of its http servers. The tenant's
@@ -423,9 +420,9 @@ const STEPS: &[(&str, Step)] = &[
     // Replaced: the GitLab pair's handle goes to the tenant's encrypted
     // `TenantSecrets` rows, never a secrets.json file.
     ("intent_core::FileSecretStore::new", Wired("FileSecretStore::with_backend")),
-    ("GitStatusRefresher::start_with_presence", Gap("file changes in head's worktrees do not refresh clients")),
-    ("git_status_refresher.shutdown", Gap("file changes in head's worktrees do not refresh clients")),
-    ("intent_services::SharedWatchHub::new", Gap("file changes in head's worktrees do not refresh clients")),
+    ("GitStatusRefresher::start_with_presence", Wired("GitStatusRefresher::start_with_presence")),
+    ("git_status_refresher.shutdown", Wired("git_status_refresher.shutdown")),
+    ("intent_services::SharedWatchHub::new", Wired("intent_services::SharedWatchHub::new")),
     ("intent_services::WatchHealth::default", Gap("`system.status` reports no file watch coverage")),
     ("intent_transport::SharedGuestLimits::new", Gap("`sharing.maxGuestConnections` and `maxConnectionsPerGuest` are not enforced")),
     ("guest_limits.follow", Gap("`sharing.maxGuestConnections` and `maxConnectionsPerGuest` are not enforced")),
@@ -689,6 +686,7 @@ fn orchestrator_sources() -> String {
         "intentd-orchestrator/src/listen.rs",
         "intentd-orchestrator/src/process.rs",
         "intentd-orchestrator/src/secrets.rs",
+        "intentd-orchestrator/src/tenant_watch.rs",
         "intent-app/src/lib.rs",
         "intent-app/src/tenant.rs",
         "intent-app/src/agents.rs",
