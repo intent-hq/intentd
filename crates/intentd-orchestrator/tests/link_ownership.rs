@@ -199,7 +199,7 @@ async fn two_processes_claim_one_link_and_the_survivor_takes_it_over_after_expir
     );
 
     // A clean stop frees the link at once.
-    loser.release(&owner).await;
+    loser.release(&taken).await;
     assert!(loser_store
         .acquire_lease(LINK_LEASE_SCOPE, "m1", TTL)
         .await

@@ -139,11 +139,13 @@ pub trait LinkOwnership: Send + Sync + 'static {
         Box::pin(std::future::pending())
     }
 
-    /// Give up the link of `owner`'s machine, so another process can claim
-    /// it at once: the connector stopped. A no-op for an owner that holds
-    /// nothing.
-    fn release<'a>(&'a self, owner: &'a LeaseOwner) -> BoxFuture<'a, ()> {
-        let _ = owner;
+    /// Give up the link `claim` claimed, so another process can claim it at
+    /// once: its connector stopped, went idle or no longer wants the link.
+    /// A no-op for an owner that holds nothing, and for a claim that is no
+    /// longer the latest of its machine in this process (a replacement
+    /// connector claimed since).
+    fn release<'a>(&'a self, claim: &'a LinkClaim) -> BoxFuture<'a, ()> {
+        let _ = claim;
         Box::pin(async {})
     }
 
@@ -222,7 +224,7 @@ mod tests {
 
     use super::*;
 
-    async fn store_with_lease() -> (tempfile::TempDir, Store, LeaseOwner) {
+    pub(super) async fn store_with_lease() -> (tempfile::TempDir, Store, LeaseOwner) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("intent.db")).await.unwrap();
         let owner = LeaseOwner {
@@ -336,11 +338,8 @@ mod tests {
         let (_dir, store, owner) = store_with_lease().await;
         let (a, b) = (leased(&store, TTL), leased(&store, TTL));
         let first = a.claim(&owner).await.unwrap();
-        assert_eq!(
-            a.claim(&owner).await.unwrap().epoch,
-            first.epoch,
-            "a redial keeps the lease"
-        );
+        let redial = a.claim(&owner).await.unwrap();
+        assert_eq!(redial.epoch, first.epoch, "a redial keeps the lease");
         let error = b.claim(&owner).await.unwrap_err();
         assert!(
             error.to_string().contains("remote-link-owned-elsewhere"),
@@ -352,7 +351,8 @@ mod tests {
         assert!(b.claim(&owner).await.is_err());
         assert_eq!(a.fence(&first).await, Ok(()));
 
-        a.release(&owner).await;
+        // The latest claim (the redial) releases it.
+        a.release(&redial).await;
         let taken = b
             .claim(&owner)
             .await
@@ -404,6 +404,32 @@ mod tests {
             error.to_string().contains("remote-link-owned-elsewhere"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_claim_of_a_held_lease_releases_it() {
+        // Two connectors of one machine in this process (one replacing the
+        // other) share the lease; the older one stopping keeps it.
+        let (_dir, store, owner) = store_with_lease().await;
+        let (a, b) = (leased(&store, TTL), leased(&store, TTL));
+        let old = a.claim(&owner).await.unwrap();
+        let new = a.claim(&owner).await.unwrap();
+        assert_eq!(new.epoch, old.epoch);
+        assert!(new.generation > old.generation);
+
+        a.release(&old).await;
+        assert_eq!(a.fence(&new).await, Ok(()), "the newer claim still holds");
+        assert!(
+            b.claim(&owner).await.is_err(),
+            "the older claim's release left the lease held"
+        );
+
+        a.release(&new).await;
+        let taken = b.claim(&owner).await.expect("the latest claim released it");
+        assert!(taken.epoch > new.epoch);
+        // A second release of an already released claim does nothing.
+        a.release(&new).await;
+        assert_eq!(b.fence(&taken).await, Ok(()));
     }
 
     #[tokio::test]

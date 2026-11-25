@@ -1949,9 +1949,13 @@ impl RemoteNode {
         }
         let shared_run = shared.clone();
         intent_core::spawn_daemon(async move {
-            run(shared_run, lease.clone(), Ingest::new(acked), demands).await;
-            // The connector stopped: free the link for another process.
-            lease.release().await;
+            // The connector stopped: free the link for another process,
+            // also when `run` panicked or its task was dropped.
+            let mut release = ReleaseOnDrop(Some(lease.clone()));
+            run(shared_run, lease, Ingest::new(acked), demands).await;
+            if let Some(lease) = release.0.take() {
+                lease.release().await;
+            }
         });
         intent_core::spawn_daemon(expire_final_stops(Arc::downgrade(&shared)));
         Ok(Self { shared })
@@ -2874,6 +2878,9 @@ async fn run(
     let mut demanded = false;
     loop {
         if !retry && !demanded && waiters.is_empty() && !shared.wants_link() {
+            // Not wanted: hold no link lease while parked, so another
+            // process can claim the link meanwhile.
+            lease.release().await;
             tokio::select! {
                 demand = demands.recv() => match demand {
                     Some(waiter) => {
@@ -2905,8 +2912,10 @@ async fn run(
         let target = shared.target();
         if let Some(gate) = &target.gate {
             if gate.parked() && !demanded && waiters.is_empty() {
-                // Paused: wait for a prompt, a stop or a connect request.
+                // Paused: wait for a prompt, a stop or a connect request,
+                // holding no link lease meanwhile.
                 retry = false;
+                lease.release().await;
                 tokio::select! {
                     demand = demands.recv() => match demand {
                         Some(waiter) => {
@@ -3311,6 +3320,19 @@ async fn run(
             }
         }
         shared.announce().await;
+    }
+}
+
+/// Releases the connector's link lease when dropped without
+/// [`HeadLease::release`] having run (a panicked or dropped connector task).
+struct ReleaseOnDrop(Option<HeadLease>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let Some(lease) = self.0.take() else { return };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { lease.release().await });
+        }
     }
 }
 

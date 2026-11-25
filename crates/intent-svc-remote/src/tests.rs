@@ -1381,15 +1381,14 @@ async fn a_fenced_ack_is_not_written_and_closes_the_link() {
     closed_without_writes(&mut first, NodeCounter(2)).await;
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(1));
 
-    // This process claims the link back with a newer generation: the hello
-    // offers only the ack it wrote, the replay is deduplicated and acked.
-    let mut second = machine.accept().await;
+    // This process claims the link back with a newer generation, and only
+    // then persists what it ingested: under the new claim, so the hello
+    // offers it and the machine replays nothing head already took in.
+    let second = machine.accept().await;
     assert!(second.hello.binding.generation >= taken);
-    assert_eq!(second.hello.acked_seq, NodeCounter(1));
-    second.journal(note(2, &agent, "two")).await;
-    second.replay_complete(2).await;
-    second.acked(2).await;
+    assert_eq!(second.hello.acked_seq, NodeCounter(2));
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(2));
+    second.replay_complete(2).await;
     node.shutdown();
 }
 
@@ -1445,7 +1444,9 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
 async fn a_leased_link_closes_once_its_lease_is_lost_and_releases_it_on_stop() {
     let (mut machine, backend, bare) = exposed().await;
     bare.shutdown();
-    let ttl = Duration::from_millis(600);
+    // Long enough that a renewal (every ttl/2) slipping on a loaded runner
+    // does not lapse the lease while it is meant to be held.
+    let ttl = Duration::from_secs(2);
     let ownership = Arc::new(intent_node_connections::LeaseLinkOwnership::new(
         backend.store().clone(),
         uuid::Uuid::new_v4().to_string().into(),
@@ -1472,21 +1473,26 @@ async fn a_leased_link_closes_once_its_lease_is_lost_and_releases_it_on_stop() {
     // it. Once renewal finds that, the link closes without waiting for a
     // write.
     ownership.stall_renewals().await;
-    let other = loop {
-        if let Some(lease) = backend
-            .store()
-            .acquire_lease(
-                intent_node_connections::LINK_LEASE_SCOPE,
-                &machine_id,
-                ttl * 20,
-            )
-            .await
-            .unwrap()
-        {
-            break lease;
+    let other = tokio::time::timeout(intentd_test_support::test_timeout(ttl * 10), async {
+        loop {
+            if let Some(lease) = backend
+                .store()
+                .acquire_lease(
+                    intent_node_connections::LINK_LEASE_SCOPE,
+                    &machine_id,
+                    ttl * 20,
+                )
+                .await
+                .unwrap()
+            {
+                break lease;
+            }
+            // timing-guard: poll interval while the stalled lease lapses
+            tokio::time::sleep(ttl / 8).await;
         }
-        tokio::time::sleep(ttl / 4).await;
-    };
+    })
+    .await
+    .expect("the stalled lease lapses and is taken over");
     // Back in touch: the next renewal finds the lease taken.
     ownership.resume_renewals();
     closed_without_writes(&mut first, NodeCounter(3)).await;

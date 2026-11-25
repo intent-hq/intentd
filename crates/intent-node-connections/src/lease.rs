@@ -200,10 +200,14 @@ impl HeadLease {
         }
     }
 
-    /// Give the link up (the connector stopped, or went idle): the next dial
-    /// claims it again.
+    /// Give the link up (the connector stopped, went idle or no longer
+    /// wants it): the next dial claims it again. A no-op before the first
+    /// claim, and once a newer claim of the machine replaced this one.
     pub async fn release(&self) {
-        self.ownership.release(&self.owner).await;
+        let claim = lock(&self.claim).clone();
+        if let Some(claim) = claim {
+            self.ownership.release(&claim).await;
+        }
     }
 
     /// The persisted journal ack.
@@ -255,7 +259,10 @@ impl HeadLease {
     }
 
     /// Claim the link (durably advancing the generation), then build the
-    /// hello offering it.
+    /// hello offering it. The claim comes first so the ack below is written
+    /// under it: an ack written before it would be fenced by the previous
+    /// claim (released when the link went idle) or, before the first claim,
+    /// written with no ownership check.
     /// The hello acks only what is persisted: the node deletes the records
     /// it acks, so offering `ingested` before it is saved could lose records
     /// a restarted head still needs. Head first tries to persist `ingested`;
@@ -266,6 +273,9 @@ impl HeadLease {
     ///
     /// When the claim or the lease's agents and homes cannot be read.
     pub async fn next_hello(&self, ingested: NodeCounter) -> Result<LinkHello> {
+        let claim = self.ownership.claim(&self.owner).await?;
+        let generation = claim.generation;
+        *lock(&self.claim) = Some(claim);
         let acked = match self.persist_ack(ingested, None).await {
             Ok(acked) => acked,
             Err(error) => {
@@ -273,9 +283,6 @@ impl HeadLease {
                 self.acked().await?
             }
         };
-        let claim = self.ownership.claim(&self.owner).await?;
-        let generation = claim.generation;
-        *lock(&self.claim) = Some(claim);
         let lease_agents = self.lease_agents().await?;
         let lease_homes = self.lease_homes().await?;
         Ok(LinkHello {
