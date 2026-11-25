@@ -157,9 +157,11 @@ fn query<'a>(url: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// An invite link names the orchestrator's public address (`host=`), its
-/// WSS port and certificate, and `workspace.invite.list` rebuilds the same
-/// link.
+/// An open invite's link names the orchestrator's public address (`host=`),
+/// its WSS port and certificate, and no tunnel. (Minting needs a connected
+/// owner forge, so the invite is put in the store; `workspace.invite.list`
+/// rebuilds its link with the envelope `create` stamps — intent-transport's
+/// invite tests cover `create`.)
 #[tokio::test]
 async fn an_invite_link_names_the_public_address() {
     let dir = tempfile::tempdir().unwrap();
@@ -170,42 +172,52 @@ async fn an_invite_link_names_the_public_address() {
         .as_str()
         .unwrap()
         .to_owned();
-
-    let invite = ws_rpc(
-        &mut ws,
-        3,
-        "workspace.invite.create",
-        json!({ "workspaceId": workspace }),
-    )
-    .await;
-    let invite = result(&invite);
-    let url = invite["url"].as_str().expect("a link").to_owned();
-    assert!(url.starts_with("intent://invite?"), "{url}");
-    assert_eq!(query(&url, "host"), Some(PUBLIC_HOST), "{url}");
-    assert_eq!(query(&url, "tc"), None, "no tunnel: {url}");
-    assert_eq!(
-        query(&url, "port"),
-        Some(listeners.ws_port().to_string().as_str()),
-        "{url}"
-    );
-    assert_eq!(invite["hosts"], json!([PUBLIC_HOST]), "{invite}");
-    assert_eq!(invite["invite"]["url"], json!(url), "{invite}");
+    let owner = services.store().get_primary_principal().await.unwrap();
+    services
+        .store()
+        .insert_workspace_invite(&intent_core::WorkspaceInvite {
+            id: "inv-public".into(),
+            workspace_id: WorkspaceId(workspace.clone()),
+            secret_hash: "unused".into(),
+            secret: Some("s3cret".into()),
+            created_by_principal_id: owner.id,
+            pin_identity: None,
+            pin_github_user_id: None,
+            pin_login: None,
+            created_at: intent_core::now_iso(),
+            expires_at: "2999-01-01T00:00:00Z".into(),
+            redeemed_at: None,
+            redeemed_by_principal_id: None,
+            revoked_at: None,
+            redemption_count: 0,
+        })
+        .await
+        .unwrap();
 
     let listed = ws_rpc(
         &mut ws,
-        4,
+        3,
         "workspace.invite.list",
         json!({ "workspaceId": workspace }),
     )
     .await;
     let rows: &Vec<Value> = result(&listed)["invites"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{listed}");
-    let listed_url = rows[0]["url"].as_str().expect("the row carries its link");
+    let url = rows[0]["url"].as_str().expect("the row carries its link");
+    assert!(url.starts_with("intent://invite?"), "{url}");
+    assert_eq!(query(url, "host"), Some(PUBLIC_HOST), "{url}");
+    assert_eq!(query(url, "tc"), None, "no tunnel: {url}");
     assert_eq!(
-        listed_url.split("&secret=").next(),
-        url.split("&secret=").next(),
-        "the listed link is the minted one's envelope: {listed_url} vs {url}"
+        query(url, "port"),
+        Some(listeners.ws_port().to_string().as_str()),
+        "{url}"
     );
+    assert_eq!(
+        query(url, "fp"),
+        Some(listeners.fingerprint().unwrap()),
+        "{url}"
+    );
+    assert_eq!(query(url, "inviteId"), Some("inv-public"), "{url}");
     listeners.stop().await;
 }
 

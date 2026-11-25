@@ -697,6 +697,7 @@ async fn create_without_a_pairing_provider_is_unsupported_and_mints_nothing() {
 struct StubPairingInfo {
     port: Option<u16>,
     tc_address: Option<String>,
+    public_hosts: Vec<String>,
     data_dir: std::path::PathBuf,
     token_store: crate::AsyncTokenStore,
 }
@@ -742,11 +743,22 @@ impl crate::server::ServerPairingInfo for StubPairingInfo {
     fn token_store(&self) -> &crate::AsyncTokenStore {
         &self.token_store
     }
+    fn invite_hosts(&self) -> Vec<String> {
+        self.public_hosts.clone()
+    }
 }
 
 fn stub_provider(
     port: Option<u16>,
     tc_address: Option<&str>,
+) -> (Arc<dyn crate::server::ServerPairingInfo>, tempfile::TempDir) {
+    stub_provider_with_hosts(port, tc_address, &[])
+}
+
+fn stub_provider_with_hosts(
+    port: Option<u16>,
+    tc_address: Option<&str>,
+    public_hosts: &[&str],
 ) -> (Arc<dyn crate::server::ServerPairingInfo>, tempfile::TempDir) {
     let mut tmpdir = tempfile::Builder::new()
         .prefix("intentd-test-invite-links-")
@@ -758,6 +770,7 @@ fn stub_provider(
     let provider = Arc::new(StubPairingInfo {
         port,
         tc_address: tc_address.map(str::to_string),
+        public_hosts: public_hosts.iter().map(|h| (*h).to_string()).collect(),
         data_dir: tmpdir.path().to_path_buf(),
         token_store: crate::AsyncTokenStore::new(Arc::new(NoToken)),
     });
@@ -773,7 +786,7 @@ fn stub_provider(
 async fn link_resolver_rebuilds_the_minted_link_and_is_none_without_a_tunnel() {
     let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
     let minted = link_envelope(Some(&provider)).await.expect("envelope");
-    assert_eq!(minted.tc_address, "tc-abc");
+    assert_eq!(minted.tc_address(), Some("tc-abc"));
     let resolved = InviteLinkResolver::new(provider.clone())
         .invite_link_envelope()
         .await
@@ -818,7 +831,7 @@ async fn link_envelope_never_carries_direct_hosts() {
     let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
     let envelope = link_envelope(Some(&provider)).await.expect("envelope");
     assert_eq!(envelope.port, 7443);
-    assert_eq!(envelope.tc_address, "tc-abc");
+    assert_eq!(envelope.tc_address(), Some("tc-abc"));
     let url = envelope.invite_url("inv-1", "s3cret");
     assert!(!url.contains("127.0.0.1"), "{url}");
     assert!(!url.contains("host="), "{url}");
@@ -938,6 +951,60 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
         stub.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "nothing minted while the tunnel is down"
+    );
+}
+
+/// A server with public hosts and no tunnel (the orchestrator) mints a
+/// direct link: `host=` names those hosts, there is no `tc`, the result
+/// lists them as `hosts` with a `null` `tcAddress`, and the resolver
+/// rebuilds the same link. A running tunnel still wins.
+#[tokio::test]
+async fn public_hosts_route_a_link_without_a_tunnel() {
+    let stub = Arc::new(CreateStub {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "workspace.invite.create",
+        "params": { "workspaceId": "ws" }
+    }))
+    .unwrap();
+    let (provider, _dir) =
+        stub_provider_with_hosts(Some(7443), None, &["orch.example.test", "203.0.113.7"]);
+    let frame: Value =
+        serde_json::from_str(&handle_create(req, &api, Some(&provider)).await.unwrap()).unwrap();
+    let r = &frame["result"];
+    let url = r["url"].as_str().unwrap_or_else(|| panic!("{frame}"));
+    let envelope = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(
+        url,
+        format!(
+            "intent://invite?v=1&host=orch.example.test,203.0.113.7&port=7443&fp={}&inviteId=inv-1&secret=s3cret",
+            encode_query_value(&envelope.fingerprint)
+        )
+    );
+    assert_eq!(r["invite"]["url"], json!(url), "{r}");
+    assert_eq!(
+        r["hosts"],
+        json!(["orch.example.test", "203.0.113.7"]),
+        "{r}"
+    );
+    assert_eq!(r["tcAddress"], Value::Null, "{r}");
+    let rebuilt = InviteLinkResolver::new(provider)
+        .invite_link_envelope()
+        .await
+        .expect("resolves")
+        .invite_url("inv-1", "s3cret");
+    assert_eq!(rebuilt, url);
+
+    let (both, _dir) = stub_provider_with_hosts(Some(7443), Some("tc-abc"), &["orch.example.test"]);
+    let url = link_envelope(Some(&both))
+        .await
+        .expect("envelope")
+        .invite_url("inv-1", "s3cret");
+    assert!(
+        url.ends_with("&tc=tc-abc") && !url.contains("host="),
+        "{url}"
     );
 }
 
