@@ -532,10 +532,10 @@ async fn create_scoped_json(
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;
     obj.insert("url".into(), url.into());
     obj.insert("hosts".into(), json!(envelope.hosts()));
-    obj.insert("tcAddress".into(), json!(envelope.tc_address()));
     obj.insert("port".into(), envelope.port.into());
-    obj.insert("fingerprint".into(), envelope.fingerprint.into());
+    obj.insert("fingerprint".into(), envelope.fingerprint.clone().into());
     obj.insert("version".into(), INVITE_PAYLOAD_VERSION.into());
+    obj.insert("tcAddress".into(), json!(envelope.tc_address()));
     Ok(result)
 }
 

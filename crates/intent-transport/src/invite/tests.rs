@@ -909,6 +909,18 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
     assert_eq!(r["hosts"], json!([]), "{r}");
     assert_eq!(r["port"], json!(7443));
     assert_eq!(r["tcAddress"], json!("tc-abc"), "{r}");
+    let keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+    assert!(
+        keys.ends_with(&[
+            "url",
+            "hosts",
+            "port",
+            "fingerprint",
+            "version",
+            "tcAddress"
+        ]),
+        "the desktop result keeps its key order: {keys:?}"
+    );
     assert!(url.contains("&tc=tc-abc"), "{url}");
     assert!(!url.contains("host="), "{url}");
     assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
