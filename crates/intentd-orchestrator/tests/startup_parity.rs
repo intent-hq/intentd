@@ -257,7 +257,7 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_core::workload::init", Wired("intent_core::workload::init")),
     (
         "intent_services::workload_memory_ceiling",
-        Refused("one ceiling for the whole process: no tenant's `agents.workloadMemoryMaxMb` sets it, the host's memory does"),
+        Refused("one ceiling for the whole process: `INTENTD_WORKLOAD_MEMORY_MAX_MB` sets it, no tenant's `agents.workloadMemoryMaxMb`"),
     ),
     (
         "init_adapter_slots",

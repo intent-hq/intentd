@@ -57,6 +57,24 @@ fn logs_the_raised_fd_limit_and_containment_at_start() {
     );
 }
 
+#[test]
+fn a_bad_workload_memory_ceiling_fails_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_intentd-orchestrator"))
+        .env("INTENTD_POSTGRES_URL", "postgres://127.0.0.1:1/never")
+        .env("INTENTD_WORKLOAD_MEMORY_MAX_MB", "lots")
+        .env("INTENTD_DATA_DIR", dir.path())
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the orchestrator");
+    let log =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{log}");
+    assert!(log.contains("INTENTD_WORKLOAD_MEMORY_MAX_MB"), "{log}");
+    assert!(!log.contains("fd limit"), "nothing is set up: {log}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn runs_the_pty_workload_shim() {

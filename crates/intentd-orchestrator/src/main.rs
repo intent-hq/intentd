@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use intent_store::postgres::SecretKeyring;
+use intentd_orchestrator::process::{ceiling_from_env, WORKLOAD_MEMORY_ENV};
 use intentd_orchestrator::secrets::{keyring_from_env, KEY_ENV};
 use intentd_orchestrator::serve::{try_serve_tenant, LeaseTiming, ServedTenant, Serving};
 use intentd_orchestrator::{
@@ -66,25 +67,34 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // Read and clear the URL (it may carry a password) and the tenant
+    // secret key while this process is still single-threaded, so no child
+    // process inherits them: not even the process setup's own (`systemctl`).
+    let url = std::env::var(POSTGRES_URL_ENV);
+    std::env::remove_var(POSTGRES_URL_ENV);
+    let keyring = keyring_from_env(|name| std::env::var(name).ok());
+    std::env::remove_var(KEY_ENV);
+    let ceiling =
+        std::env::var_os(WORKLOAD_MEMORY_ENV).map(|value| value.into_string().unwrap_or_default());
+    let ceiling = match ceiling_from_env(ceiling.as_deref()) {
+        Ok(ceiling) => ceiling,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     match intent_core::Config::resolve() {
-        Ok(config) => intentd_orchestrator::process::setup(&config.data_dir),
+        Ok(config) => intentd_orchestrator::process::setup(&config.data_dir, ceiling),
         Err(error) => {
             tracing::error!(%error, "data dir");
             return ExitCode::FAILURE;
         }
     }
-    // Read and clear the URL (it may carry a password) while this process
-    // is still single-threaded, so no child process inherits it.
-    let url = std::env::var(POSTGRES_URL_ENV);
-    std::env::remove_var(POSTGRES_URL_ENV);
     let Ok(url) = url else {
         tracing::error!("{POSTGRES_URL_ENV} is unset");
         return ExitCode::FAILURE;
     };
-    // The tenant secret keyring, read before any thread starts; a key in
-    // the environment is cleared the same way. No key: no tenant opens.
-    let keyring = keyring_from_env(|name| std::env::var(name).ok());
-    std::env::remove_var(KEY_ENV);
+    // No key: no tenant opens.
     let keyring = match keyring {
         Ok(keyring) => Arc::new(keyring),
         Err(error) => {

@@ -66,6 +66,11 @@ pub fn read() -> std::io::Result<(u64, Option<u64>)> {
     Ok((to_u64(lim.rlim_cur), finite(lim.rlim_max)))
 }
 
+/// Current `(soft, hard)` `RLIMIT_NOFILE`: unavailable off Unix.
+///
+/// # Errors
+///
+/// Always `Unsupported`.
 #[cfg(not(unix))]
 pub fn read() -> std::io::Result<(u64, Option<u64>)> {
     Err(std::io::Error::new(
