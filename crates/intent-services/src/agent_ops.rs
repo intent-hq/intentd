@@ -631,6 +631,8 @@ mod queue_merge_tests;
 #[cfg(test)]
 mod queue_visibility_contract_tests;
 #[cfg(test)]
+mod shared_queue_tests;
+#[cfg(test)]
 mod shutdown_queue_tests;
 
 #[cfg(test)]
@@ -2406,6 +2408,22 @@ impl DrainingGuard {
     pub(crate) fn merge(&mut self, mut other: DrainingGuard) {
         debug_assert_eq!(self.agent_id, other.agent_id);
         self.ids.append(&mut other.ids);
+    }
+
+    /// Retire `ids` now: entries this drain will not deliver because another
+    /// process claimed them first ([`Services::claim_queue_pop`]).
+    pub(crate) fn release(&mut self, ids: &[String]) {
+        let mut overlay = self
+            .overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = overlay.get_mut(&self.agent_id) {
+            entries.retain(|m| !ids.contains(&m.id));
+            if entries.is_empty() {
+                overlay.remove(&self.agent_id);
+            }
+        }
+        self.ids.retain(|id| !ids.contains(id));
     }
 }
 
@@ -10106,6 +10124,8 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // Another process may have changed the queue (shared store).
+        self.refresh_queue_from_store(&agent_id).await;
         let mut queue = self.queue_snapshot(&agent_id);
         if !intent_core::queue_contents_visible_to(
             intent_core::current_caller().as_ref(),
@@ -20557,11 +20577,148 @@ impl Services {
     /// later re-reads the live queue (which already includes the earlier
     /// mutation). Once this returns, the DB holds this mutation's state or a
     /// newer superset — never an older snapshot.
+    ///
+    /// When another process shares the store (Postgres) and wrote the queue
+    /// since, the write merges this process's change onto the stored queue
+    /// instead of replacing it ([`intent_store::Store::sync_agent_queue`]),
+    /// and the in-memory queue is refreshed from the merged result.
     pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
         let _gate = self.agent_queue_persist_gate.lock().await;
+        self.sync_queue_locked(agent_id, &[]).await;
+    }
+
+    /// The write of [`Services::persist_queue_snapshot`]; the caller holds
+    /// `agent_queue_persist_gate`. Returns the `claims` another process
+    /// removed from the stored queue first (always empty on `SQLite`, and
+    /// on a failed write, which is logged like before).
+    async fn sync_queue_locked(&self, agent_id: &AgentId, claims: &[String]) -> Vec<String> {
         let rows = self.queue_rows(agent_id);
-        if let Err(e) = self.store.replace_agent_queue(agent_id, &rows).await {
-            tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
+        match self.store.sync_agent_queue(agent_id, &rows, claims).await {
+            Ok(sync) => {
+                if let Some(merged) = sync.merged {
+                    self.adopt_stored_queue(agent_id, &rows, merged);
+                }
+                sync.lost
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Bring the in-memory queue up to date with the stored one when another
+    /// process wrote it ([`intent_store::Store::refresh_agent_queue`]). A
+    /// no-op on a store no other process writes (`SQLite`), where memory is
+    /// always current.
+    pub(crate) async fn refresh_queue_from_store(&self, agent_id: &AgentId) {
+        if !self.store.agent_queues_shared() {
+            return;
+        }
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        self.refresh_queue_locked(agent_id).await;
+    }
+
+    /// [`Services::refresh_queue_from_store`] under the held persist gate.
+    async fn refresh_queue_locked(&self, agent_id: &AgentId) {
+        let rows = self.queue_rows(agent_id);
+        match self.store.refresh_agent_queue(agent_id, &rows).await {
+            Ok(Some(merged)) => self.adopt_stored_queue(agent_id, &rows, merged),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "agent queue refresh failed");
+            }
+        }
+    }
+
+    /// Pop entries to deliver them so that, of several processes sharing
+    /// the store, exactly one delivers each entry: under the persist gate,
+    /// refresh the queue from the store, `pop`, then write the shrunk queue
+    /// claiming the popped `ids`. Returns the popped value with the claimed
+    /// ids another process removed first (lost: the caller must not deliver
+    /// them). On a store no other process writes this is just `pop()` and
+    /// nothing is lost; the caller persists the shrink as before.
+    pub(crate) async fn claim_queue_pop<T>(
+        &self,
+        agent_id: &AgentId,
+        pop: impl FnOnce() -> Option<T>,
+        ids: impl FnOnce(&T) -> Vec<String>,
+    ) -> Option<(T, Vec<String>)> {
+        if !self.store.agent_queues_shared() {
+            return pop().map(|popped| (popped, Vec::new()));
+        }
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        self.refresh_queue_locked(agent_id).await;
+        let popped = pop()?;
+        let claims = ids(&popped);
+        let lost = self.sync_queue_locked(agent_id, &claims).await;
+        if !lost.is_empty() {
+            tracing::info!(agent = %agent_id, lost = ?lost, "queue entries were drained or removed by another process; not delivering them");
+        }
+        Some((popped, lost))
+    }
+
+    /// Replace the in-memory queue with `merged`, the store's queue, after a
+    /// sync or refresh that started from `from` (this process's rows then).
+    /// A mutation that landed in memory meanwhile is merged on top, so it is
+    /// kept and still persisted by its own write-through. Entries that are
+    /// never persisted (monitor turns) keep their place. Skipped once
+    /// shutdown froze the drains: memory is only flushed from then on.
+    fn adopt_stored_queue(
+        &self,
+        agent_id: &AgentId,
+        from: &[intent_store::AgentQueueRow],
+        merged: Vec<intent_store::AgentQueueRow>,
+    ) {
+        if self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let draining = self.draining_queue_entries.lock().unwrap();
+        let mut queues = self.agent_queues.lock().unwrap();
+        let live = queues.get(agent_id).cloned().unwrap_or_default();
+        let now = Self::rows_of(&draining, &live, false, agent_id);
+        let merged = if same_queue_rows(from, &now) {
+            merged
+        } else {
+            intent_store::merge_agent_queue(
+                agent_id,
+                &intent_store::agent_queue_base(from),
+                &now,
+                &merged,
+            )
+        };
+        let mut next: Vec<QueuedMessage> = Vec::with_capacity(merged.len());
+        for row in merged {
+            let same = live.iter().find(|m| {
+                m.id == row.id && serde_json::to_value(m).is_ok_and(|v| v == row.payload)
+            });
+            if let Some(entry) = same {
+                next.push(entry.clone());
+                continue;
+            }
+            match serde_json::from_value::<QueuedMessage>(row.payload) {
+                Ok(entry) => next.push(entry),
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, id = %row.id, error = %e, "skipping undecodable stored queue entry");
+                }
+            }
+        }
+        for (index, entry) in live.iter().enumerate() {
+            if entry.monitor_turn.is_some() {
+                next.insert(index.min(next.len()), entry.clone());
+            }
+        }
+        if let Some(order) = next.iter().map(|m| m.submission_order).max() {
+            self.queue_submission_order
+                .fetch_max(order, std::sync::atomic::Ordering::Relaxed);
+        }
+        if next.is_empty() {
+            queues.remove(agent_id);
+        } else {
+            queues.insert(agent_id.clone(), next);
         }
     }
 
@@ -20575,6 +20732,16 @@ impl Services {
         let frozen = self
             .draining_shutdown
             .load(std::sync::atomic::Ordering::Relaxed);
+        Self::rows_of(&draining, live, frozen, agent_id)
+    }
+
+    /// [`Services::queue_rows`] over already-locked maps.
+    fn rows_of(
+        draining: &HashMap<AgentId, Vec<QueuedMessage>>,
+        live: &[QueuedMessage],
+        frozen: bool,
+        agent_id: &AgentId,
+    ) -> Vec<intent_store::AgentQueueRow> {
         let retained: Vec<_> = draining
             .get(agent_id)
             .into_iter()
@@ -20684,7 +20851,9 @@ impl Services {
             if unchanged {
                 continue;
             }
-            if let Err(e) = self.store.replace_agent_queue(&agent_id, &rows).await {
+            // A sync, not a replace: another process's newer queue is merged
+            // with, not refused or overwritten (memory is not refreshed).
+            if let Err(e) = self.store.sync_agent_queue(&agent_id, &rows, &[]).await {
                 tracing::warn!(agent = %agent_id, error = %e, "shutdown queue reconcile failed");
             }
         }
