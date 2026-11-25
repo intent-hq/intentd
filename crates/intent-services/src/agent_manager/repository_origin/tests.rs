@@ -666,7 +666,9 @@ async fn actual_teardown_retires_the_source_leaf_before_aborting_work() {
                 .unwrap()
                 .serve_task = task;
         } else {
-            f.manager.slots.insert_worker_for_test(f.row.id.clone(), task);
+            f.manager
+                .slots
+                .insert_worker_for_test(f.row.id.clone(), task);
         }
         if action == "drop" {
             drop(handle);
@@ -833,7 +835,9 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
         std::future::pending::<()>().await;
     });
     started.await.unwrap();
-    f.manager.slots.insert_worker_for_test(f.row.id.clone(), worker);
+    f.manager
+        .slots
+        .insert_worker_for_test(f.row.id.clone(), worker);
     let (_stage, fence) = held_stage_fence(&f, leaf).await;
     let (entered, inside) = std::sync::mpsc::channel();
     let (release, held) = std::sync::mpsc::channel();

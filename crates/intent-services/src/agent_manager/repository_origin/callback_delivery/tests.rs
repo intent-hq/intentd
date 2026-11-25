@@ -8759,9 +8759,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .await
             .unwrap();
         tokio::time::timeout(fixture_wait(), async {
-            while h.f.manager.is_busy(&h.f.row.id)
-                || h.f.manager.slots.has_workers()
-            {
+            while h.f.manager.is_busy(&h.f.row.id) || h.f.manager.slots.has_workers() {
                 tokio::task::yield_now().await;
             }
         })

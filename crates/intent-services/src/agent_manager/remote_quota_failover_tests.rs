@@ -1798,7 +1798,10 @@ async fn paused_retry(
     tokio::task::JoinHandle<Value>,
 ) {
     let pause = Arc::new(crate::agent_manager::TurnStartPause::default());
-    mgr.turn_schedule.arm(crate::agent_manager::turn_schedule::TurnStep::RetryChecked, pause.clone());
+    mgr.turn_schedule.arm(
+        crate::agent_manager::turn_schedule::TurnStep::RetryChecked,
+        pause.clone(),
+    );
     let retry = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move { mgr.agent_retry(id, ws).await.unwrap() }
@@ -1926,7 +1929,8 @@ async fn a_store_error_after_queueing_reports_the_message_queued() {
     let (_tmp, mgr, ws, id) =
         remote_failed_first_turn("redrive-store-error", vec![Launch::Runs(next.clone())]).await;
 
-    mgr.turn_schedule.inject(crate::agent_manager::turn_schedule::TurnFault::RedriveStore);
+    mgr.turn_schedule
+        .inject(crate::agent_manager::turn_schedule::TurnFault::RedriveStore);
     let result = mgr
         .send_message(
             id.clone(),
@@ -1959,7 +1963,8 @@ async fn a_retry_does_not_cancel_a_turn_whose_active_write_failed() {
         "the failed message was queued"
     );
 
-    mgr.turn_schedule.inject(crate::agent_manager::turn_schedule::TurnFault::ActiveWrite);
+    mgr.turn_schedule
+        .inject(crate::agent_manager::turn_schedule::TurnFault::ActiveWrite);
     send(&mgr, &id, &ws, "message alpha").await;
     next.wait_prompts(1).await;
     assert_eq!(
@@ -2005,7 +2010,8 @@ async fn a_retry_still_recovers_a_real_failure_after_an_unrecorded_turn_start() 
         "the failed message was queued"
     );
 
-    mgr.turn_schedule.inject(crate::agent_manager::turn_schedule::TurnFault::ActiveWrite);
+    mgr.turn_schedule
+        .inject(crate::agent_manager::turn_schedule::TurnFault::ActiveWrite);
     send(&mgr, &id, &ws, "message alpha").await;
     next.wait_prompts(1).await;
     crate::agent_manager::persist_terminal_error_status_via_services(

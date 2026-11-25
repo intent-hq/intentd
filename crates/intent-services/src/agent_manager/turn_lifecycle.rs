@@ -52,9 +52,7 @@ pub(crate) enum RetryOwnership {
     StartedSince,
     /// The caller owns the restart. `failed_turn` is the failed turn still
     /// holding the slot, which the caller tears down with this admission.
-    Owned {
-        failed_turn: Option<TurnAdmission>,
-    },
+    Owned { failed_turn: Option<TurnAdmission> },
 }
 
 struct Inner {
@@ -316,7 +314,12 @@ impl TurnSlots {
 
     #[cfg(test)]
     pub(crate) fn worker_id_for_test(&self, agent_id: &AgentId) -> Option<tokio::task::Id> {
-        self.0.workers.lock().unwrap().get(agent_id).map(JoinHandle::id)
+        self.0
+            .workers
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(JoinHandle::id)
     }
 
     #[cfg(test)]

@@ -75,23 +75,24 @@ impl Case {
     }
 }
 
-/// `first` parked at each of its steps (and run to its end), followed by
-/// every second action.
-fn pairs(scenario: Scenario, fault: Option<TurnFault>, first: Action) -> Vec<Case> {
-    let mut cases = Vec::new();
-    let steps = first.steps().iter().copied().map(Some).chain([None]);
-    for at in steps {
-        for then in Action::THEN {
-            cases.push(Case {
-                scenario,
-                fault,
-                first,
-                at,
-                then: vec![then],
-            });
-        }
-    }
-    cases
+/// `first` parked at `at` (or run to its end), followed by every second
+/// action.
+fn pairs(
+    scenario: Scenario,
+    fault: Option<TurnFault>,
+    first: Action,
+    at: Option<TurnStep>,
+) -> Vec<Case> {
+    Action::THEN
+        .into_iter()
+        .map(|then| Case {
+            scenario,
+            fault,
+            first,
+            at,
+            then: vec![then],
+        })
+        .collect()
 }
 
 const SPARE_RUNS: usize = 4;
@@ -213,7 +214,10 @@ async fn fixture(scenario: Scenario, name: &str) -> (TempDb, Actor, Vec<&'static
             let (tmp, mgr, ws, id) = remote_failed_first_turn(name, launches).await;
             let mut sent = vec![FIRST_MESSAGE];
             if scenario == Scenario::FailedNoQueue {
-                assert!(mgr.services.clear_queue(&id), "the failed message was queued");
+                assert!(
+                    mgr.services.clear_queue(&id),
+                    "the failed message was queued"
+                );
                 sent.clear();
             }
             (tmp, Actor { mgr, ws, id, runs }, sent)
@@ -324,7 +328,10 @@ async fn finish(actor: &Actor, label: &str, cancels: bool, sent: &mut Vec<&'stat
         return;
     }
     for text in sent.iter() {
-        assert!(prompts.contains(text), "{label}: {text} was lost: {prompts}");
+        assert!(
+            prompts.contains(text),
+            "{label}: {text} was lost: {prompts}"
+        );
     }
     for (n, run) in actor.runs.iter().enumerate() {
         let run_prompts = all_prompts(run);
@@ -363,35 +370,55 @@ async fn run_cases(cases: Vec<Case>) {
     }
 }
 
-/// One test per scenario, fault and first action, so the orders run in
-/// parallel.
+/// One test per scenario, fault, first action and step, so the orders run
+/// in parallel and each test stays well inside its time limit.
 macro_rules! interleavings {
-    ($($name:ident: $scenario:ident, $fault:expr, $first:expr;)*) => {$(
+    ($($name:ident: $scenario:ident, $fault:expr, $first:expr, $at:expr;)*) => {$(
         #[intent_test_macros::daemon_test]
         async fn $name() {
-            run_cases(pairs(Scenario::$scenario, $fault, $first)).await;
+            run_cases(pairs(Scenario::$scenario, $fault, $first, $at)).await;
         }
     )*};
 }
 
 interleavings! {
-    failed_turn_then_send: FailedPark, None, Action::Send(ALPHA);
-    failed_turn_then_retry: FailedPark, None, Action::Retry;
-    failed_turn_then_redrive: FailedPark, None, Action::Redrive;
-    failed_turn_then_interrupt: FailedPark, None, Action::Interrupt;
-    failed_turn_then_stop: FailedPark, None, Action::Stop;
-    failed_turn_redrive_store_error_then_send: FailedPark, Some(TurnFault::RedriveStore), Action::Send(ALPHA);
-    failed_turn_redrive_store_error_then_redrive: FailedPark, Some(TurnFault::RedriveStore), Action::Redrive;
-    failed_active_write_then_send: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Send(ALPHA);
-    failed_active_write_then_retry: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Retry;
-    failed_active_write_then_redrive: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Redrive;
-    failed_active_write_then_interrupt: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt;
-    failed_active_write_then_stop: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Stop;
-    running_turn_then_send: Running, None, Action::Send(ALPHA);
-    running_turn_then_retry: Running, None, Action::Retry;
-    running_turn_then_redrive: Running, None, Action::Redrive;
-    running_turn_then_interrupt: Running, None, Action::Interrupt;
-    running_turn_then_stop: Running, None, Action::Stop;
+    failed_turn_then_send_at_user_persist: FailedPark, None, Action::Send(ALPHA), Some(TurnStep::UserPersist);
+    failed_turn_then_send_to_its_end: FailedPark, None, Action::Send(ALPHA), None;
+    failed_turn_then_retry_at_retry_checked: FailedPark, None, Action::Retry, Some(TurnStep::RetryChecked);
+    failed_turn_then_retry_at_retry_lifted: FailedPark, None, Action::Retry, Some(TurnStep::RetryLifted);
+    failed_turn_then_retry_to_its_end: FailedPark, None, Action::Retry, None;
+    failed_turn_then_redrive_at_redrive_checked: FailedPark, None, Action::Redrive, Some(TurnStep::RedriveChecked);
+    failed_turn_then_redrive_to_its_end: FailedPark, None, Action::Redrive, None;
+    failed_turn_then_interrupt_at_interrupt_releasing: FailedPark, None, Action::Interrupt, Some(TurnStep::InterruptReleasing);
+    failed_turn_then_interrupt_to_its_end: FailedPark, None, Action::Interrupt, None;
+    failed_turn_then_stop_at_detach_releasing: FailedPark, None, Action::Stop, Some(TurnStep::DetachReleasing);
+    failed_turn_then_stop_to_its_end: FailedPark, None, Action::Stop, None;
+    failed_turn_redrive_store_error_then_send_at_user_persist: FailedPark, Some(TurnFault::RedriveStore), Action::Send(ALPHA), Some(TurnStep::UserPersist);
+    failed_turn_redrive_store_error_then_send_to_its_end: FailedPark, Some(TurnFault::RedriveStore), Action::Send(ALPHA), None;
+    failed_turn_redrive_store_error_then_redrive_at_redrive_checked: FailedPark, Some(TurnFault::RedriveStore), Action::Redrive, Some(TurnStep::RedriveChecked);
+    failed_turn_redrive_store_error_then_redrive_to_its_end: FailedPark, Some(TurnFault::RedriveStore), Action::Redrive, None;
+    failed_active_write_then_send_at_user_persist: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Send(ALPHA), Some(TurnStep::UserPersist);
+    failed_active_write_then_send_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Send(ALPHA), None;
+    failed_active_write_then_retry_at_retry_checked: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Retry, Some(TurnStep::RetryChecked);
+    failed_active_write_then_retry_at_retry_lifted: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Retry, Some(TurnStep::RetryLifted);
+    failed_active_write_then_retry_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Retry, None;
+    failed_active_write_then_redrive_at_redrive_checked: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Redrive, Some(TurnStep::RedriveChecked);
+    failed_active_write_then_redrive_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Redrive, None;
+    failed_active_write_then_interrupt_at_interrupt_releasing: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt, Some(TurnStep::InterruptReleasing);
+    failed_active_write_then_interrupt_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Interrupt, None;
+    failed_active_write_then_stop_at_detach_releasing: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Stop, Some(TurnStep::DetachReleasing);
+    failed_active_write_then_stop_to_its_end: FailedNoQueue, Some(TurnFault::ActiveWrite), Action::Stop, None;
+    running_turn_then_send_at_user_persist: Running, None, Action::Send(ALPHA), Some(TurnStep::UserPersist);
+    running_turn_then_send_to_its_end: Running, None, Action::Send(ALPHA), None;
+    running_turn_then_retry_at_retry_checked: Running, None, Action::Retry, Some(TurnStep::RetryChecked);
+    running_turn_then_retry_at_retry_lifted: Running, None, Action::Retry, Some(TurnStep::RetryLifted);
+    running_turn_then_retry_to_its_end: Running, None, Action::Retry, None;
+    running_turn_then_redrive_at_redrive_checked: Running, None, Action::Redrive, Some(TurnStep::RedriveChecked);
+    running_turn_then_redrive_to_its_end: Running, None, Action::Redrive, None;
+    running_turn_then_interrupt_at_interrupt_releasing: Running, None, Action::Interrupt, Some(TurnStep::InterruptReleasing);
+    running_turn_then_interrupt_to_its_end: Running, None, Action::Interrupt, None;
+    running_turn_then_stop_at_detach_releasing: Running, None, Action::Stop, Some(TurnStep::DetachReleasing);
+    running_turn_then_stop_to_its_end: Running, None, Action::Stop, None;
 }
 
 /// A stop or interrupt parked before it frees the slot, while another one

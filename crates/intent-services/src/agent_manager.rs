@@ -8483,7 +8483,9 @@ impl AgentManager {
         origin: TurnOrigin,
     ) -> bool {
         #[cfg(test)]
-        self.turn_schedule.reach(turn_schedule::TurnStep::TurnStarting).await;
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::TurnStarting)
+            .await;
         {
             // A real turn is starting: if the workspace is Archived, flip it
             // back to Active and emit the stamped §6.5 delta (auto-unarchive
@@ -9241,7 +9243,12 @@ impl AgentManager {
     /// Register the worker that runs `admission`'s turn. Its caller checked
     /// the admission under the closure locks; a teardown that released the
     /// slot since then wins, and the worker is aborted unregistered.
-    fn register_worker(&self, agent_id: &AgentId, admission: TurnAdmission, worker: JoinHandle<()>) {
+    fn register_worker(
+        &self,
+        agent_id: &AgentId,
+        admission: TurnAdmission,
+        worker: JoinHandle<()>,
+    ) {
         match self.slots.register_worker(agent_id, admission, worker) {
             Ok(Some(previous)) => self.retain_finishing_worker(previous),
             Ok(None) => {}
@@ -10525,7 +10532,9 @@ impl AgentManager {
         // already names that row.
         if !entry.persisted {
             #[cfg(test)]
-            self.turn_schedule.reach(turn_schedule::TurnStep::UserPersist).await;
+            self.turn_schedule
+                .reach(turn_schedule::TurnStep::UserPersist)
+                .await;
             // STAB-133: persist the entry's attachments alongside the text
             // block, under the entry id so the RPC result's `messageId` and
             // the `agent:message` event both name the actual transcript row.
@@ -11501,7 +11510,9 @@ impl AgentManager {
                 // and the durable queue intact, dispose of the hung provider,
                 // and never publish a successful idle to completion watchers.
                 #[cfg(test)]
-                mgr.turn_schedule.reach(turn_schedule::TurnStep::FailedWakeDisposal).await;
+                mgr.turn_schedule
+                    .reach(turn_schedule::TurnStep::FailedWakeDisposal)
+                    .await;
                 mgr.kill_child_only(&id).await;
                 mgr.clear_worker(&id);
                 mgr.release_in_flight_slot(&id, admission);
@@ -11588,7 +11599,9 @@ impl AgentManager {
             return Ok(json!({ "ok": false }));
         }
         #[cfg(test)]
-        self.turn_schedule.reach(turn_schedule::TurnStep::RetryChecked).await;
+        self.turn_schedule
+            .reach(turn_schedule::TurnStep::RetryChecked)
+            .await;
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = session.workspace_id.clone();
@@ -11609,9 +11622,10 @@ impl AgentManager {
                 .await?;
             Self::check_retry_not_retired(&agent_id, &session)?;
             match self.slots.retry_ownership(&agent_id, session.status) {
-                RetryOwnership::Owned { failed_turn } => {
-                    Some(self.lift_failed_park(&agent_id, &session, failed_turn).await?)
-                }
+                RetryOwnership::Owned { failed_turn } => Some(
+                    self.lift_failed_park(&agent_id, &session, failed_turn)
+                        .await?,
+                ),
                 RetryOwnership::NotFailed | RetryOwnership::StartedSince => None,
             }
         };
@@ -13718,7 +13732,9 @@ impl AgentManager {
             let gate = self.turn_start_gates.for_agent(id);
             let _starting = gate.lock().await;
             #[cfg(test)]
-            self.turn_schedule.reach(turn_schedule::TurnStep::ShutdownPersist).await;
+            self.turn_schedule
+                .reach(turn_schedule::TurnStep::ShutdownPersist)
+                .await;
             // Best-effort: persist any partial in-flight assistant content from
             // the pinned slot so the transcript keeps the streamed-so-far
             // output across the restart. Runs before the status guards below so
@@ -17620,7 +17636,9 @@ async fn run_message_worker(
         break 'outer;
     }
     #[cfg(test)]
-    mgr.turn_schedule.reach(turn_schedule::TurnStep::WorkerFinish).await;
+    mgr.turn_schedule
+        .reach(turn_schedule::TurnStep::WorkerFinish)
+        .await;
     mgr.clear_worker(&agent_id);
     // Parked recovery send (intent-hq/intent#4962): a `send_message` that
     // lost `try_begin` to THIS worker while it was parking the session in
@@ -17983,7 +18001,9 @@ async fn persist_user(
     user_origin: bool,
 ) -> bool {
     #[cfg(test)]
-    mgr.turn_schedule.reach(turn_schedule::TurnStep::UserPersist).await;
+    mgr.turn_schedule
+        .reach(turn_schedule::TurnStep::UserPersist)
+        .await;
     if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.
