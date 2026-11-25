@@ -483,6 +483,7 @@ async fn idle_publish_resolves_without_batch_window_delay() {
         },
         wrx,
         btx,
+        |_: &intent_core::Error| false,
     ));
 
     let start = tokio::time::Instant::now();
@@ -678,6 +679,7 @@ async fn queued_publishes_are_persisted_in_full_batches() {
         },
         wrx,
         btx,
+        |_: &intent_core::Error| false,
     ));
 
     for (i, reply) in replies.into_iter().enumerate() {
@@ -1014,6 +1016,7 @@ async fn transient_batch_insert_failure_retries_and_delivers() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
 
@@ -1050,6 +1053,7 @@ async fn permanent_batch_insert_failure_does_not_retry() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
 
@@ -1111,6 +1115,7 @@ async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
 
@@ -1154,6 +1159,7 @@ async fn transient_batch_insert_failure_exhausts_retries() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
 
@@ -1639,6 +1645,7 @@ async fn persisted_event_is_broadcast_before_its_publisher_wakes() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
 
@@ -1736,6 +1743,7 @@ async fn a_fenced_store_drops_the_batch_without_retry_or_broadcast() {
         },
         &mut pending,
         &btx,
+        |_: &intent_core::Error| false,
     )
     .await;
     assert_eq!(attempts.get(), 1, "NotOwner is never retried");
@@ -1752,4 +1760,53 @@ async fn a_fenced_store_drops_the_batch_without_retry_or_broadcast() {
         ),
         "nothing is broadcast"
     );
+}
+
+/// F7: once this process's own fence fired, its refusal of a batch (the
+/// `client:disconnected` of a connection a clean stop closed) is the
+/// expected end of the tenant here, not an error: it is dropped like any
+/// permanent failure, logged below WARN, and the publisher keeps the
+/// `NotOwner` variant so it can tell the refusal apart. A refusal the
+/// writer does not classify as the fence's own still logs at ERROR.
+#[tokio::test(start_paused = true)]
+async fn the_fences_own_refusal_is_dropped_quietly() {
+    let warnings = crate::test_tracing::Warnings::default();
+    let _guard = warnings.install();
+    for own in [true, false] {
+        let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+        let btx = super::bus::RawBus::from(btx);
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        let ev = new_event("client:disconnected", None, ActorType::System);
+        let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+        let attempts = std::cell::Cell::new(0u32);
+        super::bus::flush_prepared(
+            || {
+                attempts.set(attempts.get() + 1);
+                async {
+                    Err(intent_core::Error::NotOwner(
+                        "tenant t: this process fenced itself (instance a at epoch 1) and no \
+                         longer serves it: the orchestrator is stopping; nothing was written"
+                            .to_owned(),
+                    ))
+                }
+            },
+            &mut pending,
+            &btx,
+            |e: &intent_core::Error| own && matches!(e, intent_core::Error::NotOwner(_)),
+        )
+        .await;
+        assert_eq!(attempts.get(), 1, "never retried");
+        let resolved = orx
+            .await
+            .expect("oneshot resolved")
+            .expect_err("the publisher sees the refusal");
+        assert_eq!(
+            matches!(resolved, intent_core::Error::NotOwner(_)),
+            own,
+            "{resolved:?}"
+        );
+        assert!(brx.try_recv().is_err(), "nothing is broadcast");
+        let loud = warnings.containing("dropping batch");
+        assert_eq!(loud.len(), usize::from(!own), "own={own}: {loud:?}");
+    }
 }

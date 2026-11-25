@@ -40,7 +40,25 @@ pub(super) fn resolve(
 ) -> DesktopResult<DesktopConnection> {
     let state = registry.inner.lock();
     let entry = resolve_entry(&state.entries, target).map_err(|_| {
-        DesktopError::new("desktop-offline", "Workspace primary desktop is offline")
+        // A named client that is connected, and allowed to host browser
+        // work, but cannot execute (a web tab) is incapable, not offline.
+        // A connection without that authority keeps the old answer:
+        // capability is not permission (desktop.md).
+        let connected = match target {
+            ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => state
+                .entries
+                .iter()
+                .any(|entry| entry.has_client(id) && entry.channel.may_host_browser()),
+            ReverseTarget::Default | ReverseTarget::Preferred(_) => false,
+        };
+        if connected {
+            DesktopError::new(
+                "desktop-unsupported",
+                "Workspace primary does not support desktop control",
+            )
+        } else {
+            DesktopError::new("desktop-offline", "Workspace primary desktop is offline")
+        }
     })?;
     if entry
         .identity
@@ -179,6 +197,72 @@ mod tests {
                 .unwrap_err()
                 .code,
             "forbidden"
+        );
+    }
+
+    /// A connected client that cannot execute (a web tab: no `browserExec`,
+    /// no `desktopControl`) is incapable, not offline (desktop.md: offline
+    /// is `desktop-offline`, incapable is `desktop-unsupported`). The web
+    /// app asks `desktop.getState` for its own connection, which the
+    /// orchestrator answered `desktop-offline` on every workspace open.
+    #[test]
+    fn a_connected_client_without_execution_is_unsupported_not_offline() {
+        let registry = PrimaryReverseRegistry::new();
+        let web = registry.register(
+            ReverseChannel::new(mpsc::channel(4).0),
+            ReverseTransport::Wss,
+        );
+        let principal = PrincipalId::from("owner");
+        let identity = ReverseClientIdentity {
+            client_id: ClientId::from("web"),
+            name: None,
+            capabilities: json!({}),
+            host: ClientHostInfo::default(),
+        };
+        web.bind_device(identity.clone(), principal.clone());
+        web.bind_hello(identity);
+        for target in [
+            ReverseTarget::Client(ClientId::from("web")),
+            ReverseTarget::Pinned(ClientId::from("web")),
+        ] {
+            assert_eq!(
+                registry
+                    .desktop_resolve(&target, &principal)
+                    .unwrap_err()
+                    .code,
+                "desktop-unsupported",
+                "{target:?}"
+            );
+        }
+        // Without the authority to host browser work the answer stays
+        // offline: capability is not permission.
+        let guest = registry.register(
+            ReverseChannel::new(mpsc::channel(4).0).with_administrator(false),
+            ReverseTransport::Wss,
+        );
+        let guest_identity = ReverseClientIdentity {
+            client_id: ClientId::from("guest"),
+            name: None,
+            capabilities: json!({"browserExec":true,"desktopControl":1}),
+            host: ClientHostInfo::default(),
+        };
+        guest.bind_device(guest_identity.clone(), principal.clone());
+        guest.bind_hello(guest_identity);
+        assert_eq!(
+            registry
+                .desktop_resolve(&ReverseTarget::Client(ClientId::from("guest")), &principal)
+                .unwrap_err()
+                .code,
+            "desktop-offline"
+        );
+        drop(web);
+        assert_eq!(
+            registry
+                .desktop_resolve(&ReverseTarget::Client(ClientId::from("web")), &principal)
+                .unwrap_err()
+                .code,
+            "desktop-offline",
+            "gone is offline"
         );
     }
 

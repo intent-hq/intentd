@@ -509,6 +509,16 @@ impl Store {
             Backend::Postgres(store) => store.tenant_fence(),
         }
     }
+
+    /// Whether `error` is the refusal of this process's own fired fence
+    /// ([`TenantFence::refused`]): expected once the process stopped serving
+    /// the tenant, so log it quietly and do not retry. Always `false` on
+    /// `SQLite`.
+    #[must_use]
+    pub fn refused_by_own_fence(&self, error: &Error) -> bool {
+        self.tenant_fence()
+            .is_some_and(|fence| fence.refused(error))
+    }
 }
 
 impl Store {

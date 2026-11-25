@@ -191,6 +191,15 @@ impl ScriptMonitorExt for Services {
                     () = services.feature_settings_tasks().closed() => break,
                     _ = sweep.tick() => {}
                 }
+                // Once this process's tenant fence fired, every write of
+                // the tenant is refused: nothing is left to maintain here.
+                if services
+                    .store()
+                    .tenant_fence()
+                    .is_some_and(|fence| fence.is_fenced())
+                {
+                    break;
+                }
                 let completions = services
                     .runtime()
                     .script_locks
@@ -208,7 +217,12 @@ impl ScriptMonitorExt for Services {
                     .cleanup_completed_script_notifications()
                     .await
                 {
-                    tracing::warn!(%error, "completed notification cleanup will retry");
+                    if services.store().refused_by_own_fence(&error) {
+                        // The fence fired during this tick; the next one stops.
+                        tracing::debug!(%error, "completed notification cleanup refused by the fired tenant fence");
+                    } else {
+                        tracing::warn!(%error, "completed notification cleanup will retry");
+                    }
                 }
                 if let Ok(rows) = services.store().pending_script_monitors().await {
                     for (row, _) in rows {
@@ -218,7 +232,11 @@ impl ScriptMonitorExt for Services {
                                 .reconcile_monitor(&row.workspace_id, &row.monitor_id)
                                 .await
                             {
-                                tracing::warn!(%error, monitor=%row.monitor_id, "script monitor reconciliation failed; will retry");
+                                if services.store().refused_by_own_fence(&error) {
+                                    tracing::debug!(%error, monitor=%row.monitor_id, "script monitor reconciliation refused by the fired tenant fence");
+                                } else {
+                                    tracing::warn!(%error, monitor=%row.monitor_id, "script monitor reconciliation failed; will retry");
+                                }
                             }
                         } else {
                             services.dispatch_script_monitor(&row).await;
@@ -228,7 +246,11 @@ impl ScriptMonitorExt for Services {
                 if let Ok(jobs) = services.store().script_notification_jobs().await {
                     for job in jobs {
                         if let Err(error) = services.dispatch_script_notification(&job).await {
-                            tracing::warn!(%error, wake=%job.wake_id, "script notification remains pending");
+                            if services.store().refused_by_own_fence(&error) {
+                                tracing::debug!(%error, wake=%job.wake_id, "script notification refused by the fired tenant fence");
+                            } else {
+                                tracing::warn!(%error, wake=%job.wake_id, "script notification remains pending");
+                            }
                         }
                     }
                 }
