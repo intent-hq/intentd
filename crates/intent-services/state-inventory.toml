@@ -287,11 +287,6 @@ class = "volatile"
 note = "Consecutive identical terminal failures per agent (monorepo#840); feeds session_poisoned. Restart forgets it."
 
 [[field]]
-name = "unrecorded_turn_starts"
-class = "volatile"
-note = "Turn starts whose Active write failed, so agent.retry does not reuse the admission."
-
-[[field]]
 name = "pending_terminal_error"
 class = "volatile"
 note = "Single-shot handoff of an already-persisted terminal error to the turn worker (monorepo#2050)."
@@ -933,6 +928,11 @@ note = "Ephemeral workspace and note presence table (gap D)."
 name = "github_api_base_uri"
 class = "test"
 note = "Test override for the GitHub API base."
+
+[[field]]
+name = "gitlab_api_base_uri"
+class = "test"
+note = "Test override for the GitLab API base (None in production: env, then the instance origin)."
 
 [[field]]
 name = "disk_usage"
