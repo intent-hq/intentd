@@ -5577,6 +5577,12 @@ impl Services {
         self
     }
 
+    /// The root set with [`Self::with_workspaces_root`], if any.
+    #[must_use]
+    pub fn configured_workspaces_root(&self) -> Option<&Path> {
+        self.workspaces_root.as_deref()
+    }
+
     /// Override the `workspace.create` base-refresh fetch bound (default
     /// 100 s). Tests use a short bound to exercise the `timeout` category.
     #[must_use]

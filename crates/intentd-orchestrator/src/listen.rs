@@ -11,6 +11,10 @@
 //!   process's ([`TLS_DIR_ENV`]).
 //! - [`INSECURE_ENV`] turns both TLS and the bearer check off, as
 //!   `intentd serve --insecure` does: for local development only.
+//! - Invite links name the public addresses in [`PUBLIC_HOSTS_ENV`]: the
+//!   orchestrator has no tunnel, so without them no invite is minted.
+//! - The Assistant's `ws.rpc` runs over an in-process connection with the
+//!   local socket's semantics, as in `intentd`.
 //!
 //! Every accepted connection joins the tenant's
 //! [`ClientConnections`], so the tenant's self-fence closes it; once the
@@ -49,6 +53,10 @@ pub const TLS_DIR_ENV: &str = "INTENTD_ORCHESTRATOR_TLS_DIR";
 /// `intentd serve --insecure`. Local development only.
 pub const INSECURE_ENV: &str = "INTENTD_ORCHESTRATOR_INSECURE";
 
+/// The public host names (or addresses) clients reach the WSS port at,
+/// comma-separated: what invite links name (`host=`). None when unset.
+pub const PUBLIC_HOSTS_ENV: &str = "INTENTD_ORCHESTRATOR_PUBLIC_HOSTS";
+
 /// The default WSS port: next to `intentd`'s 5181, so both run on one host.
 pub const DEFAULT_WS_PORT: u16 = 5191;
 
@@ -63,6 +71,8 @@ pub struct ListenConfig {
     pub ws_port: u16,
     pub tls_dir: PathBuf,
     pub insecure: bool,
+    /// [`PUBLIC_HOSTS_ENV`].
+    pub public_hosts: Vec<String>,
 }
 
 impl ListenConfig {
@@ -95,12 +105,17 @@ impl ListenConfig {
             Some("1" | "true") => true,
             Some(other) => return Err(format!("{INSECURE_ENV}: {other:?} is not 1/true/0/false")),
         };
+        let public_hosts = match set(PUBLIC_HOSTS_ENV) {
+            Some(raw) => parse_public_hosts(&raw)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             socket_path,
             bind_addresses,
             ws_port,
             tls_dir,
             insecure,
+            public_hosts,
         })
     }
 }
@@ -126,6 +141,35 @@ fn parse_bind(raw: &str) -> Result<Vec<IpAddr>, String> {
     Ok(addresses)
 }
 
+/// `raw` ([`PUBLIC_HOSTS_ENV`]): comma-separated host names or IP
+/// addresses, with no scheme, port or path.
+fn parse_public_hosts(raw: &str) -> Result<Vec<String>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            // IPv6 as the app takes pairing hosts: bare, no brackets.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .filter(|h| h.parse::<std::net::Ipv6Addr>().is_ok())
+                .unwrap_or(host);
+            let valid = host.parse::<IpAddr>().is_ok()
+                || host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+            if valid {
+                Ok(host.to_owned())
+            } else {
+                Err(format!(
+                    "{PUBLIC_HOSTS_ENV}: {host:?} is not a host name or address \
+                     (no scheme, port or path)"
+                ))
+            }
+        })
+        .collect()
+}
+
 /// A tenant's [`ClientConnections`], as the listeners take it.
 struct TenantConnections(ClientConnections);
 
@@ -142,12 +186,16 @@ impl ConnectionSet for TenantConnections {
 }
 
 /// `server.pairingInfo` and `server.rotateToken` on the local socket: the
-/// tenant's owner token, this process's certificate and WSS port.
+/// tenant's owner token, this process's certificate and WSS port; and the
+/// envelope of the tenant's invite links.
 struct Pairing {
     tls_dir: PathBuf,
     tokens: AsyncTokenStore,
     host: HostEnvironment,
-    ws: Arc<OnceLock<WsApiServer>>,
+    /// Weak, as [`StatusControl::ws`]: the tenant's `Services` hold this
+    /// (invite links, `ws.rpc`), and the listener holds the `Services`.
+    ws: Arc<OnceLock<std::sync::Weak<WsApiServer>>>,
+    public_hosts: Vec<String>,
 }
 
 impl ServerPairingInfo for Pairing {
@@ -155,7 +203,7 @@ impl ServerPairingInfo for Pairing {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PairingSnapshot> + Send + '_>> {
         Box::pin(async move {
-            let (port, bind_addresses) = match self.ws.get() {
+            let (port, bind_addresses) = match self.ws.get().and_then(std::sync::Weak::upgrade) {
                 Some(ws) => (ws.bound_port().await, Some(ws.bound_addresses())),
                 None => (None, None),
             };
@@ -179,6 +227,10 @@ impl ServerPairingInfo for Pairing {
         &self.tokens
     }
 
+    fn invite_hosts(&self) -> Vec<String> {
+        self.public_hosts.clone()
+    }
+
     fn daemon_mode(&self) -> intent_core::settings_file::DaemonMode {
         intent_core::settings_file::DaemonMode::Orchestrator
     }
@@ -192,7 +244,8 @@ impl ServerPairingInfo for Pairing {
 ///
 /// [`SystemServices::StatusOnly`]: intent_transport::control::SystemServices::StatusOnly
 struct StatusControl {
-    services: Services,
+    /// Weak: the tenant's `Services` hold this control (`ws.rpc`).
+    services: std::sync::Weak<Services>,
     host: HostEnvironment,
     /// Weak: the listener owns this control, so a strong reference would
     /// keep a stopped listener (and the tenant's `Services`) alive. The
@@ -206,20 +259,37 @@ struct StatusControl {
 }
 
 /// What [`sample_usage`] last read: this process's CPU (100 = one core) and
-/// resident memory, and the host's addresses for `localIps`.
+/// resident memory, the host's addresses for `localIps` and its names, and
+/// the `(available, total)` bytes of the volume the tenant's workspaces are
+/// on.
 #[derive(Default)]
 struct UsageSample {
     cpu_percent: f32,
     memory_bytes: u64,
     local_v4: Vec<String>,
     local_v6: Vec<String>,
+    names: Option<(String, String)>,
+    workspaces_disk: Option<(u64, u64)>,
+}
+
+/// The `(available, total)` bytes of the mounted volume holding `root`
+/// (the longest mount point it is under), as `intentd`'s status reports.
+fn disk_sample(root: &Path) -> Option<(u64, u64)> {
+    let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
+    disks
+        .iter()
+        .filter(|disk| target.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| (disk.available_space(), disk.total_space()))
 }
 
 /// How often [`sample_usage`] reads CPU and memory: CPU is a delta between
 /// two reads, so a fixed interval keeps it steady however often clients poll.
 const USAGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How many [`USAGE_INTERVAL`]s apart the host's addresses are re-read.
+/// How many [`USAGE_INTERVAL`]s apart the host's addresses, names and
+/// workspaces disk are re-read.
 const ROUTES_EVERY: u32 = 10;
 
 /// Keep `sample` fresh until the listeners stop (or are dropped): CPU and memory every
@@ -227,6 +297,7 @@ const ROUTES_EVERY: u32 = 10;
 /// runtime's worker threads. Without `sysinfo` on this host, usage reads 0.
 async fn sample_usage(
     sample: Arc<std::sync::Mutex<UsageSample>>,
+    workspaces_root: Option<PathBuf>,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
     let process = sysinfo::System::new()
@@ -245,6 +316,7 @@ async fn sample_usage(
         let routes = ticks.is_multiple_of(ROUTES_EVERY);
         ticks = ticks.wrapping_add(1);
         let process = process.clone();
+        let workspaces_root = workspaces_root.clone();
         let read = tokio::task::spawn_blocking(move || {
             let mut process = process
                 .lock()
@@ -265,6 +337,11 @@ async fn sample_usage(
                 (
                     intent_transport::collect_local_ips(),
                     intent_transport::collect_local_ipv6s(),
+                    (
+                        intent_transport::local_hostname(),
+                        intent_transport::pretty_hostname(),
+                    ),
+                    workspaces_root.as_deref().and_then(disk_sample),
                 )
             });
             (usage, routes)
@@ -278,9 +355,11 @@ async fn sample_usage(
             sample.cpu_percent = cpu;
             sample.memory_bytes = memory;
         }
-        if let Some((v4, v6)) = routes {
+        if let Some((v4, v6, names, disk)) = routes {
             sample.local_v4 = v4;
             sample.local_v6 = v6;
+            sample.names = Some(names);
+            sample.workspaces_disk = disk;
         }
     }
 }
@@ -293,8 +372,9 @@ impl StatusControl {
         let tcp = port.is_some();
         // Agents run only on other machines; a local manager, if any, is
         // counted as `intentd` counts its own.
-        let manager = self.services.agent_manager();
-        let (cpu_percent, memory_bytes, local_ips) = {
+        let services = self.services.upgrade();
+        let manager = services.as_ref().and_then(|s| s.agent_manager());
+        let (cpu_percent, memory_bytes, local_ips, names, workspaces_disk) = {
             let sample = self
                 .sample
                 .lock()
@@ -307,8 +387,20 @@ impl StatusControl {
                 ),
                 _ => Vec::new(),
             };
-            (sample.cpu_percent, sample.memory_bytes, local_ips)
+            (
+                sample.cpu_percent,
+                sample.memory_bytes,
+                local_ips,
+                sample.names.clone(),
+                sample.workspaces_disk,
+            )
         };
+        let (hostname, pretty_hostname) = names.unwrap_or_else(|| {
+            (
+                self.host.hostname.clone(),
+                self.host.pretty_hostname.clone(),
+            )
+        });
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_owned(),
             uds: true,
@@ -328,8 +420,8 @@ impl StatusControl {
             uptime_seconds: self.started.elapsed().as_secs(),
             local_ips,
             tc_address: None,
-            hostname: self.host.hostname.clone(),
-            pretty_hostname: self.host.pretty_hostname.clone(),
+            hostname,
+            pretty_hostname,
             device_kind: self.host.device_kind.clone(),
             hardware_model: self.host.hardware_model.clone(),
             cpu_percent,
@@ -342,8 +434,8 @@ impl StatusControl {
             agent_memory_budget_bytes: None,
             agent_memory_charged_bytes: None,
             queued_spawns: None,
-            workspaces_disk_available_bytes: None,
-            workspaces_disk_total_bytes: None,
+            workspaces_disk_available_bytes: workspaces_disk.map(|(available, _)| available),
+            workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
             file_watch: None,
             fd_count: None,
             fd_limit: intent_core::fd_limit::soft_limit(),
@@ -353,9 +445,9 @@ impl StatusControl {
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
             remote_links: Some(intent_transport::RemoteLinks {
                 backends: 0,
-                machines: self
-                    .services
-                    .remote_feature()
+                machines: services
+                    .as_ref()
+                    .and_then(|s| s.remote_feature())
                     .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
             }),
             workload_containment: Some(intent_core::workload::status()),
@@ -521,6 +613,7 @@ pub async fn start_client_listeners(
     if let Err(error) = api_services.initialize_repository_wire().await {
         tracing::debug!(%error, "native repository context remains unavailable");
     }
+    let weak_services = Arc::downgrade(&api_services);
     let api: Arc<dyn WorkspaceApi> = api_services;
     let options = WsOptions {
         bind_addresses: config.bind_addresses.clone(),
@@ -528,7 +621,6 @@ pub async fn start_client_listeners(
         rpc_limiter: limiter.clone(),
         ..WsOptions::default()
     };
-    let ws_slot = Arc::new(OnceLock::new());
     let host = tokio::task::spawn_blocking(intent_transport::detect_host_environment)
         .await
         .map_err(|e| format!("host environment: {e}"))?;
@@ -536,7 +628,7 @@ pub async fn start_client_listeners(
     let status_ws_slot = Arc::new(OnceLock::new());
     let sample = Arc::new(std::sync::Mutex::new(UsageSample::default()));
     let control: Arc<dyn SystemControl> = Arc::new(StatusControl {
-        services: services.clone(),
+        services: weak_services,
         host: host.clone(),
         ws: status_ws_slot.clone(),
         port: port_slot.clone(),
@@ -570,7 +662,8 @@ pub async fn start_client_listeners(
             tls_dir: config.tls_dir.clone(),
             tokens: (*tokens).clone(),
             host,
-            ws: ws_slot.clone(),
+            ws: status_ws_slot.clone(),
+            public_hosts: config.public_hosts.clone(),
         });
         let mut ws = WsApiServer::new_with_reverse(
             api.clone(),
@@ -586,11 +679,19 @@ pub async fn start_client_listeners(
         (ws, Some(pairing))
     };
     ws.install_connection_set(hook.clone());
+    attach_tenant_surfaces(
+        services,
+        &api,
+        bus,
+        &control,
+        pairing.as_ref(),
+        &limiter,
+        &reverse,
+    );
     let ws_port = ws
         .start()
         .await
         .map_err(|e| format!("WSS listener on port {}: {e}", config.ws_port))?;
-    let _ = ws_slot.set(ws.clone());
     let status_ws = Arc::new(ws.clone());
     let _ = status_ws_slot.set(Arc::downgrade(&status_ws));
     let _ = port_slot.set(ws_port);
@@ -636,13 +737,47 @@ pub async fn start_client_listeners(
         stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
         stopped: Arc::new(tokio::sync::watch::channel(false).0),
     };
-    tokio::spawn(sample_usage(sample, stop.stopped.subscribe()));
+    tokio::spawn(sample_usage(
+        sample,
+        services.configured_workspaces_root().map(Path::to_path_buf),
+        stop.stopped.subscribe(),
+    ));
     Ok(ClientListeners {
         stop,
         ws_port,
         socket_path,
         socket,
     })
+}
+
+/// What the tenant's `Services` reach through the listeners, as `intentd`
+/// attaches them: invite links (`workspace.invite.list` rows carry their
+/// `url`) and the Assistant's `ws.rpc` loopback.
+fn attach_tenant_surfaces(
+    services: &Services,
+    api: &Arc<dyn WorkspaceApi>,
+    bus: &EventBus,
+    control: &Arc<dyn SystemControl>,
+    pairing: Option<&Arc<dyn ServerPairingInfo>>,
+    limiter: &RpcLimiter,
+    reverse: &Arc<PrimaryReverseRegistry>,
+) {
+    if let Some(pairing) = pairing {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            pairing.clone(),
+        )));
+    }
+    services.attach_agent_rpc(Arc::new(
+        intent_transport::LoopbackAgentRpc::new(
+            api,
+            bus.clone(),
+            Some(control.clone()),
+            pairing.cloned(),
+            limiter.clone(),
+            intent_transport::VERSION,
+        )
+        .with_reverse_registry(reverse.clone()),
+    ));
 }
 
 /// Wait until the local socket is bound, or fail with why it is not.

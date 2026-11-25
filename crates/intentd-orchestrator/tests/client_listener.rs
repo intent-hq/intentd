@@ -29,6 +29,7 @@ fn config(dir: &Path, insecure: bool) -> ListenConfig {
         ws_port: 0,
         tls_dir: dir.join("tls"),
         insecure,
+        public_hosts: Vec::new(),
     }
 }
 

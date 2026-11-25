@@ -842,6 +842,7 @@ mod tests {
             ws_port: 0,
             tls_dir: dir.join("tls"),
             insecure: true,
+            public_hosts: Vec::new(),
         };
         let listeners =
             crate::listen::start_client_listeners(&config, &services, &bus, reverse, &connections)

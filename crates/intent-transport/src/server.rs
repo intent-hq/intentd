@@ -48,6 +48,12 @@ pub trait ServerPairingInfo: Send + Sync {
     fn data_dir(&self) -> &std::path::Path;
     /// Token store for get/generate operations.
     fn token_store(&self) -> &crate::AsyncTokenStore;
+    /// The public addresses an invite link names (`host=`) when no tunnel
+    /// is up: a server with public names, as the orchestrator. Empty (the
+    /// default): invite links are tunnel-only.
+    fn invite_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Whether the running daemon is in node mode: `pairing.getInfo` reports
     /// it as `daemonMode` and adds the `mode=node` link hint.
     fn node_mode(&self) -> bool {
