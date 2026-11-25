@@ -50,7 +50,7 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_app::compose", Wired("intent_app::compose")),
     (
         ".with_hooks_max_per_agent",
-        Gap("`[hooks] maxPerAgent` is the built-in default for every tenant"),
+        Wired("with_hooks_max_per_agent"),
     ),
     (
         ".with_node_mode",
@@ -296,8 +296,8 @@ const STEPS: &[(&str, Step)] = &[
         Refused("local agent process trees: an orchestrator runs no agent itself"),
     ),
     (
-        "spawn_idle_reap_loop",
-        Gap("idle agents are never evicted from the tenant's agent registry"),
+        "intent_app::agents::spawn_idle_reap_loop",
+        Wired("spawn_idle_reap_loop"),
     ),
     // Resume on start.
     (
@@ -375,10 +375,7 @@ const STEPS: &[(&str, Step)] = &[
         "settle_mcp_background",
         Gap("external MCP servers: head subprocesses per tenant need an isolation decision"),
     ),
-    (
-        ".with_host_exec",
-        Gap("the outstanding-RPC limiter does not count streamed host commands"),
-    ),
+    (".with_host_exec", Wired("with_host_exec")),
     // `SQLite` only.
     ("store.activate_incremental_vacuum", Refused("SQLite only")),
     (

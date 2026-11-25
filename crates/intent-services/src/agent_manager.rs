@@ -1073,6 +1073,8 @@ struct ProcessEntry {
     last_active_ms: u64,
     is_active: bool,
     kill: KillFn,
+    /// Runs on a machine, not on this host.
+    remote: bool,
 }
 
 #[derive(Default)]
@@ -1858,6 +1860,22 @@ impl ProcessRegistry {
         self.inner.lock().unwrap().entries.len()
     }
 
+    /// Number of registered processes running on this host: [`Self::size`]
+    /// without the agents on machines.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn local_size(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter(|entry| !entry.remote)
+            .count()
+    }
+
     /// Whether `agent_id` is currently registered.
     #[cfg(test)]
     pub(crate) fn is_registered(&self, agent_id: &AgentId) -> bool {
@@ -1871,12 +1889,22 @@ impl ProcessRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register(&self, agent_id: AgentId, kill: KillFn) {
+        self.insert_idle(agent_id, kill, false);
+    }
+
+    /// [`Self::register`] for an agent running on a machine.
+    pub(crate) fn register_remote(&self, agent_id: AgentId, kill: KillFn) {
+        self.insert_idle(agent_id, kill, true);
+    }
+
+    fn insert_idle(&self, agent_id: AgentId, kill: KillFn, remote: bool) {
         self.inner.lock().unwrap().entries.insert(
             agent_id,
             ProcessEntry {
                 last_active_ms: now_ms(),
                 is_active: false,
                 kill,
+                remote,
             },
         );
     }
@@ -2050,6 +2078,7 @@ impl ProcessRegistry {
                 last_active_ms: now_ms(),
                 is_active: true,
                 kill,
+                remote: false,
             },
         );
         Ok(())
@@ -13585,7 +13614,7 @@ impl AgentManager {
                     slots.entry(agent_id.clone())
                 {
                     entry.insert(handle);
-                    self.registry.register(
+                    self.registry.register_remote(
                         agent_id.clone(),
                         self.make_original_kill(agent_id.clone(), Arc::downgrade(&origin)),
                     );

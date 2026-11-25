@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::settings_file::SettingsFile;
 use intent_services::{
@@ -123,4 +124,95 @@ pub async fn restore_startup_queues(services: &Services) -> intent_core::Result<
     let count = services.rehydrate_agent_queues().await?;
     services.desktop_recover().await?;
     Ok(count)
+}
+
+/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
+/// sweep (`idle_reap_minutes == 0` and no memory budget). The sweep interval
+/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep and
+/// short ones do not busy-loop.
+///
+/// With a memory budget installed (monorepo#2063 level 2), every tick also
+/// drains idle agents largest-attributed-first while charged > budget — no
+/// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
+/// keeps the budget drain alive on the interval-clamp floor cadence, and TTL
+/// reaping on caps the shared interval at that same floor so a long TTL
+/// cannot slow the budget drain's reaction time.
+#[must_use]
+pub fn spawn_idle_reap_loop(
+    manager: Arc<AgentManager>,
+    idle_reap_minutes: u32,
+    budget_enabled: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let timings = reap_timings(idle_reap_minutes);
+    if timings.is_none() && !budget_enabled {
+        tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
+        return None;
+    }
+    // TTL off but budget on: sweep at the same floor cadence the TTL clamp
+    // uses, running only the budget drain. With BOTH on, cap the shared
+    // interval at that floor — a long TTL may stretch its interval to 300s,
+    // and turning TTL reaping on must not slow the budget drain's reaction
+    // time below the budget-only cadence (an early TTL sweep is harmless: it
+    // just finds nothing old enough).
+    let budget_floor = Duration::from_secs(30);
+    let interval = if let Some((ttl, interval)) = timings {
+        let interval = if budget_enabled {
+            interval.min(budget_floor)
+        } else {
+            interval
+        };
+        tracing::info!(
+            ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+            "idle agent reaping enabled"
+        );
+        interval
+    } else {
+        tracing::info!(
+            interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
+            "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+        );
+        budget_floor
+    };
+    Some(intent_core::spawn_daemon(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Some((ttl, _)) = timings {
+                let reaped = manager.reap_idle_older_than(ttl).await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "idle agent sweep evicted idle agents");
+                }
+            }
+            if budget_enabled {
+                let reaped = manager.reap_over_budget().await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "over-budget sweep evicted idle agents");
+                }
+            }
+        }
+    }))
+}
+
+/// Compute the idle-reap `(ttl, sweep interval)`, or `None` when disabled
+/// (`idle_reap_minutes == 0`). Production rule: interval ≈ ttl/4, clamped to
+/// `[30s, 300s]`. The `INTENTD_IDLE_REAP_MS` env seam (§13.1 E2E, test-only)
+/// forces a sub-second TTL+interval so the E2E suite can assert reaping without
+/// a ≥30s wait; it is ignored in production deployments.
+fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
+    if let Some(ms) = std::env::var("INTENTD_IDLE_REAP_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&m| m > 0)
+    {
+        let d = Duration::from_millis(ms);
+        return Some((d, d));
+    }
+    if idle_reap_minutes == 0 {
+        return None;
+    }
+    let ttl = Duration::from_secs(u64::from(idle_reap_minutes) * 60);
+    let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
+    Some((ttl, interval))
 }
