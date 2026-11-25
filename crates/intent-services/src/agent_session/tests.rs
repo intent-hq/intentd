@@ -6186,7 +6186,7 @@ async fn suspend_late_enrollment_persists_after_early_close() {
             &workspace_id,
             uuid::Uuid::new_v4().to_string(),
             vec![json!({"type":"text","text":"retained partial"})],
-            super::ToolCallTally::default(),
+            super::ToolTallyCell::default(),
             None,
             intent_acp::AcpError::Transport("Connection reset by peer".into()),
         )
@@ -10212,7 +10212,7 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         last_activity_emit: None,
         flush_pending: false,
         flush_failed: false,
-        tool_tally: super::ToolCallTally::default(),
+        tool_tally: super::ToolTallyCell::default(),
     };
     let enrolled = services
         .flush_partial_turn_on_interruption(
@@ -10308,7 +10308,7 @@ async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
         last_activity_emit: None,
         flush_pending: false,
         flush_failed: false,
-        tool_tally: super::ToolCallTally::default(),
+        tool_tally: super::ToolTallyCell::default(),
     };
     let flushed = services
         .flush_partial_turn_on_interruption(
@@ -12381,7 +12381,7 @@ async fn tool_call_tally_counts_each_call_once_at_first_terminal_status() {
             .await;
     }
     assert_eq!(
-        transcript.tool_call_tally,
+        transcript.tool_tally.peek(),
         super::ToolCallTally {
             total: 3,
             failed: 1
@@ -12481,7 +12481,7 @@ async fn wake_writer_consumes_the_tally_before_an_interrupt_flush() {
     services.update_live_turn(&agent_id, &transcript);
     // The wake worker schedules its write, then is aborted before it
     // appends the envelope; a stop flushes the pinned slot.
-    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_call_tally);
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
     drop(transcript);
     services.pin_live_turn(&agent_id);
     services
@@ -12530,9 +12530,9 @@ async fn interrupt_snapshot_before_wake_claim_records_one_tally() {
     services.pin_live_turn(&agent_id);
     // The stop copies the slot (tally included) first…
     let snapshot = services.live_turn(&agent_id).expect("pinned slot");
-    assert_eq!(snapshot.tool_tally.total, 2);
+    assert_eq!(snapshot.tool_tally.peek().total, 2);
     // …the aborted wake still finishes scheduling its writer…
-    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_call_tally);
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
     drop(transcript);
     // …then the stop appends the row with its earlier copy.
     let outcome = services
@@ -12559,4 +12559,57 @@ async fn interrupt_snapshot_before_wake_claim_records_one_tally() {
     assert_eq!(sum(|r| r.tool_calls), 2, "one claim, not two writes");
     assert_eq!(sum(|r| r.tool_calls_failed), 1);
     assert_eq!(sum(|r| r.runs), 0);
+}
+
+/// Usage stats (§5.36): the reverse cleanup order — the stop appends the
+/// interrupted row, claims the tally and removes the live slot BEFORE the
+/// already-running wake reaches its writer. The claim lives in a per-turn
+/// cell shared by the transcript and the slot, so it survives the slot's
+/// removal and the wake's late claim takes nothing.
+#[tokio::test]
+async fn interrupt_claim_and_cleanup_before_wake_claim_records_one_tally() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m-rev".to_string());
+    for update in [
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "ok", "title": "Read",
+                "kind": "read", "status": "completed" }),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "bad", "title": "Bash",
+                "kind": "execute", "status": "failed" }),
+    ] {
+        services
+            .route_notification(
+                &tool_call_notification(&update),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services.set_live_turn(&agent_id, "m-rev", Vec::new());
+    services.update_live_turn(&agent_id, &transcript);
+    services.pin_live_turn(&agent_id);
+    // The stop flushes first: appends, claims, and removes the slot.
+    services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("pinned slot flushed");
+    assert!(services.live_turn(&agent_id).is_none(), "slot removed");
+    // The aborted wake's final poll then reaches its writer.
+    services.flush_tool_tally_detached(&agent_id, &workspace_id, transcript.tool_tally.claim());
+    services.store_tasks.drain_finite().await;
+
+    let rows = services
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("rows");
+    let sum = |f: fn(&intent_store::UsageStatsRow) -> u64| rows.iter().map(f).sum::<u64>();
+    assert_eq!(
+        sum(|r| r.tool_calls),
+        2,
+        "the late wake claim takes nothing"
+    );
+    assert_eq!(sum(|r| r.tool_calls_failed), 1);
+    assert_eq!(sum(|r| r.runs), 0);
+    assert_eq!(sum(|r| r.total_run_ms), 0);
 }

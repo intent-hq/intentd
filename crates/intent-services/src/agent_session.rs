@@ -504,9 +504,9 @@ struct Transcript {
     /// `toolCallId`s that already reached a terminal status this turn, so
     /// the usage-stats tally (§5.36 `toolCalls`) counts each call once.
     terminal_tool_calls: HashSet<String>,
-    /// This turn's terminal tool-call tally, flushed into the usage-stats
-    /// bucket at turn end.
-    tool_call_tally: ToolCallTally,
+    /// This turn's terminal tool-call tally, shared with the live-turn slot
+    /// and claimed once into the usage-stats bucket (§5.36).
+    pub(crate) tool_tally: ToolTallyCell,
 }
 
 /// Tool calls that reached a terminal status in one turn (§5.36): `total`
@@ -521,6 +521,47 @@ pub(crate) struct ToolCallTally {
 impl ToolCallTally {
     pub(crate) fn is_zero(self) -> bool {
         self.total == 0
+    }
+}
+
+/// One turn's tool-call tally plus whether a writer already claimed it
+/// (§5.36). The turn's `Transcript` and its live-turn slot hold clones of
+/// the same cell, so the claim outlives either one: whichever writer claims
+/// first (turn end, wake, append failure, interrupt flush) records the
+/// tally, and every later claim — even after the slot is removed — gets
+/// zero.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolTallyCell(Arc<std::sync::Mutex<(ToolCallTally, bool)>>);
+
+impl ToolTallyCell {
+    /// Count one call's first terminal status; ignored once claimed.
+    fn add(&self, failed: bool) {
+        if let Ok(mut state) = self.0.lock() {
+            if !state.1 {
+                state.0.total += 1;
+                if failed {
+                    state.0.failed += 1;
+                }
+            }
+        }
+    }
+
+    /// The tally so far, without claiming it.
+    #[cfg(test)]
+    pub(crate) fn peek(&self) -> ToolCallTally {
+        self.0.lock().map(|state| state.0).unwrap_or_default()
+    }
+
+    /// Take the tally for the one writer that records it: the first call
+    /// returns it, every later call returns zero.
+    pub(crate) fn claim(&self) -> ToolCallTally {
+        match self.0.lock() {
+            Ok(mut state) if !state.1 => {
+                state.1 = true;
+                state.0
+            }
+            _ => ToolCallTally::default(),
+        }
     }
 }
 
@@ -566,7 +607,7 @@ impl Transcript {
             media_refs_seen: 0,
             provider_output_seen: false,
             terminal_tool_calls: HashSet::new(),
-            tool_call_tally: ToolCallTally::default(),
+            tool_tally: ToolTallyCell::default(),
         }
     }
 
@@ -862,10 +903,7 @@ impl Transcript {
             // status only — a repeated `completed`, or `error` then
             // `completed`, never counts again.
             if self.terminal_tool_calls.insert(tc.tool_call_id.clone()) {
-                self.tool_call_tally.total += 1;
-                if tc.status == "error" {
-                    self.tool_call_tally.failed += 1;
-                }
+                self.tool_tally.add(tc.status == "error");
             }
         } else {
             self.open_tool_calls.insert(tc.tool_call_id.clone());
@@ -1207,7 +1245,7 @@ pub(crate) struct LiveTurn {
     /// `worker.abort()` that drops the `Transcript`, so the interrupt flush
     /// that persists the interrupted row can record it — once, only when
     /// that flush is the one that appended the row.
-    pub(crate) tool_tally: ToolCallTally,
+    pub(crate) tool_tally: ToolTallyCell,
 }
 
 /// What [`flush_pinned_turn_on_interruption`](Services::flush_pinned_turn_on_interruption)
@@ -2351,7 +2389,7 @@ impl Services {
                     last_activity_emit: None,
                     flush_pending: false,
                     flush_failed: false,
-                    tool_tally: ToolCallTally::default(),
+                    tool_tally: ToolTallyCell::default(),
                 },
             );
         }
@@ -2365,7 +2403,7 @@ impl Services {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
                 slot.final_text_block_open = transcript.final_text_block_open();
-                slot.tool_tally = transcript.tool_call_tally;
+                slot.tool_tally = transcript.tool_tally.clone();
                 slot.last_activity_at = now_iso();
             }
         }
@@ -2813,7 +2851,7 @@ impl Services {
         owns_slot: bool,
     ) -> InterruptFlushOutcome {
         let block_count = live.blocks.len();
-        let tool_tally = live.tool_tally;
+        let tool_tally = live.tool_tally.clone();
         // A partial tail can already carry proposal blocks (the interrupt
         // landed after the propose tool call): capture their ids BEFORE the
         // blocks move into the persisted row, so the flushed row feeds the
@@ -2870,7 +2908,11 @@ impl Services {
                     // This flush appended the interrupted row, so the worker
                     // never reached its turn-end stats write: record the
                     // turn's terminal tool calls here (§5.36), once.
-                    self.flush_tool_tally_detached(agent_id, &session.workspace_id, tool_tally);
+                    self.flush_tool_tally_detached(
+                        agent_id,
+                        &session.workspace_id,
+                        tool_tally.claim(),
+                    );
                     self.invalidate_agent_list_cache(&session.workspace_id);
                     self.publish_agent_message_events(
                         &session.workspace_id,
@@ -4494,7 +4536,7 @@ impl Services {
         let turn_cost = transcript.usage_cost.clone();
         // Terminal tool calls of the turn (§5.36), flushed with the turn-end
         // stats delta even when the turn failed without a usage report.
-        let tool_tally = transcript.tool_call_tally;
+        let tool_tally = transcript.tool_tally.clone();
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let block_count = blocks.len();
@@ -4786,7 +4828,7 @@ impl Services {
                     }
                     // Exits before the bookkeeping below: still count the
                     // turn's terminal tool calls (§5.36).
-                    self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally);
+                    self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally.claim());
                     return Err(e);
                 }
             };
@@ -4876,7 +4918,7 @@ impl Services {
         // including a `_meta`-only bill (grok), which the task below resolves
         // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
         let run_completed = result.is_ok() && !spurious_cancel;
-        let tool_tally = self.claim_tool_tally(agent_id, tool_tally);
+        let tool_tally = tool_tally.claim();
         if turn_usage.is_some()
             || turn_cost.is_some()
             || turn_meta.is_some()
@@ -5557,7 +5599,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         message_id: String,
         blocks: Vec<Value>,
-        tool_tally: ToolCallTally,
+        tool_tally: ToolTallyCell,
         turn_id: Option<&str>,
         err: AcpError,
     ) -> Result<StopReason> {
@@ -5840,7 +5882,7 @@ impl Services {
         }
         // A wake turn records no run, but its terminal tool calls still
         // count toward usage stats (§5.36).
-        self.flush_tool_tally_detached(agent_id, workspace_id, transcript.tool_call_tally);
+        self.flush_tool_tally_detached(agent_id, workspace_id, transcript.tool_tally.claim());
         let blocks = transcript.into_blocks();
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
@@ -6457,23 +6499,6 @@ impl Services {
         .await;
     }
 
-    /// Claim a turn's tool-call tally for exactly one writer (§5.36). While
-    /// the agent's live-turn slot exists it owns the tally: the slot's value
-    /// is swapped out for zero under the slot lock and returned, and the
-    /// caller's own copy is ignored, so a wake writer and an interrupt flush
-    /// that each hold a copy record it once between them. With no slot (it
-    /// was already cleared, or never opened) the caller's copy is the only
-    /// one and is returned as is.
-    pub(crate) fn claim_tool_tally(&self, agent_id: &AgentId, own: ToolCallTally) -> ToolCallTally {
-        match self.live_turns.lock() {
-            Ok(mut slots) => match slots.get_mut(agent_id) {
-                Some(slot) => std::mem::take(&mut slot.tool_tally),
-                None => own,
-            },
-            Err(_) => own,
-        }
-    }
-
     /// Record a turn's terminal tool calls on their own (§5.36), detached
     /// and best-effort, for turn exits that skip the turn-end bookkeeping
     /// (wake turns, append failures, interrupt flushes). A zero
@@ -6484,7 +6509,6 @@ impl Services {
         workspace_id: &WorkspaceId,
         tally: ToolCallTally,
     ) {
-        let tally = self.claim_tool_tally(agent_id, tally);
         if tally.is_zero() {
             return;
         }
