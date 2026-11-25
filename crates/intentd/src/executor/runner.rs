@@ -131,6 +131,11 @@ pub(crate) struct ProviderLaunch {
 /// The machine's shared agent limits, which local agents count against
 /// too. A launch they deny is refused, never queued.
 pub(crate) trait Admission: Send + Sync {
+    /// Take back idle local agents' processes while the limits would deny a
+    /// launch, as a local spawn does. Never waits for a busy one.
+    fn reclaim_idle(&self) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
     /// Take a slot for `agent_id`, or say which limit denies it.
     fn try_admit(&self, agent_id: &AgentId) -> Result<(), CapacityRefusal>;
     /// Give `agent_id`'s slot back.
@@ -1549,6 +1554,13 @@ impl Runner {
         let resolved = tokio::task::spawn_blocking(move || launch.resolve(&provider))
             .await
             .unwrap_or_else(|_| Err("provider resolution failed".to_owned()));
+        let admits_next = resolved.is_ok() && {
+            let state = lock(&self.inner.state);
+            !state.closing && !state.agents.contains_key(&command.agent_id)
+        };
+        if admits_next {
+            self.inner.admission.reclaim_idle().await;
+        }
         if let Some(refusal) = self.begin_launch(command, resolved) {
             self.append(refusal).await;
         }

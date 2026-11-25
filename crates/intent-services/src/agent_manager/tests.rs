@@ -32286,6 +32286,159 @@ fn try_admit_refuses_over_the_shared_memory_budget() {
     );
 }
 
+/// At the slot cap, a remote launch first takes back the LRU idle local
+/// process, as a local spawn would, and then admits.
+#[tokio::test]
+async fn reclaim_for_remote_evicts_the_lru_idle_local_process_at_the_cap() {
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let older = AgentId::from("older");
+    let newer = AgentId::from("newer");
+    reg.register(older.clone(), recording_kill(older.clone(), log.clone()));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    reg.register(newer.clone(), recording_kill(newer.clone(), log.clone()));
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert_eq!(*log.lock().unwrap(), vec![older.clone()]);
+    assert!(!reg.is_registered(&older));
+    assert!(reg.is_registered(&newer), "only one slot was needed");
+    reg.try_admit(&AgentId::from("remote"))
+        .expect("the reclaimed slot admits the remote launch");
+}
+
+/// Over the memory budget with the host short, idle local processes are
+/// taken back, LRU first, until the budget admits.
+#[tokio::test]
+async fn reclaim_for_remote_evicts_idle_local_processes_until_the_budget_admits() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(4 * gb + PROVISIONAL_AGENT_BYTES + 1);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let ids: Vec<AgentId> = ["a", "b", "c"].into_iter().map(AgentId::from).collect();
+    for id in &ids {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![ids[0].clone(), ids[1].clone()],
+        "two provisional credits bring the charge under budget"
+    );
+    assert!(reg.is_registered(&ids[2]));
+    reg.try_admit(&AgentId::from("remote"))
+        .expect("the reclaimed budget admits the remote launch");
+}
+
+/// Busy local agents and admitted remote agents are never reclaimed, and
+/// with nothing idle the pass returns at once: the launch is then refused,
+/// never queued.
+#[tokio::test]
+async fn reclaim_for_remote_spares_busy_and_remote_agents_and_never_waits() {
+    use intent_core::placement::CapacityRefusal;
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let busy = AgentId::from("busy");
+    reg.register(busy.clone(), recording_kill(busy.clone(), log.clone()));
+    reg.mark_active(&busy);
+    reg.try_admit(&AgentId::from("remote-1")).expect("admits");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        reg.reclaim_for_remote(claim_all, release_none),
+    )
+    .await
+    .expect("a pass with nothing to reclaim returns at once");
+    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(reg.size(), 2);
+    assert!(reg.inner.lock().unwrap().wait_queue.is_empty());
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote-2")),
+        Err(CapacityRefusal::Count {
+            running_agents: 2,
+            agent_cap: 2,
+        })
+    );
+}
+
+/// The capabilities report's facts: idle local agents count as
+/// reclaimable (busy and remote ones never do), and the host is short only
+/// when the budget's host-reserve rule would deny.
+#[test]
+fn remote_capacity_reports_idle_local_agents_and_host_shortage() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    assert_eq!(
+        reg.remote_capacity_facts(),
+        (0, None),
+        "no budget installed"
+    );
+    let probe = FakeProbe::new(gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    for id in ["idle-1", "idle-2", "busy"] {
+        let id = AgentId::from(id);
+        reg.register(id.clone(), recording_kill(id, log.clone()));
+    }
+    reg.mark_active(&AgentId::from("busy"));
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+    assert_eq!(
+        reg.remote_capacity_facts(),
+        (2, Some(true)),
+        "an unmeasured host keeps the tree-only rule"
+    );
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES));
+    assert_eq!(reg.remote_capacity_facts(), (2, Some(false)));
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert_eq!(reg.remote_capacity_facts(), (2, Some(true)));
+}
+
+/// Under both limits nothing is reclaimed.
+#[tokio::test]
+async fn reclaim_for_remote_evicts_nothing_under_the_limits() {
+    let reg = ProcessRegistry::new(4);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let idle = AgentId::from("idle");
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert!(log.lock().unwrap().is_empty());
+    assert!(reg.is_registered(&idle));
+}
+
+/// A candidate whose claim fails (another sweep holds it) is skipped for
+/// the next LRU one; when no claim succeeds the pass gives up instead of
+/// spinning.
+#[tokio::test]
+async fn reclaim_for_remote_skips_unclaimable_candidates_and_gives_up() {
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let held = AgentId::from("held");
+    let free = AgentId::from("free");
+    reg.register(held.clone(), recording_kill(held.clone(), log.clone()));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    reg.register(free.clone(), recording_kill(free.clone(), log.clone()));
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let release = {
+        let released = released.clone();
+        move |id: &AgentId| released.lock().unwrap().push(id.clone())
+    };
+    let held_id = held.clone();
+    reg.reclaim_for_remote(move |id: &AgentId| *id != held_id, release.clone())
+        .await;
+    assert_eq!(*log.lock().unwrap(), vec![free.clone()]);
+    assert_eq!(*released.lock().unwrap(), vec![free.clone()]);
+    assert!(reg.is_registered(&held));
+
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        reg.reclaim_for_remote(|_: &AgentId| false, release),
+    )
+    .await
+    .expect("no claimable candidate: the pass returns");
+    assert!(reg.is_registered(&held));
+}
+
 /// A remote agent's provider resolves like a local spawn's: the configured
 /// `providers.paths` override wins, a profile resolves to its base, and an
 /// unknown or disabled provider is refused.

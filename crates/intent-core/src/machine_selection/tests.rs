@@ -51,6 +51,8 @@ fn report(
             agent_cap: 4,
             charged_memory_bytes: 0,
             memory_budget_bytes: None,
+            reclaimable_agents: 0,
+            host_memory_short: None,
         },
         providers,
         disabled_providers: vec![],
@@ -601,6 +603,51 @@ async fn no_capacity_names_the_limit_of_one_full_machine() {
     assert_eq!(data["nodeId"], "full");
     assert_eq!(data["limit"], "count");
     assert_eq!(data["retryable"], true);
+}
+
+/// A machine at a limit that reports idle local agents takes them back
+/// before it refuses, so it stays a candidate.
+#[tokio::test]
+async fn a_full_machine_with_idle_local_agents_stays_a_candidate() {
+    let mut count = report(MAC, FRESH, claude(&["opus"]));
+    count.capacity.running_agents = 4;
+    count.capacity.reclaimable_agents = 1;
+    let mut memory = report(MAC, FRESH, claude(&["opus"]));
+    memory.capacity.charged_memory_bytes = 8 << 30;
+    memory.capacity.memory_budget_bytes = Some(8 << 30);
+    memory.capacity.host_memory_short = Some(true);
+    memory.capacity.reclaimable_agents = 2;
+    let fake = Fake::new(vec![
+        machine("count", Some(count)),
+        machine("memory", Some(memory)),
+    ]);
+    let chosen = select(&fake, request(&remote(), Some("opus")))
+        .await
+        .unwrap();
+    assert_eq!(chosen, ["count", "memory"]);
+}
+
+/// Over the memory budget, a machine whose host still has headroom admits
+/// (the budget only denies when the host is short), so it stays a
+/// candidate. An older machine that omits the fact is refused as before.
+#[tokio::test]
+async fn an_over_budget_machine_with_host_headroom_stays_a_candidate() {
+    let over = |short: Option<bool>| {
+        let mut caps = report(MAC, FRESH, claude(&["opus"]));
+        caps.capacity.charged_memory_bytes = 47 << 30;
+        caps.capacity.memory_budget_bytes = Some(40 << 30);
+        caps.capacity.host_memory_short = short;
+        caps
+    };
+    let fake = Fake::new(vec![
+        machine("headroom", Some(over(Some(false)))),
+        machine("short", Some(over(Some(true)))),
+        machine("older", Some(over(None))),
+    ]);
+    let chosen = select(&fake, request(&remote(), Some("opus")))
+        .await
+        .unwrap();
+    assert_eq!(chosen, ["headroom"]);
 }
 
 #[tokio::test]

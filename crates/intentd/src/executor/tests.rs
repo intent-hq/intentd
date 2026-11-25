@@ -160,6 +160,8 @@ impl intent_transport::TokenStore for OwnerToken {
 struct CountAdmission {
     cap: u32,
     running: Mutex<Vec<AgentId>>,
+    /// Charged bytes, budget and host shortage the report carries.
+    memory: Mutex<(u64, Option<u64>, Option<bool>)>,
 }
 
 impl CountAdmission {
@@ -167,6 +169,7 @@ impl CountAdmission {
         Arc::new(Self {
             cap,
             running: Mutex::new(Vec::new()),
+            memory: Mutex::new((0, None, None)),
         })
     }
 }
@@ -188,11 +191,14 @@ impl Admission for CountAdmission {
         self.running.lock().unwrap().retain(|id| id != agent_id);
     }
     fn capacity(&self) -> MachineCapacity {
+        let (charged, budget, short) = *self.memory.lock().unwrap();
         MachineCapacity {
             running_agents: u32::try_from(self.running.lock().unwrap().len()).unwrap(),
             agent_cap: self.cap,
-            charged_memory_bytes: 0,
-            memory_budget_bytes: None,
+            charged_memory_bytes: charged,
+            memory_budget_bytes: budget,
+            reclaimable_agents: 0,
+            host_memory_short: short,
         }
     }
 }
@@ -2369,6 +2375,55 @@ async fn a_resources_move_pushes_the_report_at_most_every_ten_seconds() {
         Some(host_at(Some(10), 20)),
         "memory moved"
     );
+    node.stop().await;
+}
+
+/// A change that flips whether the machine would refuse a launch pushes
+/// the report, so a backend does not pre-refuse (or offer) the machine on a
+/// stale reading; a change that leaves the answer alone does not.
+#[tokio::test]
+async fn a_flip_of_the_admission_answer_pushes_the_report() {
+    async fn pushed(dialed: &mut DialedLink) -> MachineCapacity {
+        loop {
+            match next_frame(dialed).await {
+                Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                    return capabilities.capacity;
+                }
+                Some(LinkFrame::Journal(_)) => {}
+                other => panic!("expected a pushed capabilities report, got {other:?}"),
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(3);
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        BTreeMap::new(),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    node.service.push_load_change().await;
+
+    *admission.memory.lock().unwrap() = (47, Some(40), Some(true));
+    node.service.push_load_change().await;
+    let capacity = pushed(&mut dialed).await;
+    assert!(capacity.refusal().is_some(), "now refuses: {capacity:?}");
+
+    *admission.memory.lock().unwrap() = (48, Some(40), Some(true));
+    node.service.push_load_change().await;
+    *admission.memory.lock().unwrap() = (48, Some(40), Some(false));
+    node.service.push_load_change().await;
+    let capacity = pushed(&mut dialed).await;
+    assert_eq!(
+        capacity.charged_memory_bytes, 48,
+        "the unchanged answer was not pushed"
+    );
+    assert_eq!(capacity.refusal(), None, "host headroom admits again");
     node.stop().await;
 }
 

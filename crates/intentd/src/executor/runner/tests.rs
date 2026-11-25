@@ -25,9 +25,30 @@ fn wait() -> Duration {
 struct CountAdmission {
     cap: u32,
     running: Mutex<Vec<AgentId>>,
+    /// Running local agents that are idle: `reclaim_idle` may take them back.
+    idle: Mutex<Vec<AgentId>>,
+}
+
+impl CountAdmission {
+    fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            running: Mutex::new(Vec::new()),
+            idle: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Admission for CountAdmission {
+    fn reclaim_idle(&self) -> BoxFuture<'static, ()> {
+        let mut running = lock(&self.running);
+        let mut idle = lock(&self.idle);
+        while u32::try_from(running.len()).unwrap() >= self.cap {
+            let Some(id) = idle.pop() else { break };
+            running.retain(|r| *r != id);
+        }
+        Box::pin(async {})
+    }
     fn try_admit(&self, agent_id: &AgentId) -> Result<(), CapacityRefusal> {
         let mut running = lock(&self.running);
         let used = u32::try_from(running.len()).unwrap();
@@ -49,6 +70,8 @@ impl Admission for CountAdmission {
             agent_cap: self.cap,
             charged_memory_bytes: 0,
             memory_budget_bytes: None,
+            reclaimable_agents: 0,
+            host_memory_short: None,
         }
     }
 }
@@ -112,10 +135,7 @@ fn harness_with(node: PathBuf, max_agents: u32, args: &[&str]) -> Harness {
     let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
     let checkouts = crate::executor::checkout::PlainCheckouts::new(storage.clone());
-    let admission = Arc::new(CountAdmission {
-        cap: max_agents,
-        running: Mutex::new(Vec::new()),
-    });
+    let admission = Arc::new(CountAdmission::new(max_agents));
     let auth_failures = Arc::new(Mutex::new(Vec::new()));
     let runner = Runner::new(RunnerConfig {
         one_shot: None,
@@ -438,10 +458,7 @@ async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
     let runner = Runner::new(RunnerConfig {
         one_shot: None,
         home_records: None,
-        admission: Arc::new(CountAdmission {
-            cap: 1,
-            running: Mutex::new(Vec::new()),
-        }),
+        admission: Arc::new(CountAdmission::new(1)),
         launch: Arc::new(FixtureLaunch(ProviderLaunch {
             config: ProviderConfig {
                 ..*intent_providers::find_provider(PROVIDER).unwrap()
@@ -561,6 +578,30 @@ async fn node_runner_refuses_over_the_shared_limits_with_the_structured_reason()
         other => panic!("expected a structured refusal, got {other:?}"),
     }
     assert!(h.runner.running().is_empty(), "the refusal was not queued");
+}
+
+/// Before refusing, a launch takes back an idle local agent's slot, as a
+/// local spawn would.
+#[tokio::test]
+async fn node_runner_reclaims_an_idle_local_agent_before_refusing() {
+    let Some(h) = harness(1, &[]) else { return };
+    let local = AgentId::from("a-idle-local-agent");
+    h.admission.try_admit(&local).unwrap();
+    lock(&h.admission.idle).push(local.clone());
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hi"))
+        .await;
+    let all = wait_for(&h.runner, "turn after reclaim", turn_ended("a1", "t1")).await;
+    assert_eq!(
+        turn_end(find(&all, turn_ended("a1", "t1"))),
+        ("end_turn", None)
+    );
+    assert!(
+        !lock(&h.admission.running).contains(&local),
+        "the idle local agent gave its slot back"
+    );
+    h.runner.shutdown().await;
 }
 
 #[tokio::test]
@@ -3645,10 +3686,7 @@ fn quick_action_runner(dir: &std::path::Path) -> Runner {
     Runner::new(RunnerConfig {
         one_shot: Some(Arc::new(Hangs)),
         home_records: None,
-        admission: Arc::new(CountAdmission {
-            cap: 1,
-            running: Mutex::new(Vec::new()),
-        }),
+        admission: Arc::new(CountAdmission::new(1)),
         launch: Arc::new(FixtureLaunch(ProviderLaunch {
             config: ProviderConfig {
                 ..*intent_providers::find_provider(PROVIDER).unwrap()

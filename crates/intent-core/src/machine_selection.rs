@@ -540,20 +540,7 @@ fn machine_models(row: &ExposedMachine, provider: &str) -> Option<MachineModels>
 
 /// The shared limit a machine's last report says is used up.
 fn capacity_refusal(row: &ExposedMachine) -> Option<CapacityRefusal> {
-    let capacity = row.capabilities.as_ref()?.capacity;
-    if capacity.running_agents >= capacity.agent_cap {
-        return Some(CapacityRefusal::Count {
-            running_agents: capacity.running_agents,
-            agent_cap: capacity.agent_cap,
-        });
-    }
-    capacity
-        .memory_budget_bytes
-        .filter(|budget| capacity.charged_memory_bytes >= *budget)
-        .map(|budget| CapacityRefusal::Memory {
-            charged_memory_bytes: capacity.charged_memory_bytes,
-            memory_budget_bytes: budget,
-        })
+    row.capabilities.as_ref()?.capacity.refusal()
 }
 
 fn no_capacity(

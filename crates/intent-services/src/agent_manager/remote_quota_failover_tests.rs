@@ -1144,6 +1144,8 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
                     agent_cap: 4,
                     charged_memory_bytes: 0,
                     memory_budget_bytes: None,
+                    reclaimable_agents: 0,
+                    host_memory_short: None,
                 },
                 providers: vec![ProviderCapability {
                     id: "claude-code".into(),

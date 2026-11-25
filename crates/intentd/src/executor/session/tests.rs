@@ -31,6 +31,8 @@ impl SharedLimits for Unlimited {
             agent_cap: 1,
             charged_memory_bytes: 0,
             memory_budget_bytes: None,
+            reclaimable_agents: 0,
+            host_memory_short: None,
         }
     }
 }

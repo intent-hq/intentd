@@ -157,6 +157,8 @@ fn capabilities() -> MachineCapabilities {
             agent_cap: 4,
             charged_memory_bytes: 1 << 30,
             memory_budget_bytes: Some(8 << 30),
+            reclaimable_agents: 0,
+            host_memory_short: None,
         },
         providers: vec![
             ProviderCapability {
