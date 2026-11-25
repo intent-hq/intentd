@@ -48,6 +48,11 @@ const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// lease lapses after its TTL instead.
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long the tenants' drains may take together on shutdown; past it
+/// their fences fire anyway and refuse whatever the drains still write.
+/// Inside the usual 30 s stop grace (systemd, Kubernetes).
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn main() -> ExitCode {
     // Before reading any secret from the environment: same-user processes
     // (tenant workloads) must not read this one's environ or memory.
@@ -354,7 +359,8 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     }
 }
 
-/// Fire every tenant's fence and wait until every one stopped; an overrun
+/// Drain every tenant ([`ServedTenant::drain`], within [`DRAIN_BUDGET`]),
+/// fire every tenant's fence and wait until every one stopped; an overrun
 /// exits from its watcher as soon as it is reported, before any release.
 /// A tenant whose fence this call fired releases its lease once its work
 /// stopped, concurrently with the others; one already fenced (lease lost, a
@@ -363,6 +369,7 @@ async fn stop_all(
     served: &mut Vec<ServedTenant>,
     stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> ExitCode {
+    drain_all(served).await;
     let ours: Vec<String> = served
         .iter()
         .filter(|tenant| tenant.fence().fire(STOPPING))
@@ -383,6 +390,27 @@ async fn stop_all(
     }
     while releases.join_next().await.is_some() {}
     ExitCode::SUCCESS
+}
+
+/// Drain every tenant concurrently, with the process's host command
+/// streams: the process stops.
+async fn drain_all(served: &[ServedTenant]) {
+    let streams = intent_services::host_exec_stream::registry();
+    let mut drains = tokio::task::JoinSet::new();
+    for tenant in served {
+        drains.spawn(tenant.drain(Some(streams)));
+    }
+    let drained = tokio::time::timeout(DRAIN_BUDGET, async {
+        while drains.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::error!(
+            budget_ms = DRAIN_BUDGET.as_millis(),
+            "draining the tenants timed out; their fences refuse the rest"
+        );
+        drains.detach_all();
+    }
 }
 
 /// Release a cleanly stopped tenant's lease, within [`RELEASE_BUDGET`]; a

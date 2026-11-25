@@ -355,198 +355,251 @@ impl MachineEnd {
     }
 }
 
+/// A tenant agent's turn running on the tenant's machine: the machine got
+/// the prompt and has not ended the turn.
+struct RunningTurn {
+    served: intentd_orchestrator::serve::ServedTenant,
+    listeners: intentd_orchestrator::listen::ClientListeners,
+    client: Uds,
+    machine: Machine,
+    end: MachineEnd,
+    agent: AgentId,
+    workspace: WorkspaceId,
+    turn: String,
+    _dir: tempfile::TempDir,
+}
+
+impl RunningTurn {
+    /// Serve `tenant`, add its machine, create an agent on it over the
+    /// tenant's local socket and message it, until the machine has the
+    /// prompt. `None` when the test skips.
+    async fn start(pool: PgPool, tenant: &str) -> Option<Self> {
+        if intent_providers_missing_git() {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let served = serve_tenant(
+            pool,
+            tenant,
+            dir.path(),
+            &format!("orchestrator-test-{tenant}"),
+            LeaseTiming::default(),
+            keyring(),
+            OrchestratorOnly::for_tests(),
+        )
+        .await
+        .expect("serve the tenant");
+        let services = served.services().clone();
+        assert!(
+            services.agent_manager().is_some(),
+            "serving the tenant attaches its agent manager"
+        );
+        let listeners = served
+            .listen(&ListenConfig {
+                socket_path: dir.path().join("o.sock"),
+                bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+                ws_port: 0,
+                tls_dir: dir.path().join("tls"),
+                insecure: true,
+            })
+            .await
+            .unwrap();
+        let mut client = Uds::connect(listeners.socket_path()).await;
+        result(
+            &client
+                .rpc(
+                    1,
+                    "client.hello",
+                    json!({ "clientId": "agents-test", "name": "Agents test" }),
+                )
+                .await,
+        );
+        let status = client.rpc(2, "system.status", json!({})).await;
+        assert!(
+            result(&status)["maxAgents"]
+                .as_u64()
+                .is_some_and(|cap| cap > 0),
+            "the tenant can run agents: {status}"
+        );
+
+        // The tenant's machine.
+        let backend = client.rpc(3, "remoteMachines.backendInfo", json!({})).await;
+        let backend_id = result(&backend)["backendId"].as_str().unwrap().to_owned();
+        let mut machine = Machine::start(&backend_id).await;
+        result(
+            &client
+                .rpc(4, "remoteMachines.add", machine.add_params())
+                .await,
+        );
+
+        // In orchestrator mode `workspace.create` needs a home machine, so the
+        // workspace is put in the tenant's store directly, over a repository on
+        // head; everything after that goes over the wire.
+        let repo = dir.path().join("repo");
+        repository(&repo);
+        let workspace = WorkspaceId(format!("ws-{}", uuid::Uuid::new_v4().simple()));
+        let now = intent_core::now_iso();
+        services
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace.clone(),
+                title: "Remote turn".into(),
+                branch: "main".into(),
+                repository_path: Some(repo.to_string_lossy().into_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .expect("seed the workspace");
+
+        // An unplaced agent runs on the machine once it reports its providers.
+        let deadline = tokio::time::Instant::now() + wait();
+        let mut id = 10;
+        let agent = loop {
+            id += 1;
+            let created = client
+                .rpc(
+                    id,
+                    "agent.create",
+                    json!({ "workspaceId": workspace, "name": "Remote", "model": "default", "provider": "mock" }),
+                )
+                .await;
+            if created.get("error").is_none() {
+                break created["result"]["agent"].clone();
+            }
+            assert_eq!(created["error"]["data"]["retryable"], true, "{created}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the machine never took the agent: {created}"
+            );
+            // timing-guard: poll interval while head reads the machine's providers (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(agent["nodeId"], machine.node_id.as_str(), "{agent}");
+        let agent_id = AgentId::from(agent["id"].as_str().unwrap());
+
+        result(
+            &client
+                .rpc(
+                    50,
+                    "agent.sendMessage",
+                    json!({ "workspaceId": workspace, "agentId": agent_id, "content": "hello machine" }),
+                )
+                .await,
+        );
+
+        // Head dials the machine for the agent: it is told to launch it, then
+        // gets the message.
+        let (mut end, launch) = machine.launched().await;
+        assert_eq!(launch.agent_id, agent_id);
+        assert_eq!(launch.provider, "mock");
+        end.journal(
+            1,
+            &agent_id,
+            &workspace,
+            None,
+            JournalBody::Started {
+                base_commit: launch.base_commit.clone(),
+            },
+        )
+        .await;
+        let (turn, prompt) = end
+            .next(wait(), |frame| match frame {
+                LinkFrame::Prompt {
+                    agent_id: to,
+                    turn_id,
+                    prompt,
+                } if to == agent_id => Some((turn_id, prompt)),
+                _ => None,
+            })
+            .await
+            .expect("the message reaches the machine as a prompt");
+        assert!(
+            serde_json::to_string(&prompt)
+                .unwrap()
+                .contains("hello machine"),
+            "{prompt:?}"
+        );
+        Some(Self {
+            served,
+            listeners,
+            client,
+            machine,
+            end,
+            agent: agent_id,
+            workspace,
+            turn,
+            _dir: dir,
+        })
+    }
+
+    /// The machine streams `text` into the turn.
+    async fn reply(&self, seq: u64, text: &str) {
+        self.end
+            .journal(
+                seq,
+                &self.agent,
+                &self.workspace,
+                Some(&self.turn),
+                JournalBody::Notification {
+                    notification: json!({
+                        "sessionId": "machine-session",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": text },
+                        },
+                    }),
+                },
+            )
+            .await;
+    }
+
+    /// The machine ends the turn; whether the send went out (not once the
+    /// link closed).
+    async fn end_turn(&self, seq: u64) -> bool {
+        self.end
+            .link
+            .send(&LinkFrame::Journal(JournalRecord {
+                seq: NodeCounter(seq),
+                owner: self.agent.clone().into(),
+                workspace_id: self.workspace.clone(),
+                turn_id: Some(self.turn.clone()),
+                recorded_at: intent_core::now_iso(),
+                body: JournalBody::TurnEnded {
+                    stop_reason: "end_turn".into(),
+                    error: None,
+                },
+            }))
+            .await
+            .is_ok()
+    }
+}
+
 /// A Postgres tenant's agent, created and messaged by a client over the
 /// tenant's local socket, is launched on the tenant's machine, gets the
 /// message as its prompt, and the machine's reply completes the turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_agent_runs_its_turn_on_a_machine() {
     let Some(pool) = pool().await else { return };
-    if intent_providers_missing_git() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
     let tenant = format!("agents-{}", uuid::Uuid::new_v4().simple());
-    let served = serve_tenant(
-        pool,
-        &tenant,
-        dir.path(),
-        &format!("orchestrator-test-{tenant}"),
-        LeaseTiming::default(),
-        keyring(),
-        OrchestratorOnly::for_tests(),
-    )
-    .await
-    .expect("serve the tenant");
-    let services = served.services();
-    assert!(
-        services.agent_manager().is_some(),
-        "serving the tenant attaches its agent manager"
-    );
-    let listeners = served
-        .listen(&ListenConfig {
-            socket_path: dir.path().join("o.sock"),
-            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
-            ws_port: 0,
-            tls_dir: dir.path().join("tls"),
-            insecure: true,
-        })
-        .await
-        .unwrap();
-    let mut client = Uds::connect(listeners.socket_path()).await;
-    result(
-        &client
-            .rpc(
-                1,
-                "client.hello",
-                json!({ "clientId": "agents-test", "name": "Agents test" }),
-            )
-            .await,
-    );
-    let status = client.rpc(2, "system.status", json!({})).await;
-    assert!(
-        result(&status)["maxAgents"]
-            .as_u64()
-            .is_some_and(|cap| cap > 0),
-        "the tenant can run agents: {status}"
-    );
-
-    // The tenant's machine.
-    let backend = client.rpc(3, "remoteMachines.backendInfo", json!({})).await;
-    let backend_id = result(&backend)["backendId"].as_str().unwrap().to_owned();
-    let mut machine = Machine::start(&backend_id).await;
-    result(
-        &client
-            .rpc(4, "remoteMachines.add", machine.add_params())
-            .await,
-    );
-
-    // In orchestrator mode `workspace.create` needs a home machine, so the
-    // workspace is put in the tenant's store directly, over a repository on
-    // head; everything after that goes over the wire.
-    let repo = dir.path().join("repo");
-    repository(&repo);
-    let workspace = WorkspaceId(format!("ws-{}", uuid::Uuid::new_v4().simple()));
-    let now = intent_core::now_iso();
-    services
-        .store()
-        .insert_workspace(&intent_core::Workspace {
-            id: workspace.clone(),
-            title: "Remote turn".into(),
-            branch: "main".into(),
-            repository_path: Some(repo.to_string_lossy().into_owned()),
-            created_at: now.clone(),
-            updated_at: now,
-            ..Default::default()
-        })
-        .await
-        .expect("seed the workspace");
-
-    // An unplaced agent runs on the machine once it reports its providers.
-    let deadline = tokio::time::Instant::now() + wait();
-    let mut id = 10;
-    let agent = loop {
-        id += 1;
-        let created = client
-            .rpc(
-                id,
-                "agent.create",
-                json!({ "workspaceId": workspace, "name": "Remote", "model": "default", "provider": "mock" }),
-            )
-            .await;
-        if created.get("error").is_none() {
-            break created["result"]["agent"].clone();
-        }
-        assert_eq!(created["error"]["data"]["retryable"], true, "{created}");
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the machine never took the agent: {created}"
-        );
-        // timing-guard: poll interval while head reads the machine's providers (no event exposes it)
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let Some(mut running) = RunningTurn::start(pool, &tenant).await else {
+        return;
     };
-    assert_eq!(agent["nodeId"], machine.node_id.as_str(), "{agent}");
-    let agent_id = AgentId::from(agent["id"].as_str().unwrap());
-
-    result(
-        &client
-            .rpc(
-                50,
-                "agent.sendMessage",
-                json!({ "workspaceId": workspace, "agentId": agent_id, "content": "hello machine" }),
-            )
-            .await,
-    );
-
-    // Head dials the machine for the agent: it is told to launch it, then
-    // gets the message.
-    let (mut end, launch) = machine.launched().await;
-    assert_eq!(launch.agent_id, agent_id);
-    assert_eq!(launch.provider, "mock");
-    end.journal(
-        1,
-        &agent_id,
-        &workspace,
-        None,
-        JournalBody::Started {
-            base_commit: launch.base_commit.clone(),
-        },
-    )
-    .await;
-    let (turn, prompt) = end
-        .next(wait(), |frame| match frame {
-            LinkFrame::Prompt {
-                agent_id: to,
-                turn_id,
-                prompt,
-            } if to == agent_id => Some((turn_id, prompt)),
-            _ => None,
-        })
-        .await
-        .expect("the message reaches the machine as a prompt");
-    assert!(
-        serde_json::to_string(&prompt)
-            .unwrap()
-            .contains("hello machine"),
-        "{prompt:?}"
-    );
 
     // The machine's reply completes the turn on head.
-    end.journal(
-        2,
-        &agent_id,
-        &workspace,
-        Some(&turn),
-        JournalBody::Notification {
-            notification: json!({
-                "sessionId": "machine-session",
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": "hi from the machine" },
-                },
-            }),
-        },
-    )
-    .await;
-    end.journal(
-        3,
-        &agent_id,
-        &workspace,
-        Some(&turn),
-        JournalBody::TurnEnded {
-            stop_reason: "end_turn".into(),
-            error: None,
-        },
-    )
-    .await;
+    running.reply(2, "hi from the machine").await;
+    assert!(running.end_turn(3).await);
     let deadline = tokio::time::Instant::now() + wait();
     let mut id = 60;
     loop {
         id += 1;
-        let got = client
+        let got = running
+            .client
             .rpc(
                 id,
                 "agent.get",
-                json!({ "workspaceId": workspace, "agentId": agent_id }),
+                json!({ "workspaceId": running.workspace, "agentId": running.agent }),
             )
             .await;
         let text = result(&got).to_string();
@@ -560,10 +613,77 @@ async fn a_tenant_agent_runs_its_turn_on_a_machine() {
         // timing-guard: poll interval for the turn's end on head (read over the wire)
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    drop(end);
-    listeners.stop().await;
-    machine.server.stop().await;
-    drop(machine.git);
+    drop(running.end);
+    running.listeners.stop().await;
+    running.machine.server.stop().await;
+    drop(running.machine.git);
+}
+
+/// How many rows the tenant's work wrote: its events and transcript
+/// messages, and its interrupted-agent rows.
+async fn written(pool: &PgPool, tenant: &str) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM event WHERE tenant_id = $1), \
+                (SELECT count(*) FROM agent_message WHERE tenant_id = $1), \
+                (SELECT count(*) FROM interrupted_agent WHERE tenant_id = $1)",
+    )
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .expect("count the tenant's rows")
+}
+
+/// Stopping a tenant mid-turn ends the turn as `intentd`'s shutdown does:
+/// it is recorded as interrupted (with what the machine streamed so far)
+/// before the fence refuses the tenant's writes, and nothing of the tenant
+/// is written once its lease is released, not even the machine's late end
+/// of the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
+    let Some(pool) = pool().await else { return };
+    let tenant = format!("drain-{}", uuid::Uuid::new_v4().simple());
+    let Some(mut running) = RunningTurn::start(pool.clone(), &tenant).await else {
+        return;
+    };
+    // The turn runs on head from the prompt on; the machine is mid-reply.
+    running.reply(2, "partial from the machine").await;
+
+    // As the binary stops a tenant on SIGTERM: drain, fence, release.
+    running.served.drain(None).await;
+    assert!(running.served.fence().fire("the test stops the tenant"));
+    let report = running.served.stopped().await;
+    assert!(report.overran.is_empty(), "{report:?}");
+    assert!(
+        running.served.heartbeat().release().await.expect("release"),
+        "the lease was still ours"
+    );
+
+    let (resolution, prev_status): (String, String) = sqlx::query_as(
+        "SELECT resolution, prev_status FROM interrupted_agent \
+         WHERE tenant_id = $1 AND agent_id = $2",
+    )
+    .bind(&tenant)
+    .bind(&running.agent.0)
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+    .expect("the running turn is recorded as interrupted");
+    assert_eq!(resolution, "pending", "it resumes on the next claim");
+    assert_eq!(prev_status, "active", "it was recorded mid-turn");
+
+    // Nothing of the tenant lands after the release: the machine's late end
+    // of the turn included.
+    let released = written(&pool, &tenant).await;
+    // The fence closed the link, so the send may fail.
+    let _ = running.end_turn(3).await;
+    // timing-guard: a late write would land within this window; no event exposes its absence
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(written(&pool, &tenant).await, released);
+
+    drop(running.end);
+    running.listeners.stop().await;
+    running.machine.server.stop().await;
+    drop(running.machine.git);
 }
 
 /// Whether `git` is missing (the test then skips).
