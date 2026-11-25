@@ -197,7 +197,7 @@ pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
 pub use discussion_activity_repo::DiscussionActivityReceipt;
 pub use discussion_agent_repo::DiscussionDelivery;
-pub use event_repo::{EventQuery, NewEvent};
+pub use event_repo::{EventQuery, EventSeq, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use executor_repo::ExecutorRevocation;
 pub use hook_repo::ActiveHookMetadata;
