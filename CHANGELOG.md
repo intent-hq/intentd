@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.299] - 2026-11-25
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* A stopped tenant releases its Services ([#3788](https://github.com/intent-hq/intentd/pull/3788))
+
+
 ## [0.11.298] - 2026-11-25
 
 ### 🐛 Bug Fixes
