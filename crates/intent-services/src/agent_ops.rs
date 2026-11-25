@@ -683,6 +683,9 @@ mod tests_proposal_origin;
 mod tests_proposal_invariant;
 
 #[cfg(test)]
+mod tests_proposal_stale_writes;
+
+#[cfg(test)]
 mod tests_parent_provider;
 
 #[cfg(test)]

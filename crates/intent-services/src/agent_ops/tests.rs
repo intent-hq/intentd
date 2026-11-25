@@ -10604,17 +10604,6 @@ async fn worst_case_agent_list_row(
         intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8T9",
         intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U0",
         intent_core::LAST_SEEN_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U1",
-        intent_core::PENDING_PROPOSALS_KEY: [
-            { "proposalId": "prop-01", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U2" },
-            { "proposalId": "prop-02", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U3" },
-        ],
-        intent_core::PROPOSAL_RESOLUTIONS_KEY: {
-            "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
-            "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
-        },
-        intent_core::PROPOSAL_CREATED_WORKSPACES_KEY: {
-            "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4",
-        },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
         "chiefPromptVersion": u32::MAX,
@@ -10623,6 +10612,33 @@ async fn worst_case_agent_list_row(
         .update_agent_session(ws, &s)
         .await
         .expect("populate session");
+    // The proposal maps are daemon-owned: only their single-key writer sets
+    // them.
+    for (key, value) in [
+        (
+            intent_core::PENDING_PROPOSALS_KEY,
+            json!([
+                { "proposalId": "prop-01", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U2" },
+                { "proposalId": "prop-02", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U3" },
+            ]),
+        ),
+        (
+            intent_core::PROPOSAL_RESOLUTIONS_KEY,
+            json!({
+                "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
+                "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+            }),
+        ),
+        (
+            intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+            json!({ "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4" }),
+        ),
+    ] {
+        svc.store()
+            .set_agent_session_metadata_key_json(ws, &s.id, key, &value.to_string(), &ts)
+            .await
+            .expect("populate proposal metadata");
+    }
     // The goal is a preference column the full-row write leaves alone;
     // fill it to its cap through its own writer, with 4-byte characters (the
     // widest printable UTF-8): 1,000 characters serialize to ≈ 4,000 B.
@@ -22256,11 +22272,23 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     template.initial_message = Some("initial".repeat(10000));
     template.system_prompt = Some("prompt".repeat(10000));
     template.context_references = Some(json!([{"body":"context".repeat(10000)}]));
-    template.metadata = Some(json!({"pendingProposals":[{"body":"proposal".repeat(10000)}]}));
     svc.store()
         .update_agent_session(&ws, &template)
         .await
         .unwrap();
+    let proposals = json!([{"body":"proposal".repeat(10000)}]);
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &first,
+            intent_core::PENDING_PROPOSALS_KEY,
+            &proposals.to_string(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // The batch clones below are inserted, which writes metadata as given.
+    template.metadata = Some(json!({ intent_core::PENDING_PROPOSALS_KEY: proposals }));
     svc.store()
         .append_agent_message(
             &first,
