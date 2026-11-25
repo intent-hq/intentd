@@ -1,5 +1,5 @@
-//! Source lint: every session `metadata` key the daemon writes on its own is
-//! protected from stale whole-document writes.
+//! Source lint: every session `metadata` key the daemon writes through the
+//! JSON single-key writer is protected from stale whole-document writes.
 //!
 //! A key written through `Store::set_agent_session_metadata_key_json` (or its
 //! `_if_identity` form) is daemon state. `Store::update_agent_session` and
@@ -16,8 +16,10 @@
 //! non-test source. It fails naming `file:line` when the key is neither in
 //! `DAEMON_OWNED_METADATA_KEYS` nor in [`NOT_DAEMON_OWNED`] (with a reason).
 //! A key passed through a variable must be listed in [`FORWARDED`] with its
-//! call count and the keys it carries. Limit: a call made through an alias
-//! or a function pointer is not seen.
+//! call count and the keys it carries. Limits: a call made through an alias,
+//! a function pointer or UFCS is not seen, and the string-valued writer
+//! `Store::set_agent_session_metadata_key` (read markers, notices) is out of
+//! scope; its keys are not yet classified.
 
 use std::collections::{BTreeMap, BTreeSet};
 
