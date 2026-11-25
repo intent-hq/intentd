@@ -1173,3 +1173,326 @@ fn intent_providers_missing_git() -> bool {
     }
     missing
 }
+
+/// The tool the test's HTTP MCP server offers.
+const MCP_TOOL: &str = "lookup_forecast";
+
+/// A streamable-HTTP MCP server on loopback that answers `initialize` and
+/// `tools/list` (one tool, [`MCP_TOOL`]), as a user's remote server would.
+/// Its URL; it serves until the test ends.
+async fn http_mcp_server() -> String {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut socket = tokio::io::BufReader::new(socket);
+                loop {
+                    let mut length = 0;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if socket.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    if socket.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let reply = match request["method"].as_str() {
+                        Some("initialize") => Some(json!({
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "forecast", "version": "1" },
+                        })),
+                        Some("tools/list") => Some(json!({ "tools": [{
+                            "name": MCP_TOOL,
+                            "description": "The forecast for a city",
+                            "inputSchema": { "type": "object" },
+                        }] })),
+                        _ => None,
+                    };
+                    let response = match (reply, request.get("id")) {
+                        (Some(result), Some(id)) => {
+                            let body =
+                                json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                        // Notifications and the session DELETE.
+                        _ => "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_owned(),
+                    };
+                    if socket
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+/// Serve `tenant` as `instance`, over the tenant's local socket under `dir`.
+async fn serve_with_client(
+    pool: PgPool,
+    tenant: &str,
+    dir: &Path,
+    instance: &str,
+) -> (
+    intentd_orchestrator::serve::ServedTenant,
+    intentd_orchestrator::listen::ClientListeners,
+    Uds,
+) {
+    let served = serve_tenant(
+        pool,
+        tenant,
+        dir,
+        instance,
+        LeaseTiming::default(),
+        keyring(),
+        OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("serve the tenant");
+    let listeners = served
+        .listen(&ListenConfig {
+            socket_path: dir.join(format!("{instance}.sock")),
+            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ws_port: 0,
+            tls_dir: dir.join("tls"),
+            insecure: true,
+        })
+        .await
+        .unwrap();
+    let mut client = Uds::connect(listeners.socket_path()).await;
+    result(
+        &client
+            .rpc(
+                1,
+                "client.hello",
+                json!({ "clientId": "mcp-test", "name": "MCP test" }),
+            )
+            .await,
+    );
+    (served, listeners, client)
+}
+
+/// A tenant's HTTP MCP server in its settings is started when the tenant
+/// is served, and an agent on the tenant's machine gets it: the launch
+/// names it and the machine lists its tools through head. A stdio server
+/// is refused: an orchestrator starts no process for a tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_http_mcp_server_reaches_its_machine_agents_and_stdio_is_refused() {
+    let Some(pool) = pool().await else { return };
+    if intent_providers_missing_git() {
+        return;
+    }
+    let mcp_url = http_mcp_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let tenant = format!("mcp-{}", uuid::Uuid::new_v4().simple());
+
+    // The first instance saves the servers, as the settings page does.
+    let (first, listeners, mut client) =
+        serve_with_client(pool.clone(), &tenant, dir.path(), "first").await;
+    let stdio = client
+        .rpc(
+            2,
+            "mcp.servers.create",
+            json!({ "config": {
+                "id": "local-tool", "name": "Local", "transport": "stdio",
+                "command": "/bin/cat", "enabled": true,
+            } }),
+        )
+        .await;
+    let refusal = stdio["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("stdio") && refusal.contains("http"),
+        "a stdio server is refused with a clear message: {stdio}"
+    );
+    result(
+        &client
+            .rpc(
+                3,
+                "mcp.servers.create",
+                json!({ "config": {
+                    "id": "forecast", "name": "Forecast", "transport": "http",
+                    "url": mcp_url, "enabled": true,
+                } }),
+            )
+            .await,
+    );
+    let servers = client.rpc(4, "mcp.servers.list", json!({})).await;
+    assert_eq!(
+        result(&servers)["servers"]
+            .as_array()
+            .map(|servers| servers.iter().map(|s| s["id"].clone()).collect::<Vec<_>>()),
+        Some(vec![json!("forecast")]),
+        "only the HTTP server is saved: {servers}"
+    );
+    drop(client);
+    listeners.stop().await;
+    let mut first = first;
+    first.fence().fire("test: the first instance stops");
+    tokio::time::timeout(wait(), first.stopped())
+        .await
+        .expect("the first instance stops");
+    first
+        .heartbeat()
+        .release()
+        .await
+        .expect("release the lease");
+
+    // The instance that takes the tenant over starts the saved server.
+    let (served, listeners, mut client) =
+        serve_with_client(pool, &tenant, dir.path(), "second").await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    loop {
+        id += 1;
+        let status = client
+            .rpc(
+                id,
+                "mcp.servers.getStatus",
+                json!({ "serverId": "forecast" }),
+            )
+            .await;
+        if result(&status)["status"]["state"] == "running" {
+            assert_eq!(result(&status)["status"]["toolCount"], 1, "{status}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "serving the tenant never started its MCP server: {status}"
+        );
+        // timing-guard: poll interval for the tenant's background MCP start (read over the wire)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // An agent on the tenant's machine gets the server.
+    let backend = client
+        .rpc(30, "remoteMachines.backendInfo", json!({}))
+        .await;
+    let backend_id = result(&backend)["backendId"].as_str().unwrap().to_owned();
+    let mut machine = Machine::start(&backend_id).await;
+    result(
+        &client
+            .rpc(31, "remoteMachines.add", machine.add_params())
+            .await,
+    );
+    let repo = dir.path().join("repo");
+    repository(&repo);
+    let workspace = WorkspaceId(format!("ws-{}", uuid::Uuid::new_v4().simple()));
+    let now = intent_core::now_iso();
+    served
+        .services()
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: workspace.clone(),
+            title: "MCP".into(),
+            branch: "main".into(),
+            repository_path: Some(repo.to_string_lossy().into_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Default::default()
+        })
+        .await
+        .expect("seed the workspace");
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 40;
+    let agent = loop {
+        id += 1;
+        let created = client
+            .rpc(
+                id,
+                "agent.create",
+                json!({ "workspaceId": workspace, "name": "Remote", "model": "default", "provider": "mock" }),
+            )
+            .await;
+        if created.get("error").is_none() {
+            break created["result"]["agent"].clone();
+        }
+        assert_eq!(created["error"]["data"]["retryable"], true, "{created}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the agent: {created}"
+        );
+        // timing-guard: poll interval while head reads the machine's providers (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = AgentId::from(agent["id"].as_str().unwrap());
+    result(
+        &client
+            .rpc(
+                90,
+                "agent.sendMessage",
+                json!({ "workspaceId": workspace, "agentId": agent_id, "content": "forecast?" }),
+            )
+            .await,
+    );
+    let (end, launch) = machine.launched().await;
+    assert_eq!(launch.agent_id, agent_id);
+    assert_eq!(
+        launch.mcp_proxies,
+        vec![intent_core::node_link::McpProxy {
+            name: "Forecast".into(),
+            server_id: "forecast".into(),
+        }],
+        "the launch names the tenant's HTTP server"
+    );
+    end.journal(
+        1,
+        &agent_id,
+        &workspace,
+        None,
+        JournalBody::Started {
+            base_commit: launch.base_commit.clone(),
+        },
+    )
+    .await;
+    // The agent's provider lists the server's tools: the machine forwards
+    // `tools/list` to head, whose hub runs it.
+    let listed = end
+        .link
+        .call(
+            agent_id.clone(),
+            intent_core::remote_launch::workspace_api::CALL_METHOD,
+            json!({
+                "method": intent_core::remote_launch::workspace_api::MCP_PROXY_LIST_TOOLS_METHOD,
+                "args": { "serverId": "forecast" },
+            }),
+            wait(),
+        )
+        .await
+        .expect("head answers the proxied tools/list");
+    match listed {
+        intent_core::node_link::LinkOutcome::Ok(tools) => {
+            assert_eq!(tools["tools"][0]["name"], MCP_TOOL, "{tools}");
+        }
+        intent_core::node_link::LinkOutcome::Err(other) => {
+            panic!("the proxied tools/list failed: {other:?}")
+        }
+    }
+    drop(end);
+    listeners.stop().await;
+    machine.server.stop().await;
+    drop(machine.git);
+}

@@ -37,6 +37,8 @@ use intent_core::tenant_fence::SelfFenceReport;
 
 #[cfg(unix)]
 pub mod listen;
+#[cfg(feature = "postgres")]
+mod mcp;
 pub mod process;
 #[cfg(feature = "postgres")]
 pub mod secrets;

@@ -259,6 +259,9 @@ async fn try_serve_tenant_with(
     if let Some(reap) = spawn_idle_reap(&services, &recovered.agents, &admission) {
         runner.adopt_task(reap);
     }
+    if !fence.is_fenced() {
+        crate::mcp::start_tenant_mcp(&services, &mut runner);
+    }
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be
@@ -491,7 +494,7 @@ fn tenant_services(
     let registry = SettingsRegistry::load(dir.join("config.toml"))?;
     let hooks_max_per_agent = registry.snapshot().effective.hooks.max_per_agent;
     let gitlab_pair = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
-    Ok(intent_app::compose(
+    let services = intent_app::compose(
         Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
@@ -505,7 +508,11 @@ fn tenant_services(
             .with_provider_profiles_dir(dir)
             .with_script_output_dir(dir)
             .with_orchestrator_mode(true),
-    ))
+    );
+    // No process starts on this host for a tenant: its hub refuses stdio
+    // MCP servers (`crate::mcp`).
+    services.mcp_hub().refuse_stdio();
+    Ok(services)
 }
 
 impl ServedTenant {
