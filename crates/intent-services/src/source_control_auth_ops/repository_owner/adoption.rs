@@ -380,11 +380,17 @@ impl GitlabCredentialGate {
         Ok(())
     }
 
+    /// `isolated_transport` is the test services' own GitLab API base
+    /// ([`crate::Services::with_gitlab_api_base_uri`]). Like every other
+    /// reader it shadows `$INTENTD_GITLAB_API_BASE_URI`, but it is applied
+    /// only after the descriptor check and only when the settings set no
+    /// transport, so it can make a call fail locally but never approve one.
     fn stored_source_host(
         &self,
         registry: &SettingsRegistry,
         store: &FileSecretStore,
         allow_new: bool,
+        isolated_transport: Option<&str>,
     ) -> Result<GitlabHost> {
         let owner = self.repository.get().ok_or_else(unavailable)?;
         let settings = owner.settings.get().ok_or_else(unavailable)?;
@@ -412,16 +418,27 @@ impl GitlabCredentialGate {
         let override_url = current
             .api_base_url
             .clone()
-            .or_else(|| std::env::var(super::super::GITLAB_API_BASE_URI_ENV).ok());
-        if let Some(endpoint) = override_url.filter(|v| !v.trim().is_empty()) {
+            .or_else(|| {
+                isolated_transport
+                    .is_none()
+                    .then(|| std::env::var(super::super::GITLAB_API_BASE_URI_ENV).ok())
+                    .flatten()
+            })
+            .filter(|v| !v.trim().is_empty());
+        if let Some(endpoint) = &override_url {
             host = host
-                .with_api_origin(&endpoint)
+                .with_api_origin(endpoint)
                 .map_err(crate::pr_ops::map_sc_err)?;
         }
         if !matches_host(&descriptor, &host) {
             return Err(unavailable());
         }
-        Ok(host)
+        match isolated_transport.filter(|v| override_url.is_none() && !v.trim().is_empty()) {
+            Some(endpoint) => host
+                .with_api_origin(endpoint)
+                .map_err(crate::pr_ops::map_sc_err),
+            None => Ok(host),
+        }
     }
 }
 
@@ -665,6 +682,7 @@ impl crate::Services {
             registry,
             &self.gitlab_secret_store,
             false,
+            self.gitlab_api_base_uri.as_deref(),
         )?;
         let credential =
             intent_sourcecontrol::gitlab_auth::stored_credential(self.gitlab_secret_store.clone())
@@ -850,6 +868,7 @@ impl crate::Services {
             registry,
             &self.gitlab_secret_store,
             allow_new,
+            self.gitlab_api_base_uri.as_deref(),
         )?;
         self.verify_stored_repository_account(
             &host,

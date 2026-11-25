@@ -18521,10 +18521,19 @@ pub(crate) mod pr {
         assert_eq!(v["user"]["login"], "octocat", "{v}");
     }
 
+    fn is_loopback_origin(base: &str) -> bool {
+        let host = base
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or_default();
+        matches!(host, "127.0.0.1" | "localhost")
+    }
+
     /// Test services that forget the API-base override must fail locally,
     /// never send a fake token to api.github.com (intentd#3725 found one such
     /// leak only because GitHub answered "Bad credentials"). Every test
-    /// constructor must resolve GitHub to loopback.
+    /// constructor must resolve the GitHub API and login hosts and the GitLab
+    /// API to loopback.
     #[intent_test_macros::daemon_test]
     async fn isolated_services_without_a_mock_never_reach_a_non_loopback_github() {
         let tmp = TempDb::new();
@@ -18553,7 +18562,81 @@ pub(crate) mod pr {
                 matches!(host, "127.0.0.1" | "localhost"),
                 "{name}: GitHub API base must be loopback, got {base}"
             );
+            let login = crate::github_auth_ops::resolve_login_base_uri(
+                svc.github_login_base_uri.as_deref(),
+            );
+            assert!(
+                is_loopback_origin(&login),
+                "{name}: GitHub login base must be loopback, got {login}"
+            );
+            let override_base = svc
+                .gitlab_api_base_override()
+                .unwrap_or_else(|| panic!("{name}: no GitLab API base, so gitlab.com"));
+            assert!(
+                is_loopback_origin(&override_base),
+                "{name}: GitLab API base must be loopback, got {override_base}"
+            );
+            for (path, target) in [
+                (
+                    "sourceControl",
+                    svc.resolve_source_control_target("gitlab", None),
+                ),
+                (
+                    "collaboration",
+                    svc.collaboration_connect_target("gitlab", None),
+                ),
+            ] {
+                let Ok(crate::source_control_auth_ops::Target::Gitlab { host }) = target else {
+                    panic!("{name}: {path} GitLab target did not resolve: {target:?}");
+                };
+                assert!(
+                    is_loopback_origin(host.base_url()),
+                    "{name}: {path} GitLab target must be loopback, got {}",
+                    host.base_url()
+                );
+            }
         }
+
+        // A gitlab.com invite pin or collaboration connect while another
+        // instance is bound: the env seam never applied there, so the isolated
+        // base must still catch it, and so must the ls-remote fallback.
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(scratch.path().join("config.toml")).expect("registry"),
+        );
+        registry
+            .apply(&[(
+                "sourceControl.gitlab.host".into(),
+                serde_json::json!("gitlab.probe.test"),
+            )])
+            .expect("bind another GitLab instance");
+        let svc = Services::new_isolated(store.clone()).with_settings_registry(registry);
+        for (path, target) in [
+            (
+                "invite pin",
+                svc.resolve_forge_target(
+                    crate::source_control_auth_ops::Provider::Gitlab,
+                    Some("gitlab.com"),
+                ),
+            ),
+            (
+                "collaboration",
+                svc.collaboration_connect_target("gitlab", Some("gitlab.com")),
+            ),
+        ] {
+            let Ok(crate::source_control_auth_ops::Target::Gitlab { host }) = target else {
+                panic!("{path}: GitLab target did not resolve: {target:?}");
+            };
+            assert!(
+                is_loopback_origin(host.base_url()),
+                "{path}: gitlab.com must resolve to loopback, got {}",
+                host.base_url()
+            );
+        }
+        let ls_remote = svc.branches_ls_remote_base.as_deref().unwrap_or_default();
+        assert!(
+            is_loopback_origin(ls_remote),
+            "branches ls-remote base must be loopback, got {ls_remote:?}"
+        );
 
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());
         crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_fake")
