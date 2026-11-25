@@ -32451,8 +32451,16 @@ async fn reclaim_for_remote_yields_to_queued_local_spawns() {
                 .await;
         })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!waiting.is_finished(), "the local spawn is queued");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !crate::agent_manager::has_live_waiter(&reg.inner.lock().unwrap()) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        },
+    )
+    .await
+    .expect("the local spawn queued");
     reg.inner
         .lock()
         .unwrap()
