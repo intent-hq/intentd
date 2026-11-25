@@ -604,6 +604,29 @@ async fn node_runner_reclaims_an_idle_local_agent_before_refusing() {
     h.runner.shutdown().await;
 }
 
+/// A launch refused for its own content (here a malformed profile) never
+/// takes back an idle local agent first.
+#[tokio::test]
+async fn node_runner_reclaims_nothing_for_a_launch_refused_for_another_reason() {
+    let Some(h) = harness(1, &[]) else { return };
+    let local = AgentId::from("a-idle-local-agent");
+    h.admission.try_admit(&local).unwrap();
+    lock(&h.admission.idle).push(local.clone());
+    let mut command = launch_with_profile("a1", &json!([]));
+    command.profile_env = Some(intent_core::node_link::LaunchProfileEnv(json!({
+        "providerRef": "codex@work",
+        "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }],
+    })));
+    h.runner.launch(command).await;
+    let all = wait_for(&h.runner, "profile refusal", exited("a1")).await;
+    let error = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(error.starts_with(codes::PROFILE), "{error}");
+    assert!(
+        lock(&h.admission.running).contains(&local),
+        "the idle local agent kept its slot"
+    );
+}
+
 #[tokio::test]
 async fn node_runner_refuses_an_unconfigured_provider_by_name() {
     let Some(h) = harness(2, &[]) else { return };

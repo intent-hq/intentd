@@ -535,6 +535,14 @@ impl StopWait {
     }
 }
 
+/// Whether a launch refusal came from the shared limits alone.
+fn is_capacity_refusal(entry: &JournalEntry) -> bool {
+    matches!(
+        &entry.body,
+        JournalBody::Exited { failure: Some(failure), .. } if failure.code == codes::CAPACITY
+    )
+}
+
 /// A journal entry of `agent` with `body`, outside any turn.
 fn agent_entry(agent: &Agent, body: JournalBody) -> JournalEntry {
     JournalEntry {
@@ -1554,14 +1562,14 @@ impl Runner {
         let resolved = tokio::task::spawn_blocking(move || launch.resolve(&provider))
             .await
             .unwrap_or_else(|_| Err("provider resolution failed".to_owned()));
-        let admits_next = resolved.is_ok() && {
-            let state = lock(&self.inner.state);
-            !state.closing && !state.agents.contains_key(&command.agent_id)
-        };
-        if admits_next {
+        // Every other check runs first: idle local agents are taken back only
+        // for a launch whose one remaining obstacle is the shared limits.
+        let mut refusal = self.begin_launch(command.clone(), resolved.clone());
+        if refusal.as_ref().is_some_and(is_capacity_refusal) {
             self.inner.admission.reclaim_idle().await;
+            refusal = self.begin_launch(command, resolved);
         }
-        if let Some(refusal) = self.begin_launch(command, resolved) {
+        if let Some(refusal) = refusal {
             self.append(refusal).await;
         }
     }

@@ -1231,6 +1231,21 @@ fn idle_older_than(
         .collect()
 }
 
+/// Whether a local spawn is parked in the admission queue.
+fn has_live_waiter(inner: &RegistryInner) -> bool {
+    inner.wait_queue.iter().any(|(_, tx, _)| !tx.is_closed())
+}
+
+/// What evicting `id` frees for the budget: its attributed subtree, never
+/// less than the provisional cost `deregister` credits.
+fn attributed_bytes(samples: &HashMap<AgentId, u64>, id: &AgentId) -> u64 {
+    samples
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+        .max(PROVISIONAL_AGENT_BYTES)
+}
+
 /// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
 /// attributed subtree first (Phase A attribution), ties and unattributed
 /// entries (charged 0 by the sort) falling back to least-recently-used first —
@@ -1865,20 +1880,20 @@ impl ProcessRegistry {
     /// [`Self::try_admit`]: the idle processes a remote launch may take back,
     /// and whether the host is short of its reserve (the budget denies only
     /// then; `None` without a budget or a sample). Busy and remote entries
-    /// are never reclaimable.
+    /// are never reclaimable, and nothing is while a local spawn is queued.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn remote_capacity_facts(&self) -> (u32, Option<bool>) {
-        let idle = self
-            .inner
-            .lock()
-            .unwrap()
-            .entries
-            .values()
-            .filter(|e| !e.is_active)
-            .count();
+        let idle = {
+            let inner = self.inner.lock().unwrap();
+            if has_live_waiter(&inner) {
+                0
+            } else {
+                inner.entries.values().filter(|e| !e.is_active).count()
+            }
+        };
         let short = self.memory.get().and_then(|budget| {
             let sample = budget.probe.sample()?;
             Some(
@@ -1892,10 +1907,15 @@ impl ProcessRegistry {
 
     /// Make room for a remote (executor) launch the way [`Self::acquire`]
     /// does for a local spawn: while the slot cap or the memory budget would
-    /// deny it, evict the LRU idle process (same claim-before-kill contract
-    /// and re-validation). Never waits: when nothing idle can be claimed it
-    /// returns, and [`Self::try_admit`] refuses. Admitted remote entries are
-    /// always active, so they are never candidates.
+    /// deny it, evict an idle process (same claim-before-kill contract and
+    /// re-validation). For the slot cap the LRU one goes; for the budget the
+    /// largest attributed one, credited at its attributed size, and only when
+    /// the idle processes together could clear the overshoot, so a launch
+    /// that would be refused anyway kills nothing. Never queues: when nothing
+    /// idle can be claimed it returns, and [`Self::try_admit`] refuses.
+    /// Admitted remote entries are always active, so they are never
+    /// candidates, and a queued local spawn keeps its priority: nothing is
+    /// taken back while one waits.
     ///
     /// # Panics
     ///
@@ -1906,19 +1926,36 @@ impl ProcessRegistry {
         R: Fn(&AgentId),
     {
         loop {
-            let (candidates, reason) = {
+            let (candidates, reason, samples) = {
                 let mut inner = self.inner.lock().unwrap();
-                let reason = if self.budget_denies(&mut inner).is_some() {
-                    REASON_MEMORY_BUDGET
+                if has_live_waiter(&inner) {
+                    return;
+                }
+                if let Some(denial) = self.budget_denies(&mut inner) {
+                    let samples = self
+                        .memory
+                        .get()
+                        .map(|b| b.probe.agent_samples())
+                        .unwrap_or_default();
+                    let candidates = idle_largest_first(&inner, &samples, self.keep_alive.as_ref());
+                    let reclaimable: u64 = candidates
+                        .iter()
+                        .map(|(id, _)| attributed_bytes(&samples, id))
+                        .sum();
+                    let budget = self.memory.get().map_or(0, |b| b.budget_bytes);
+                    if denial.charged.saturating_sub(reclaimable) >= budget {
+                        return;
+                    }
+                    (candidates, REASON_MEMORY_BUDGET, samples)
                 } else if inner.entries.len() >= self.cap {
-                    REASON_SLOTS
+                    (
+                        lru_idle_ordered(&inner, None, self.keep_alive.as_ref()),
+                        REASON_SLOTS,
+                        HashMap::new(),
+                    )
                 } else {
                     return;
-                };
-                (
-                    lru_idle_ordered(&inner, None, self.keep_alive.as_ref()),
-                    reason,
-                )
+                }
             };
             let mut evicted_one = false;
             for (id, kill) in candidates {
@@ -1951,6 +1988,9 @@ impl ProcessRegistry {
                 }
                 kill().await;
                 self.deregister(&id);
+                self.budget_credit_extra_bytes(
+                    attributed_bytes(&samples, &id).saturating_sub(PROVISIONAL_AGENT_BYTES),
+                );
                 drop(guard);
                 evicted_one = true;
                 break;

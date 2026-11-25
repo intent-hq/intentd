@@ -634,6 +634,7 @@ async fn a_full_machine_with_idle_local_agents_stays_a_candidate() {
 async fn an_over_budget_machine_with_host_headroom_stays_a_candidate() {
     let over = |short: Option<bool>| {
         let mut caps = report(MAC, FRESH, claude(&["opus"]));
+        caps.capacity.running_agents = 1;
         caps.capacity.charged_memory_bytes = 47 << 30;
         caps.capacity.memory_budget_bytes = Some(40 << 30);
         caps.capacity.host_memory_short = short;
@@ -655,6 +656,7 @@ async fn no_capacity_lists_each_full_machine_and_its_limit() {
     let mut count = report(MAC, FRESH, claude(&["opus"]));
     count.capacity.running_agents = 4;
     let mut memory = report(MAC, FRESH, claude(&["opus"]));
+    memory.capacity.running_agents = 1;
     memory.capacity.charged_memory_bytes = 8 << 30;
     memory.capacity.memory_budget_bytes = Some(8 << 30);
     let fake = Fake::new(vec![

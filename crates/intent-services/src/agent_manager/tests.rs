@@ -32393,6 +32393,80 @@ fn remote_capacity_reports_idle_local_agents_and_host_shortage() {
     assert_eq!(reg.remote_capacity_facts(), (2, Some(true)));
 }
 
+/// Over the budget, idle processes that together cannot clear the overshoot
+/// are left alone: killing them would not admit the launch.
+#[tokio::test]
+async fn reclaim_for_remote_evicts_nothing_when_idle_agents_cannot_clear_the_budget() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(10 * gb);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let ids: Vec<AgentId> = ["a", "b"].into_iter().map(AgentId::from).collect();
+    for id in &ids {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    }
+    probe.set_agents(&[(&ids[0], gb), (&ids[1], gb)]);
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+    assert!(ids.iter().all(|id| reg.is_registered(id)));
+}
+
+/// For the budget, the largest attributed idle process goes first and is
+/// credited at its attributed size, so one kill can be enough.
+#[tokio::test]
+async fn reclaim_for_remote_evicts_the_largest_idle_process_for_the_budget() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(6 * gb);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let small = AgentId::from("small-older");
+    let large = AgentId::from("large-newer");
+    reg.register(small.clone(), recording_kill(small.clone(), log.clone()));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    reg.register(large.clone(), recording_kill(large.clone(), log.clone()));
+    probe.set_agents(&[(&small, gb / 2), (&large, 3 * gb)]);
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert_eq!(*log.lock().unwrap(), vec![large.clone()]);
+    assert!(reg.is_registered(&small));
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+}
+
+/// Local spawns already queued keep their priority: a remote launch takes
+/// back nothing while one waits, and the report says nothing is reclaimable.
+#[tokio::test]
+async fn reclaim_for_remote_yields_to_queued_local_spawns() {
+    let reg = Arc::new(ProcessRegistry::new(1));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let busy = AgentId::from("busy");
+    reg.register(busy.clone(), recording_kill(busy.clone(), log.clone()));
+    reg.mark_active(&busy);
+    let waiting = {
+        let reg = reg.clone();
+        tokio::spawn(async move {
+            reg.acquire(&AgentId::from("queued"), claim_all, release_none)
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "the local spawn is queued");
+    reg.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&busy)
+        .unwrap()
+        .is_active = false;
+    assert_eq!(reg.remote_capacity_facts().0, 0);
+    reg.reclaim_for_remote(claim_all, release_none).await;
+    assert!(log.lock().unwrap().is_empty());
+    assert!(reg.is_registered(&busy));
+    waiting.abort();
+}
+
 /// Under both limits nothing is reclaimed.
 #[tokio::test]
 async fn reclaim_for_remote_evicts_nothing_under_the_limits() {

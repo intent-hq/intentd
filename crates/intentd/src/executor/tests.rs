@@ -2396,6 +2396,9 @@ async fn a_flip_of_the_admission_answer_pushes_the_report() {
     }
     let dir = tempfile::tempdir().unwrap();
     let admission = CountAdmission::new(3);
+    admission
+        .try_admit(&AgentId::from_string("local-agent".to_owned()))
+        .unwrap();
     let node = Running::start_with(
         dir.path(),
         MachineApi::new(),

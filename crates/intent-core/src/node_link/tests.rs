@@ -2872,3 +2872,60 @@ fn a_launch_fits_its_session_meta_to_the_link() {
     let mut none = labelled_launch(LaunchLabels::default());
     assert!(!none.fit_session_meta(SESSION_META_PROTOCOL));
 }
+
+/// The backend reads a report the way the machine admits: no refusal while
+/// idle local agents can be taken back, the memory budget only while the
+/// host is short and something is running, and an older report (no new
+/// fields) as before.
+#[test]
+fn a_capacity_report_refuses_only_when_the_machine_would() {
+    let base = MachineCapacity {
+        running_agents: 2,
+        agent_cap: 4,
+        charged_memory_bytes: 9,
+        memory_budget_bytes: Some(8),
+        reclaimable_agents: 0,
+        host_memory_short: None,
+    };
+    let memory = Some(CapacityRefusal::Memory {
+        charged_memory_bytes: 9,
+        memory_budget_bytes: 8,
+    });
+    assert_eq!(base.refusal(), memory, "an older report");
+    let short = MachineCapacity {
+        host_memory_short: Some(true),
+        ..base
+    };
+    assert_eq!(short.refusal(), memory);
+    let headroom = MachineCapacity {
+        host_memory_short: Some(false),
+        ..base
+    };
+    assert_eq!(headroom.refusal(), None);
+    let idle = MachineCapacity {
+        reclaimable_agents: 1,
+        ..short
+    };
+    assert_eq!(idle.refusal(), None);
+    let empty = MachineCapacity {
+        running_agents: 0,
+        ..short
+    };
+    assert_eq!(
+        empty.refusal(),
+        None,
+        "the budget admits with nothing running"
+    );
+    let full = MachineCapacity {
+        running_agents: 4,
+        memory_budget_bytes: None,
+        ..base
+    };
+    assert_eq!(
+        full.refusal(),
+        Some(CapacityRefusal::Count {
+            running_agents: 4,
+            agent_cap: 4
+        })
+    );
+}

@@ -1503,7 +1503,8 @@ fn is_zero(count: &u32) -> bool {
 impl MachineCapacity {
     /// The limit this report says would refuse a launch, after the machine
     /// takes back its idle local agents: none while any is idle, and the
-    /// memory budget only while the host is short.
+    /// memory budget only while the host is short and an agent is running
+    /// (the machine's budget always admits with nothing running).
     #[must_use]
     pub fn refusal(&self) -> Option<CapacityRefusal> {
         if self.reclaimable_agents > 0 {
@@ -1517,7 +1518,9 @@ impl MachineCapacity {
         }
         self.memory_budget_bytes
             .filter(|budget| {
-                self.charged_memory_bytes >= *budget && self.host_memory_short != Some(false)
+                self.running_agents > 0
+                    && self.charged_memory_bytes >= *budget
+                    && self.host_memory_short != Some(false)
             })
             .map(|budget| CapacityRefusal::Memory {
                 charged_memory_bytes: self.charged_memory_bytes,

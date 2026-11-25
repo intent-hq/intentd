@@ -511,7 +511,7 @@ async fn machines_availability(svc: &Services) -> Result<PlatformAvailability> {
         ) && row
             .capabilities
             .as_ref()
-            .is_none_or(|caps| caps.capacity.running_agents < caps.capacity.agent_cap);
+            .is_none_or(|caps| caps.capacity.refusal().is_none());
         if usable && !available.contains(&platform) {
             available.push(platform);
         }
