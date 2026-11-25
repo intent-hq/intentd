@@ -436,6 +436,7 @@ impl RunningTurn {
                 ws_port: 0,
                 tls_dir: dir.path().join("tls"),
                 insecure: true,
+                public_hosts: Vec::new(),
             })
             .await
             .unwrap();
