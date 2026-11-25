@@ -310,6 +310,7 @@ mod tests {
         let fence = keeper.fence();
         keeper.release(&store).await;
         assert!(!fence.is_fired());
+        // fixed-deadline: allow — an observation window: asserts the fence stays unfired
         assert!(
             tokio::time::timeout(Duration::from_millis(50), fence.fired())
                 .await
