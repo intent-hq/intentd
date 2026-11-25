@@ -114,7 +114,7 @@ pub fn merge_agent_queue(
         );
     }
     for (position, row) in merged.iter_mut().enumerate() {
-        row.position = i64::try_from(position).expect("queue position fits in i64");
+        row.position = i64::try_from(position).unwrap_or(i64::MAX);
         row.agent_id = agent_id.clone();
     }
     merged

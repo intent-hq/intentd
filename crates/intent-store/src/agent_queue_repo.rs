@@ -182,6 +182,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(
+            clippy::unused_async,
+            reason = "only the Postgres backend awaits; the signature is shared"
+        )
+    )]
     pub async fn refresh_agent_queue(
         &self,
         agent_id: &AgentId,
