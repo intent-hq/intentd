@@ -69,7 +69,7 @@ const GUARD_SQL: &str = "SELECT 1 FROM lease \
 impl PgStore {
     pub async fn lease_acquire(&self, lease: &Lease) -> Result<Option<u64>> {
         let ttl = ttl_millis(lease.ttl())?;
-        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
+        let mut tx: WriteTx = self.begin_write_as(Fence::LeaseOnly).await?;
         let token = sqlx::query_scalar::<_, i64>(ACQUIRE_SQL)
             .bind(self.tenant())
             .bind(lease.scope())
@@ -86,7 +86,7 @@ impl PgStore {
 
     pub async fn lease_renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
         let ttl = ttl_millis(ttl)?;
-        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
+        let mut tx: WriteTx = self.begin_write_as(Fence::LeaseOnly).await?;
         let kept = sqlx::query(RENEW_SQL)
             .bind(self.tenant())
             .bind(lease.scope())
@@ -104,7 +104,7 @@ impl PgStore {
     }
 
     pub async fn lease_release(&self, lease: &Lease) -> Result<()> {
-        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
+        let mut tx: WriteTx = self.begin_write_as(Fence::LeaseOnly).await?;
         sqlx::query(RELEASE_SQL)
             .bind(self.tenant())
             .bind(lease.scope())
