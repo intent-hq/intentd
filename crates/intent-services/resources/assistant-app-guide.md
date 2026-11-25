@@ -848,9 +848,10 @@ output, and the X dismisses a failure. When the
 home has been offline for a minute, a banner in the workspace and a **Home unavailable**
 marker on its Home card say so: chats, notes and script logs keep working, and file, diff
 and terminal panels show the reason instead. **Wait** tries to reconnect it. **Move home…**
-(owner and managers; also in the workspace header's menu) moves the home to an agent's
-machine or sandbox, to a machine from the list, or to a cloud entry (a new sandbox),
-starting from the last backup. When the old home is unavailable the dialog first warns that its changes
+(owner and managers; also in the workspace header's menu) moves the home to a machine,
+starting from the last backup. The dialog lists each machine once, in the Settings →
+Machines order, with the agents that run on it; a cloud entry starts a new sandbox, and an
+agent's sandbox has its own row. Older versions may differ. When the old home is unavailable the dialog first warns that its changes
 after that backup are not on the new home. While the home moves, files, terminals and
 scripts pause; if the move fails, the old home stays. Agents that worked in the old home
 stay on their machine and continue in their own copy, with a notice. A banner also warns
