@@ -3,8 +3,9 @@
 //! another instance, a workspace on head reports its repository (the
 //! metadata prewarm fills its owner and name), a file edit in it refreshes
 //! its git status (`changes:git-status`), and an edit of the tenant's
-//! `config.toml` is applied without a restart. All of it stops with the
-//! tenant's fence.
+//! `config.toml` is applied without a restart. A workspace whose home is on
+//! a machine gets its status from that home only: head's own copy of it is
+//! neither watched nor scanned. All of it stops with the tenant's fence.
 //!
 //! Needs `--features postgres` and `INTENT_STORE_TEST_PG_URL` (the
 //! `store-postgres` CI job sets both); skipped without the URL unless
@@ -17,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::events::CHANGES_GIT_STATUS;
-use intent_core::WorkspaceId;
+use intent_core::node_link::{HomeEvent, HomeEvents};
+use intent_core::{HomeId, HomeState, WorkspaceHome, WorkspaceId};
 use intent_services::SubscriptionFilter;
 use intent_store::postgres::{self, PgPool, SecretKeyring};
 use intent_store::OrchestratorOnly;
@@ -119,6 +121,9 @@ async fn stop(mut served: ServedTenant) {
     );
 }
 
+/// The machine the homed workspace lives on.
+const MACHINE: &str = "machine-1";
+
 fn rtk_enabled(served: &ServedTenant) -> bool {
     served
         .services()
@@ -171,6 +176,46 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
         })
         .await
         .expect("seed the workspace");
+    // A workspace homed on a machine, with a clean copy of its repository
+    // left on head.
+    let homed_repo = data.path().join("homed");
+    repository(&homed_repo);
+    let homed = WorkspaceId(format!("ws-homed-{run}"));
+    let home_id = HomeId::from(format!("home-{run}").as_str());
+    let now = intent_core::now_iso();
+    first
+        .services()
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: homed.clone(),
+            title: "Homed".into(),
+            branch: "main".into(),
+            repository_path: Some(homed_repo.to_string_lossy().into_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("seed the homed workspace");
+    first
+        .services()
+        .store()
+        .set_workspace_home(
+            &homed,
+            &WorkspaceHome {
+                home_id: home_id.clone(),
+                node_id: Some(MACHINE.to_owned()),
+                cloud_machine_id: None,
+                name: "machine".into(),
+                state: HomeState::Attached,
+                since: now,
+                last_backup_at: None,
+                backup_warning: false,
+                setup: None,
+            },
+        )
+        .await
+        .expect("home the workspace on a machine");
     stop(first).await;
 
     // The tenant restarts on a second instance, over the same files.
@@ -178,6 +223,11 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
     let mut git_status = second.bus().subscribe(SubscriptionFilter {
         event_types: vec![CHANGES_GIT_STATUS.to_owned()],
         workspace_id: Some(workspace.as_str().to_owned()),
+        ..SubscriptionFilter::default()
+    });
+    let mut homed_status = second.bus().subscribe(SubscriptionFilter {
+        event_types: vec![CHANGES_GIT_STATUS.to_owned()],
+        workspace_id: Some(homed.as_str().to_owned()),
         ..SubscriptionFilter::default()
     });
 
@@ -200,11 +250,28 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
 
     // Its git status: an edit in the checkout refreshes it. The watch goes
     // live in the background, so the edit repeats until the refresh comes.
+    // Each round the homed workspace's head copy is edited too, and its
+    // machine relays a file event (its home is dirty, head's copy clean).
     let refreshed = tokio::time::timeout(wait(), async {
         let mut edit = 0;
         loop {
             edit += 1;
             std::fs::write(repo.join("notes.txt"), format!("edit {edit}\n")).unwrap();
+            std::fs::write(homed_repo.join("README.md"), "base\n").unwrap();
+            second
+                .services()
+                .publish_home_events(
+                    MACHINE,
+                    HomeEvents {
+                        workspace_id: homed.clone(),
+                        home_id: home_id.clone(),
+                        events: vec![HomeEvent {
+                            event_type: "file:changed".into(),
+                            data: serde_json::json!({ "path": "notes.txt" }),
+                        }],
+                    },
+                )
+                .await;
             // timing-guard: one edit per debounce window while the watch registers
             // fixed-deadline: allow — the re-edit interval, not a hang guard; `wait()` bounds the loop
             let next = tokio::time::timeout(Duration::from_secs(2), git_status.recv()).await;
@@ -218,6 +285,17 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
     .await
     .expect("an edit in the workspace refreshes its git status");
     assert_eq!(refreshed.workspace_id, workspace);
+    // Longer than the refresher's debounce: a head scan of the homed
+    // workspace would have published by now.
+    let homed_scan = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        homed_status.recv(),
+    )
+    .await;
+    assert!(
+        homed_scan.is_err(),
+        "head published a git status for a workspace homed on a machine: {homed_scan:?}"
+    );
 
     // Its config: an edit of the tenant's config.toml applies at once.
     let before = rtk_enabled(&second);

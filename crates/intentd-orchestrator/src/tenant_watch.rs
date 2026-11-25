@@ -1,17 +1,18 @@
 //! A tenant's repository context, file watchers and `config.toml` live
 //! reload, as `intentd serve` starts them for its one backend.
 //!
-//! The watchers see the checkouts on head: workspaces over a repository
-//! here, and head's copies. A workspace whose home is on a machine is
-//! watched there (the machine's `HomeWatches`): its file and git-status
-//! events arrive as `homeEvents` and are published for the workspace
-//! (`Services::publish_home_events`), so head does not watch those files.
+//! The watchers see the checkouts on head. A workspace whose home is on a
+//! machine is watched there (the machine's `HomeWatches`): its file and
+//! git-status events arrive as `homeEvents` and are published for the
+//! workspace (`Services::publish_home_events`). Head neither watches nor
+//! scans its own copy of such a workspace ([`HeadCheckouts`]): a scan of
+//! that stale copy would overwrite the home's status.
 
 use std::sync::Arc;
 
 use intent_app::tenant::Admission;
 use intent_core::tenant_fence::SelfFence;
-use intent_core::WorkspaceApi;
+use intent_core::{BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId, WorkspaceListFilter};
 use intent_services::{
     ConfigWatcher, EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry,
 };
@@ -44,7 +45,7 @@ pub(crate) fn start(
         prewarm.prewarm_repository_metadata().await;
     }));
 
-    let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    let api: Arc<dyn WorkspaceApi> = Arc::new(HeadCheckouts(services.clone()));
     let git_status_refresher = Arc::new(GitStatusRefresher::start_with_presence(
         bus.clone(),
         api.clone(),
@@ -136,5 +137,52 @@ fn start_config_reload(
             );
             None
         }
+    }
+}
+
+/// The tenant's workspaces as head's watchers see them: a workspace homed on
+/// a machine is left out of the list and reads as remote, so the registry
+/// does not watch head's copy and the git-status refresher does not scan it,
+/// whatever triggers a refresh (a relayed home file event, a head watch).
+struct HeadCheckouts(Services);
+
+impl HeadCheckouts {
+    async fn homed_on_machine(&self, id: &WorkspaceId) -> Result<bool> {
+        Ok(self
+            .0
+            .store()
+            .get_workspace_home(id)
+            .await?
+            .is_some_and(|home| on_machine(&home)))
+    }
+}
+
+fn on_machine(home: &intent_core::WorkspaceHome) -> bool {
+    home.node_id.is_some() || home.cloud_machine_id.is_some()
+}
+
+impl WorkspaceApi for HeadCheckouts {
+    fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        Box::pin(async move {
+            let mut workspace = WorkspaceApi::get_workspace(&self.0, id.clone()).await?;
+            if self.homed_on_machine(&id).await? {
+                workspace.is_remote = true;
+            }
+            Ok(workspace)
+        })
+    }
+
+    fn list_workspaces(
+        &self,
+        filter: WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        Box::pin(async move {
+            let homes = self.0.store().list_workspace_homes().await?;
+            let workspaces = WorkspaceApi::list_workspaces(&self.0, filter).await?;
+            Ok(workspaces
+                .into_iter()
+                .filter(|workspace| !homes.get(&workspace.id).is_some_and(on_machine))
+                .collect())
+        })
     }
 }
