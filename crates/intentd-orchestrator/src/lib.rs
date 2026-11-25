@@ -49,6 +49,8 @@ pub mod secrets;
 pub mod serve;
 #[cfg(feature = "postgres")]
 pub mod settings;
+#[cfg(feature = "postgres")]
+mod tenant_watch;
 
 /// The Postgres URL the orchestrator connects to (may carry a password).
 pub const POSTGRES_URL_ENV: &str = "INTENTD_POSTGRES_URL";
