@@ -73,6 +73,14 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { None })
     }
 
+    /// Whether this daemon's watcher registry watches `id`'s checkout on its
+    /// own disk. An orchestrator answers `false` for a workspace homed on a
+    /// machine: the home watches it and relays its events. `true` by default.
+    fn watches_checkout_here(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        let _ = id;
+        Box::pin(async { true })
+    }
+
     /// Whether this daemon runs in node mode (`intentd serve --node` or
     /// `daemon.mode = "node"`): the transport then serves only
     /// `NODE_MODE_METHODS` and refuses everything else with `node-mode`.

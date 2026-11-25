@@ -141,9 +141,10 @@ fn start_config_reload(
 }
 
 /// The tenant's workspaces as head's watchers see them: a workspace homed on
-/// a machine is left out of the list and reads as remote, so the registry
-/// does not watch head's copy and the git-status refresher does not scan it,
-/// whatever triggers a refresh (a relayed home file event, a head watch).
+/// a machine is left out of the list, is not watched here when it is
+/// created, opened or unarchived (its watches stop when its home moves to a
+/// machine), and reads as remote, so the git-status refresher does not scan
+/// head's copy whatever triggers a refresh.
 struct HeadCheckouts(Services);
 
 impl HeadCheckouts {
@@ -169,6 +170,18 @@ impl WorkspaceApi for HeadCheckouts {
                 workspace.is_remote = true;
             }
             Ok(workspace)
+        })
+    }
+
+    fn watches_checkout_here(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            match self.homed_on_machine(&id).await {
+                Ok(homed) => !homed,
+                Err(error) => {
+                    tracing::warn!(workspace = %id, %error, "workspace home read failed; not watching its checkout");
+                    false
+                }
+            }
         })
     }
 

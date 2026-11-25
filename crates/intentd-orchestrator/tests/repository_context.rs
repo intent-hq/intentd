@@ -329,3 +329,193 @@ async fn a_restarted_tenant_reports_its_repository_git_status_and_live_config() 
         "a fenced tenant reloads nothing"
     );
 }
+
+/// Add a workspace over the repository `repo` on head to the tenant's store.
+async fn seed_workspace(services: &intent_services::Services, id: &WorkspaceId, repo: &Path) {
+    let now = intent_core::now_iso();
+    services
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: id.clone(),
+            title: id.as_str().to_owned(),
+            branch: "main".into(),
+            repository_path: Some(repo.to_string_lossy().into_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Default::default()
+        })
+        .await
+        .expect("seed the workspace");
+}
+
+/// Home workspace `id` on [`MACHINE`].
+async fn home_on_machine(services: &intent_services::Services, id: &WorkspaceId, home: &HomeId) {
+    services
+        .store()
+        .set_workspace_home(
+            id,
+            &WorkspaceHome {
+                home_id: home.clone(),
+                node_id: Some(MACHINE.to_owned()),
+                cloud_machine_id: None,
+                name: "machine".into(),
+                state: HomeState::Attached,
+                since: intent_core::now_iso(),
+                last_backup_at: None,
+                backup_warning: false,
+                setup: None,
+            },
+        )
+        .await
+        .expect("home the workspace on a machine");
+}
+
+async fn publish_opened(served: &ServedTenant, id: &WorkspaceId) {
+    served
+        .bus()
+        .publish(&intent_store::NewEvent {
+            workspace_id: id.clone(),
+            timestamp: intent_core::now_iso(),
+            event_type: intent_core::events::WORKSPACE_OPENED.to_owned(),
+            actor: intent_services::system_actor(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({}),
+        })
+        .await
+        .expect("publish workspace:opened");
+}
+
+/// While the tenant serves, a workspace homed on a machine never gets a
+/// watch on head's copy: not when it is opened, and not when a workspace
+/// head already watches moves its home to a machine. Head publishes no file
+/// event for edits to those copies; the machine's relayed events still
+/// arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn head_does_not_watch_a_copy_of_a_workspace_homed_on_a_machine() {
+    let Some(pool) = pool().await else { return };
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let run = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let tenant = format!("homed-{run}");
+    let served = serve(&pool, &tenant, data.path(), &format!("only-{run}")).await;
+    let services = served.services().clone();
+    let mut files = served.bus().subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".to_owned()],
+        ..SubscriptionFilter::default()
+    });
+
+    // Opened while the tenant serves, already homed on a machine.
+    let opened = WorkspaceId(format!("ws-opened-{run}"));
+    let opened_repo = data.path().join("opened");
+    repository(&opened_repo);
+    let opened_home = HomeId::from(format!("home-opened-{run}").as_str());
+    seed_workspace(&services, &opened, &opened_repo).await;
+    home_on_machine(&services, &opened, &opened_home).await;
+    publish_opened(&served, &opened).await;
+
+    // Watched on head, then homed on a machine.
+    let moved = WorkspaceId(format!("ws-moved-{run}"));
+    let moved_repo = data.path().join("moved");
+    repository(&moved_repo);
+    seed_workspace(&services, &moved, &moved_repo).await;
+    publish_opened(&served, &moved).await;
+    home_on_machine(
+        &services,
+        &moved,
+        &HomeId::from(format!("home-moved-{run}").as_str()),
+    )
+    .await;
+    services.publish_workspace_home_changed(&moved).await;
+
+    // The control: a workspace on head, opened after both. Once an edit to
+    // it is seen, the registry has handled every event above.
+    let control = WorkspaceId(format!("ws-control-{run}"));
+    let control_repo = data.path().join("control");
+    repository(&control_repo);
+    seed_workspace(&services, &control, &control_repo).await;
+    publish_opened(&served, &control).await;
+
+    let mut seen = Vec::new();
+    tokio::time::timeout(wait(), async {
+        let mut edit = 0;
+        loop {
+            edit += 1;
+            for repo in [&opened_repo, &moved_repo, &control_repo] {
+                std::fs::write(repo.join("notes.txt"), format!("edit {edit}\n")).unwrap();
+            }
+            // fixed-deadline: allow — the re-edit interval, not a hang guard; `wait()` bounds the loop
+            let next = tokio::time::timeout(Duration::from_secs(2), files.recv()).await;
+            if let Ok(Some(batch)) = next {
+                let done = batch.iter().any(|event| event.workspace_id == control);
+                seen.extend(batch);
+                if done {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("head watches the control workspace's checkout");
+
+    // `moved` was watched until its home changed: drop what head published
+    // before then (and what it was still debouncing), then edit both copies
+    // again while the machine relays an edit in its home.
+    // fixed-deadline: allow — a settle window longer than the watcher's debounce; it only discards events
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(batch) = files.recv().await {
+            seen.extend(batch);
+        }
+    })
+    .await;
+    seen.retain(|event| event.workspace_id != moved);
+    for repo in [&opened_repo, &moved_repo] {
+        std::fs::write(repo.join("notes.txt"), "after\n").unwrap();
+    }
+    services
+        .publish_home_events(
+            MACHINE,
+            HomeEvents {
+                workspace_id: opened.clone(),
+                home_id: opened_home.clone(),
+                events: vec![HomeEvent {
+                    event_type: "file:changed".into(),
+                    data: serde_json::json!({ "path": "relayed.txt" }),
+                }],
+            },
+        )
+        .await;
+    // Longer than the file watcher's debounce: head's events for the homed
+    // copies would have arrived by now.
+    let _ = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while let Some(batch) = files.recv().await {
+                seen.extend(batch);
+            }
+        },
+    )
+    .await;
+    let relayed = |event: &intent_core::Event| event.data["path"] == "relayed.txt";
+    let from_head: Vec<_> = seen
+        .iter()
+        .filter(|event| {
+            (event.workspace_id == opened || event.workspace_id == moved) && !relayed(event)
+        })
+        .collect();
+    assert!(
+        from_head.is_empty(),
+        "head published file events for copies of workspaces homed on a machine: {from_head:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|event| event.workspace_id == opened && relayed(event)),
+        "the machine's relayed file event arrives"
+    );
+    served.fence().fire("test: done");
+}

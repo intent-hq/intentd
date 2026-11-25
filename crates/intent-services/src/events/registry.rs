@@ -436,6 +436,14 @@ fn archived_delta(ev: &Event) -> Option<bool> {
         .and_then(serde_json::Value::as_bool)
 }
 
+/// Whether a `workspace:updated` delta changes the workspace's home
+/// (`data.changes.home`).
+fn home_delta(ev: &Event) -> bool {
+    ev.data
+        .get("changes")
+        .is_some_and(|changes| changes.get("home").is_some())
+}
+
 /// Checkout presence state for the lifecycle loop (intent-hq/intent#7183):
 /// the root of every watched workspace and of every workspace whose root is
 /// currently missing, plus the shared transition log.
@@ -548,6 +556,9 @@ async fn lifecycle_loop(
                     .collect();
                 for ws_id in expired {
                     let p = pending.remove(&ws_id).expect("expired entry present");
+                    if !services.watches_checkout_here(ws_id.clone()).await {
+                        continue;
+                    }
                     tracing::warn!(
                         workspace = %ws_id,
                         "workspace setup completion not observed within {}s; starting watchers anyway",
@@ -581,6 +592,10 @@ async fn lifecycle_loop(
                     .collect();
                 for (ws_id, path) in missing {
                     if !probe.presence.observe(&ws_id, &path) {
+                        continue;
+                    }
+                    if !services.watches_checkout_here(ws_id.clone()).await {
+                        probe.forget(&ws_id);
                         continue;
                     }
                     start_watches(
@@ -657,6 +672,10 @@ async fn lifecycle_loop(
                     let Some(p) = pending.remove(&ws_id) else {
                         continue;
                     };
+                    if !services.watches_checkout_here(ws_id.clone()).await {
+                        tracing::debug!(workspace = %ws_id, "checkout watched on its home; not watching here");
+                        continue;
+                    }
                     start_watches(
                         &hub,
                         &common_watches,
@@ -674,6 +693,10 @@ async fn lifecycle_loop(
                     specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
+                    if !services.watches_checkout_here(ws_id.clone()).await {
+                        tracing::debug!(workspace = %ws_id, "checkout watched on its home; not watching here");
+                        continue;
+                    }
                     note_plain_folder(&ev, services.as_ref(), &mut plain).await;
                     let path = match resolve_path(&ev, services.as_ref()).await {
                         Some(p)
@@ -777,6 +800,10 @@ async fn lifecycle_loop(
                         tracing::debug!(workspace = %ws_id, "already watching; ignoring redundant unarchive delta");
                     }
                     Some(false) => {
+                        if !services.watches_checkout_here(ws_id.clone()).await {
+                            tracing::debug!(workspace = %ws_id, "checkout watched on its home; not watching here");
+                            continue;
+                        }
                         note_plain_folder(&ev, services.as_ref(), &mut plain).await;
                         let path = match resolve_path(&ev, services.as_ref()).await {
                             Some(p)
@@ -829,7 +856,22 @@ async fn lifecycle_loop(
                         skills.resume_workspace(ws_id.clone(), &path.clone());
                         specialists.resume_workspace(ws_id, &path);
                     }
-                    None => {}
+                    // A home that moved to a machine: the machine watches
+                    // the checkout from now on.
+                    None => {
+                        if home_delta(&ev) && !services.watches_checkout_here(ws_id.clone()).await {
+                            pending.remove(&ws_id);
+                            stop_watches(
+                                &mut file_watchers,
+                                &mut git_watchers,
+                                &ws_id,
+                                "checkout watched on its home",
+                            );
+                            probe.forget(&ws_id);
+                            skills.pause_workspace(&ws_id);
+                            specialists.pause_workspace(&ws_id);
+                        }
+                    }
                 },
                 _ => {}
             }
