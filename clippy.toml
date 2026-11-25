@@ -1,0 +1,2 @@
+# Brand names clippy::doc_markdown would otherwise ask to backtick; ".." keeps the defaults.
+doc-valid-idents = ["DeepSeek", "OTel", ".."]

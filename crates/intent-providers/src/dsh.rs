@@ -75,6 +75,9 @@ pub const UPLOAD_PACKAGE_PREFIXES: &[&str] = &[
 /// known. DSH cannot read it and refuses to start.
 const UNAVAILABLE_OVERLAY_ARG: &str = "intent-dsh-overlay-unavailable.yml";
 
+/// Unique per write, so concurrent first writes never share a temp file.
+static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `<home>/.local/share/intent/providers/dsh/intent-overlay.yml`.
 #[must_use]
 pub fn overlay_path_in(home: &Path) -> PathBuf {
@@ -95,7 +98,11 @@ pub fn ensure_overlay_in(home: &Path) -> std::io::Result<PathBuf> {
         .parent()
         .ok_or_else(|| std::io::Error::other("overlay path has no parent"))?;
     create_private_dir(dir)?;
-    let tmp = dir.join(format!(".intent-overlay-{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(
+        ".intent-overlay-{}-{}.tmp",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     write_private_file(&tmp, OVERLAY)?;
     std::fs::rename(&tmp, &path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -170,6 +177,7 @@ fn overlay_home() -> Option<PathBuf> {
 
 /// Unit tests never write into the real home.
 #[cfg(test)]
+#[expect(clippy::unnecessary_wraps, reason = "matches the non-test signature")]
 fn overlay_home() -> Option<PathBuf> {
     static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     Some(
@@ -359,6 +367,33 @@ mod tests {
         std::fs::write(&path, "[]\n").unwrap();
         ensure_overlay_in(home.path()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), OVERLAY);
+    }
+
+    #[test]
+    fn concurrent_first_writes_all_succeed_with_the_full_overlay() {
+        for _ in 0..20 {
+            let home = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Barrier::new(16);
+            let results: Vec<std::io::Result<PathBuf>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            ensure_overlay_in(home.path())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for result in results {
+                let path = result.expect("every concurrent write succeeds");
+                assert_eq!(std::fs::read_to_string(path).unwrap(), OVERLAY);
+            }
+            let leftovers = std::fs::read_dir(overlay_path_in(home.path()).parent().unwrap())
+                .unwrap()
+                .count();
+            assert_eq!(leftovers, 1, "no temp files are left behind");
+        }
     }
 
     #[cfg(unix)]

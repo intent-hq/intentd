@@ -92,6 +92,7 @@ const SITES: &[(&str, Class)] = &[
         PROBE,
     ),
     ("crates/intent-services/src/cursor_cli.rs", PROBE),
+    ("crates/intent-services/src/dsh_cli.rs", PROBE),
     ("crates/intent-services/src/enhance_ops.rs", Workload),
     ("crates/intent-services/src/host_exec.rs", Workload),
     ("crates/intent-services/src/installed_cli.rs", PROBE),

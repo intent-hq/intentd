@@ -4386,8 +4386,8 @@ impl AgentManager {
             crate::cursor_cli::check_cursor_cli_for_spawn(&status)?;
         }
         // DeepSeek Harness: refuse a `dsh` that is not DSH, or one whose
-        // composed profile would still upload sessions (`dsh_cli`). Blocking
-        // probe; the guard verdict is cached per binary and version.
+        // composed profile would still upload sessions (`dsh_cli`), judged
+        // under this launch's profile overlay. Blocking probe; cached.
         if opts.provider.id == intent_providers::dsh::PROVIDER_ID {
             let override_path = self
                 .services
@@ -4396,10 +4396,13 @@ impl AgentManager {
                 .paths
                 .get(intent_providers::dsh::PROVIDER_ID)
                 .cloned();
-            let binary = opts.provider_binary.map(Path::to_path_buf);
-            let status = tokio::task::spawn_blocking(move || match binary {
-                Some(path) => crate::dsh_cli::probe_dsh_cli_at(Some(path)),
-                None => crate::dsh_cli::probe_dsh_cli(override_path.as_deref()),
+            let binary = opts
+                .provider_binary
+                .map(Path::to_path_buf)
+                .or_else(|| crate::provider_models::dsh_binary(override_path.as_deref()));
+            let profile = opts.profile_env.cloned();
+            let status = tokio::task::spawn_blocking(move || {
+                crate::dsh_cli::probe_dsh_cli_at(binary, profile.as_ref())
             })
             .await
             .map_err(|e| Error::Internal(format!("DSH CLI probe task failed: {e}")))?;

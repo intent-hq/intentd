@@ -416,12 +416,14 @@ and `provider_models`.
   file, so a failed write fails closed. This is the one filesystem write in the args
   builder: every launch path (sessions, probes, one-shot completions) goes through it.
 - **Upload guard** — a patch for an absent row id is ignored, so a DSH rename could turn
-  uploads back on. Discovery and agent start run `dsh --version` (must be a bare semver:
+  uploads back on. Discovery, the model-list probe and agent start run `dsh --version` (must be a bare semver:
   another tool named `dsh` exists) and `dsh --profile acp --patch <overlay> --dump-config`;
   every row from a `@deepseek-ai/dsh-session-log-*` or `…-session-telemetry-*` package must
   read `disabled: true` (`dsh::check_dump_config`). Otherwise the row is unavailable
-  (`unavailableReason`) and agent start fails. The verdict is cached per binary and
-  version. Refresh `tests/fixtures/dsh-dump-config-*.txt` when verifying a new DSH.
+  (`unavailableReason`), the model probe never opens a session, and agent start fails.
+  The guard runs under the launch's composed env (`dsh_cli::launch_env`: profile overlay,
+  provider env, login-shell gap-fill, as in `intent_acp::spawn`). The verdict is cached
+  per binary, version, effective `DSH_*` env and DSH patch-file stamps. Refresh `tests/fixtures/dsh-dump-config-*.txt` when verifying a new DSH.
 - **Auth** — `authMethods` is empty; sign-in is a DeepSeek API key (`DEEPSEEK_API_KEY` in
   the daemon or login-shell env, or `$DSH_HOME/.credentials.yaml` / `.env`). The check
   reads presence only and starts no process. A signed-out `session/new` succeeds; the
