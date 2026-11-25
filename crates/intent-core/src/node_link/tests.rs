@@ -166,6 +166,7 @@ fn capabilities() -> MachineCapabilities {
                 visible: true,
                 status: ProviderStatus::SignedIn,
                 models: vec!["opus".into(), "sonnet".into()],
+                model_labels: std::collections::BTreeMap::new(),
                 models_stale: false,
             },
             ProviderCapability {
@@ -173,6 +174,7 @@ fn capabilities() -> MachineCapabilities {
                 visible: true,
                 status: ProviderStatus::CliMissing,
                 models: vec![],
+                model_labels: std::collections::BTreeMap::new(),
                 models_stale: true,
             },
         ],

@@ -58,6 +58,24 @@ pub(crate) fn provider_status(
     }
 }
 
+/// The display names of a `models.list` response by model id, leaving out
+/// a model whose name is empty or just its id.
+pub(crate) fn model_labels(response: &Value) -> std::collections::BTreeMap<String, String> {
+    response
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = ["id", "modelId", "value"]
+                .iter()
+                .find_map(|key| model.get(*key).and_then(Value::as_str))?;
+            let name = model.get("name").and_then(Value::as_str)?.trim();
+            (!name.is_empty() && name != id).then(|| (id.to_owned(), name.to_owned()))
+        })
+        .collect()
+}
+
 /// The model ids of a `models.list` response.
 pub(crate) fn model_ids(response: &Value) -> Vec<String> {
     response
@@ -102,6 +120,7 @@ impl Services {
                 .is_none(),
                 status: launch_status(&resolve_provider_launch(provider.id, &settings)),
                 models: Vec::new(),
+                model_labels: std::collections::BTreeMap::new(),
                 models_stale: true,
             })
             .collect()
@@ -178,25 +197,27 @@ impl Services {
             })
             .is_none();
             let status = provider_status(launch, sign_in, auth_failures.get(provider.id).copied());
-            let (models, models_stale) = if launch == ProviderStatus::Unknown {
+            let (models, model_labels, models_stale) = if launch == ProviderStatus::Unknown {
                 match self
                     .models_list_op(Some(provider.id.to_owned()), false)
                     .await
                 {
                     Ok(response) => (
                         model_ids(&response),
+                        model_labels(&response),
                         response.get("stale").and_then(Value::as_bool) == Some(true),
                     ),
-                    Err(_) => (Vec::new(), true),
+                    Err(_) => (Vec::new(), std::collections::BTreeMap::new(), true),
                 }
             } else {
-                (Vec::new(), false)
+                (Vec::new(), std::collections::BTreeMap::new(), false)
             };
             providers.push(ProviderCapability {
                 id: provider.id.to_owned(),
                 visible,
                 status,
                 models,
+                model_labels,
                 models_stale,
             });
         }
@@ -220,6 +241,20 @@ mod tests {
             npx_fallback_package: npx.then_some("pkg"),
             extra_env: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn model_labels_keep_only_real_names() {
+        let response = json!({ "models": [
+            { "id": "opus[1m]", "name": "Opus (1M context)" },
+            { "modelId": "plain", "name": "plain" },
+            { "id": "blank", "name": "  " },
+            { "id": "nameless" },
+        ]});
+        let labels = model_labels(&response);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels["opus[1m]"], "Opus (1M context)");
+        assert_eq!(model_ids(&response).len(), 4);
     }
 
     #[test]

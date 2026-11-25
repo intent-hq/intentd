@@ -1568,6 +1568,10 @@ pub struct ProviderCapability {
     pub visible: bool,
     pub status: ProviderStatus,
     pub models: Vec<String>,
+    /// Display names by model id, for the models the machine named. Absent
+    /// from an older machine and for a model it gave no name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_labels: std::collections::BTreeMap<String, String>,
     /// The model list is a cached one the machine could not refresh.
     pub models_stale: bool,
 }
