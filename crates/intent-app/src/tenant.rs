@@ -725,9 +725,12 @@ mod tests {
         tokio::task::yield_now().await;
         let second = recovery.clone();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), second.drain())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                second.drain()
+            )
+            .await
+            .is_err(),
             "a second drain waits for the held reconcile"
         );
 
