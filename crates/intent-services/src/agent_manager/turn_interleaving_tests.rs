@@ -463,13 +463,17 @@ async fn running_turn_two_stops_then_a_new_message() {
     run_cases(cases).await;
 }
 
-/// Review of intentd#3772: a Stop that chose turn A while the worker ended A
-/// and started the next queued message (B) still stops the agent: B is
-/// cancelled and the agent settles, instead of the Stop being dropped.
+/// Review of intentd#3772: a Stop that chose turn A while A ended, released
+/// its slot, and a new message claimed it as turn B, still stops the agent:
+/// B is cancelled and the agent settles, instead of the Stop being dropped.
 #[intent_test_macros::daemon_test]
 async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
     let (_tmp, actor, _sent) = fixture(Scenario::Running, "stop-across-boundary").await;
-    send(&actor.mgr, &actor.id, &actor.ws, BETA).await;
+    let turn_a = actor
+        .mgr
+        .slots
+        .holder(&actor.id)
+        .expect("turn A holds the slot");
 
     let pause = actor.mgr.turn_schedule.pause(TurnStep::InterruptObserved);
     let interrupt = tokio::spawn(actor.clone().act(Action::Interrupt));
@@ -481,8 +485,24 @@ async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
     .expect("the stop reaches its pause");
     let run = &actor.runs[0];
     run.finish.add_permits(1);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while actor.mgr.is_busy(&actor.id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
+    .await
+    .expect("turn A ends and releases its slot");
+    send(&actor.mgr, &actor.id, &actor.ws, BETA).await;
     run.wait_prompts(2).await;
-    assert!(all_prompts(run).contains(BETA), "{}", all_prompts(run));
+    let turn_b = actor
+        .mgr
+        .slots
+        .holder(&actor.id)
+        .expect("turn B holds the slot");
+    assert_ne!(turn_a, turn_b, "a new admission holds the slot");
 
     pause.resume.notify_one();
     interrupt.await.unwrap().unwrap();
@@ -494,5 +514,5 @@ async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
         "the stop cancelled the turn running when it acted: {}",
         all_prompts(run)
     );
-    assert!(!actor.mgr.is_busy(&actor.id), "the stop ended the turn");
+    assert!(!actor.mgr.is_busy(&actor.id), "the stop ended turn B");
 }
