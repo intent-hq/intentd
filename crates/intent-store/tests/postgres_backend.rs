@@ -94,6 +94,8 @@ mod tenant_lease;
 mod tenant_secrets;
 #[path = "postgres_backend/usage_metrics.rs"]
 mod usage_metrics;
+#[path = "postgres_backend/work_claims.rs"]
+mod work_claims;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
 #[path = "postgres_backend/writer_lock.rs"]

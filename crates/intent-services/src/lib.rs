@@ -1720,7 +1720,7 @@ pub struct Services {
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
-/// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
+/// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage_claimed`])
 /// so a single sweep never monopolizes `SQLite` pool slots: a real sleep (not a
 /// bare `yield_now`) lets queued interactive acquires win the slot between
 /// workspaces (intent-hq/monorepo#703).
@@ -8004,7 +8004,20 @@ impl Services {
     /// pausing [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so the
     /// sweep never monopolizes `SQLite` pool slots (intent-hq/monorepo#703).
     /// Errors are logged per workspace and never abort the sweep.
+    #[cfg(test)]
     async fn scan_all_token_usage(&self) {
+        self.scan_all_token_usage_claimed(&mut None).await;
+    }
+
+    /// The token-usage sweep under the work claim in `held`
+    /// (see `work_claims`): before each workspace after the first it renews
+    /// the claim once half its TTL has passed, and stops the sweep when the
+    /// claim is lost or cannot be renewed. Returns whether the sweep ran to
+    /// the end.
+    async fn scan_all_token_usage_claimed(
+        &self,
+        held: &mut Option<intent_store::WorkClaim>,
+    ) -> bool {
         let workspaces = match self
             .store
             .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
@@ -8013,10 +8026,13 @@ impl Services {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "token usage scan: listing workspaces failed");
-                return;
+                return false;
             }
         };
-        for ws in workspaces {
+        for (i, ws) in workspaces.into_iter().enumerate() {
+            if i > 0 && !self.keep_work_claim(held).await {
+                return false;
+            }
             if let Err(e) = self.scan_workspace_token_usage(&ws.id).await {
                 tracing::warn!(
                     workspace = %ws.id.as_str(),
@@ -8028,6 +8044,25 @@ impl Services {
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
+        true
+    }
+
+    /// One tick of the token-usage loop: hold the `token-usage-scan` work
+    /// claim (renew it, or take it for `ttl`) and sweep, or skip the tick
+    /// when another process holds the claim. Returns whether it swept.
+    pub(crate) async fn token_usage_scan_tick(
+        &self,
+        held: &mut Option<intent_store::WorkClaim>,
+        ttl: std::time::Duration,
+    ) -> bool {
+        if !self
+            .hold_work_claim(held, work_claims::TOKEN_USAGE_SCAN_WORK, ttl)
+            .await
+        {
+            return false;
+        }
+        self.scan_all_token_usage_claimed(held).await;
+        true
     }
 
     /// Spawn the daemon-internal periodic token-usage **reconciliation** loop
@@ -8040,8 +8075,12 @@ impl Services {
     /// never regresses a live-updated tally to zeros. Each sweep pauses
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
     /// monopolizes `SQLite` pool slots. The first sweep runs after one
-    /// `interval`; missed ticks are skipped (no pile-up). Returns the task
-    /// handle so the composition root can hold/abort it.
+    /// `interval`; missed ticks are skipped (no pile-up). Each tick runs
+    /// under the `token-usage-scan` work claim (TTL two intervals): the
+    /// holder keeps it across ticks and a process without it skips the tick,
+    /// so processes sharing a tenant sweep once per interval between them. A
+    /// clean stop releases the claim; an abort lets it lapse. Returns the
+    /// task handle so the composition root can hold/abort it.
     #[must_use]
     pub fn spawn_token_usage_scan_loop(
         &self,
@@ -8053,14 +8092,17 @@ impl Services {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
             ticker.tick().await;
+            let ttl = interval.saturating_mul(2);
+            let mut held = None;
             loop {
                 tokio::select! {
                     biased;
                     () = services.settings_tasks.closed() => break,
                     _ = ticker.tick() => {}
                 }
-                services.scan_all_token_usage().await;
+                services.token_usage_scan_tick(&mut held, ttl).await;
             }
+            services.release_held_work_claim(held).await;
         })
     }
 
@@ -38842,6 +38884,7 @@ pub mod metrics;
 #[cfg(test)]
 mod node_mode_tests;
 mod tracked_changes_sweep;
+mod work_claims;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
