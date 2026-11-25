@@ -1,6 +1,6 @@
 [package]
 name = "intent-linear"
-version = "0.11.293"
+version = "0.11.294"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

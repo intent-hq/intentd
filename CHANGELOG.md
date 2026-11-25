@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.294] - 2026-11-25
+
+### 📚 Documentation
+
+- *(app-guide)* Describe the single Move home machine list ([#3767](https://github.com/intent-hq/intentd/pull/3767))
+
+
 ## [0.11.293] - 2026-11-25
 
 ### 🐛 Bug Fixes
