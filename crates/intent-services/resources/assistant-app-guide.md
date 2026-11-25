@@ -850,9 +850,10 @@ marker on its Home card say so: chats, notes and script logs keep working, and f
 and terminal panels show the reason instead. **Wait** tries to reconnect it. **Move home…**
 (owner and managers; also in the workspace header's menu) moves the home to a machine,
 starting from the last backup. The dialog lists each machine once, in the Settings →
-Machines order, with the agents that run on it; a cloud entry starts a new sandbox, and an
-agent's sandbox has its own row. Older versions may differ. When the old home is unavailable the dialog first warns that its changes
-after that backup are not on the new home. While the home moves, files, terminals and
+Machines order, with the agents that run on it. A cloud entry starts a new sandbox; an
+agent's sandbox has its own row after its cloud entry. Older versions may differ. When the
+old home is unavailable the dialog first warns that its changes after that backup are not
+on the new home. While the home moves, files, terminals and
 scripts pause; if the move fails, the old home stays. Agents that worked in the old home
 stay on their machine and continue in their own copy, with a notice. A banner also warns
 when a home's backups keep failing. A cloud home shows **Starting home…** while its
