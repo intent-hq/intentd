@@ -125,6 +125,11 @@ pub trait RuntimeServicesExt {
     /// Start the loop that republishes the host execution context when its
     /// inputs change.
     fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()>;
+
+    /// Release the machine-run registry's hooks, which hold these
+    /// `Services`, for good: for a tenant that stops while the process
+    /// lives on. A registry built later (by a manager) has no hooks.
+    fn release_machine_runs(&self);
 }
 
 impl RuntimeServicesExt for Services {
@@ -138,6 +143,13 @@ impl RuntimeServicesExt for Services {
 
     fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
         HostExecutionExt::spawn_execution_context_loop(self)
+    }
+
+    fn release_machine_runs(&self) {
+        self.runtime()
+            .machine_runs
+            .get_or_init(script_ops::machine_runs::MachineRuns::released)
+            .release_hooks();
     }
 }
 
@@ -2048,6 +2060,45 @@ mod merge_summary_page_tests {
         assert_eq!(
             page["nextCursor"], "c",
             "no machine rows: the stored page as is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod release_machine_runs_tests {
+    use std::sync::Arc;
+
+    use super::{RuntimeServicesExt as _, RuntimeStateExt as _};
+    use intent_services::feature_api::test_support::fixtures::TempDb;
+    use intent_services::feature_api::Services;
+
+    /// A release before the machine-run registry exists (a tenant fenced
+    /// before its scripts were hydrated) still keeps a later manager (the
+    /// fence's own script shutdown builds one) from capturing the
+    /// `Services` in new hooks.
+    #[tokio::test]
+    async fn a_manager_built_after_the_release_does_not_keep_the_services() {
+        let tmp = TempDb::new();
+        let secrets: Arc<dyn intent_core::SecretStore> = Arc::new(
+            intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+        );
+        let alive = Arc::downgrade(&secrets);
+        let svc = crate::test_runtime::with_runtime(Services::new_isolated(
+            intent_store::Store::open(&tmp.path).await.unwrap(),
+        ))
+        .with_secret_store(secrets);
+
+        svc.release_machine_runs();
+        let manager = svc.script_manager();
+        assert!(
+            manager.machine_runs().is_some(),
+            "the released registry stays installed"
+        );
+        drop(manager);
+        drop(svc);
+        assert!(
+            alive.upgrade().is_none(),
+            "nothing captured the Services after the release"
         );
     }
 }

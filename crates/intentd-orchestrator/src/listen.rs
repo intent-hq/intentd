@@ -254,7 +254,7 @@ struct StatusControl {
     host: HostEnvironment,
     /// Weak: the listener owns this control, so a strong reference would
     /// keep a stopped listener (and the tenant's `Services`) alive. The
-    /// strong one is [`ListenersStop`]'s.
+    /// strong one is [`ListenersStop`]'s until they stop.
     ws: Arc<OnceLock<std::sync::Weak<WsApiServer>>>,
     /// The WSS port once bound; for the synchronous [`SystemControl::status`].
     port: Arc<OnceLock<u16>>,
@@ -517,6 +517,7 @@ impl SystemControl for StatusControl {
 pub struct ClientListeners {
     stop: ListenersStop,
     ws_port: u16,
+    fingerprint: Option<String>,
     socket_path: PathBuf,
     socket: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -524,25 +525,46 @@ pub struct ClientListeners {
 /// Stops both listeners; cheap to clone.
 #[derive(Clone)]
 pub struct ListenersStop {
-    ws: WsApiServer,
-    /// What the status control reaches weakly; dropped with the last clone.
-    _status_ws: Arc<WsApiServer>,
-    stop_socket: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Taken by the first [`Self::stop`], so held handles do not keep a
+    /// stopped tenant's `Services` alive.
+    running: Arc<std::sync::Mutex<Option<Running>>>,
     stopped: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// What serves until the listeners stop.
+struct Running {
+    /// The only strong handle: the status control and the pairing reach
+    /// it weakly.
+    ws: Arc<WsApiServer>,
+    stop_socket: tokio::sync::oneshot::Sender<()>,
+    /// Its client-event publisher holds the tenant's API until stopped,
+    /// and the tenant's `Services` hold the registry.
+    reverse: Arc<PrimaryReverseRegistry>,
 }
 
 impl ListenersStop {
     /// Stop accepting on both listeners and close their connections.
-    /// Idempotent.
+    /// Idempotent: a later call waits until the first one is done.
     pub async fn stop(&self) {
-        self.ws.stop().await;
-        let stop = self
-            .stop_socket
+        let running = self
+            .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(stop) = stop {
-            let _ = stop.send(());
+        let Some(Running {
+            ws,
+            stop_socket,
+            reverse,
+        }) = running
+        else {
+            self.stopped().await;
+            return;
+        };
+        ws.stop().await;
+        drop(ws);
+        let _ = stop_socket.send(());
+        if let Err(error) = reverse.shutdown_publisher().await {
+            tracing::warn!(%error, "the client-event publisher did not stop cleanly");
         }
         self.stopped.send_replace(true);
     }
@@ -570,7 +592,7 @@ impl ClientListeners {
     /// The pinned SHA-256 certificate fingerprint; `None` when insecure.
     #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
-        self.stop.ws.fingerprint()
+        self.fingerprint.as_deref()
     }
 
     /// A handle that stops both listeners.
@@ -654,12 +676,12 @@ pub async fn start_client_listeners_with_public_hosts(
         .await
         .map_err(|e| format!("host environment: {e}"))?;
     let port_slot = Arc::new(OnceLock::new());
-    let status_ws_slot = Arc::new(OnceLock::new());
+    let ws_slot = Arc::new(OnceLock::new());
     let sample = Arc::new(std::sync::Mutex::new(UsageSample::default()));
     let control: Arc<dyn SystemControl> = Arc::new(StatusControl {
         services: weak_services,
         host: host.clone(),
-        ws: status_ws_slot.clone(),
+        ws: ws_slot.clone(),
         port: port_slot.clone(),
         started: std::time::Instant::now(),
         sample: sample.clone(),
@@ -691,7 +713,7 @@ pub async fn start_client_listeners_with_public_hosts(
             tls_dir: config.tls_dir.clone(),
             tokens: (*tokens).clone(),
             host,
-            ws: status_ws_slot.clone(),
+            ws: ws_slot.clone(),
             public_hosts,
         });
         let mut ws = WsApiServer::new_with_reverse(
@@ -721,8 +743,8 @@ pub async fn start_client_listeners_with_public_hosts(
         .start()
         .await
         .map_err(|e| format!("WSS listener on port {}: {e}", config.ws_port))?;
-    let status_ws = Arc::new(ws.clone());
-    let _ = status_ws_slot.set(Arc::downgrade(&status_ws));
+    let ws = Arc::new(ws);
+    let _ = ws_slot.set(Arc::downgrade(&ws));
     let _ = port_slot.set(ws_port);
 
     let socket_path = config.socket_path.clone();
@@ -733,6 +755,7 @@ pub async fn start_client_listeners_with_public_hosts(
     let mut socket = tokio::spawn({
         let socket_path = socket_path.clone();
         let bus = bus.clone();
+        let reverse_for_socket = reverse.clone();
         async move {
             intent_transport::serve_uds_with_connections(
                 api,
@@ -740,7 +763,7 @@ pub async fn start_client_listeners_with_public_hosts(
                 &socket_path,
                 Some(control),
                 pairing,
-                reverse,
+                reverse_for_socket,
                 limiter,
                 Some(hook),
                 async {
@@ -752,6 +775,7 @@ pub async fn start_client_listeners_with_public_hosts(
     });
     if let Err(error) = wait_for_socket(&socket_path, &mut socket).await {
         ws.stop().await;
+        let _ = reverse.shutdown_publisher().await;
         return Err(error);
     }
     tracing::info!(
@@ -760,10 +784,13 @@ pub async fn start_client_listeners_with_public_hosts(
         secure = !config.insecure,
         "serving the default tenant's clients"
     );
+    let fingerprint = ws.fingerprint().map(str::to_owned);
     let stop = ListenersStop {
-        ws,
-        _status_ws: status_ws,
-        stop_socket: Arc::new(std::sync::Mutex::new(Some(stop_socket))),
+        running: Arc::new(std::sync::Mutex::new(Some(Running {
+            ws,
+            stop_socket,
+            reverse,
+        }))),
         stopped: Arc::new(tokio::sync::watch::channel(false).0),
     };
     tokio::spawn(sample_usage(
@@ -774,6 +801,7 @@ pub async fn start_client_listeners_with_public_hosts(
     Ok(ClientListeners {
         stop,
         ws_port,
+        fingerprint,
         socket_path,
         socket,
     })

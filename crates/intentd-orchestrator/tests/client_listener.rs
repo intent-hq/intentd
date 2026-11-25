@@ -181,6 +181,73 @@ async fn closing_the_tenant_connections_ends_both_listeners_clients() {
     listeners.stop().await;
 }
 
+/// Stopped listeners that are still held (`main` holds them for the life
+/// of the process) do not keep the tenant's `Services` alive.
+#[tokio::test]
+async fn stopped_listeners_free_the_tenant_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = intent_store::Store::open(&dir.path().join("db.sqlite"))
+        .await
+        .unwrap();
+    let bus = EventBus::new(store.clone());
+    let reverse = Arc::new(PrimaryReverseRegistry::new());
+    let secrets: Arc<dyn intent_services::SecretStore> = Arc::new(
+        intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+    );
+    let tenant_alive = Arc::downgrade(&secrets);
+    let services = Services::new_isolated(store)
+        .with_event_bus(bus.clone())
+        .with_reverse_dispatch(reverse.clone())
+        .with_secret_store(secrets)
+        .with_workspaces_root(dir.path().join("workspaces"));
+    let connections = ClientConnections::default();
+    let listeners = start_client_listeners(
+        &config(dir.path(), false),
+        &services,
+        &bus,
+        reverse,
+        &connections,
+    )
+    .await
+    .unwrap();
+    let fingerprint = listeners.fingerprint().unwrap().to_owned();
+    let token = services
+        .secret_source()
+        .load(TOKEN_ACCOUNT)
+        .unwrap()
+        .unwrap();
+    let mut ws = wss(listeners.ws_port(), &fingerprint, Some(&token))
+        .await
+        .unwrap();
+    result(
+        &ws_rpc(
+            &mut ws,
+            1,
+            "client.hello",
+            json!({ "clientId": "web-leak", "capabilities": {} }),
+        )
+        .await,
+    );
+    let mut uds = Uds::connect(listeners.socket_path()).await;
+    result(&uds.rpc(1, "system.status", json!({})).await);
+    until("both connections to join the tenant", || {
+        connections.len() == 2
+    })
+    .await;
+
+    let _ = connections.close_all();
+    listeners.stopper().stop().await;
+    ws_ends(&mut ws).await;
+    uds.ends().await;
+    drop(services);
+    drop(bus);
+    until("the tenant's Services to be freed", || {
+        tenant_alive.upgrade().is_none()
+    })
+    .await;
+    drop(listeners);
+}
+
 #[tokio::test]
 async fn the_insecure_dev_seat_serves_plain_ws_without_a_token() {
     let dir = tempfile::tempdir().unwrap();
@@ -462,5 +529,73 @@ mod postgres {
         assert!(refused_late(&late), "{late:?}");
         assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
         listeners.stop().await;
+    }
+
+    /// Once a Postgres tenant stops, its stopped client listeners (still
+    /// held, as `main` holds them) do not keep its `Services` alive.
+    // Multi-thread: the tenant's secret store needs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_tenant_is_freed_though_its_listeners_are_held() {
+        let Some(pool) = pool().await else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = format!("listener-{}", uuid::Uuid::new_v4().simple());
+        let mut served = serve_tenant(
+            pool.clone(),
+            &tenant,
+            dir.path(),
+            &format!("orchestrator-test-{tenant}"),
+            LeaseTiming::default(),
+            std::sync::Arc::new(
+                intent_store::postgres::SecretKeyring::new("test", &[0x5a; 32]).unwrap(),
+            ),
+            OrchestratorOnly::for_tests(),
+        )
+        .await
+        .expect("serve the tenant");
+        let listeners = served.listen(&config(dir.path(), false)).await.unwrap();
+        let fingerprint = listeners.fingerprint().unwrap().to_owned();
+        let token = served
+            .services()
+            .secret_source()
+            .load(TOKEN_ACCOUNT)
+            .unwrap()
+            .unwrap();
+        let mut ws = wss(listeners.ws_port(), &fingerprint, Some(&token))
+            .await
+            .unwrap();
+        result(
+            &ws_rpc(
+                &mut ws,
+                1,
+                "client.hello",
+                json!({ "clientId": "web-pg-leak", "capabilities": { "browserExec": true } }),
+            )
+            .await,
+        );
+        let mut uds = Uds::connect(listeners.socket_path()).await;
+        result(&uds.rpc(1, "system.status", json!({})).await);
+        until("both connections to join the tenant", || {
+            served.runtime().connections().len() == 2
+        })
+        .await;
+        // Only the tenant's `Services` (and what they hand out) hold its
+        // secret store besides `served`.
+        let tenant_alive = Arc::downgrade(served.secrets());
+
+        served.fence().fire("test: the tenant stops");
+        let report = tokio::time::timeout(common::wait(), served.stopped())
+            .await
+            .expect("the fence stops the tenant");
+        assert!(report.overran.is_empty(), "{:?}", report.overran);
+        ws_ends(&mut ws).await;
+        uds.ends().await;
+        let socket = listeners.socket_path().to_path_buf();
+        until("the local socket to go", || !socket.exists()).await;
+        drop(served);
+        until("the stopped tenant's Services to be freed", || {
+            tenant_alive.upgrade().is_none()
+        })
+        .await;
+        drop(listeners);
     }
 }

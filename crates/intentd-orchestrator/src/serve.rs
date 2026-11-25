@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_app::tenant::{Admission, TenantRuntime};
-use intent_app::StartupExt as _;
+use intent_app::{RuntimeServicesExt as _, StartupExt as _};
 use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
 use intent_services::host_exec_stream::HostExecStreamRegistry;
@@ -83,6 +83,16 @@ impl SettingsFollowerSlot {
         self.0
             .try_lock()
             .map_or(true, |slot| slot.as_ref().is_some_and(|f| !f.is_finished()))
+    }
+}
+
+/// Releases the tenant's machine-run hooks when dropped: they hold the
+/// tenant's `Services`, which hold the machine runs.
+struct ReleaseMachineRuns(Services);
+
+impl Drop for ReleaseMachineRuns {
+    fn drop(&mut self) {
+        self.0.release_machine_runs();
     }
 }
 
@@ -275,6 +285,7 @@ async fn try_serve_tenant_with(
                 agents.shutdown().await;
             }
             let _ = runner.stop().await;
+            services.release_machine_runs();
             if let Err(error) = heartbeat.release().await {
                 tracing::warn!(tenant, %error, "could not release the tenant lease");
             }
@@ -304,6 +315,9 @@ async fn try_serve_tenant_with(
         crate::mcp::start_tenant_mcp(&services, &mut runner);
     }
     crate::tenant_watch::start(&services, &bus, &admission, &mut runner);
+    // Owned, so released once every fence step ran: the stops run
+    // concurrently and may still settle machine runs through the hooks.
+    runner.own(ReleaseMachineRuns(services.clone()));
     if let Some(completions) = recovered.completions {
         // Deliver what finished while no one served the tenant, off the
         // open path. Machines receive the wakes; no client needs to be
