@@ -72,18 +72,40 @@ pub(crate) fn start(
             });
             let mut config = start_config_reload(&hub, &services);
             let _ = stopped.await;
-            if let Some(config) = config.as_mut() {
-                config.shutdown().await;
-            }
-            registry.shutdown().await;
+            tokio::join!(
+                async {
+                    if let Some(config) = config.as_mut() {
+                        config.shutdown().await;
+                    }
+                },
+                registry.shutdown(),
+            );
         })
     };
     runner.on_tasks(move || async move {
         let _ = stop.send(());
-        let _ = watchers.await;
-        git_status_refresher.shutdown().await;
+        let abort = watchers.abort_handle();
+        let joined = tokio::time::timeout(STOP_BUDGET, async {
+            tokio::join!(
+                async {
+                    let _ = watchers.await;
+                },
+                git_status_refresher.shutdown(),
+            );
+        })
+        .await;
+        if joined.is_err() {
+            // An overrun fence step ends the process: cut the watchers short
+            // instead (dropping them aborts their tasks).
+            abort.abort();
+            tracing::warn!("the tenant's watchers did not stop in time; aborted");
+        }
     });
 }
+
+/// How long the watchers may take to stop: under the fence's step budget
+/// (`intent_core::tenant_fence::SELF_FENCE_STEP_BUDGET`, one second).
+const STOP_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Watch the tenant's `config.toml` over `hub`: a valid edit is applied as
 /// `settings.update` applies it; an invalid one keeps the last good values.
