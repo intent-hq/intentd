@@ -86,6 +86,7 @@ impl WorkClaim {
         self.remaining() < self.ttl / 2
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) fn claim_id(&self) -> &str {
         &self.claim_id
     }
@@ -166,10 +167,13 @@ impl Store {
 /// `SQLite`'s work claims: in this process, keyed by (`kind`, `key`), each
 /// naming its claim id and deadline. Shared by every clone of the store.
 #[derive(Clone, Default)]
-pub(crate) struct LocalWorkClaims(Arc<Mutex<HashMap<(String, String), (String, Instant)>>>);
+pub(crate) struct LocalWorkClaims(Arc<Mutex<LocalClaimMap>>);
+
+/// (`kind`, `key`) to the holding claim's id and deadline.
+type LocalClaimMap = HashMap<(String, String), (String, Instant)>;
 
 impl LocalWorkClaims {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), (String, Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LocalClaimMap> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
