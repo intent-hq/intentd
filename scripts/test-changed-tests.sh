@@ -1832,12 +1832,13 @@ run_script --base HEAD
 expect_ok
 expect_cargo "-p alpha --lib -E (binary_id(=alpha)&test(/^(tests)::/))" "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
 
-# Source lints (crates/<c>/tests/*_lint.rs) scan other crates' source text, so
-# a src change in any crate also selects every lint binary, and only those of
-# a crate it does not otherwise select (intentd#3742: an intent-services-only
-# change broke intent-core's queue_entry_egress_lint, which test-changed never
-# ran). intentd's lint is a [[test]] of an autotests = false manifest; its
-# unregistered stray_lint.rs is not a target, so it is left out.
+# Source lints (crates/<c>/tests/*_lint.rs) scan other crates' source text,
+# src and test code alike, so any selected change under crates/ also selects
+# every lint binary, and only those of a crate it does not otherwise select
+# (intentd#3742: an intent-services-only change broke intent-core's
+# queue_entry_egress_lint, which test-changed never ran). intentd's lint is a
+# [[test]] of an autotests = false manifest; its unregistered stray_lint.rs is
+# not a target, so it is left out.
 lint_fixture() {
   write crates/intent-core/tests/queue_entry_egress_lint.rs
   write crates/intent-core/tests/fixed_sleep_lint.rs
@@ -1848,7 +1849,9 @@ lint_fixture() {
   commit_all "lint fixture"
 }
 lint_core_plan="-p intent-core --test fixed_sleep_lint --test queue_entry_egress_lint"
+lint_services_plan="-p intent-services --test note_write_path_lint"
 lint_intentd_plan="-p intentd --test tmp_hygiene_lint"
+lint_note="[test-changed] note: crates/ changed; every source lint (*_lint) runs too"
 
 case_name="an intent-services-only src change runs every crate's source lints"
 reset_repo
@@ -1857,8 +1860,7 @@ edit crates/intent-services/src/lib.rs
 DRY_RUN=1 run_script --base HEAD
 expect_ok
 expect_plan "-p intent-app -p intent-services -p intent-svc-transfer --lib --bins --tests" "$lint_core_plan" "$lint_intentd_plan"
-[[ "$stdout" == *"[test-changed] note: crate source changed; every source lint (*_lint) runs too"* ]] ||
-  fail "$case_name did not note the source lints: $stdout"
+[[ "$stdout" == *"$lint_note"* ]] || fail "$case_name did not note the source lints: $stdout"
 [[ -z "$cargo_log" ]] || fail "$case_name dry run invoked cargo: $cargo_log"
 run_script --base HEAD
 expect_ok
@@ -1870,7 +1872,7 @@ lint_fixture
 edit crates/gamma/src/lib.rs
 run_script --base HEAD
 expect_ok
-expect_cargo "-p gamma --lib --bins --tests" "$lint_core_plan" "-p intent-services --test note_write_path_lint" "$lint_intentd_plan"
+expect_cargo "-p gamma --lib --bins --tests" "$lint_core_plan" "$lint_services_plan" "$lint_intentd_plan"
 
 case_name="source lints join a crate's other selected test targets"
 reset_repo
@@ -1879,15 +1881,38 @@ edit crates/gamma/src/lib.rs
 edit crates/intent-core/tests/core.rs
 run_script --base HEAD
 expect_ok
-expect_cargo "-p gamma --lib --bins --tests" "-p intent-core --test core --test fixed_sleep_lint --test queue_entry_egress_lint" "-p intent-services --test note_write_path_lint" "$lint_intentd_plan"
+expect_cargo "-p gamma --lib --bins --tests" "-p intent-core --test core --test fixed_sleep_lint --test queue_entry_egress_lint" "$lint_services_plan" "$lint_intentd_plan"
 
-case_name="a test-only change does not run the source lints"
+# Test-code lints (fixed_sleep, tmp_hygiene, ...) scan crates/*/tests/**.
+case_name="a test-only change runs the source lints"
 reset_repo
 lint_fixture
 edit crates/alpha/tests/one.rs
 run_script --base HEAD
 expect_ok
-expect_cargo "-p alpha --test one"
+expect_cargo "-p alpha --test one" "$lint_core_plan" "$lint_services_plan" "$lint_intentd_plan"
+
+case_name="a non-src crate file runs the source lints"
+reset_repo
+lint_fixture
+edit crates/beta/migrations/001.sql
+run_script --base HEAD
+expect_ok
+expect_cargo "-p beta" "$lint_core_plan" "$lint_services_plan" "$lint_intentd_plan"
+
+case_name="an ignored crate path or a map-only edit does not run the source lints"
+reset_repo
+lint_fixture
+edit crates/alpha/benches/bench.rs
+run_script --base HEAD
+expect_ok
+[[ -z "$cargo_log" && "$stdout" != *"$lint_note"* ]] || fail "$case_name ran the lints: $stdout"
+reset_repo
+lint_fixture
+echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
+run_script --base HEAD
+expect_ok
+[[ -n "$cargo_log" && "$cargo_log" != *_lint* && "$stdout" != *"$lint_note"* ]] || fail "$case_name: a map edit ran the lints: $stdout"
 
 case_name="an instrumented src change leaves the source lints to CI's check job"
 reset_repo
