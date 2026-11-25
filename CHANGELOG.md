@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.293] - 2026-11-25
+
+### 🐛 Bug Fixes
+
+- *(store)* Keep proposal outcomes through stale whole-session writes ([#3760](https://github.com/intent-hq/intentd/pull/3760))
+- *(services)* Point test services at dead GitHub login and GitLab API bases ([#3758](https://github.com/intent-hq/intentd/pull/3758))
+- *(orchestrator)* Quiet the fence's own refusals at stop; desktop-unsupported for incapable clients ([#3751](https://github.com/intent-hq/intentd/pull/3751))
+- *(orchestrator)* Attach the agent manager and run intentd's startup recovery per tenant ([#3750](https://github.com/intent-hq/intentd/pull/3750))
+
+
 ## [0.11.292] - 2026-11-25
 
 ### 🐛 Bug Fixes
