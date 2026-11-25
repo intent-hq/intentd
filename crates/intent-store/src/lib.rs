@@ -67,6 +67,7 @@ macro_rules! sqlite_only {
 
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
+mod agent_queue_merge;
 mod agent_queue_repo;
 mod agent_repo;
 mod agent_session_summary;
@@ -181,7 +182,11 @@ pub use repository_lifecycle::{
 };
 
 pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
-pub use agent_queue_repo::AgentQueueRow;
+pub use agent_queue_merge::{
+    agent_queue_base, agent_queue_row_digest, lost_agent_queue_claims, merge_agent_queue,
+    AgentQueueBase,
+};
+pub use agent_queue_repo::{AgentQueueRow, AgentQueueSync};
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, project_user_message_index_metadata, AgentTurnEffort,

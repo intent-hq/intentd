@@ -142,6 +142,51 @@ impl Services {
         self.persist_queue_snapshot(agent_id).await;
     }
 
+    /// Test seam: `agent_get_queue_op` without a workspace scope.
+    pub async fn agent_get_queue_op_for_test(&self, agent_id: &AgentId) -> Result<Value> {
+        self.agent_get_queue_op(agent_id.clone(), None).await
+    }
+
+    /// Test seam: the drain's claimed pop of the queue head
+    /// (`claim_queue_pop` over `dequeue_message_draining`). Returns the
+    /// popped entry's id and the claimed ids another process took first;
+    /// the draining guard is dropped before returning.
+    pub async fn claim_next_queued_message_for_test(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(String, Vec<String>)> {
+        self.claim_queue_pop(
+            agent_id,
+            || self.dequeue_message_draining(agent_id),
+            |(next, _)| vec![next.clone()],
+        )
+        .await
+        .map(|((next, _draining), lost)| (next.id, lost))
+    }
+
+    /// Test seam: the flush drain's claimed batch pop (`claim_queue_pop`
+    /// over `dequeue_ready_batch_draining`, at least `min_ready` entries),
+    /// running `before_pop` after the claim's snapshot and right before the
+    /// pop: the window in which another worker can enqueue. Returns the
+    /// popped ids and the claimed ids another process took first.
+    pub async fn claim_queue_batch_for_test(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+        before_pop: impl FnOnce(),
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        self.claim_queue_pop(
+            agent_id,
+            || {
+                before_pop();
+                self.dequeue_ready_batch_draining(agent_id, false, min_ready)
+            },
+            |(batch, _)| batch.clone(),
+        )
+        .await
+        .map(|((batch, _draining), lost)| (batch.into_iter().map(|m| m.id).collect(), lost))
+    }
+
     /// Test seam: `queue_snapshot`.
     #[must_use]
     pub fn queue_snapshot_for_test(&self, agent_id: &AgentId) -> Vec<Value> {

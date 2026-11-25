@@ -628,6 +628,9 @@ pub struct Services {
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
+    /// A cache of the stored `agent_queue` rows: when other processes share the
+    /// store (Postgres), writes merge with their changes and reads and drains
+    /// refresh from it first ([`agent_ops::Services::refresh_queue_from_store`]).
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
     queue_submission_order: Arc<AtomicU64>,
     /// Entries a drain arm has popped from `agent_queues` but whose user rows
@@ -669,6 +672,10 @@ pub struct Services {
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
+    /// Store refreshes and a drain's refresh-pop-claim step
+    /// ([`agent_ops::Services::claim_queue_pop`]) run under it too. Other
+    /// processes are ordered by the store (writer lock + queue version), not
+    /// by this lock.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
     /// Serializes every `agent:queue:updated` publish
     /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read

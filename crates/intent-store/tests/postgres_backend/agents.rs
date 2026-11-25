@@ -1234,6 +1234,103 @@ parity_test!(
     }
 );
 
+// Stateless replicas groundwork: `sync_agent_queue` merges an out-of-date
+// process's change onto the stored queue instead of refusing it, and a
+// drain's claim is lost when another process removed the entry first.
+// `SQLite` (one writer) is a plain replace that never merges or loses.
+parity_test!(
+    queue_syncs_from_two_processes_merge_and_claim_once,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let agent = aid("agent-a");
+        let row = |id: &str| queue_row(id, "agent-a", 0, tenant);
+        let ids =
+            |rows: &[AgentQueueRow]| -> Vec<String> { rows.iter().map(|r| r.id.clone()).collect() };
+        let stored = |store: &Store| {
+            let store = store.clone();
+            async move {
+                let rows = store.load_all_agent_queues().await.unwrap();
+                rows.into_iter()
+                    .filter(|r| r.agent_id.0 == "agent-a")
+                    .map(|r| r.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let Some(test_db) = db else {
+            let sync = store
+                .sync_agent_queue(&agent, &[row("q1")], &["gone".into()])
+                .await
+                .unwrap();
+            assert!(sync.merged.is_none() && sync.lost.is_empty());
+            assert!(store
+                .refresh_agent_queue(&agent, &[])
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!store.agent_queues_shared());
+            assert_eq!(stored(&store).await, ["q1"]);
+            return;
+        };
+        assert!(store.agent_queues_shared());
+        let other = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        let (a, b) = (&store, &other);
+
+        // Concurrent enqueue: A appends q1; B, which never saw it, appends
+        // q2. Nothing is refused or overwritten; commit order is kept.
+        assert!(a
+            .sync_agent_queue(&agent, &[row("q1")], &[])
+            .await
+            .unwrap()
+            .merged
+            .is_none());
+        let sync = b.sync_agent_queue(&agent, &[row("q2")], &[]).await.unwrap();
+        assert_eq!(ids(sync.merged.as_deref().unwrap()), ["q1", "q2"]);
+        assert_eq!(stored(a).await, ["q1", "q2"]);
+
+        // A refreshes: it sees B's entry, merged after its own.
+        let refreshed = a.refresh_agent_queue(&agent, &[row("q1")]).await.unwrap();
+        assert_eq!(ids(refreshed.as_deref().unwrap()), ["q1", "q2"]);
+        assert!(a
+            .refresh_agent_queue(&agent, &[row("q1"), row("q2")])
+            .await
+            .unwrap()
+            .is_none());
+
+        // Double drain: both hold q1 at the head and claim it; the first
+        // sync keeps it, the second is told it is lost.
+        let first = a
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        assert!(first.lost.is_empty(), "{first:?}");
+        let second = b
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(second.lost, ["q1"]);
+        assert_eq!(stored(a).await, ["q2"]);
+
+        // Cancel during drain: B removes q2 (no claim) and enqueues q3; A,
+        // out of date, then drains q2 and loses it.
+        b.sync_agent_queue(&agent, &[row("q3")], &[]).await.unwrap();
+        let drained = a
+            .sync_agent_queue(&agent, &[], &["q2".into()])
+            .await
+            .unwrap();
+        assert_eq!(drained.lost, ["q2"], "{drained:?}");
+        // A's removal of q2 does not take B's q3 with it.
+        assert_eq!(ids(drained.merged.as_deref().unwrap()), ["q3"]);
+        assert_eq!(stored(a).await, ["q3"]);
+
+        // An entry this process never saw stored is never lost.
+        let fresh = a
+            .sync_agent_queue(&agent, &[row("q3")], &["never-stored".into()])
+            .await
+            .unwrap();
+        assert!(fresh.lost.is_empty());
+    }
+);
+
 parity_test!(agent_queues_round_trip, |store, tenant| {
     assert!(store.load_all_agent_queues().await.unwrap().is_empty());
     seed_sessions(&store, tenant).await;
