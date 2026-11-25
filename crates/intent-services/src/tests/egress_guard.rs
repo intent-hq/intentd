@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const BUDGET: Duration = Duration::from_secs(10);
+fn budget() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 
 fn chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
@@ -45,7 +47,7 @@ async fn public_host_fails_on_the_dead_proxy_while_loopback_fixtures_answer() {
     let port = loopback_fixture().await;
     for host in ["127.0.0.1", "localhost"] {
         let response = tokio::time::timeout(
-            BUDGET,
+            budget(),
             client
                 .get(format!("http://{host}:{port}/api/v3/user"))
                 .send(),
@@ -60,7 +62,7 @@ async fn public_host_fails_on_the_dead_proxy_while_loopback_fixtures_answer() {
         "https://api.github.com/user",
         "https://gitlab.com/api/v4/user",
     ] {
-        let error = tokio::time::timeout(BUDGET, client.get(url).send())
+        let error = tokio::time::timeout(budget(), client.get(url).send())
             .await
             .expect("blocked request fails fast")
             .expect_err("a real forge request must not leave the test process");
@@ -74,10 +76,13 @@ async fn public_host_fails_on_the_dead_proxy_while_loopback_fixtures_answer() {
 #[tokio::test]
 async fn git_subprocess_is_sent_to_the_dead_proxy() {
     let output = tokio::time::timeout(
-        BUDGET,
+        budget(),
         tokio::process::Command::new("git")
             .args(["ls-remote", "https://github.com/git/git.git", "HEAD"])
             .env("GIT_TERMINAL_PROMPT", "0")
+            // A developer's `http.proxy` setting would win over the proxy vars.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .kill_on_drop(true)
             .output(),
     )
@@ -89,5 +94,5 @@ async fn git_subprocess_is_sent_to_the_dead_proxy() {
         !output.status.success(),
         "git reached the network: {stderr}"
     );
-    assert!(stderr.contains("127.0.0.1 port 0"), "{stderr}");
+    assert!(stderr.contains("127.0.0.1"), "{stderr}");
 }

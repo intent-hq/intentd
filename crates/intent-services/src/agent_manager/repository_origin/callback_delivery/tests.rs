@@ -9358,6 +9358,8 @@ mod genuine_native_startup {
             ("NODE_DISABLE_COMPILE_CACHE", "1"),
         ]
         .into_iter()
+        // crate::tests::block_test_egress sets these before test threads.
+        .chain(crate::tests::TEST_EGRESS_ENV)
         .map(|(key, value)| (key.into(), value.into()))
         .collect()
     }
