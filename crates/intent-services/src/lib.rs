@@ -1823,6 +1823,7 @@ impl Services {
         self.github_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
         self.github_login_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
         self.gitlab_api_base_uri = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
+        self.branches_ls_remote_base = Some(ISOLATED_GITHUB_API_BASE_URI.to_string());
         self
     }
 

@@ -275,7 +275,7 @@ impl Services {
                     .map_err(crate::pr_ops::map_sc_err)?;
             }
         }
-        Ok(target)
+        self.isolate_gitlab_target(target)
     }
 
     fn collaboration_client_id(&self, target: &Target) -> Option<String> {

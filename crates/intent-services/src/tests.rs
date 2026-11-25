@@ -18597,6 +18597,47 @@ pub(crate) mod pr {
             }
         }
 
+        // A gitlab.com invite pin or collaboration connect while another
+        // instance is bound: the env seam never applied there, so the isolated
+        // base must still catch it, and so must the ls-remote fallback.
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(scratch.path().join("config.toml")).expect("registry"),
+        );
+        registry
+            .apply(&[(
+                "sourceControl.gitlab.host".into(),
+                serde_json::json!("gitlab.probe.test"),
+            )])
+            .expect("bind another GitLab instance");
+        let svc = Services::new_isolated(store.clone()).with_settings_registry(registry);
+        for (path, target) in [
+            (
+                "invite pin",
+                svc.resolve_forge_target(
+                    crate::source_control_auth_ops::Provider::Gitlab,
+                    Some("gitlab.com"),
+                ),
+            ),
+            (
+                "collaboration",
+                svc.collaboration_connect_target("gitlab", Some("gitlab.com")),
+            ),
+        ] {
+            let Ok(crate::source_control_auth_ops::Target::Gitlab { host }) = target else {
+                panic!("{path}: GitLab target did not resolve: {target:?}");
+            };
+            assert!(
+                is_loopback_origin(host.base_url()),
+                "{path}: gitlab.com must resolve to loopback, got {}",
+                host.base_url()
+            );
+        }
+        let ls_remote = svc.branches_ls_remote_base.as_deref().unwrap_or_default();
+        assert!(
+            is_loopback_origin(ls_remote),
+            "branches ls-remote base must be loopback, got {ls_remote:?}"
+        );
+
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());
         crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_fake")
             .expect("seed token");

@@ -1245,6 +1245,29 @@ impl crate::Services {
         Ok(Target::Gitlab { host: target })
     }
 
+    /// Test-isolation backstop for the forge lookups that never bind a
+    /// repository credential (invite pins and account search, collaboration
+    /// connect): a GitLab target still on its own origin (no settings or env
+    /// transport applied, e.g. gitlab.com while another instance is bound)
+    /// moves to this `Services`' own GitLab base. That base is `None` in
+    /// production, so this is the identity there. The repository-credential
+    /// connect path does not use it: its fixture descriptors approve the
+    /// transport.
+    pub(crate) fn isolate_gitlab_target(&self, target: Target) -> Result<Target> {
+        match (target, self.gitlab_api_base_uri.as_deref()) {
+            (Target::Gitlab { host }, Some(base))
+                if !base.trim().is_empty() && host.base_url() == host.logical_base_url() =>
+            {
+                Ok(Target::Gitlab {
+                    host: host
+                        .with_api_origin(base)
+                        .map_err(crate::pr_ops::map_sc_err)?,
+                })
+            }
+            (target, _) => Ok(target),
+        }
+    }
+
     /// Parse + resolve the `(provider, host)` of a `sourceControl.*` call
     /// against the effective `sourceControl.gitlab.*` settings.
     pub(crate) fn resolve_source_control_target(

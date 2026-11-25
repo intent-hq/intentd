@@ -381,10 +381,10 @@ impl GitlabCredentialGate {
     }
 
     /// `isolated_transport` is the test services' own GitLab API base
-    /// ([`crate::Services::with_gitlab_api_base_uri`]). It is applied only
-    /// after the descriptor check and only when neither the settings nor
-    /// `$INTENTD_GITLAB_API_BASE_URI` moved the transport, so it can make a
-    /// call fail locally but never approve a transport.
+    /// ([`crate::Services::with_gitlab_api_base_uri`]). Like every other
+    /// reader it shadows `$INTENTD_GITLAB_API_BASE_URI`, but it is applied
+    /// only after the descriptor check and only when the settings set no
+    /// transport, so it can make a call fail locally but never approve one.
     fn stored_source_host(
         &self,
         registry: &SettingsRegistry,
@@ -418,7 +418,12 @@ impl GitlabCredentialGate {
         let override_url = current
             .api_base_url
             .clone()
-            .or_else(|| std::env::var(super::super::GITLAB_API_BASE_URI_ENV).ok())
+            .or_else(|| {
+                isolated_transport
+                    .is_none()
+                    .then(|| std::env::var(super::super::GITLAB_API_BASE_URI_ENV).ok())
+                    .flatten()
+            })
             .filter(|v| !v.trim().is_empty());
         if let Some(endpoint) = &override_url {
             host = host

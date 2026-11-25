@@ -324,7 +324,11 @@ impl Services {
     /// The `(provider, host)` a forge-scoped invite param names, with the
     /// github.com host spelled out accepted for `provider: "github"` (the
     /// GitHub side has no instance selection).
-    fn resolve_forge_target(&self, provider: Provider, host: Option<&str>) -> Result<Target> {
+    pub(crate) fn resolve_forge_target(
+        &self,
+        provider: Provider,
+        host: Option<&str>,
+    ) -> Result<Target> {
         if host.is_some_and(|h| h.trim().is_empty()) {
             return Err(Error::InvalidParams("host must not be blank".into()));
         }
@@ -337,7 +341,8 @@ impl Services {
             }
             _ => host,
         };
-        self.resolve_source_control_target(provider.as_wire(), host)
+        let target = self.resolve_source_control_target(provider.as_wire(), host)?;
+        self.isolate_gitlab_target(target)
     }
 
     /// Resolve a `workspace.invite.create` pin to the account it names: the
