@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use intent_store::postgres::SecretKeyring;
+use intentd_orchestrator::process::{ceiling_from_env, WORKLOAD_MEMORY_ENV};
 use intentd_orchestrator::secrets::{keyring_from_env, KEY_ENV};
 use intentd_orchestrator::serve::{try_serve_tenant, LeaseTiming, ServedTenant, Serving};
 use intentd_orchestrator::{
@@ -54,6 +55,11 @@ const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn main() -> ExitCode {
+    // The PTY workload shim: a contained terminal runs as
+    // `/proc/self/exe cgroup-exec …`, which joins its cgroup and execs.
+    if let Some(code) = intent_core::workload::dispatch_shim() {
+        return code;
+    }
     // Before reading any secret from the environment: same-user processes
     // (tenant workloads) must not read this one's environ or memory.
     if let Err(error) = intentd_orchestrator::secrets::harden_process() {
@@ -66,18 +72,34 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    // Read and clear the URL (it may carry a password) while this process
-    // is still single-threaded, so no child process inherits it.
+    // Read and clear the URL (it may carry a password) and the tenant
+    // secret key while this process is still single-threaded, so no child
+    // process inherits them: not even the process setup's own (`systemctl`).
     let url = std::env::var(POSTGRES_URL_ENV);
     std::env::remove_var(POSTGRES_URL_ENV);
+    let keyring = keyring_from_env(|name| std::env::var(name).ok());
+    std::env::remove_var(KEY_ENV);
+    let ceiling =
+        std::env::var_os(WORKLOAD_MEMORY_ENV).map(|value| value.into_string().unwrap_or_default());
+    let ceiling = match ceiling_from_env(ceiling.as_deref()) {
+        Ok(ceiling) => ceiling,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match intent_core::Config::resolve() {
+        Ok(config) => intentd_orchestrator::process::setup(&config.data_dir, ceiling),
+        Err(error) => {
+            tracing::error!(%error, "data dir");
+            return ExitCode::FAILURE;
+        }
+    }
     let Ok(url) = url else {
         tracing::error!("{POSTGRES_URL_ENV} is unset");
         return ExitCode::FAILURE;
     };
-    // The tenant secret keyring, read before any thread starts; a key in
-    // the environment is cleared the same way. No key: no tenant opens.
-    let keyring = keyring_from_env(|name| std::env::var(name).ok());
-    std::env::remove_var(KEY_ENV);
+    // No key: no tenant opens.
     let keyring = match keyring {
         Ok(keyring) => Arc::new(keyring),
         Err(error) => {
@@ -105,6 +127,9 @@ fn main() -> ExitCode {
 }
 
 async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, String> {
+    // Process-owned, like the containment it cleans up after: every tenant's
+    // finished workloads leave leaves only this releases.
+    let _leaf_sweeper = intentd_orchestrator::process::spawn_leaf_sweeper();
     // Unset serves the default tenant; set but not UTF-8 is an error, never
     // the default.
     let raw = match std::env::var(TENANTS_ENV) {

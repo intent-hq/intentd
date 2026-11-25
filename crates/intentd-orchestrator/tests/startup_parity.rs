@@ -247,21 +247,12 @@ const STEPS: &[(&str, Step)] = &[
         "apply_startup_pins",
         Refused("a tenant's paths are set explicitly, not pinned from the environment"),
     ),
-    (
-        "fd_limit::raise_at_startup",
-        Gap("the soft descriptor limit is not raised"),
-    ),
-    (
-        "probe_cow_at_startup",
-        Gap("the copy-on-write probe runs on first use, not at start"),
-    ),
-    (
-        "intent_core::workload::init",
-        Gap("scripts, terminals and host commands run without memory containment"),
-    ),
+    ("fd_limit::raise_at_startup", Wired("fd_limit::raise_at_startup")),
+    ("probe_cow_at_startup", Wired("intent_git::cow_probe")),
+    ("intent_core::workload::init", Wired("intent_core::workload::init")),
     (
         "intent_services::workload_memory_ceiling",
-        Gap("scripts, terminals and host commands run without memory containment"),
+        Refused("one ceiling for the whole process: `INTENTD_WORKLOAD_MEMORY_MAX_MB` sets it, no tenant's `agents.workloadMemoryMaxMb`"),
     ),
     (
         "init_adapter_slots",
@@ -701,6 +692,7 @@ fn orchestrator_sources() -> String {
         "intentd-orchestrator/src/main.rs",
         "intentd-orchestrator/src/serve.rs",
         "intentd-orchestrator/src/listen.rs",
+        "intentd-orchestrator/src/process.rs",
         "intentd-orchestrator/src/secrets.rs",
         "intent-app/src/lib.rs",
         "intent-app/src/tenant.rs",
