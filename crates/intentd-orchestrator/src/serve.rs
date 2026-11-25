@@ -57,7 +57,32 @@ pub struct ServedTenant {
     /// The tenant's agent manager: `services` holds only a weak handle, so
     /// this one keeps every `agent.*` turn running while the tenant serves.
     agents: Arc<AgentManager>,
+    /// The tenant's settings follower ([`follow_settings`]): stopped by the
+    /// fence, and joined by [`ServedTenant::drain`] and
+    /// [`ServedTenant::stopped`] before they return.
+    settings_follower: SettingsFollowerSlot,
     report: Option<tokio::task::JoinHandle<SelfFenceReport>>,
+}
+
+/// The running settings follower, until someone stops it. Whoever stops it
+/// first joins it; a second caller waits on the lock until that join ends,
+/// so every caller returns only once the follower has ended.
+#[derive(Clone, Default)]
+struct SettingsFollowerSlot(Arc<tokio::sync::Mutex<Option<StoreSettingsFollower>>>);
+
+impl SettingsFollowerSlot {
+    async fn stop(&self) {
+        let mut slot = self.0.lock().await;
+        if let Some(mut follower) = slot.take() {
+            follower.shutdown().await;
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.0
+            .try_lock()
+            .map_or(true, |slot| slot.as_ref().is_some_and(|f| !f.is_finished()))
+    }
 }
 
 /// The tenant's work is admitted until its fence fires.
@@ -232,8 +257,8 @@ async fn try_serve_tenant_with(
         reverse.clone(),
         secrets.clone(),
         settings,
-    )?;
-    follow_settings(&services, &fence);
+    );
+    let settings_follower = follow_settings(&services, &fence);
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -284,6 +309,7 @@ async fn try_serve_tenant_with(
         fence,
         heartbeat,
         agents: recovered.agents,
+        settings_follower,
         report: Some(runner.spawn()),
     })))
 }
@@ -433,13 +459,17 @@ fn install_receive_hooks(data_dir: &Path) -> Result<()> {
 
 /// Follow the tenant's settings for other processes' writes until its
 /// fence fires ([`intent_services::settings_store_follower`]).
-fn follow_settings(services: &Services, fence: &TenantFence) {
-    let mut follower = StoreSettingsFollower::start(services.clone(), DEFAULT_POLL_INTERVAL);
+fn follow_settings(services: &Services, fence: &TenantFence) -> SettingsFollowerSlot {
+    let slot = SettingsFollowerSlot(Arc::new(tokio::sync::Mutex::new(Some(
+        StoreSettingsFollower::start(services.clone(), DEFAULT_POLL_INTERVAL),
+    ))));
     let fence = fence.clone();
+    let stopper = slot.clone();
     tokio::spawn(async move {
         fence.fenced().await;
-        follower.shutdown().await;
+        stopper.stop().await;
     });
+    slot
 }
 
 /// The tenant's `Services` over `bus`: every path under `dir`, in
@@ -457,13 +487,13 @@ fn tenant_services(
     reverse: Arc<PrimaryReverseRegistry>,
     secrets: Arc<dyn intent_services::SecretStore>,
     settings: Arc<SettingsRegistry>,
-) -> Result<Services> {
+) -> Services {
     // The handle's identity only: nothing reads or writes this path.
     let gitlab_pair = intent_core::FileSecretStore::with_backend(
         dir.join("gitlab-pair (tenant secrets)"),
         secrets.clone(),
     );
-    Ok(intent_app::compose(
+    intent_app::compose(
         Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
@@ -476,7 +506,7 @@ fn tenant_services(
             .with_provider_profiles_dir(dir)
             .with_script_output_dir(dir)
             .with_orchestrator_mode(true),
-    ))
+    )
 }
 
 impl ServedTenant {
@@ -593,12 +623,16 @@ impl ServedTenant {
         let connections = self.runtime.connections().clone();
         let reconcile = self.runtime.drain_reconcile();
         let loops = self.runtime.stop_loops();
+        let settings_follower = self.settings_follower.clone();
         async move {
             if fence.is_fenced() {
+                settings_follower.stop().await;
                 return;
             }
             let closed = connections.close_all();
             intent_app::shutdown::close_admission(&services, &agents, streams);
+            // No settings adoption runs past the drain.
+            settings_follower.stop().await;
             // Before the checkpoint: no startup sweep starts work after it.
             reconcile.await;
             services.shutdown_pty_sessions().await;
@@ -621,10 +655,18 @@ impl ServedTenant {
         crate::watch_report(report, move |report| {
             let _ = tx.send(report);
         });
-        match rx.await {
-            Ok(report) => report,
-            Err(_) => std::future::pending().await,
-        }
+        let Ok(report) = rx.await else {
+            return std::future::pending().await;
+        };
+        // The fence stops the follower; return only once it has ended.
+        self.settings_follower.stop().await;
+        report
+    }
+
+    /// Whether the tenant's settings follower is still running.
+    #[must_use]
+    pub fn settings_follower_running(&self) -> bool {
+        self.settings_follower.running()
     }
 
     /// Hand the tenant's fence report to `on_stop` as soon as it is ready,
@@ -691,7 +733,7 @@ mod tests {
         ));
         let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
         (
-            tenant_services(store, bus, &dir, reverse, secrets, settings).unwrap(),
+            tenant_services(store, bus, &dir, reverse, secrets, settings),
             dir,
         )
     }
@@ -716,7 +758,7 @@ mod tests {
         ));
         let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
         let services =
-            tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets, settings).unwrap();
+            tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets, settings);
         let earlier = services.clone();
         let dispatch = earlier
             .feature_reverse_dispatch()

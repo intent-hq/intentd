@@ -19478,15 +19478,20 @@ impl WorkspaceApi for Services {
                 .flatten()
                 .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str));
             self.check_settings_paths("settings.update", paths, true)?;
-            self.settings_update_checking_profiles(changes).await
+            let result = self.settings_update_checking_profiles(changes).await;
+            settings_store_follower::catch_up_after_conflict(self, &result).await;
+            result
         })
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.check_settings_paths("settings.reset", [path.as_str()], true)?;
-            self.owned_settings_mutation(serde_json::Value::Null, Some(path))
-                .await
+            let result = self
+                .owned_settings_mutation(serde_json::Value::Null, Some(path))
+                .await;
+            settings_store_follower::catch_up_after_conflict(self, &result).await;
+            result
         })
     }
 

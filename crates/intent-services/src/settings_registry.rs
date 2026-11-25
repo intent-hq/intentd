@@ -44,7 +44,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::{LegacySettings, SettingsFile};
@@ -291,7 +292,8 @@ fn revision_conflict(held: u64, current: u64) -> Error {
         current: serde_json::json!({
             "settingsRevision": current,
             "heldRevision": held,
-            "message": "settings were changed by another process; reload them and retry",
+            "message": "settings were changed by another process; \
+                        the newer settings are loaded, retry the change",
         }),
     }
 }
@@ -409,7 +411,18 @@ pub struct SettingsRegistry {
     path: PathBuf,
     /// The store backend; `None` for the file.
     store: Option<Arc<dyn SettingsDocumentStore>>,
+    /// Serializes every mutation (apply, pin, reload, legacy strip, port
+    /// assignment). A mutation holds it across its document write — for a
+    /// store backend a compare-and-set that can wait out the tenant's writer
+    /// budget — while `inner` is only locked for short in-memory steps, so
+    /// readers (`generation`, `validate`, `preview`, the self-write guard,
+    /// reload preparation) never wait on an in-flight write. Order: `writer`
+    /// before `inner`.
+    writer: Mutex<()>,
     inner: Mutex<Inner>,
+    /// `inner.revision`, readable without any lock
+    /// ([`SettingsRegistry::store_revision`]).
+    revision: AtomicU64,
     snapshot: RwLock<Arc<SettingsSnapshot>>,
     tx: watch::Sender<SettingsChanged>,
 }
@@ -420,6 +433,9 @@ pub(crate) struct PreparedRepositorySettings {
     expected: Arc<SettingsSnapshot>,
     candidate: Inner,
     snapshot: Arc<SettingsSnapshot>,
+    /// Prepared from a store document another process wrote: publication
+    /// never waits behind an in-flight write ([`SettingsRegistry::publish_repository_reload`]).
+    from_store: bool,
 }
 impl PreparedRepositorySettings {
     pub(crate) fn snapshot(&self) -> &SettingsSnapshot {
@@ -566,10 +582,41 @@ impl SettingsRegistry {
             context_publication_probe: Mutex::new(None),
             path,
             store,
+            writer: Mutex::new(()),
+            revision: AtomicU64::new(inner.revision),
             inner: Mutex::new(inner),
             snapshot: RwLock::new(snapshot),
             tx,
         })
+    }
+
+    /// Take the mutation lock (see the `writer` field).
+    fn lock_writer(&self) -> MutexGuard<'_, ()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The mutation state, cloned under a short lock. Callers hold
+    /// [`Self::lock_writer`], so it cannot change until they install theirs.
+    fn current(&self) -> Inner {
+        self.inner
+            .lock()
+            .expect("settings registry lock poisoned")
+            .clone()
+    }
+
+    /// Install `inner` as the mutation state (the caller holds the writer
+    /// lock), keeping the lock-free revision in step.
+    fn install(&self, held: &mut Inner, inner: Inner) {
+        self.revision.store(inner.revision, Ordering::SeqCst);
+        *held = inner;
+    }
+
+    /// Whether a mutation (and so possibly a store write) is in progress.
+    #[must_use]
+    pub fn write_in_flight(&self) -> bool {
+        matches!(self.writer.try_lock(), Err(TryLockError::WouldBlock))
     }
 
     /// Persist `text` as the successor of `inner`'s document: an atomic
@@ -608,17 +655,10 @@ impl SettingsRegistry {
     }
 
     /// The store revision of the current document (0 for a file, and for a
-    /// store document never written).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// store document never written). Lock-free: never waits on a write.
     #[must_use]
     pub fn store_revision(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("settings registry lock poisoned")
-            .revision
+        self.revision.load(Ordering::SeqCst)
     }
 
     /// Re-read a store-backed document: `Some` when another process wrote a
@@ -677,7 +717,8 @@ impl SettingsRegistry {
     /// persisted elsewhere, so a failed import keeps the file intact for the
     /// next boot to retry.
     pub(crate) fn strip_legacy(&self) -> Result<Vec<String>> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let _writer = self.lock_writer();
+        let mut inner = self.current();
         if inner.legacy.is_empty() {
             return Ok(Vec::new());
         }
@@ -695,6 +736,8 @@ impl SettingsRegistry {
         inner.record_write(&text);
         inner.revision = revision;
         inner.legacy.clear();
+        let mut held = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut held, inner);
         Ok(stripped)
     }
 
@@ -832,6 +875,7 @@ impl SettingsRegistry {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
         }
+        let _writer = self.lock_writer();
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         let mut json = file_json(&inner.file)?;
         for (pin_path, pin) in &inner.pins {
@@ -849,7 +893,7 @@ impl SettingsRegistry {
         );
         let snapshot = Arc::new(build_snapshot(&candidate)?);
         self.before_repository_publication(&snapshot, write, None)?;
-        *inner = candidate;
+        self.install(&mut inner, candidate);
         self.repository_published(&snapshot);
         *self
             .snapshot
@@ -885,13 +929,16 @@ impl SettingsRegistry {
         write: Option<&RepositorySettingsWrite>,
         auth: Option<&RepositoryWrite>,
     ) -> Result<SettingsChanged> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
-        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
+        let _writer = self.lock_writer();
+        let current = self.current();
+        let (mut candidate, text, snapshot) = Self::validate_changes(&current, changes)?;
         self.before_repository_publication(&snapshot, write, auth)?;
-        let revision = self.write_document(&inner, &text, false)?;
+        // The document write runs without `inner` held (see `writer`).
+        let revision = self.write_document(&current, &text, false)?;
         candidate.record_write(&text);
         candidate.revision = revision;
-        *inner = candidate;
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut inner, candidate);
         self.repository_published(&snapshot);
         Ok(self.publish_snapshot(snapshot, inner.generation))
     }
@@ -923,7 +970,8 @@ impl SettingsRegistry {
         expected: &Arc<SettingsSnapshot>,
         port: u16,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let _writer = self.lock_writer();
+        let current = self.current();
         if !Arc::ptr_eq(expected, &self.snapshot())
             || expected.ws_api_port_policy() != WsApiPortPolicy::Unassigned
         {
@@ -932,11 +980,12 @@ impl SettingsRegistry {
             ));
         }
         let changes = [("server.wsApi.port".to_string(), Value::from(port))];
-        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, &changes)?;
-        let revision = self.write_document(&inner, &text, true)?;
+        let (mut candidate, text, snapshot) = Self::validate_changes(&current, &changes)?;
+        let revision = self.write_document(&current, &text, true)?;
         candidate.record_write(&text);
         candidate.revision = revision;
-        *inner = candidate;
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut inner, candidate);
         *self
             .snapshot
             .write()
@@ -1136,6 +1185,7 @@ impl SettingsRegistry {
             expected,
             candidate,
             snapshot,
+            from_store: revision.is_some(),
         })
     }
 
@@ -1144,6 +1194,22 @@ impl SettingsRegistry {
         prepared: PreparedRepositorySettings,
         write: Option<&RepositorySettingsWrite>,
     ) -> Result<SettingsChanged> {
+        // Another process's document never waits behind this process's
+        // in-flight write (a store write can take the writer budget); the
+        // follower retries at its next poll.
+        let _writer =
+            if prepared.from_store {
+                match self.writer.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => return Err(Error::Internal(
+                        "a settings write is in flight; the newer stored revision is adopted next"
+                            .into(),
+                    )),
+                }
+            } else {
+                self.lock_writer()
+            };
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         if !Arc::ptr_eq(&prepared.expected, &self.snapshot()) {
             return Err(Error::Internal(
@@ -1163,13 +1229,14 @@ impl SettingsRegistry {
             // Same text at a newer store revision: hold the newer revision
             // so the next write compares against it.
             inner.revision = prepared.candidate.revision;
+            self.revision.store(inner.revision, Ordering::SeqCst);
             return Ok(SettingsChanged {
                 generation: inner.generation,
                 changed: BTreeSet::new(),
             });
         }
         self.before_repository_publication(&prepared.snapshot, write, None)?;
-        *inner = prepared.candidate;
+        self.install(&mut inner, prepared.candidate);
         self.repository_published(&prepared.snapshot);
         Ok(self.publish_snapshot(prepared.snapshot, inner.generation))
     }

@@ -52,6 +52,10 @@ pub async fn poll_once(
     let Some(registry) = store_registry(services) else {
         return Ok(FollowOutcome::Current);
     };
+    if registry.write_in_flight() {
+        // Adopting waits for no write; a later poll sees the result.
+        return Ok(FollowOutcome::Current);
+    }
     let expected = registry.snapshot();
     let Some(stored) = registry.fetch_newer()? else {
         return Ok(FollowOutcome::Current);
@@ -66,6 +70,31 @@ pub async fn poll_once(
         .apply_stored_settings_reload(stored, expected, admission)
         .await
         .map(FollowOutcome::Adopted)
+}
+
+/// After a `settings.update` / `settings.reset` lost the revision race
+/// (`result` is `Error::Conflict` on a store-backed registry), adopt the
+/// newer document at once, through the same path as the follower, so a
+/// retry the caller makes right away writes from the winner's revision
+/// instead of conflicting again until the next poll. Anything else is left
+/// alone. A failed catch-up is logged; the follower retries it.
+pub(crate) async fn catch_up_after_conflict<T>(services: &Services, result: &Result<T>) {
+    if !matches!(result, Err(intent_core::Error::Conflict { .. })) {
+        return;
+    }
+    if store_registry(services).is_none() {
+        return;
+    }
+    let (_running, stopped) = tokio::sync::watch::channel(false);
+    match poll_once(services, PreparedReloadAdmission::new(stopped)).await {
+        Ok(FollowOutcome::Adopted(notice)) => {
+            tracing::info!(changed = ?notice.changed, "adopted the settings that won the race");
+        }
+        Ok(FollowOutcome::Current) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not adopt the settings that won the race; the follower retries");
+        }
+    }
 }
 
 fn store_registry(services: &Services) -> Option<Arc<SettingsRegistry>> {
@@ -92,6 +121,12 @@ impl StoreSettingsFollower {
             stop,
             task: Some(task),
         }
+    }
+
+    /// Whether the follower's task has ended (or was joined).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Stop following and wait for the task to end.

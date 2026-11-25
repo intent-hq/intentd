@@ -154,7 +154,7 @@ fn value_of(response: &Value) -> &Value {
     &result(response)["value"]
 }
 
-/// DoD: `settings.update` over WSS, then the instance that takes the tenant
+/// Definition of done: `settings.update` over WSS, then the instance that takes the tenant
 /// over on a fresh data dir reads the same value — settings and the GitLab
 /// token alike — and neither data dir ever holds a `config.toml` or a
 /// `secrets.json`.
@@ -336,7 +336,7 @@ async fn registry_on(pool: &PgPool, tenant: &str) -> Arc<SettingsRegistry> {
     )
 }
 
-/// DoD: two registries on one tenant, both at the same revision, apply at
+/// Definition of done: two registries on one tenant, both at the same revision, apply at
 /// once: one wins, the other gets a revision conflict and changes nothing;
 /// after a refresh the loser sees the winner's value and its retry lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -428,4 +428,48 @@ async fn a_served_tenant_adopts_another_writers_revision() {
     })
     .await;
     served.fence().fire("test: done");
+}
+
+/// The settings follower ends before `drain` and `stopped` return: no
+/// settings adoption outlives a drained or fenced tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_and_stopped_join_the_settings_follower() {
+    let Some(pool) = pool().await else { return };
+    let run = run_id();
+
+    let drained_dir = tempfile::tempdir().unwrap();
+    let drained = serve_when_free(
+        &pool,
+        &format!("settings-drain-{run}"),
+        drained_dir.path(),
+        &format!("drain-{run}"),
+        LeaseTiming::default(),
+    )
+    .await;
+    assert!(drained.settings_follower_running());
+    drained.drain(None).await;
+    assert!(
+        !drained.settings_follower_running(),
+        "drain returns only once the follower ended"
+    );
+    drained.fence().fire("test: done");
+
+    let fenced_dir = tempfile::tempdir().unwrap();
+    let mut fenced = serve_when_free(
+        &pool,
+        &format!("settings-fence-{run}"),
+        fenced_dir.path(),
+        &format!("fence-{run}"),
+        LeaseTiming::default(),
+    )
+    .await;
+    assert!(fenced.settings_follower_running());
+    fenced.fence().fire("test: the lease is lost");
+    tokio::time::timeout(common::wait(), fenced.stopped())
+        .await
+        .expect("the fence stops the tenant");
+    assert!(
+        !fenced.settings_follower_running(),
+        "stopped returns only once the follower ended"
+    );
 }

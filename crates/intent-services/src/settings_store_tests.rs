@@ -275,9 +275,10 @@ async fn the_follower_adopts_another_writers_revision_with_its_event() {
 }
 
 /// A `settings.update` that loses the race surfaces the conflict to the
-/// caller and changes nothing.
-#[tokio::test]
-async fn a_settings_update_that_lost_the_race_is_a_conflict() {
+/// caller and writes nothing, but adopts the winner's document before it
+/// returns, so a retry made right away lands (no wait for the follower).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_update_that_lost_the_race_is_a_conflict_and_a_retry_lands() {
     let dir = crate::test_support::test_tempdir("settings-update-conflict");
     let doc = MemoryDocument::default();
     let (svc, _bus) = tenant_services(&dir, &doc).await;
@@ -292,6 +293,105 @@ async fn a_settings_update_that_lost_the_race_is_a_conflict() {
     .expect_err("the tenant's document moved on");
     assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
     assert_eq!(doc.current().unwrap().revision, 1);
+    assert!(!doc.current().unwrap().text.contains("maxConcurrent = 4"));
+
+    // The loser already holds the winner's revision and value.
+    let registry = svc.settings_registry().unwrap();
+    assert_eq!(registry.store_revision(), 1);
+    let got = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        svc.settings_get("git.autoCommit".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got["value"], json!(false), "the winner's value is served");
+    intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        svc.settings_update(json!([{ "path": "agents.maxConcurrent", "value": 4 }])),
+    )
+    .await
+    .expect("an immediate retry writes from the winner's revision");
+    let stored = doc.current().unwrap();
+    assert_eq!(stored.revision, 2);
+    assert!(stored.text.contains("maxConcurrent = 4"), "{}", stored.text);
+    assert!(
+        stored.text.contains("autoCommit = false"),
+        "the winner's change is kept"
+    );
+}
+
+/// A document store whose next compare-and-set blocks until released, as a
+/// busy tenant's writer lock would.
+#[derive(Clone)]
+struct StalledDocument {
+    doc: MemoryDocument,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+impl SettingsDocumentStore for StalledDocument {
+    fn load(&self) -> Result<Option<StoredSettings>> {
+        self.doc.load()
+    }
+
+    fn compare_and_set(&self, expected: u64, text: &str) -> Result<SettingsWrite> {
+        self.entered.wait();
+        self.release.wait();
+        self.doc.compare_and_set(expected, text)
+    }
+
+    fn label(&self) -> String {
+        "memory/stalled".into()
+    }
+}
+
+/// While a store write waits on the database, readers of the registry —
+/// the revision, the generation, validation, previews, snapshots — and the
+/// follower answer at once instead of queueing behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readers_and_the_follower_never_wait_on_an_in_flight_store_write() {
+    let dir = crate::test_support::test_tempdir("settings-stalled-write");
+    let stalled = StalledDocument {
+        doc: MemoryDocument::default(),
+        entered: Arc::new(std::sync::Barrier::new(2)),
+        release: Arc::new(std::sync::Barrier::new(2)),
+    };
+    let registry = Arc::new(SettingsRegistry::load_from_store(Arc::new(stalled.clone())).unwrap());
+    let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(registry.clone())
+        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+
+    let writer = {
+        let registry = registry.clone();
+        std::thread::spawn(move || registry.apply(&set("git.autoCommit", json!(false))))
+    };
+    stalled.entered.wait();
+    // The write is inside its compare-and-set now.
+    assert!(registry.write_in_flight());
+    assert_eq!(registry.store_revision(), 0);
+    assert_eq!(registry.generation(), 0);
+    registry
+        .validate(&set("agents.maxConcurrent", json!(2)))
+        .unwrap();
+    registry
+        .preview(&set("agents.maxConcurrent", json!(2)))
+        .unwrap();
+    assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
+    assert!(!registry.is_self_write("x"));
+    let (_running, stopped) = tokio::sync::watch::channel(false);
+    assert!(matches!(
+        poll_once(&svc, PreparedReloadAdmission::new(stopped))
+            .await
+            .unwrap(),
+        FollowOutcome::Current
+    ));
+
+    stalled.release.wait();
+    writer.join().unwrap().unwrap();
+    assert!(!registry.write_in_flight());
+    assert_eq!(registry.store_revision(), 1);
+    assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
 }
 
 /// The GitLab pair's handle over a backend: every read and write goes to
