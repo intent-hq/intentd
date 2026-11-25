@@ -85,6 +85,12 @@ fn pairs(
 }
 
 const SPARE_RUNS: usize = 4;
+
+/// How long a second action may wait on the parked first one before the
+/// harness resumes the first.
+fn blocked_on_first() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(2))
+}
 const ALPHA: &str = "interleaved message alpha";
 const BETA: &str = "interleaved message beta";
 const FINAL_MESSAGE: &str = "interleaved final message";
@@ -248,7 +254,18 @@ async fn run_case(case: &Case, n: usize) {
     actor.settle(&label).await;
 
     for &then in &case.then {
-        let done = actor.clone().act(then).await;
+        let mut next = tokio::spawn(actor.clone().act(then));
+        let done = if let Ok(done) = timeout(blocked_on_first(), &mut next).await {
+            done.unwrap()
+        } else {
+            // The parked action holds what this one waits for (the
+            // turn-start gate): resume it first.
+            if let Some(pause) = parked.take() {
+                pause.resume.notify_one();
+                record_sent(&mut sent, case.first, &(&mut first).await.unwrap());
+            }
+            next.await.unwrap()
+        };
         record_sent(&mut sent, then, &done);
         actor.settle(&label).await;
     }
