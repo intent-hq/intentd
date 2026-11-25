@@ -1324,6 +1324,11 @@ pub(crate) enum Fence {
     Check,
     /// A claim, which changes the fence under the same lock.
     Skip,
+    /// A store lease write (`leases.rs`): it takes the writer lock for its
+    /// ordering but not the owner check, because a lease is fenced by its
+    /// own token and must not depend on the tenant owner or epoch. It never
+    /// touches the tenant fence.
+    LeaseOnly,
 }
 
 #[derive(Clone)]

@@ -10,7 +10,7 @@
 //! No statement reads the tenant epoch: a tenant lease takeover leaves every
 //! lease as it was. While the tenant lease exists, acquire, renew and
 //! release take the tenant writer lock without its owner check
-//! (`Fence::Skip`), so they order with the tenant's other writes and pass
+//! (`Fence::LeaseOnly`), so they order with the tenant's other writes and pass
 //! the writer-lock lint; a process that lost the tenant keeps its leases.
 //!
 //! The unleased first open (`clear_foreign_claims_once`) leaves leases
@@ -69,7 +69,7 @@ const GUARD_SQL: &str = "SELECT 1 FROM lease \
 impl PgStore {
     pub async fn lease_acquire(&self, lease: &Lease) -> Result<Option<u64>> {
         let ttl = ttl_millis(lease.ttl())?;
-        let mut tx = self.begin_write_as(Fence::Skip).await?;
+        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
         let token = sqlx::query_scalar::<_, i64>(ACQUIRE_SQL)
             .bind(self.tenant())
             .bind(lease.scope())
@@ -86,7 +86,7 @@ impl PgStore {
 
     pub async fn lease_renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
         let ttl = ttl_millis(ttl)?;
-        let mut tx = self.begin_write_as(Fence::Skip).await?;
+        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
         let kept = sqlx::query(RENEW_SQL)
             .bind(self.tenant())
             .bind(lease.scope())
@@ -104,7 +104,7 @@ impl PgStore {
     }
 
     pub async fn lease_release(&self, lease: &Lease) -> Result<()> {
-        let mut tx = self.begin_write_as(Fence::Skip).await?;
+        let mut tx = self.begin_write_as(Fence::LeaseOnly).await?;
         sqlx::query(RELEASE_SQL)
             .bind(self.tenant())
             .bind(lease.scope())

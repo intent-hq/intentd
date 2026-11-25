@@ -2453,6 +2453,11 @@ const FENCE_MOVERS: &[(&str, &str)] = &[
 ];
 const FENCE_SKIPPER: &str = "claim_lease";
 
+/// Who may take the writer lock without the owner check for a store lease
+/// (`Fence::LeaseOnly`), as functions in `src/postgres/leases.rs`. They
+/// write only the `lease` table, never the tenant fence.
+const LEASE_ONLY_USERS: &[&str] = &["lease_acquire", "lease_renew", "lease_release"];
+
 /// What one source file says about the fence: per function, the
 /// `FENCE_MOVERS` consts and `Fence::Skip` it names; per string literal
 /// that writes the lease or the fence columns, the const it belongs to.
@@ -2500,6 +2505,8 @@ impl<'ast> syn::visit::Visit<'ast> for FenceUses {
         let segments: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
         let name = if segments.ends_with(&["Fence".to_owned(), "Skip".to_owned()]) {
             Some("Fence::Skip".to_owned())
+        } else if segments.ends_with(&["Fence".to_owned(), "LeaseOnly".to_owned()]) {
+            Some("Fence::LeaseOnly".to_owned())
         } else {
             segments
                 .last()
@@ -2526,10 +2533,17 @@ fn fence_problems(sources: &[(PathBuf, String)]) -> Vec<String> {
     for (path, text) in sources {
         let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
         let in_lease = file.as_deref() == Some("lease.rs");
+        let in_leases = file.as_deref() == Some("leases.rs");
         let parsed = syn::parse_file(text).expect("parse source");
         let mut uses = FenceUses::default();
         syn::visit::Visit::visit_file(&mut uses, &parsed);
         for (scope, name) in &uses.names {
+            if name == "Fence::LeaseOnly" {
+                if !(in_leases && LEASE_ONLY_USERS.contains(&scope.as_str())) {
+                    problems.push(format!("{}: `{scope}` uses {name}", path.display()));
+                }
+                continue;
+            }
             let allowed = in_lease
                 && if name == "Fence::Skip" {
                     scope == FENCE_SKIPPER
@@ -2571,8 +2585,9 @@ fn only_the_claim_moves_the_fence_and_only_claim_renewal_and_release_write_the_l
     let problems = fence_problems(&sources);
     assert!(
         problems.is_empty(),
-        "only lease.rs's claim_lease may move the fence or skip its check, and only \
-         claim_lease, renew_lease and release_lease may write tenant_lease (FENCE_MOVERS):\n{}",
+        "only lease.rs's claim_lease may move the fence or skip its check, only \
+         claim_lease, renew_lease and release_lease may write tenant_lease (FENCE_MOVERS), \
+         and only leases.rs's LEASE_ONLY_USERS may use Fence::LeaseOnly:\n{}",
         problems.join("\n")
     );
     let lease = std::fs::read_to_string(src().join("postgres/lease.rs")).expect("read lease.rs");
@@ -2605,8 +2620,15 @@ fn the_fence_lint_flags_a_new_fence_mover() {
     let ok = "const FENCE_MOVE_SQL: &str = \"UPDATE tenant_writer SET epoch = $2 WHERE tenant_id = $1\";\n\
               fn claim_lease() { let _ = (Fence::Skip, FENCE_MOVE_SQL); }\n";
     assert!(fence_problems(&[(lease.clone(), ok.to_owned())]).is_empty());
+    let leases = PathBuf::from("src/postgres/leases.rs");
+    let lease_only = "fn lease_renew() { let _ = Fence::LeaseOnly; }\n";
+    assert!(fence_problems(&[(leases.clone(), lease_only.to_owned())]).is_empty());
     for (path, bad) in [
         (&lease, "fn other() { let _ = Fence::Skip; }\n"),
+        (&leases, "fn lease_renew() { let _ = Fence::Skip; }\n"),
+        (&leases, "fn other() { let _ = Fence::LeaseOnly; }\n"),
+        (&other, "fn lease_renew() { let _ = Fence::LeaseOnly; }\n"),
+        (&lease, "fn claim_lease() { let _ = Fence::LeaseOnly; }\n"),
         (&lease, "fn other() { let _ = FENCE_MOVE_SQL; }\n"),
         (&lease, "fn renew_lease() { let _ = LEASE_TAKE_SQL; }\n"),
         (

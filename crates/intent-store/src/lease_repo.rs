@@ -29,7 +29,7 @@
 //!   renewed.
 //!
 //! While the tenant lease still exists, Postgres lease writes take the
-//! tenant writer lock (`begin_write_as(Fence::Skip)`) for the writer-lock
+//! tenant writer lock (`begin_write_as(Fence::LeaseOnly)`) for the writer-lock
 //! lint and its ordering, without its owner check.
 
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ use crate::Store;
 pub struct Lease {
     scope: String,
     key: String,
-    lease_id: String,
+    id: String,
     token: u64,
     ttl: Duration,
     deadline: Instant,
@@ -60,7 +60,7 @@ impl Lease {
         Self {
             scope: scope.to_owned(),
             key: key.to_owned(),
-            lease_id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
             token: 0,
             ttl,
             deadline: started + ttl,
@@ -82,7 +82,7 @@ impl Lease {
     /// This lease's own id (a fresh one per acquire).
     #[must_use]
     pub fn lease_id(&self) -> &str {
-        &self.lease_id
+        &self.id
     }
 
     /// The fencing token: strictly increasing per (tenant, `scope`, `key`)
@@ -250,7 +250,7 @@ impl LocalLeases {
     }
 
     fn names(slot: &LocalSlot, lease: &Lease) -> bool {
-        slot.lease_id.as_deref() == Some(lease.lease_id.as_str()) && slot.token == lease.token
+        slot.lease_id.as_deref() == Some(lease.id.as_str()) && slot.token == lease.token
     }
 
     fn acquire(&self, lease: &Lease) -> Option<u64> {
@@ -264,7 +264,7 @@ impl LocalLeases {
         if slot.lease_id.is_some() && slot.deadline > now {
             return None;
         }
-        slot.lease_id = Some(lease.lease_id.clone());
+        slot.lease_id = Some(lease.id.clone());
         slot.token += 1;
         slot.deadline = now + lease.ttl;
         Some(slot.token)
