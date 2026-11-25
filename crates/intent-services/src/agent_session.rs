@@ -6469,6 +6469,14 @@ impl Services {
         if tally.is_zero() {
             return;
         }
+        // Consume-once: this write owns the tally now. Clear it from the
+        // live slot so an interrupt flush that later appends the row (the
+        // worker aborted after scheduling this write) records nothing.
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.tool_tally = ToolCallTally::default();
+            }
+        }
         let services = self.clone();
         let agent_id = agent_id.clone();
         let workspace_id = workspace_id.clone();
