@@ -13,6 +13,7 @@ use intent_services::host_exec_stream::HostExecStreamRegistry;
 use intent_services::retention::TenantSweepTiming;
 use intent_services::{
     AgentManager, EventBus, Services, SettingsRegistry, StartupCompletionRecovery,
+    StartupResumeCandidates,
 };
 use intent_store::postgres::{
     LeaseHeartbeat, LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId,
@@ -244,6 +245,7 @@ async fn try_serve_tenant_with(
             )));
         }
     };
+    let resume = prepare_resume(&services, &fence).await;
     let runtime = TenantRuntime::start_with_sweeps(
         &services,
         &dir,
@@ -258,6 +260,9 @@ async fn try_serve_tenant_with(
         // open path. Machines receive the wakes; no client needs to be
         // connected for them.
         runtime.reconcile_completions(&services, completions);
+    }
+    if let Some(candidates) = resume {
+        runtime.resume_interrupted(&services, candidates);
     }
     tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
     Ok(Serving::Served(Box::new(ServedTenant {
@@ -391,6 +396,37 @@ async fn recover_tenant(
         agents,
         completions,
     })
+}
+
+/// The interrupted agents this claim resumes once the tenant serves,
+/// captured before any client is served (so none offers them for a manual
+/// resume): none when `agents.resumeInterruptedOnStart` is `off` or the
+/// fence fired. Each resume claims its agent's row under the lease, so an
+/// instance that lost the tenant resumes nothing the new owner resumes.
+async fn prepare_resume(
+    services: &Services,
+    fence: &TenantFence,
+) -> Option<StartupResumeCandidates> {
+    let setting = services
+        .effective_settings()
+        .agents
+        .resume_interrupted_on_start;
+    let resume = intent_app::resume::resume_on_claim(setting);
+    tracing::info!(
+        setting = setting.as_str(),
+        resume,
+        "interrupted-agent resume decision"
+    );
+    if !resume || fence.is_fenced() {
+        return None;
+    }
+    match services.prepare_startup_resume().await {
+        Ok(candidates) => Some(candidates),
+        Err(error) => {
+            tracing::error!(%error, "resume on claim: failed to list interrupted agents");
+            None
+        }
+    }
 }
 
 /// The tenant's chief cwd, as [`tenant_services`] configures it.

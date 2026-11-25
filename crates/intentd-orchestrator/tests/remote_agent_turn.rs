@@ -40,7 +40,7 @@ use intent_transport::{
     WsOptions,
 };
 use intentd_orchestrator::listen::ListenConfig;
-use intentd_orchestrator::serve::{serve_tenant, LeaseTiming};
+use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -684,6 +684,298 @@ async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
     running.listeners.stop().await;
     running.machine.server.stop().await;
     drop(running.machine.git);
+}
+
+/// Serve `tenant` from `dir` as `instance`, with its client socket at
+/// `socket`.
+async fn claim(
+    pool: &PgPool,
+    tenant: &str,
+    dir: &Path,
+    instance: &str,
+    socket: &str,
+) -> (
+    ServedTenant,
+    intentd_orchestrator::listen::ClientListeners,
+    Uds,
+) {
+    let served = serve_tenant(
+        pool.clone(),
+        tenant,
+        dir,
+        instance,
+        LeaseTiming::default(),
+        keyring(),
+        OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("serve the tenant");
+    let listeners = served
+        .listen(&ListenConfig {
+            socket_path: dir.join(socket),
+            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ws_port: 0,
+            tls_dir: dir.join("tls"),
+            insecure: true,
+        })
+        .await
+        .unwrap();
+    let mut client = Uds::connect(listeners.socket_path()).await;
+    result(
+        &client
+            .rpc(
+                1,
+                "client.hello",
+                json!({ "clientId": "resume-test", "name": "Resume test" }),
+            )
+            .await,
+    );
+    (served, listeners, client)
+}
+
+/// Stop serving the tenant as the orchestrator does on SIGTERM: drain it
+/// (its running turns are recorded as interrupted), fire the fence, wait
+/// for its work to stop, then release the lease so the next claim takes it
+/// at once.
+async fn release(mut served: ServedTenant) {
+    served.drain(None).await;
+    served.fence().fire("test: the tenant stops");
+    tokio::time::timeout(wait(), served.stopped())
+        .await
+        .expect("the tenant stops");
+    assert!(
+        served
+            .heartbeat()
+            .release()
+            .await
+            .expect("release the lease"),
+        "the lease was still ours"
+    );
+}
+
+/// How many resume continuations the agent's transcript holds.
+async fn continuations(services: &Services, agent: &AgentId) -> usize {
+    services
+        .store()
+        .get_agent_session_with_transcript(agent)
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.metadata
+                .as_ref()
+                .is_some_and(|meta| meta["type"] == "resume_continuation")
+        })
+        .count()
+}
+
+/// A tenant stopped while its agent's turn runs on a machine records the
+/// turn as interrupted; the next instance that claims the tenant resumes
+/// the agent on the machine, and a claim after that does not resume it
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claimed_tenant_resumes_an_interrupted_agent_exactly_once() {
+    let Some(pool) = pool().await else { return };
+    if intent_providers_missing_git() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tenant = format!("resume-{}", uuid::Uuid::new_v4().simple());
+    let (first, listeners, mut client) = claim(
+        &pool,
+        &tenant,
+        dir.path(),
+        &format!("first-{tenant}"),
+        "1.sock",
+    )
+    .await;
+
+    let backend = client.rpc(2, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = result(&backend)["backendId"].as_str().unwrap().to_owned();
+    let mut machine = Machine::start(&backend_id).await;
+    result(
+        &client
+            .rpc(3, "remoteMachines.add", machine.add_params())
+            .await,
+    );
+    let repo = dir.path().join("repo");
+    repository(&repo);
+    let workspace = WorkspaceId(format!("ws-{}", uuid::Uuid::new_v4().simple()));
+    let now = intent_core::now_iso();
+    first
+        .services()
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: workspace.clone(),
+            title: "Resume".into(),
+            branch: "main".into(),
+            repository_path: Some(repo.to_string_lossy().into_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Default::default()
+        })
+        .await
+        .expect("seed the workspace");
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let agent = loop {
+        id += 1;
+        let created = client
+            .rpc(
+                id,
+                "agent.create",
+                json!({ "workspaceId": workspace, "name": "Remote", "model": "default", "provider": "mock" }),
+            )
+            .await;
+        if created.get("error").is_none() {
+            break created["result"]["agent"].clone();
+        }
+        assert_eq!(created["error"]["data"]["retryable"], true, "{created}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the agent: {created}"
+        );
+        // timing-guard: poll interval while head reads the machine's providers (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = AgentId::from(agent["id"].as_str().unwrap());
+    result(
+        &client
+            .rpc(
+                50,
+                "agent.sendMessage",
+                json!({ "workspaceId": workspace, "agentId": agent_id, "content": "long task" }),
+            )
+            .await,
+    );
+
+    // The turn runs on the machine and has not ended when the tenant stops.
+    let (end, launch) = machine.launched().await;
+    end.journal(
+        1,
+        &agent_id,
+        &workspace,
+        None,
+        JournalBody::Started {
+            base_commit: launch.base_commit.clone(),
+        },
+    )
+    .await;
+    let mut end = end;
+    end.next(wait(), |frame| match frame {
+        LinkFrame::Prompt { agent_id: to, .. } if to == agent_id => Some(()),
+        _ => None,
+    })
+    .await
+    .expect("the first turn reaches the machine");
+    drop(client);
+    listeners.stop().await;
+    release(first).await;
+    drop(end);
+
+    // The next claim resumes the agent on the machine, unattended.
+    let (second, listeners, client) = claim(
+        &pool,
+        &tenant,
+        dir.path(),
+        &format!("second-{tenant}"),
+        "2.sock",
+    )
+    .await;
+    let (mut end, launch) = machine.launched().await;
+    assert_eq!(launch.agent_id, agent_id);
+    end.journal(
+        1,
+        &agent_id,
+        &workspace,
+        None,
+        JournalBody::Started {
+            base_commit: launch.base_commit.clone(),
+        },
+    )
+    .await;
+    let turn = end
+        .next(wait(), |frame| match frame {
+            LinkFrame::Prompt {
+                agent_id: to,
+                turn_id,
+                ..
+            } if to == agent_id => Some(turn_id),
+            _ => None,
+        })
+        .await
+        .expect("the claim resumes the interrupted agent on the machine");
+    end.journal(
+        2,
+        &agent_id,
+        &workspace,
+        Some(&turn),
+        JournalBody::TurnEnded {
+            stop_reason: "end_turn".into(),
+            error: None,
+        },
+    )
+    .await;
+    tokio::time::timeout(wait(), second.runtime().recovered())
+        .await
+        .expect("the second claim's recovery finishes");
+    assert_eq!(continuations(second.services(), &agent_id).await, 1);
+    assert!(
+        second
+            .services()
+            .store()
+            .get_interrupted_agent(&agent_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the resume resolved the interruption"
+    );
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let status = second
+            .services()
+            .store()
+            .get_agent_session_status(&agent_id)
+            .await
+            .unwrap();
+        if !intent_services::is_stale_in_flight_status(status) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resumed turn never ended: {status:?}"
+        );
+        // timing-guard: poll interval for the resumed turn's end on head
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(client);
+    listeners.stop().await;
+    release(second).await;
+    drop(end);
+
+    // A later claim finds nothing left to resume.
+    let (third, listeners, client) = claim(
+        &pool,
+        &tenant,
+        dir.path(),
+        &format!("third-{tenant}"),
+        "3.sock",
+    )
+    .await;
+    tokio::time::timeout(wait(), third.runtime().recovered())
+        .await
+        .expect("the third claim's recovery finishes");
+    assert_eq!(
+        continuations(third.services(), &agent_id).await,
+        1,
+        "the agent resumed exactly once"
+    );
+    drop(client);
+    listeners.stop().await;
+    release(third).await;
+    machine.server.stop().await;
+    drop(machine.git);
 }
 
 /// Whether `git` is missing (the test then skips).

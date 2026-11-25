@@ -477,8 +477,9 @@ impl Loops {
     }
 }
 
-/// The tenant's startup completion reconcile: stopped between operations
-/// and joined by the self-fence.
+/// The tenant's startup recovery (the completion reconcile, then the
+/// interrupted-agent resume): run one after the other, stopped between
+/// operations and joined by the self-fence.
 #[derive(Clone)]
 struct Recovery {
     stop: Arc<tokio::sync::watch::Sender<bool>>,
@@ -486,6 +487,8 @@ struct Recovery {
     /// Held while a drain joins the reconcile: a drain that overlaps it
     /// (a graceful stop and the fence) waits for the same join.
     joining: Arc<tokio::sync::Mutex<()>>,
+    /// How many recovery steps have not finished yet.
+    pending: Arc<tokio::sync::watch::Sender<usize>>,
 }
 
 impl Default for Recovery {
@@ -494,7 +497,18 @@ impl Default for Recovery {
             stop: Arc::new(tokio::sync::watch::channel(false).0),
             running: Arc::default(),
             joining: Arc::default(),
+            pending: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+}
+
+/// Counts one recovery step as finished when dropped, even when it is
+/// aborted or panics.
+struct StepDone(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for StepDone {
+    fn drop(&mut self) {
+        self.0.send_modify(|pending| *pending -= 1);
     }
 }
 
@@ -503,8 +517,29 @@ impl Recovery {
         self.stop.subscribe()
     }
 
-    fn hold(&self, running: JoinHandle<()>) {
-        *lock(&self.running) = Some(running);
+    /// Run `step` once the steps held so far have finished. Each step
+    /// watches [`Self::stopping`] itself, so a stop request ends it between
+    /// operations.
+    fn then(&self, step: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut running = lock(&self.running);
+        let previous = running.take();
+        self.pending.send_modify(|pending| *pending += 1);
+        let done = StepDone(self.pending.clone());
+        *running = Some(intent_core::spawn_daemon(async move {
+            let _done = done;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            step.await;
+        }));
+    }
+
+    async fn finished(&self) {
+        let _ = self
+            .pending
+            .subscribe()
+            .wait_for(|pending| *pending == 0)
+            .await;
     }
 
     async fn drain(&self) {
@@ -640,12 +675,34 @@ impl TenantRuntime {
     ) {
         let services = services.clone();
         let stopping = self.recovery.stopping();
-        let running = intent_core::spawn_daemon(async move {
+        self.recovery.then(async move {
             services
                 .reconcile_startup_completions(completions, &stopping)
                 .await;
         });
-        self.recovery.hold(running);
+    }
+
+    /// Resume the agents a stop interrupted (`candidates`, from
+    /// `Services::prepare_startup_resume`) on a task of its own, after the
+    /// completion reconcile, as `intentd` does at start. The tenant's
+    /// self-fence stops it between agents and joins it before the agent
+    /// manager stops.
+    pub fn resume_interrupted(
+        &self,
+        services: &Services,
+        candidates: intent_services::StartupResumeCandidates,
+    ) {
+        let services = services.clone();
+        let stopping = self.recovery.stopping();
+        self.recovery.then(async move {
+            crate::resume::run_startup_resume_sweep(&services, candidates, stopping).await;
+        });
+    }
+
+    /// Wait until the tenant's startup recovery (completion reconcile and
+    /// interrupted-agent resume) has finished or was stopped.
+    pub async fn recovered(&self) {
+        self.recovery.finished().await;
     }
 
     /// Stop the startup reconcile between operations and join it. A
@@ -689,12 +746,12 @@ mod tests {
         let mut stopping = recovery.stopping();
         let finished = Arc::new(AtomicBool::new(false));
         let done = finished.clone();
-        recovery.hold(tokio::spawn(async move {
+        recovery.then(async move {
             let _ = stopping.wait_for(|stop| *stop).await;
             // The admitted operation's last step, after the stop request.
             tokio::task::yield_now().await;
             done.store(true, Ordering::SeqCst);
-        }));
+        });
         recovery.drain().await;
         assert!(
             finished.load(Ordering::SeqCst),
@@ -714,9 +771,9 @@ mod tests {
 
         let recovery = Recovery::default();
         let (release, held) = tokio::sync::oneshot::channel::<()>();
-        recovery.hold(tokio::spawn(async move {
+        recovery.then(async move {
             let _ = held.await;
-        }));
+        });
         let graceful = tokio::spawn({
             let recovery = recovery.clone();
             async move { recovery.drain().await }

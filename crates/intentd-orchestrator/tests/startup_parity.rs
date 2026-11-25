@@ -311,23 +311,23 @@ const STEPS: &[(&str, Step)] = &[
     // Resume on start.
     (
         "services.prepare_startup_resume",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Wired("prepare_startup_resume"),
     ),
     (
-        "run_startup_resume_sweep",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        "intent_app::resume::run_startup_resume_sweep",
+        Wired("run_startup_resume_sweep"),
     ),
     (
         "should_resume_on_start",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("`--resume-all`, update restarts and display detection are the desktop daemon's: a claimed tenant resumes unless the setting is `off` (`resume_on_claim`)"),
     ),
     (
         "resolve_resume_setting",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("the desktop daemon's test default for `auto` (an e2e seam)"),
     ),
     (
         "detect_has_display",
-        Gap("interrupted agents are not resumed when a tenant is claimed"),
+        Refused("an orchestrator has no display: `auto` resumes, as on a headless daemon"),
     ),
     // Repository context.
     (
