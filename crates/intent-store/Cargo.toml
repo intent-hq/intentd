@@ -83,7 +83,7 @@ proc-macro2 = { version = "1", default-features = false, features = ["span-locat
 quote = { version = "1", default-features = false }
 syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 
 [lints]
