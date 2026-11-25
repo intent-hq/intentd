@@ -4,7 +4,10 @@
 //! background once half its TTL has passed. Its fence fires when the lease
 //! is lost (renewal finds another holder, or the lease was released) or
 //! when renewals keep failing until the lease's TTL ran out by this
-//! process's clock (a lower bound of the store's). Work under the lease
+//! process's clock (a lower bound of the store's). Each renewal is bounded
+//! by the lease's remaining time, so a store call that never returns (a
+//! half-open connection) still fires the fence once the lease can no
+//! longer be proven held, and frees the lease lock for guarded writes. Work under the lease
 //! stops once the fence fired; writes it makes guard the lease in their
 //! transaction (`guard_lease`), so a stale holder's writes fail even before
 //! it notices.
@@ -17,6 +20,8 @@
 //! it (intent-services re-exports it). The first user is the token-usage
 //! scan (`intent-services`).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +33,20 @@ use crate::{Lease, Store};
 const RETRY_MIN: Duration = Duration::from_millis(50);
 /// The longest pause between failed renewals.
 const RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// A renewal's result: as [`Store::renew_lease`].
+type Renewal<'a> = Pin<Box<dyn Future<Output = intent_core::Result<bool>> + Send + 'a>>;
+
+/// What the renewer renews through: the store, or a test double.
+trait Renew: Send + Sync + 'static {
+    fn renew<'a>(&'a self, lease: &'a mut Lease, ttl: Duration) -> Renewal<'a>;
+}
+
+impl Renew for Store {
+    fn renew<'a>(&'a self, lease: &'a mut Lease, ttl: Duration) -> Renewal<'a> {
+        Box::pin(self.renew_lease(lease, ttl))
+    }
+}
 
 /// Holds a lease and renews it at half TTL; see the module docs.
 pub struct LeaseKeeper {
@@ -89,12 +108,17 @@ impl LeaseKeeper {
     /// Keeps `lease`, renewing it for its TTL at each half TTL.
     #[must_use]
     pub fn keep(store: Store, lease: Lease) -> Self {
+        Self::keep_with(store, lease)
+    }
+
+    /// [`Self::keep`], renewing through `renewer`.
+    fn keep_with(renewer: impl Renew, lease: Lease) -> Self {
         let (tx, rx) = watch::channel(None);
         let scope = lease.scope().to_owned();
         let key = lease.key().to_owned();
         let token = lease.token();
         let lease = Arc::new(Mutex::new(Some(lease)));
-        let renewer = intent_core::spawn_daemon(renew_until_lost(store, Arc::clone(&lease), tx));
+        let renewer = intent_core::spawn_daemon(renew_until_lost(renewer, Arc::clone(&lease), tx));
         Self {
             scope,
             key,
@@ -173,8 +197,10 @@ impl Drop for LeaseKeeper {
 /// The renewer: at each half TTL renews the lease for its TTL. A renewal
 /// that reports the lease lost fires the fence; one that fails is retried
 /// (backing off) until it succeeds or the lease ran out, which fires it.
+/// A renewal that does not answer within the lease's remaining time fires
+/// it too: the lease can no longer be proven held.
 async fn renew_until_lost(
-    store: Store,
+    store: impl Renew,
     lease: Arc<Mutex<Option<Lease>>>,
     fence: watch::Sender<Option<String>>,
 ) {
@@ -189,7 +215,19 @@ async fn renew_until_lost(
         let mut held = lease.lock().await;
         let Some(current) = held.as_mut() else { return };
         let ttl = current.ttl();
-        match store.renew_lease(current, ttl).await {
+        let left = current.remaining();
+        // Bounded by the lease's own remaining time: past it the lease is unproven.
+        let Ok(renewed) = tokio::time::timeout(left, store.renew(current, ttl)).await else {
+            tracing::warn!(
+                scope = current.scope(),
+                "lease renewal did not answer before expiry; fencing"
+            );
+            fence.send_replace(Some(
+                "lease renewal did not answer before the lease expired".to_owned(),
+            ));
+            return;
+        };
+        match renewed {
             Ok(true) => retry = RETRY_MIN,
             Ok(false) => {
                 tracing::info!(scope = current.scope(), "lease lost");
@@ -297,6 +335,35 @@ mod tests {
         assert!(
             store.lease_is_held(&other).await.unwrap(),
             "a lost keeper's release leaves the new holder"
+        );
+    }
+
+    /// A store whose renewal never answers, like a half-open connection.
+    struct HungRenewal;
+
+    impl Renew for HungRenewal {
+        fn renew<'a>(&'a self, _: &'a mut Lease, _: Duration) -> Renewal<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_never_answers_fires_the_fence_by_expiry() {
+        let (store, _dir) = sqlite().await;
+        let ttl = Duration::from_millis(100);
+        let lease = store.acquire_lease("scan", "", ttl).await.unwrap().unwrap();
+        let keeper = LeaseKeeper::keep_with(HungRenewal, lease);
+        tokio::time::timeout(timeout(), keeper.fired())
+            .await
+            .expect("the fence fires once the lease's remaining time ran out");
+        assert!(keeper.fence().reason().unwrap().contains("did not answer"));
+        // The hung renewal no longer holds the lease lock.
+        let guard = tokio::time::timeout(timeout(), keeper.lease())
+            .await
+            .expect("guarded writes are not blocked by the hung renewal");
+        assert!(
+            guard.is_some(),
+            "the fence fired but the lease is still kept"
         );
     }
 
