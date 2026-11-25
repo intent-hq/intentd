@@ -10189,7 +10189,7 @@ impl AgentManager {
                         self.services
                             .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
                     },
-                    |(batch, _)| batch.iter().map(|m| m.id.clone()).collect(),
+                    |(batch, _)| batch.clone(),
                 )
                 .await
                 .and_then(|((mut batch, mut draining), lost)| {
@@ -10233,7 +10233,7 @@ impl AgentManager {
                             self.services.dequeue_message_draining(&agent_id)
                         }
                     },
-                    |(next, _)| vec![next.id.clone()],
+                    |(next, _)| vec![next.clone()],
                 )
                 .await
                 // Lost: another process drained or removed it first.

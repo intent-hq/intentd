@@ -158,10 +158,33 @@ impl Services {
         self.claim_queue_pop(
             agent_id,
             || self.dequeue_message_draining(agent_id),
-            |(next, _)| vec![next.id.clone()],
+            |(next, _)| vec![next.clone()],
         )
         .await
         .map(|((next, _draining), lost)| (next.id, lost))
+    }
+
+    /// Test seam: the flush drain's claimed batch pop (`claim_queue_pop`
+    /// over `dequeue_ready_batch_draining`, at least `min_ready` entries),
+    /// running `before_pop` after the claim's snapshot and right before the
+    /// pop: the window in which another worker can enqueue. Returns the
+    /// popped ids and the claimed ids another process took first.
+    pub async fn claim_queue_batch_for_test(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+        before_pop: impl FnOnce(),
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        self.claim_queue_pop(
+            agent_id,
+            || {
+                before_pop();
+                self.dequeue_ready_batch_draining(agent_id, false, min_ready)
+            },
+            |(batch, _)| batch.clone(),
+        )
+        .await
+        .map(|((batch, _draining), lost)| (batch.into_iter().map(|m| m.id).collect(), lost))
     }
 
     /// Test seam: `queue_snapshot`.

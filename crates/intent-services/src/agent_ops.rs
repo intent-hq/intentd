@@ -20649,29 +20649,33 @@ impl Services {
         &self,
         agent_id: &AgentId,
         pop: impl FnOnce() -> Option<T>,
-        ids: impl FnOnce(&T) -> Vec<String>,
+        entries: impl FnOnce(&T) -> Vec<QueuedMessage>,
     ) -> Option<(T, Vec<String>)> {
         if !self.store.agent_queues_shared() {
             return pop().map(|popped| (popped, Vec::new()));
         }
         let _gate = self.agent_queue_persist_gate.lock().await;
         self.refresh_queue_locked(agent_id).await;
-        let before = self
+        // Only an ordering hint for a rollback: an enqueue may land between
+        // this snapshot and the pop (enqueues do not take the gate), so the
+        // entries put back are the popped ones, never these copies.
+        let before: Vec<String> = self
             .agent_queues
             .lock()
             .unwrap()
             .get(agent_id)
-            .cloned()
+            .map(|queue| queue.iter().map(|m| m.id.clone()).collect())
             .unwrap_or_default();
         let popped = pop()?;
-        let claims = ids(&popped);
+        let taken = entries(&popped);
+        let claims: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
         let lost = match self.sync_queue_locked(agent_id, &claims).await {
             Ok(lost) => lost,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "queue claim write failed; leaving the entries queued");
                 // Retire the draining overlay first, then put the entries back.
                 drop(popped);
-                self.restore_unclaimed(agent_id, &before, &claims);
+                self.restore_unclaimed(agent_id, &before, &taken);
                 return None;
             }
         };
@@ -20681,21 +20685,38 @@ impl Services {
         Some((popped, lost))
     }
 
-    /// Put back the entries a failed claim popped: each id of `claims`
-    /// missing from memory returns from `before` (the queue just before the
-    /// pop) right after its nearest predecessor there that memory still
-    /// holds, so a mutation that landed meanwhile is kept.
-    fn restore_unclaimed(&self, agent_id: &AgentId, before: &[QueuedMessage], claims: &[String]) {
+    /// Put back `popped`, the entries a failed claim took, as popped (their
+    /// payloads, not an earlier copy). Their order comes from `before` (the
+    /// queue's ids just before the pop) with any popped entry `before` lacks
+    /// (enqueued between that snapshot and the pop) placed right after the
+    /// popped entry ahead of it. Each goes right after its nearest
+    /// predecessor in that order that memory holds now, so a mutation that
+    /// landed meanwhile is kept. Entries already back are skipped.
+    fn restore_unclaimed(&self, agent_id: &AgentId, before: &[String], popped: &[QueuedMessage]) {
+        let mut order: Vec<&str> = before.iter().map(String::as_str).collect();
+        let mut previous: Option<&str> = None;
+        for entry in popped {
+            if !order.contains(&entry.id.as_str()) {
+                let at = previous
+                    .and_then(|prev| order.iter().position(|id| *id == prev))
+                    .map_or(0, |position| position + 1);
+                order.insert(at, entry.id.as_str());
+            }
+            previous = Some(entry.id.as_str());
+        }
         let mut queues = self.agent_queues.lock().unwrap();
         let queue = queues.entry(agent_id.clone()).or_default();
-        for (index, entry) in before.iter().enumerate() {
-            if !claims.contains(&entry.id) || queue.iter().any(|m| m.id == entry.id) {
+        for (index, id) in order.iter().enumerate() {
+            let Some(entry) = popped.iter().find(|m| m.id == *id) else {
+                continue;
+            };
+            if queue.iter().any(|m| m.id == entry.id) {
                 continue;
             }
-            let at = before[..index]
+            let at = order[..index]
                 .iter()
                 .rev()
-                .find_map(|prev| queue.iter().position(|m| m.id == prev.id))
+                .find_map(|prev| queue.iter().position(|m| m.id == *prev))
                 .map_or(0, |position| position + 1);
             queue.insert(at, entry.clone());
         }

@@ -242,3 +242,92 @@ async fn a_failed_claim_write_delivers_nothing_and_a_later_drain_delivers_once()
         assert!(queue_contents(services, &agent).await.is_empty());
     }
 }
+
+/// An entry enqueued between the claim's snapshot and its batch pop (the
+/// enqueue does not take the persist gate) survives a failed claim: the
+/// batch is put back as popped, so `c` is restored with `a` and `b`, its
+/// write-through persists all three, and draining delivers each once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_enqueued_during_a_failed_batch_claim_is_kept_and_drains_once() {
+    let Some(pool) = pool().await else { return };
+    let tenant = format!(
+        "claim-race-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store_a = open(&pool, &tenant, "process-a").await;
+    let agent = AgentId("agent-race".into());
+    let now = intent_core::now_iso();
+    store_a
+        .insert_agent_session(&AgentSession {
+            id: agent.clone(),
+            workspace_id: WorkspaceId("__chief__".into()),
+            name: "race".into(),
+            status: AgentStatus::Idle,
+            created_at: now.clone(),
+            updated_at: now,
+            ..AgentSession::default()
+        })
+        .await
+        .expect("seed the agent");
+    let a = Services::new_isolated(store_a);
+    let enqueue = |text: &str| {
+        a.enqueue_message_for_test(
+            &agent,
+            text.into(),
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::User,
+        )
+        .0
+        .id
+    };
+    let mut ids = vec![enqueue("a"), enqueue("b")];
+    a.persist_queue_snapshot_for_test(&agent).await;
+
+    let fault = break_queue_writes(&pool, &tenant).await;
+    let mut enqueued = None;
+    let claimed = a
+        .claim_queue_batch_for_test(&agent, 2, || enqueued = Some(enqueue("c")))
+        .await;
+    heal(&pool, &fault).await;
+    assert_eq!(claimed, None, "a failed claim must not be delivered");
+    ids.push(enqueued.expect("c was enqueued inside the claim window"));
+    assert_eq!(
+        queue_contents(&a, &agent).await,
+        ["a", "b", "c"],
+        "c kept, in place"
+    );
+
+    // c's own write-through, delayed past the failed claim, persists all.
+    a.persist_queue_snapshot_for_test(&agent).await;
+    let b = Services::new_isolated(open(&pool, &tenant, "process-b").await);
+    assert_eq!(
+        queue_contents(&b, &agent).await,
+        ["a", "b", "c"],
+        "all stored"
+    );
+
+    let mut delivered = Vec::new();
+    loop {
+        let (from_a, from_b) = tokio::join!(
+            a.claim_next_queued_message_for_test(&agent),
+            b.claim_next_queued_message_for_test(&agent),
+        );
+        if from_a.is_none() && from_b.is_none() {
+            break;
+        }
+        for (id, lost) in [from_a, from_b].into_iter().flatten() {
+            if !lost.contains(&id) {
+                delivered.push(id);
+            }
+        }
+    }
+    delivered.sort();
+    ids.sort();
+    assert_eq!(
+        delivered, ids,
+        "each entry, c included, is delivered exactly once"
+    );
+}

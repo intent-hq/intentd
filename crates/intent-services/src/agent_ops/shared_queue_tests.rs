@@ -48,7 +48,7 @@ async fn a_claimed_pop_on_an_unshared_store_is_the_plain_pop() {
         .claim_queue_pop(
             &agent,
             || svc.dequeue_message_draining(&agent),
-            |(next, _)| vec![next.id.clone()],
+            |(next, _)| vec![next.clone()],
         )
         .await
         .expect("the head pops");
@@ -185,30 +185,29 @@ async fn adopting_the_stored_queue_takes_a_foreign_removal() {
 
 /// A failed claim puts its popped entries back at their place, after the
 /// nearest earlier entry still queued, keeping an enqueue made meanwhile.
+/// The entries come from the pop itself: m3 was enqueued after the
+/// pre-pop snapshot (which lists only m1, m2) and is still restored, right
+/// after m2, ahead of m4 enqueued after the pop.
 #[tokio::test]
 async fn an_unclaimed_pop_returns_to_its_place() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Restore unclaimed").await;
     enqueue(&svc, &agent, "m1");
     enqueue(&svc, &agent, "m2");
+    let before = live_ids(&svc, &agent);
     enqueue(&svc, &agent, "m3");
-    let before = svc
-        .agent_queues
-        .lock()
-        .unwrap()
-        .get(&agent)
-        .cloned()
-        .unwrap();
-    svc.agent_queues
-        .lock()
-        .unwrap()
-        .get_mut(&agent)
-        .unwrap()
-        .retain(|m| m.id != "m1" && m.id != "m3");
+    let (popped, draining) = svc
+        .dequeue_ready_batch_draining(&agent, false, 2)
+        .expect("a batch");
+    drop(draining);
+    assert_eq!(
+        popped.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["m1", "m2", "m3"]
+    );
     enqueue(&svc, &agent, "m4");
-    svc.restore_unclaimed(&agent, &before, &["m1".into(), "m3".into()]);
+    svc.restore_unclaimed(&agent, &before, &popped);
     assert_eq!(live_ids(&svc, &agent), ["m1", "m2", "m3", "m4"]);
     // Restoring twice adds nothing.
-    svc.restore_unclaimed(&agent, &before, &["m1".into(), "m3".into()]);
+    svc.restore_unclaimed(&agent, &before, &popped);
     assert_eq!(live_ids(&svc, &agent), ["m1", "m2", "m3", "m4"]);
 }
