@@ -1,6 +1,7 @@
 # Agents — intentd
 
-Per-package supplement to the [monorepo-root `AGENTS.md`](../../AGENTS.md). Read the root
+Per-package supplement to the [monorepo-root `AGENTS.md`](../../AGENTS.md)
+([on GitHub](https://github.com/intent-hq/intent/blob/main/AGENTS.md)). Read the root
 guide first for the cross-package workflow (submodule PR → monorepo bump, conventional
 commits). This file covers conventions specific to `packages/intentd`, the
 Rust backend daemon.
@@ -15,7 +16,8 @@ record the affected guide section or explain why there is no user-help impact. F
 
 > **Merge permission**: never merge a PR or arm auto-merge without explicit permission
 > from a human — approved + green is not enough. See the
-> [root `AGENTS.md`](../../AGENTS.md) for the full rule.
+> [root `AGENTS.md`](../../AGENTS.md)
+> ([on GitHub](https://github.com/intent-hq/intent/blob/main/AGENTS.md)) for the full rule.
 
 ## Tech stack
 
@@ -376,8 +378,9 @@ down (the lint fails until a fixed file's entry is removed or lowered) and keep 
 | `test_helper_track_caller_lint` | a short sync, non-test helper — at most 3 panic points (`assert*!` / `panic!` / `unreachable!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect(`), at least one of them a macro, not counting closures, `async` blocks or `macro_rules!` — in `crates/*/tests/**`, `crates/*/src/**/test_support{.rs,/**}` or the `intentd-test-support` crate without `#[track_caller]` (or `cfg_attr(…, track_caller)`): a failure then reports the helper's line, not the test step that called it (intentd merge-group run 41006457347 blamed a line inside `success()`). Longer helpers keep their own lines, since the attribute would collapse every `unwrap()` onto the caller. `async fn` is exempt (the attribute is a no-op there); to name the caller, return the future from a sync `#[track_caller]` fn holding `common::CallerOnPanic`, as `expect_ok` in `e2e_wss_rpc_overload_limit.rs` does | `// track-caller: allow — <reason>` in the comment block above the fn or between its attributes; a marker that covers no helper needing the attribute is stale |
 | `compile_time_manifest_dir_lint` | `env!("CARGO_MANIFEST_DIR")` / `option_env!(…)` in library code (`crates/*/src/**` outside `#[cfg(test)]` / `#[cfg(all(test, …))]` items and test files; `cfg(any(test, feature = "test-hooks"))` code counts as library; `include_str!` / `include_bytes!` arguments are exempt), or anywhere in a source scanner (a `crates/*/tests/*_lint.rs` source lint, a module it loads by `#[path]`, or an `OTHER_SOURCE_SCANNERS` entry such as `intent-app/tests/payload_budget/`) — it bakes the building checkout's path into the build, and a build reused by another checkout (a shared target dir) then reads that path: `agent_hidden_field_egress_lint` scanned a deleted checkout on intentd#3648. Resolve it at run time with `source_lint::workspace_root()` / `source_lint::package_dir()` | none |
 
-See the [root `AGENTS.md`](../../AGENTS.md) for the submodule-PR → monorepo-bump
-workflow and conventional commits. Never quote the literal breaking-change footer token
+See the [root `AGENTS.md`](../../AGENTS.md)
+([on GitHub](https://github.com/intent-hq/intent/blob/main/AGENTS.md)) for the submodule-PR →
+monorepo-bump workflow and conventional commits. Never quote the literal breaking-change footer token
 (`BREAKING CHANGE:` / `BREAKING-CHANGE:`, or `Release-As:`) in commit messages — branch
 commit bodies fold into the squash and trigger a false major bump or pinned version
 (intent-hq/intent#2988) — nor in PR titles/bodies or review comments; write "the
