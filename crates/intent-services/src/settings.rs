@@ -164,7 +164,7 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
 pub struct AsyncSecretStore {
-    paired_gitlab: Option<std::path::PathBuf>,
+    paired_gitlab: Option<intent_core::FileSecretStore>,
     repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
     repository_write: Option<Arc<RepositorySettingsWrite>>,
     inner: Arc<dyn SecretStore>,
@@ -396,21 +396,23 @@ impl AsyncSecretStore {
     /// Explicit common backing-file construction. Generic store injection does
     /// not establish this provenance even if its values happen to match.
     pub(crate) fn paired_gitlab(store: intent_core::FileSecretStore) -> Self {
-        let path = store.path().to_path_buf();
-        let mut wrapper = Self::new(Arc::new(store));
-        wrapper.paired_gitlab = Some(path);
+        let mut wrapper = Self::new(Arc::new(store.clone()));
+        wrapper.paired_gitlab = Some(store);
         wrapper
     }
 
+    /// The paired GitLab source this wrapper was built over, with its
+    /// backend (a file, or an orchestrator tenant's rows).
     pub(crate) fn paired_gitlab_source(&self) -> Result<intent_core::FileSecretStore> {
         self.paired_gitlab
-            .as_ref()
-            .map(intent_core::FileSecretStore::with_path)
+            .clone()
             .ok_or_else(|| Error::Internal("original paired GitLab source unavailable".into()))
     }
 
     pub(crate) fn is_paired_gitlab_store(&self, store: &intent_core::FileSecretStore) -> bool {
-        self.paired_gitlab.as_deref() == Some(store.path())
+        self.paired_gitlab
+            .as_ref()
+            .is_some_and(|paired| paired.path() == store.path())
     }
 
     pub(crate) fn install_repository_boundary(&self, gate: GitlabCredentialGate) -> Result<()> {

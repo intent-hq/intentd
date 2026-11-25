@@ -11,6 +11,7 @@ use intent_core::tenant_fence::{SelfFenceReport, TenantFence};
 use intent_core::{Error, Result};
 use intent_services::host_exec_stream::HostExecStreamRegistry;
 use intent_services::retention::TenantSweepTiming;
+use intent_services::settings_store_follower::{StoreSettingsFollower, DEFAULT_POLL_INTERVAL};
 use intent_services::{
     AgentManager, EventBus, Services, SettingsRegistry, StartupCompletionRecovery,
     StartupResumeCandidates,
@@ -57,7 +58,32 @@ pub struct ServedTenant {
     /// The tenant's agent manager: `services` holds only a weak handle, so
     /// this one keeps every `agent.*` turn running while the tenant serves.
     agents: Arc<AgentManager>,
+    /// The tenant's settings follower ([`follow_settings`]): stopped by the
+    /// fence, and joined by [`ServedTenant::drain`] and
+    /// [`ServedTenant::stopped`] before they return.
+    settings_follower: SettingsFollowerSlot,
     report: Option<tokio::task::JoinHandle<SelfFenceReport>>,
+}
+
+/// The running settings follower, until someone stops it. Whoever stops it
+/// first joins it; a second caller waits on the lock until that join ends,
+/// so every caller returns only once the follower has ended.
+#[derive(Clone, Default)]
+struct SettingsFollowerSlot(Arc<tokio::sync::Mutex<Option<StoreSettingsFollower>>>);
+
+impl SettingsFollowerSlot {
+    async fn stop(&self) {
+        let mut slot = self.0.lock().await;
+        if let Some(mut follower) = slot.take() {
+            follower.shutdown().await;
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.0
+            .try_lock()
+            .map_or(true, |slot| slot.as_ref().is_some_and(|f| !f.is_finished()))
+    }
 }
 
 /// The tenant's work is admitted until its fence fires.
@@ -70,9 +96,10 @@ impl Admission for Unfenced {
 }
 
 /// Open tenant `tenant` on `pool` as `instance` and start serving it, with
-/// its files under [`crate::tenant_dir`] of `data_dir` and its secrets in
-/// its Postgres rows, sealed with `keyring` ([`crate::secrets`]). Call it
-/// on the multi-thread runtime: the secret store needs it.
+/// its files under [`crate::tenant_dir`] of `data_dir`, its secrets in its
+/// Postgres rows, sealed with `keyring` ([`crate::secrets`]), and its
+/// settings in its Postgres row ([`crate::settings`]). Call it on the
+/// multi-thread runtime: the secret and settings stores need it.
 ///
 /// # Errors
 /// For an invalid tenant id; `Error::SchemaMismatch` when the schema does
@@ -222,7 +249,18 @@ async fn try_serve_tenant_with(
     let bus = EventBus::new(store.clone());
     let reverse = Arc::new(PrimaryReverseRegistry::new());
     let secrets = Arc::new(crate::secrets::TenantSecrets::new(&store, keyring)?);
-    let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets.clone())?;
+    let settings = Arc::new(SettingsRegistry::load_from_store(Arc::new(
+        crate::settings::TenantSettings::new(&store)?,
+    ))?);
+    let services = tenant_services(
+        store,
+        bus.clone(),
+        &dir,
+        reverse.clone(),
+        secrets.clone(),
+        settings,
+    );
+    let settings_follower = follow_settings(&services, &fence);
     let mut runner = intent_services::self_fence::tenant_self_fence(services.clone())
         .ok_or_else(|| Error::Internal(format!("tenant {tenant}: the store has no fence")))?;
     let admission = Unfenced(fence.clone());
@@ -283,6 +321,7 @@ async fn try_serve_tenant_with(
         fence,
         heartbeat,
         agents: recovered.agents,
+        settings_follower,
         report: Some(runner.spawn()),
     })))
 }
@@ -478,27 +517,48 @@ fn install_receive_hooks(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Follow the tenant's settings for other processes' writes until its
+/// fence fires ([`intent_services::settings_store_follower`]).
+fn follow_settings(services: &Services, fence: &TenantFence) -> SettingsFollowerSlot {
+    let slot = SettingsFollowerSlot(Arc::new(tokio::sync::Mutex::new(Some(
+        StoreSettingsFollower::start(services.clone(), DEFAULT_POLL_INTERVAL),
+    ))));
+    let fence = fence.clone();
+    let stopper = slot.clone();
+    tokio::spawn(async move {
+        fence.fenced().await;
+        stopper.stop().await;
+    });
+    slot
+}
+
 /// The tenant's `Services` over `bus`: every path under `dir`, in
 /// orchestrator mode, dispatching to clients through `reverse`, with
-/// `secrets` as the store every secret reader and writer uses (the tenant's
-/// Postgres rows in [`serve_tenant`]). The GitLab credential pair is the one
-/// exception: `Services` keeps it in a concrete file store, here the
-/// tenant's own `secrets.json`, never the process-wide default.
+/// `settings` as its settings registry (the tenant's Postgres row in
+/// [`serve_tenant`]) and `secrets` as the store every secret reader and
+/// writer uses (the tenant's Postgres rows in [`serve_tenant`]). The GitLab
+/// credential pair, which `Services` keeps in a concrete
+/// `FileSecretStore` handle, goes to `secrets` too (`with_backend`): never
+/// a file, and never the process-wide default.
 fn tenant_services(
     store: Store,
     bus: EventBus,
     dir: &Path,
     reverse: Arc<PrimaryReverseRegistry>,
     secrets: Arc<dyn intent_services::SecretStore>,
-) -> Result<Services> {
-    let registry = SettingsRegistry::load(dir.join("config.toml"))?;
-    let hooks_max_per_agent = registry.snapshot().effective.hooks.max_per_agent;
-    let gitlab_pair = intent_core::FileSecretStore::with_path(dir.join("secrets.json"));
+    settings: Arc<SettingsRegistry>,
+) -> Services {
+    let hooks_max_per_agent = settings.snapshot().effective.hooks.max_per_agent;
+    // The handle's identity only: nothing reads or writes this path.
+    let gitlab_pair = intent_core::FileSecretStore::with_backend(
+        dir.join("gitlab-pair (tenant secrets)"),
+        secrets.clone(),
+    );
     let services = intent_app::compose(
         Services::new_with_secret_file(store, gitlab_pair)
             .with_event_bus(bus)
             .with_reverse_dispatch(reverse)
-            .with_settings_registry(Arc::new(registry))
+            .with_settings_registry(settings)
             .with_hooks_max_per_agent(hooks_max_per_agent)
             .with_secret_store(secrets)
             .with_workspaces_root(dir.join("workspaces"))
@@ -512,7 +572,7 @@ fn tenant_services(
     // No process starts on this host for a tenant: its hub refuses stdio
     // MCP servers (`crate::mcp`).
     services.mcp_hub().refuse_stdio();
-    Ok(services)
+    services
 }
 
 impl ServedTenant {
@@ -629,12 +689,16 @@ impl ServedTenant {
         let connections = self.runtime.connections().clone();
         let reconcile = self.runtime.drain_reconcile();
         let loops = self.runtime.stop_loops();
+        let settings_follower = self.settings_follower.clone();
         async move {
             if fence.is_fenced() {
+                settings_follower.stop().await;
                 return;
             }
             let closed = connections.close_all();
             intent_app::shutdown::close_admission(&services, &agents, streams);
+            // No settings adoption runs past the drain.
+            settings_follower.stop().await;
             // Before the checkpoint: no startup sweep starts work after it.
             reconcile.await;
             services.shutdown_pty_sessions().await;
@@ -657,10 +721,18 @@ impl ServedTenant {
         crate::watch_report(report, move |report| {
             let _ = tx.send(report);
         });
-        match rx.await {
-            Ok(report) => report,
-            Err(_) => std::future::pending().await,
-        }
+        let Ok(report) = rx.await else {
+            return std::future::pending().await;
+        };
+        // The fence stops the follower; return only once it has ended.
+        self.settings_follower.stop().await;
+        report
+    }
+
+    /// Whether the tenant's settings follower is still running.
+    #[must_use]
+    pub fn settings_follower_running(&self) -> bool {
+        self.settings_follower.running()
     }
 
     /// Hand the tenant's fence report to `on_stop` as soon as it is ready,
@@ -725,8 +797,9 @@ mod tests {
         let secrets = Arc::new(intent_core::FileSecretStore::with_path(
             dir.join("secrets.json"),
         ));
+        let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
         (
-            tenant_services(store, bus, &dir, reverse, secrets).unwrap(),
+            tenant_services(store, bus, &dir, reverse, secrets, settings),
             dir,
         )
     }
@@ -749,7 +822,9 @@ mod tests {
         let secrets = Arc::new(intent_core::FileSecretStore::with_path(
             dir.join("secrets.json"),
         ));
-        let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets).unwrap();
+        let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
+        let services =
+            tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets, settings);
         let earlier = services.clone();
         let dispatch = earlier
             .feature_reverse_dispatch()
@@ -811,8 +886,8 @@ mod tests {
 
     /// Every credential a tenant saves — including the GitLab token, which
     /// goes through the paired GitLab source — lands in, and resolves from,
-    /// that tenant's own `secrets.json`; the process-wide default file is
-    /// neither read nor written.
+    /// that tenant's own secret store (here a file standing in for its
+    /// rows); the process-wide default file is neither read nor written.
     #[tokio::test]
     async fn tenants_keep_credentials_in_their_own_secrets_file() {
         let root = tempfile::tempdir().unwrap();
@@ -915,7 +990,9 @@ mod tests {
         let secrets = Arc::new(intent_core::FileSecretStore::with_path(
             dir.join("secrets.json"),
         ));
-        let services = tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets).unwrap();
+        let settings = Arc::new(SettingsRegistry::load(dir.join("config.toml")).unwrap());
+        let services =
+            tenant_services(store, bus.clone(), &dir, reverse.clone(), secrets, settings);
         let connections = intent_app::tenant::ClientConnections::default();
         let config = crate::listen::ListenConfig {
             socket_path: dir.join("o.sock"),

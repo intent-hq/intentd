@@ -23,6 +23,18 @@
 //!   (not just the last write) means a stale or coalesced watcher read that
 //!   observes an earlier self-write is still recognized and skipped.
 //!
+//! **Where the document lives.** [`SettingsRegistry::load`] keeps it in a
+//! `config.toml` file (the desktop and `intentd`: the watcher, the
+//! self-write guard and atomic rewrites above). [`SettingsRegistry::load_from_store`]
+//! keeps it in a [`SettingsDocumentStore`] instead (an orchestrator tenant's
+//! Postgres row): nothing is written to disk, every write is a
+//! compare-and-set on the document's revision, so of two registries on one
+//! document that write from the same revision one wins and the other gets
+//! [`Error::Conflict`], and [`SettingsRegistry::refresh`] picks up another
+//! process's write by re-reading the revision (see
+//! [`crate::settings_store_follower`]). Both publish on the same `watch`
+//! channel.
+//!
 //! Keys are addressed by their dotted **wire path** (e.g.
 //! `server.wsApi.enabled`), which maps one-to-one onto the camelCase nested
 //! TOML schema. Secrets and the SQLite-backed machine-state blobs are not the
@@ -32,7 +44,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::{LegacySettings, SettingsFile};
@@ -234,6 +247,57 @@ pub(crate) struct WriteStamp {
     pub content_hash: u64,
 }
 
+/// A settings document as a [`SettingsDocumentStore`] holds it: the TOML
+/// text and its revision (1 or more; each write adds one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSettings {
+    pub text: String,
+    pub revision: u64,
+}
+
+/// What [`SettingsDocumentStore::compare_and_set`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsWrite {
+    /// The document was written at this new revision.
+    Written(u64),
+    /// Another write came first: nothing was written, and the document is
+    /// at this revision (0: still none).
+    Conflict(u64),
+}
+
+/// Where a store-backed [`SettingsRegistry`] keeps its document instead of
+/// `config.toml` (an orchestrator tenant's Postgres row). Calls are
+/// synchronous and short: the registry makes them under its writer lock.
+pub trait SettingsDocumentStore: Send + Sync {
+    /// The stored document; `None` before the first write.
+    ///
+    /// # Errors
+    /// When the store cannot be read.
+    fn load(&self) -> Result<Option<StoredSettings>>;
+
+    /// Write `text` if the document is still at `expected` (0: none yet).
+    ///
+    /// # Errors
+    /// When the store cannot be written (a lost tenant included); a lost
+    /// race is [`SettingsWrite::Conflict`], not an error.
+    fn compare_and_set(&self, expected: u64, text: &str) -> Result<SettingsWrite>;
+
+    /// A name for the document in logs and errors (never a filesystem path).
+    fn label(&self) -> String;
+}
+
+/// The error a store-backed write gets when another process wrote first.
+fn revision_conflict(held: u64, current: u64) -> Error {
+    Error::Conflict {
+        current: serde_json::json!({
+            "settingsRevision": current,
+            "heldRevision": held,
+            "message": "settings were changed by another process; \
+                        the newer settings are loaded, retry the change",
+        }),
+    }
+}
+
 /// A boot-time pin: the value that overrides the file, plus the flag/env
 /// label used in rejection messages (e.g. `--insecure`, `INTENTD_TCP_PORT`).
 #[derive(Debug, Clone)]
@@ -264,6 +328,9 @@ struct Inner {
     /// at [`SELF_WRITE_HISTORY`] entries; each stamp carries the write time
     /// so only writes within [`SELF_WRITE_WINDOW`] count as self-writes.
     recent_writes: VecDeque<(WriteStamp, Instant)>,
+    /// The store revision `source_text` came from (store backend only; 0
+    /// for a file, and for a store document never written).
+    revision: u64,
 }
 
 impl Inner {
@@ -339,8 +406,23 @@ pub struct SettingsRegistry {
     repository_gate: OnceLock<GitlabCredentialGate>,
     #[cfg(test)]
     pub(crate) context_publication_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// The `config.toml` path, or for a store backend a name that is never
+    /// on disk ([`SettingsRegistry::config_path`]).
     path: PathBuf,
+    /// The store backend; `None` for the file.
+    store: Option<Arc<dyn SettingsDocumentStore>>,
+    /// Serializes every mutation (apply, pin, reload, legacy strip, port
+    /// assignment). A mutation holds it across its document write — for a
+    /// store backend a compare-and-set that can wait out the tenant's writer
+    /// budget — while `inner` is only locked for short in-memory steps, so
+    /// readers (`generation`, `validate`, `preview`, the self-write guard,
+    /// reload preparation) never wait on an in-flight write. Order: `writer`
+    /// before `inner`.
+    writer: Mutex<()>,
     inner: Mutex<Inner>,
+    /// `inner.revision`, readable without any lock
+    /// ([`SettingsRegistry::store_revision`]).
+    revision: AtomicU64,
     snapshot: RwLock<Arc<SettingsSnapshot>>,
     tx: watch::Sender<SettingsChanged>,
 }
@@ -351,6 +433,9 @@ pub(crate) struct PreparedRepositorySettings {
     expected: Arc<SettingsSnapshot>,
     candidate: Inner,
     snapshot: Arc<SettingsSnapshot>,
+    /// Prepared from a store document another process wrote: publication
+    /// never waits behind an in-flight write ([`SettingsRegistry::publish_repository_reload`]).
+    from_store: bool,
 }
 impl PreparedRepositorySettings {
     pub(crate) fn snapshot(&self) -> &SettingsSnapshot {
@@ -439,7 +524,56 @@ impl SettingsRegistry {
             pins: BTreeMap::new(),
             generation: 0,
             recent_writes: VecDeque::new(),
+            revision: 0,
         };
+        Self::from_inner(path, None, inner)
+    }
+
+    /// Build the registry over a [`SettingsDocumentStore`] instead of a
+    /// file (see the module docs): the stored document, or the default
+    /// template when there is none yet (held in memory at revision 0; the
+    /// first write creates the document). Nothing is written to disk, now
+    /// or later.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read, or its document is malformed.
+    pub fn load_from_store(store: Arc<dyn SettingsDocumentStore>) -> Result<Self> {
+        let stored = store.load()?;
+        let (text, revision) = stored.map_or_else(
+            || {
+                (
+                    intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE.to_owned(),
+                    0,
+                )
+            },
+            |stored| (stored.text, stored.revision),
+        );
+        let label = store.label();
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(&text)
+            .map_err(|e| Error::InvalidInput(format!("settings {label}: {e}")))?;
+        let mut doc: DocumentMut = text
+            .parse()
+            .map_err(|e| Error::Internal(format!("could not parse settings {label}: {e}")))?;
+        sync_normalized_compounds(&mut doc, &file)?;
+        let inner = Inner {
+            file,
+            doc,
+            source_text: text,
+            legacy,
+            pins: BTreeMap::new(),
+            generation: 0,
+            recent_writes: VecDeque::new(),
+            revision,
+        };
+        Self::from_inner(PathBuf::from(label), Some(store), inner)
+    }
+
+    fn from_inner(
+        path: PathBuf,
+        store: Option<Arc<dyn SettingsDocumentStore>>,
+        inner: Inner,
+    ) -> Result<Self> {
         let snapshot = Arc::new(build_snapshot(&inner)?);
         let (tx, _rx) = watch::channel(SettingsChanged::default());
         Ok(Self {
@@ -447,10 +581,120 @@ impl SettingsRegistry {
             #[cfg(test)]
             context_publication_probe: Mutex::new(None),
             path,
+            store,
+            writer: Mutex::new(()),
+            revision: AtomicU64::new(inner.revision),
             inner: Mutex::new(inner),
             snapshot: RwLock::new(snapshot),
             tx,
         })
+    }
+
+    /// Take the mutation lock (see the `writer` field).
+    fn lock_writer(&self) -> MutexGuard<'_, ()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The mutation state, cloned under a short lock. Callers hold
+    /// [`Self::lock_writer`], so it cannot change until they install theirs.
+    fn current(&self) -> Inner {
+        self.inner
+            .lock()
+            .expect("settings registry lock poisoned")
+            .clone()
+    }
+
+    /// Install `inner` as the mutation state (the caller holds the writer
+    /// lock), keeping the lock-free revision in step.
+    fn install(&self, held: &mut Inner, inner: Inner) {
+        self.revision.store(inner.revision, Ordering::SeqCst);
+        *held = inner;
+    }
+
+    /// Whether a mutation (and so possibly a store write) is in progress.
+    #[must_use]
+    pub fn write_in_flight(&self) -> bool {
+        matches!(self.writer.try_lock(), Err(TryLockError::WouldBlock))
+    }
+
+    /// Persist `text` as the successor of `inner`'s document: an atomic
+    /// file rewrite (checked against `inner`'s exact text when `checked`),
+    /// or a compare-and-set on `inner`'s store revision. Returns the new
+    /// revision (0 for a file).
+    fn write_document(&self, inner: &Inner, text: &str, checked: bool) -> Result<u64> {
+        match &self.store {
+            None => {
+                atomic_write_checked(
+                    &self.path,
+                    text,
+                    checked.then_some(inner.source_text.as_str()),
+                )?;
+                Ok(0)
+            }
+            Some(store) => match store.compare_and_set(inner.revision, text)? {
+                SettingsWrite::Written(revision) => Ok(revision),
+                SettingsWrite::Conflict(current) => {
+                    tracing::info!(
+                        settings = %self.path.display(),
+                        held = inner.revision,
+                        current,
+                        "settings write lost to another process's write"
+                    );
+                    Err(revision_conflict(inner.revision, current))
+                }
+            },
+        }
+    }
+
+    /// Whether this registry keeps its document in a store, not a file.
+    #[must_use]
+    pub fn is_store_backed(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// The store revision of the current document (0 for a file, and for a
+    /// store document never written). Lock-free: never waits on a write.
+    #[must_use]
+    pub fn store_revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    /// Re-read a store-backed document: `Some` when another process wrote a
+    /// newer revision than this registry holds, `None` when it is current
+    /// (or this registry is file-backed, or the document is not written
+    /// yet). Adopt it with [`Self::prepare_stored_reload_at`].
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read.
+    pub fn fetch_newer(&self) -> Result<Option<StoredSettings>> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let held = self.store_revision();
+        Ok(store.load()?.filter(|stored| stored.revision > held))
+    }
+
+    /// Adopt another process's newer write in place, without the services'
+    /// runtime hooks or events (those run when the follower adopts it
+    /// through `Services`, see [`crate::settings_store_follower`]). Returns
+    /// the changed-key notice, empty when the document is current.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read, or the stored document is malformed
+    /// (the registry keeps its last-good state).
+    pub fn refresh(&self) -> Result<SettingsChanged> {
+        let Some(stored) = self.fetch_newer()? else {
+            return Ok(SettingsChanged {
+                generation: self.generation(),
+                changed: BTreeSet::new(),
+            });
+        };
+        let prepared = self.prepare_stored_reload_at(&stored, self.snapshot())?;
+        self.publish_repository_reload(prepared, None)
     }
 
     /// Legacy values captured at load (dotted wire path → JSON value; empty
@@ -473,7 +717,8 @@ impl SettingsRegistry {
     /// persisted elsewhere, so a failed import keeps the file intact for the
     /// next boot to retry.
     pub(crate) fn strip_legacy(&self) -> Result<Vec<String>> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let _writer = self.lock_writer();
+        let mut inner = self.current();
         if inner.legacy.is_empty() {
             return Ok(Vec::new());
         }
@@ -486,16 +731,27 @@ impl SettingsRegistry {
         }
         let text = doc.to_string();
         SettingsFile::parse_str(&text)?;
-        atomic_write(&self.path, &text)?;
+        let revision = self.write_document(&inner, &text, false)?;
         inner.doc = doc;
         inner.record_write(&text);
+        inner.revision = revision;
         inner.legacy.clear();
+        let mut held = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut held, inner);
         Ok(stripped)
     }
 
-    /// The `config.toml` path this registry reads and writes.
+    /// The `config.toml` path this registry reads and writes. A
+    /// store-backed registry has no file: this is then its document's
+    /// label, never a path on disk (see [`Self::file_path`]).
     pub fn config_path(&self) -> &Path {
         &self.path
+    }
+
+    /// The `config.toml` path, or `None` for a store-backed registry.
+    #[must_use]
+    pub fn file_path(&self) -> Option<&Path> {
+        self.store.is_none().then_some(self.path.as_path())
     }
 
     /// All dotted wire paths the registry manages.
@@ -619,6 +875,7 @@ impl SettingsRegistry {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
         }
+        let _writer = self.lock_writer();
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         let mut json = file_json(&inner.file)?;
         for (pin_path, pin) in &inner.pins {
@@ -636,7 +893,7 @@ impl SettingsRegistry {
         );
         let snapshot = Arc::new(build_snapshot(&candidate)?);
         self.before_repository_publication(&snapshot, write, None)?;
-        *inner = candidate;
+        self.install(&mut inner, candidate);
         self.repository_published(&snapshot);
         *self
             .snapshot
@@ -672,12 +929,16 @@ impl SettingsRegistry {
         write: Option<&RepositorySettingsWrite>,
         auth: Option<&RepositoryWrite>,
     ) -> Result<SettingsChanged> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
-        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
+        let _writer = self.lock_writer();
+        let current = self.current();
+        let (mut candidate, text, snapshot) = Self::validate_changes(&current, changes)?;
         self.before_repository_publication(&snapshot, write, auth)?;
-        atomic_write(&self.path, &text)?;
+        // The document write runs without `inner` held (see `writer`).
+        let revision = self.write_document(&current, &text, false)?;
         candidate.record_write(&text);
-        *inner = candidate;
+        candidate.revision = revision;
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut inner, candidate);
         self.repository_published(&snapshot);
         Ok(self.publish_snapshot(snapshot, inner.generation))
     }
@@ -709,7 +970,8 @@ impl SettingsRegistry {
         expected: &Arc<SettingsSnapshot>,
         port: u16,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let _writer = self.lock_writer();
+        let current = self.current();
         if !Arc::ptr_eq(expected, &self.snapshot())
             || expected.ws_api_port_policy() != WsApiPortPolicy::Unassigned
         {
@@ -718,10 +980,12 @@ impl SettingsRegistry {
             ));
         }
         let changes = [("server.wsApi.port".to_string(), Value::from(port))];
-        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, &changes)?;
-        atomic_write_checked(&self.path, &text, Some(&inner.source_text))?;
+        let (mut candidate, text, snapshot) = Self::validate_changes(&current, &changes)?;
+        let revision = self.write_document(&current, &text, true)?;
         candidate.record_write(&text);
-        *inner = candidate;
+        candidate.revision = revision;
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        self.install(&mut inner, candidate);
         *self
             .snapshot
             .write()
@@ -836,6 +1100,36 @@ impl SettingsRegistry {
         text: &str,
         expected: Arc<SettingsSnapshot>,
     ) -> Result<PreparedRepositorySettings> {
+        self.prepare_reload(text, None, expected)
+    }
+
+    /// [`Self::prepare_repository_reload_at`] for a document another
+    /// process wrote to this registry's store ([`Self::fetch_newer`]).
+    /// Refused when the registry already holds that revision or a newer one.
+    ///
+    /// # Errors
+    ///
+    /// For a malformed document, a file-backed registry, a stale revision,
+    /// or a snapshot that changed since `expected`.
+    pub(crate) fn prepare_stored_reload_at(
+        &self,
+        stored: &StoredSettings,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<PreparedRepositorySettings> {
+        if self.store.is_none() {
+            return Err(Error::Internal(
+                "a file-backed settings registry reloads from its file".into(),
+            ));
+        }
+        self.prepare_reload(&stored.text, Some(stored.revision), expected)
+    }
+
+    fn prepare_reload(
+        &self,
+        text: &str,
+        revision: Option<u64>,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<PreparedRepositorySettings> {
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
@@ -858,11 +1152,22 @@ impl SettingsRegistry {
                 "config snapshot changed after the reload was captured".into(),
             ));
         }
+        if let Some(revision) = revision {
+            if revision <= inner.revision {
+                return Err(Error::Internal(format!(
+                    "settings revision {revision} is not newer than the held {}",
+                    inner.revision
+                )));
+            }
+        }
         let mut candidate = inner.clone();
         candidate.file = file;
         candidate.doc = doc;
         candidate.source_text = text.to_string();
         candidate.recent_writes.clear();
+        if let Some(revision) = revision {
+            candidate.revision = revision;
+        }
         let snapshot = Arc::new(build_snapshot(&candidate)?);
         if expected.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
             && snapshot
@@ -880,6 +1185,7 @@ impl SettingsRegistry {
             expected,
             candidate,
             snapshot,
+            from_store: revision.is_some(),
         })
     }
 
@@ -888,6 +1194,22 @@ impl SettingsRegistry {
         prepared: PreparedRepositorySettings,
         write: Option<&RepositorySettingsWrite>,
     ) -> Result<SettingsChanged> {
+        // Another process's document never waits behind this process's
+        // in-flight write (a store write can take the writer budget); the
+        // follower retries at its next poll.
+        let _writer =
+            if prepared.from_store {
+                match self.writer.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(TryLockError::WouldBlock) => return Err(Error::Internal(
+                        "a settings write is in flight; the newer stored revision is adopted next"
+                            .into(),
+                    )),
+                }
+            } else {
+                self.lock_writer()
+            };
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         if !Arc::ptr_eq(&prepared.expected, &self.snapshot()) {
             return Err(Error::Internal(
@@ -898,14 +1220,23 @@ impl SettingsRegistry {
         // Keep its snapshot identity: publishing a replacement would retire
         // admitted repository replies even though nothing changed. Validate
         // the original snapshot first so stale reloads cannot bypass pins/ABA.
+        if prepared.candidate.revision < inner.revision {
+            return Err(Error::Internal(
+                "prepared settings revision is older than the held one".into(),
+            ));
+        }
         if prepared.candidate.source_text == inner.source_text {
+            // Same text at a newer store revision: hold the newer revision
+            // so the next write compares against it.
+            inner.revision = prepared.candidate.revision;
+            self.revision.store(inner.revision, Ordering::SeqCst);
             return Ok(SettingsChanged {
                 generation: inner.generation,
                 changed: BTreeSet::new(),
             });
         }
         self.before_repository_publication(&prepared.snapshot, write, None)?;
-        *inner = prepared.candidate;
+        self.install(&mut inner, prepared.candidate);
         self.repository_published(&prepared.snapshot);
         Ok(self.publish_snapshot(prepared.snapshot, inner.generation))
     }
@@ -1214,11 +1545,8 @@ fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value> {
 
 /// Crash-safe file replacement: write to a unique temp file in the same
 /// directory, fsync, then rename over the target. Readers only ever observe
-/// the old or the new complete content.
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    atomic_write_checked(path, text, None)
-}
-
+/// the old or the new complete content. With `expected`, refuse when the
+/// file no longer holds exactly that text just before the rename.
 fn atomic_write_checked(path: &Path, text: &str, expected: Option<&str>) -> Result<()> {
     let dir = path
         .parent()
@@ -1266,6 +1594,12 @@ fn content_hash(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// The default document text, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn tests_default_template() -> &'static str {
+    intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE
 }
 
 #[cfg(test)]

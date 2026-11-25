@@ -150,6 +150,7 @@ pub mod host_exec_stream;
 mod installed_cli;
 mod pending_delete_sweep;
 pub mod self_fence;
+pub mod settings_store_follower;
 mod workspace_mutations;
 
 mod github_ops;
@@ -377,7 +378,10 @@ pub use settings::{
     max_concurrent_adapters, max_concurrent_agents, report_to_parent_debounce_seconds,
     tool_payload_retention_days, workload_memory_ceiling, InMemorySecretStore, SecretStore,
 };
-pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
+pub use settings_registry::{
+    SettingOrigin, SettingsDocumentStore, SettingsRegistry, SettingsSnapshot, SettingsWrite,
+    StoredSettings, WsApiPortPolicy,
+};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
@@ -17991,6 +17995,43 @@ impl Services {
         &self,
         text: String,
         expected: Arc<SettingsSnapshot>,
+        admission: PreparedReloadAdmission,
+    ) -> Result<SettingsChanged> {
+        let registry = self
+            .settings_registry
+            .as_deref()
+            .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
+        let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+        self.publish_prepared_settings_reload(candidate, admission)
+            .await
+    }
+
+    /// [`Self::apply_prepared_settings_reload`] for a store-backed registry:
+    /// adopt `stored`, a newer revision another process wrote
+    /// ([`SettingsRegistry::fetch_newer`]), through the same gates, runtime
+    /// hooks and `settings:changed` event as an external `config.toml` edit.
+    ///
+    /// # Errors
+    /// As [`Self::apply_prepared_settings_reload`], and for a file-backed
+    /// registry or a revision that is not newer than the held one.
+    pub async fn apply_stored_settings_reload(
+        &self,
+        stored: settings_registry::StoredSettings,
+        expected: Arc<SettingsSnapshot>,
+        admission: PreparedReloadAdmission,
+    ) -> Result<SettingsChanged> {
+        let registry = self
+            .settings_registry
+            .as_deref()
+            .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
+        let candidate = registry.prepare_stored_reload_at(&stored, expected)?;
+        self.publish_prepared_settings_reload(candidate, admission)
+            .await
+    }
+
+    async fn publish_prepared_settings_reload(
+        &self,
+        candidate: settings_registry::PreparedRepositorySettings,
         mut admission: PreparedReloadAdmission,
     ) -> Result<SettingsChanged> {
         type Completion = (
@@ -18004,7 +18045,6 @@ impl Services {
             .settings_registry
             .as_deref()
             .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
-        let candidate = registry.prepare_repository_reload_at(&text, expected)?;
         let relevant = candidate.snapshot().effective.source_control.gitlab
             != registry.snapshot().effective.source_control.gitlab;
         let credential_guard = if relevant {
@@ -19505,15 +19545,20 @@ impl WorkspaceApi for Services {
                 .flatten()
                 .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str));
             self.check_settings_paths("settings.update", paths, true)?;
-            self.settings_update_checking_profiles(changes).await
+            let result = self.settings_update_checking_profiles(changes).await;
+            settings_store_follower::catch_up_after_conflict(self, &result).await;
+            result
         })
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.check_settings_paths("settings.reset", [path.as_str()], true)?;
-            self.owned_settings_mutation(serde_json::Value::Null, Some(path))
-                .await
+            let result = self
+                .owned_settings_mutation(serde_json::Value::Null, Some(path))
+                .await;
+            settings_store_follower::catch_up_after_conflict(self, &result).await;
+            result
         })
     }
 
@@ -38908,6 +38953,8 @@ mod file_tracking_ops;
 pub mod metrics;
 #[cfg(test)]
 mod node_mode_tests;
+#[cfg(test)]
+mod settings_store_tests;
 mod tracked_changes_sweep;
 mod work_claims;
 

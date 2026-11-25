@@ -320,7 +320,16 @@ impl ConfigWatcher {
         F: Fn(SettingsChanged) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let path = registry.config_path().to_path_buf();
+        let path = registry
+            .file_path()
+            .ok_or_else(|| {
+                Error::Internal(
+                    "a store-backed settings registry has no config.toml to watch; \
+                     follow it with settings_store_follower"
+                        .into(),
+                )
+            })?
+            .to_path_buf();
         let dir = path
             .parent()
             .ok_or_else(|| {

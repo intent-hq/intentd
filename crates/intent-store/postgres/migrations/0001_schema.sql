@@ -1506,6 +1506,29 @@ CREATE TABLE IF NOT EXISTS tenant_secrets (
     CHECK (octet_length(ciphertext) >= 16)
 );
 
+-- Tenant settings document (orchestrator mode). The desktop keeps its
+-- non-secret settings in `config.toml`; an orchestrator keeps each tenant's
+-- document here, so it follows the tenant to the process that takes it
+-- over and no file is written under the tenant directory. Postgres only;
+-- no SQLite counterpart.
+--
+-- `body` is the TOML text the settings registry renders. `revision` starts
+-- at 1 and goes up by one on each write; a writer names the revision it
+-- read and loses (writes nothing) when another process wrote first
+-- (`intent_store::postgres::TenantConfigStore::compare_and_set`). Readers
+-- that see a higher revision than they hold reload the document.
+--
+-- Keyed by tenant_id alone, no identity column, so it routes to the
+-- tenant's shard on Neki.
+CREATE TABLE IF NOT EXISTS tenant_config (
+    tenant_id text NOT NULL,
+    body text NOT NULL,
+    revision bigint NOT NULL,
+    updated_at text NOT NULL,
+    PRIMARY KEY (tenant_id),
+    CHECK (revision >= 1)
+);
+
 -- Postgres only: the tenant writer lock as a row lock. Every Postgres
 -- writer transaction locks its tenant's row here (`SELECT ... FOR UPDATE`)
 -- before it reads or writes anything else. A transaction advisory lock

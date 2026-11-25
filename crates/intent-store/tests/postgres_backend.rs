@@ -88,6 +88,8 @@ mod scripts;
 mod self_fence;
 #[path = "postgres_backend/settings.rs"]
 mod settings;
+#[path = "postgres_backend/tenant_config.rs"]
+mod tenant_config;
 #[path = "postgres_backend/tenant_lease.rs"]
 mod tenant_lease;
 #[path = "postgres_backend/tenant_secrets.rs"]

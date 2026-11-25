@@ -408,7 +408,9 @@ const STEPS: &[(&str, Step)] = &[
     ("EventBus::new", Wired("EventBus::new")),
     ("PrimaryReverseRegistry::new", Wired("PrimaryReverseRegistry::new")),
     ("Services::new", Wired("Services::new_with_secret_file")),
-    ("intent_services::SettingsRegistry::load", Wired("SettingsRegistry::load")),
+    // Replaced: a tenant's settings are its Postgres row (`crate::settings`),
+    // never a config.toml under its directory.
+    ("intent_services::SettingsRegistry::load", Wired("SettingsRegistry::load_from_store")),
     ("Store::prepare_for_daemon", Wired("Store::try_open_postgres_owned")),
     ("prepared.open", Wired("Store::try_open_postgres_owned")),
     ("RpcLimiter::new", Wired("RpcLimiter::new")),
@@ -418,7 +420,9 @@ const STEPS: &[(&str, Step)] = &[
     ("intent_transport::listener::StartupLocalListener::bind", Wired("serve_uds_with_connections")),
     ("server.start", Wired("ws.start")),
     ("tenant_background.stop_loops", Wired("adopt_task")),
-    ("intent_core::FileSecretStore::new", Wired("FileSecretStore::with_path")),
+    // Replaced: the GitLab pair's handle goes to the tenant's encrypted
+    // `TenantSecrets` rows, never a secrets.json file.
+    ("intent_core::FileSecretStore::new", Wired("FileSecretStore::with_backend")),
     ("GitStatusRefresher::start_with_presence", Gap("file changes in head's worktrees do not refresh clients")),
     ("git_status_refresher.shutdown", Gap("file changes in head's worktrees do not refresh clients")),
     ("intent_services::SharedWatchHub::new", Gap("file changes in head's worktrees do not refresh clients")),
