@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.296] - 2026-11-25
+
+### 🚀 Features
+
+- *(store)* Return the per-tenant event seq and add a seq cursor read ([#3778](https://github.com/intent-hq/intentd/pull/3778))
+- *(store)* Add generic work claims, adopted by the token-usage loop ([#3779](https://github.com/intent-hq/intentd/pull/3779))
+- *(services)* Make agent queues a cache of the stored queue ([#3782](https://github.com/intent-hq/intentd/pull/3782))
+- *(orchestrator)* Start a tenant's HTTP/SSE MCP servers and refuse stdio ([#3768](https://github.com/intent-hq/intentd/pull/3768))
+
+### 🐛 Bug Fixes
+
+- *(orchestrator)* Resume interrupted agents when a tenant is claimed ([#3765](https://github.com/intent-hq/intentd/pull/3765))
+- *(orchestrator)* Raise the fd limit, probe CoW and contain workloads at start ([#3773](https://github.com/intent-hq/intentd/pull/3773))
+- *(executor)* Remote launches take back idle local agents ([#3775](https://github.com/intent-hq/intentd/pull/3775))
+- *(orchestrator)* Apply intentd's agent limits per tenant ([#3771](https://github.com/intent-hq/intentd/pull/3771))
+
+### 🔧 Refactor
+
+- *(events)* Put EventBus behind an EventFabric trait ([#3783](https://github.com/intent-hq/intentd/pull/3783))
+
+
 ## [0.11.295] - 2026-11-25
 
 ### 🐛 Bug Fixes
