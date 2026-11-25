@@ -135,6 +135,9 @@ impl From<broadcast::Sender<Arc<BroadcastEvent>>> for LocalFabric {
     }
 }
 
+/// Test-only: a raw send through the sender skips the tail counter that
+/// fences rely on.
+#[cfg(test)]
 impl std::ops::Deref for LocalFabric {
     type Target = broadcast::Sender<Arc<BroadcastEvent>>;
     fn deref(&self) -> &Self::Target {
