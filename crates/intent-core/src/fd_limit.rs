@@ -22,6 +22,7 @@ static SOFT_LIMIT: OnceLock<u64> = OnceLock::new();
 /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
 /// reporting. `None` before `raise_at_startup` ran or when the limit
 /// could not be read (non-Unix, `getrlimit` failure).
+#[must_use]
 pub fn soft_limit() -> Option<u64> {
     SOFT_LIMIT.get().copied()
 }
@@ -36,6 +37,7 @@ pub fn soft_limit() -> Option<u64> {
 /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
 /// `fs.nr_open`), so the hard limit is always finite there. That branch
 /// is macOS-without-cap territory only, and macOS always has a cap.
+#[must_use]
 pub fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
     let target = match (hard, cap) {
         (Some(hard), Some(cap)) => hard.min(cap),
@@ -47,6 +49,10 @@ pub fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64
 }
 
 /// Current `(soft, hard)` `RLIMIT_NOFILE`; `hard == None` means unlimited.
+///
+/// # Errors
+///
+/// The OS error when the limit cannot be read; `Unsupported` off Unix.
 #[cfg(unix)]
 pub fn read() -> std::io::Result<(u64, Option<u64>)> {
     let mut lim = libc::rlimit {
@@ -69,6 +75,7 @@ pub fn read() -> std::io::Result<(u64, Option<u64>)> {
 }
 
 /// Render a hard limit for logs/doctor output.
+#[must_use]
 pub fn fmt_hard(hard: Option<u64>) -> String {
     hard.map_or_else(|| "unlimited".to_string(), |h| h.to_string())
 }
