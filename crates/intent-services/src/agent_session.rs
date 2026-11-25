@@ -1202,6 +1202,12 @@ pub(crate) struct LiveTurn {
     /// Reset by [`pin_live_turn`](Services::pin_live_turn): a fresh pin means a
     /// fresh flush attempt is in flight.
     pub(crate) flush_failed: bool,
+    /// The turn's terminal tool-call tally (§5.36) as of the last
+    /// [`update_live_turn`](Services::update_live_turn). Survives the
+    /// `worker.abort()` that drops the `Transcript`, so the interrupt flush
+    /// that persists the interrupted row can record it — once, only when
+    /// that flush is the one that appended the row.
+    pub(crate) tool_tally: ToolCallTally,
 }
 
 /// What [`flush_pinned_turn_on_interruption`](Services::flush_pinned_turn_on_interruption)
@@ -2345,6 +2351,7 @@ impl Services {
                     last_activity_emit: None,
                     flush_pending: false,
                     flush_failed: false,
+                    tool_tally: ToolCallTally::default(),
                 },
             );
         }
@@ -2358,6 +2365,7 @@ impl Services {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
                 slot.final_text_block_open = transcript.final_text_block_open();
+                slot.tool_tally = transcript.tool_call_tally;
                 slot.last_activity_at = now_iso();
             }
         }
@@ -2805,6 +2813,7 @@ impl Services {
         owns_slot: bool,
     ) -> InterruptFlushOutcome {
         let block_count = live.blocks.len();
+        let tool_tally = live.tool_tally;
         // A partial tail can already carry proposal blocks (the interrupt
         // landed after the propose tool call): capture their ids BEFORE the
         // blocks move into the persisted row, so the flushed row feeds the
@@ -2858,6 +2867,10 @@ impl Services {
                 // partial row is a transcript persist like any other, so
                 // preview subscribers converge on its `lastToolUse` too.
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    // This flush appended the interrupted row, so the worker
+                    // never reached its turn-end stats write: record the
+                    // turn's terminal tool calls here (§5.36), once.
+                    self.flush_tool_tally_detached(agent_id, &session.workspace_id, tool_tally);
                     self.invalidate_agent_list_cache(&session.workspace_id);
                     self.publish_agent_message_events(
                         &session.workspace_id,
@@ -4592,15 +4605,15 @@ impl Services {
         if suspend_interrupt {
             // `matches!` above guarantees the `Err` arm.
             let err = result.expect_err("suspend_interrupt implies Err");
-            // The turn exits before the bookkeeping below: its terminal tool
-            // calls still count (§5.36).
-            self.flush_tool_tally_detached(agent_id, workspace_id, tool_tally);
+            // The enrollment's interrupt flush records the turn's terminal
+            // tool calls (§5.36) when it appends the row.
             return self
                 .enroll_suspend_interrupted_turn(
                     agent_id,
                     workspace_id,
                     message_id,
                     blocks,
+                    tool_tally,
                     turn_id,
                     err,
                 )
@@ -5536,12 +5549,14 @@ impl Services {
     ///
     /// Returns the original error wrapped with [`PROMPT_SUSPEND_INTERRUPT_PREFIX`]
     /// so the turn worker suppresses the terminal-failure path.
+    #[expect(clippy::too_many_arguments)]
     async fn enroll_suspend_interrupted_turn(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         message_id: String,
         blocks: Vec<Value>,
+        tool_tally: ToolCallTally,
         turn_id: Option<&str>,
         err: AcpError,
     ) -> Result<StopReason> {
@@ -5564,6 +5579,7 @@ impl Services {
             last_activity_emit: None,
             flush_pending: false,
             flush_failed: false,
+            tool_tally,
         };
         // A failed flush deliberately does NOT reap the turn's mid-turn
         // staged rows (unlike the turn-end/wake failure arms): this path does
@@ -6442,7 +6458,7 @@ impl Services {
 
     /// Record a turn's terminal tool calls on their own (§5.36), detached
     /// and best-effort, for turn exits that skip the turn-end bookkeeping
-    /// (wake turns, suspend-interrupted turns, append failures). A zero
+    /// (wake turns, append failures, interrupt flushes). A zero
     /// tally writes nothing.
     pub(crate) fn flush_tool_tally_detached(
         &self,
