@@ -832,6 +832,136 @@ mod tests {
         }
     }
 
+    /// `host.exec` of `true` in `cwd` over `ws`: the reply.
+    #[cfg(unix)]
+    async fn host_exec<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        id: u64,
+        cwd: &Path,
+    ) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "host.exec",
+            "params": { "command": "true", "cwd": cwd },
+        });
+        ws.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+            async {
+                loop {
+                    if let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if value["id"] == json!(id) {
+                            return value;
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("host.exec reply")
+    }
+
+    /// A client's `host.exec` runs under the tenant's host command runtime,
+    /// the one its fence shuts down: once that runtime stops, the
+    /// listeners refuse new commands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_host_commands_stop_with_the_tenant_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let (services, dir) = tenant(root.path(), "t").await;
+        let connections = intent_app::tenant::ClientConnections::default();
+        let config = crate::listen::ListenConfig {
+            socket_path: dir.join("o.sock"),
+            bind_addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ws_port: 0,
+            tls_dir: dir.join("tls"),
+            insecure: true,
+        };
+        let reverse = services.feature_reverse_dispatch().cloned().unwrap();
+        let bus = EventBus::new(services.store().clone());
+        let listeners =
+            crate::listen::start_client_listeners(&config, &services, &bus, reverse, &connections)
+                .await
+                .unwrap();
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", listeners.ws_port()))
+                .await
+                .unwrap();
+        let ran = host_exec(&mut ws, 1, &dir).await;
+        assert!(ran.get("error").is_none(), "{ran}");
+        services.host_exec_runtime().begin_shutdown();
+        let refused = host_exec(&mut ws, 2, &dir).await;
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("shutting down")),
+            "{refused}"
+        );
+        listeners.stop().await;
+    }
+
+    /// The tenant's `[hooks] maxPerAgent` (its own `config.toml`) caps each
+    /// agent's active hooks: the hook past it is refused.
+    #[tokio::test]
+    async fn the_tenant_hooks_limit_refuses_the_extra_hook() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("t")).unwrap();
+        std::fs::write(
+            root.path().join("t").join("config.toml"),
+            "[hooks]\nmaxPerAgent = 1\n",
+        )
+        .unwrap();
+        let (services, _) = tenant(root.path(), "t").await;
+        let workspace = intent_core::WorkspaceId::new();
+        let now = intent_core::now_iso();
+        services
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace.clone(),
+                title: "Hooks".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let owner = intent_core::AgentId::from("agent-hooks");
+        services
+            .store()
+            .insert_agent_session(&intent_core::AgentSession {
+                id: owner.clone(),
+                workspace_id: workspace.clone(),
+                name: "Owner".into(),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let hook = |name: &str| {
+            json!({ "name": name, "code": "return { dispatch: false };", "delayMs": 10_000 })
+        };
+        services
+            .hook_schedule(workspace.clone(), owner.clone(), hook("first"))
+            .await
+            .expect("the first hook is under the limit");
+        let refused = services
+            .hook_schedule(workspace, owner, hook("second"))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("max 1"), "{refused}");
+    }
+
     /// The default claim wait outlasts a crashed instance's lease twice over.
     #[test]
     fn the_default_claim_wait_is_two_lease_ttls() {

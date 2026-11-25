@@ -3,7 +3,9 @@
 //! `agent.sendMessage` reaches the machine as a Launch and a Prompt, and the
 //! machine's journal completes the turn into head's transcript. Without the
 //! manager the message was stored and nothing ever reached the machine
-//! (`system.status` reported `maxAgents: 0`).
+//! (`system.status` reported `maxAgents: 0`). The tenant's agent limits
+//! apply to these agents as `intentd`'s do: an idle one is reaped, and the
+//! cap counts only agents on the orchestrator host.
 //!
 //! The machine is served in process: its WSS listener with the executor
 //! link installed and a scripted executor host that hands each admitted
@@ -24,7 +26,7 @@ use std::time::Duration;
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
     JournalBody, JournalRecord, LaunchCommand, LinkFrame, LinkHello, LinkWelcome,
-    MachineCapabilities, ProviderCapability, ProviderStatus,
+    MachineCapabilities, ProviderCapability, ProviderStatus, StopOutcome,
 };
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
@@ -44,7 +46,7 @@ use intentd_orchestrator::serve::{serve_tenant, LeaseTiming, ServedTenant};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use common::{result, wait, Uds};
+use common::{result, until, wait, Uds};
 
 async fn pool() -> Option<PgPool> {
     let Ok(url) = std::env::var("INTENT_STORE_TEST_PG_URL") else {
@@ -374,10 +376,18 @@ impl RunningTurn {
     /// tenant's local socket and message it, until the machine has the
     /// prompt. `None` when the test skips.
     async fn start(pool: PgPool, tenant: &str) -> Option<Self> {
+        Self::start_with(pool, tenant, "").await
+    }
+
+    /// [`Self::start`], with `config` as the tenant's `config.toml`.
+    async fn start_with(pool: PgPool, tenant: &str, config: &str) -> Option<Self> {
         if intent_providers_missing_git() {
             return None;
         }
         let dir = tempfile::tempdir().unwrap();
+        let tenant_dir = intentd_orchestrator::tenant_dir(dir.path(), tenant);
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(tenant_dir.join("config.toml"), config).unwrap();
         let served = serve_tenant(
             pool,
             tenant,
@@ -553,6 +563,33 @@ impl RunningTurn {
                 },
             )
             .await;
+    }
+
+    /// Wait until the agent is idle on head with `text` in its transcript.
+    async fn wait_idle_with(&mut self, text: &str) {
+        let deadline = tokio::time::Instant::now() + wait();
+        let mut id = 100;
+        loop {
+            id += 1;
+            let got = self
+                .client
+                .rpc(
+                    id,
+                    "agent.get",
+                    json!({ "workspaceId": self.workspace, "agentId": self.agent }),
+                )
+                .await;
+            if result(&got).to_string().contains(text) && result(&got)["agent"]["status"] == "idle"
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn never completed on head: {got}"
+            );
+            // timing-guard: poll interval for the turn's end on head (read over the wire)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// The machine ends the turn; whether the send went out (not once the
@@ -976,6 +1013,156 @@ async fn a_claimed_tenant_resumes_an_interrupted_agent_exactly_once() {
     release(third).await;
     machine.server.stop().await;
     drop(machine.git);
+}
+
+/// The tenant's agent cap counts only agents running on the orchestrator
+/// host: with `agents.maxConcurrent = 1`, a second agent launches on the
+/// machine while the first one's turn runs (the machine's own capacity
+/// bounds them), and `system.status` reports none against the tenant's cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_agents_do_not_count_against_the_tenant_cap() {
+    let Some(pool) = pool().await else { return };
+    let tenant = format!("cap-{}", uuid::Uuid::new_v4().simple());
+    let Some(mut running) =
+        RunningTurn::start_with(pool, &tenant, "[agents]\nmaxConcurrent = 1\n").await
+    else {
+        return;
+    };
+    let created = running
+        .client
+        .rpc(
+            60,
+            "agent.create",
+            json!({ "workspaceId": running.workspace, "name": "Second", "model": "default", "provider": "mock" }),
+        )
+        .await;
+    let second = AgentId::from(result(&created)["agent"]["id"].as_str().unwrap());
+    result(
+        &running
+            .client
+            .rpc(
+                61,
+                "agent.sendMessage",
+                json!({ "workspaceId": running.workspace, "agentId": second, "content": "hello second" }),
+            )
+            .await,
+    );
+    let launch = running
+        .end
+        .next(wait(), |frame| match frame {
+            LinkFrame::Launch(command) => Some(command),
+            _ => None,
+        })
+        .await
+        .expect("the second agent launches while the first one's turn runs");
+    assert_eq!(launch.agent_id, second);
+    running
+        .end
+        .journal(
+            2,
+            &second,
+            &running.workspace,
+            None,
+            JournalBody::Started {
+                base_commit: launch.base_commit.clone(),
+            },
+        )
+        .await;
+    running
+        .end
+        .next(wait(), |frame| match frame {
+            LinkFrame::Prompt { agent_id, .. } if agent_id == second => Some(()),
+            _ => None,
+        })
+        .await
+        .expect("the second agent gets its prompt");
+
+    assert_eq!(
+        running.served.agents().registry().size(),
+        2,
+        "both agents are running"
+    );
+    let status = result(&running.client.rpc(62, "system.status", json!({})).await).clone();
+    assert_eq!(status["maxAgents"], 1, "{status}");
+    assert_eq!(
+        status["agents"], 0,
+        "no agent runs on the orchestrator host: {status}"
+    );
+    drop(running.end);
+    running.listeners.stop().await;
+    running.machine.server.stop().await;
+    drop(running.machine.git);
+}
+
+/// Sets one env var for the test and restores it on drop (nextest runs
+/// each test in its own process).
+struct EnvVar(&'static str, Option<std::ffi::OsString>);
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self(key, old)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match self.1.take() {
+            Some(value) => std::env::set_var(self.0, value),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
+/// An agent idle on its machine past the tenant's idle timeout is reaped:
+/// head stops it on the machine (not a final stop: the agent is not
+/// deleted) and frees its slot, as `intentd` reaps its idle agents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_remote_agent_is_reaped_after_the_timeout() {
+    // The idle-reap test seam: a sub-second timeout and sweep.
+    let _reap = EnvVar::set("INTENTD_IDLE_REAP_MS", "300");
+    let Some(pool) = pool().await else { return };
+    let tenant = format!("reap-{}", uuid::Uuid::new_v4().simple());
+    let Some(mut running) = RunningTurn::start(pool, &tenant).await else {
+        return;
+    };
+    running.reply(2, "done").await;
+    assert!(running.end_turn(3).await);
+    running.wait_idle_with("done").await;
+
+    let agent = running.agent.clone();
+    let (stop_id, final_stop) = running
+        .end
+        .next(wait(), |frame| match frame {
+            LinkFrame::Stop {
+                agent_id,
+                stop_id,
+                final_stop,
+            } if agent_id == agent => Some((stop_id, final_stop)),
+            _ => None,
+        })
+        .await
+        .expect("head stops the idle agent on its machine");
+    assert!(!final_stop, "a reap is not a delete");
+    running
+        .end
+        .send(LinkFrame::StopAck {
+            stop_id,
+            agent_id: agent,
+            outcome: StopOutcome::Stopped,
+            final_push: None,
+        })
+        .await;
+    let agents = running.served.agents().clone();
+    until("the reaped agent's slot is free", || {
+        agents.registry().size() == 0
+    })
+    .await;
+    drop(running.end);
+    running.listeners.stop().await;
+    running.machine.server.stop().await;
+    drop(running.machine.git);
 }
 
 /// Whether `git` is missing (the test then skips).
