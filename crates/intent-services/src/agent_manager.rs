@@ -1236,6 +1236,21 @@ fn idle_older_than(
         .collect()
 }
 
+/// Whether a local spawn is parked in the admission queue.
+fn has_live_waiter(inner: &RegistryInner) -> bool {
+    inner.wait_queue.iter().any(|(_, tx, _)| !tx.is_closed())
+}
+
+/// What evicting `id` frees for the budget: its attributed subtree, never
+/// less than the provisional cost `deregister` credits.
+fn attributed_bytes(samples: &HashMap<AgentId, u64>, id: &AgentId) -> u64 {
+    samples
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+        .max(PROVISIONAL_AGENT_BYTES)
+}
+
 /// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
 /// attributed subtree first (Phase A attribution), ties and unattributed
 /// entries (charged 0 by the sort) falling back to least-recently-used first —
@@ -1866,10 +1881,136 @@ impl ProcessRegistry {
         );
     }
 
+    /// What a backend needs to predict [`Self::reclaim_for_remote`] and
+    /// [`Self::try_admit`]: the idle processes a remote launch may take back,
+    /// and whether the host is short of its reserve (the budget denies only
+    /// then; `None` without a budget or a sample). Busy and remote entries
+    /// are never reclaimable, and nothing is while a local spawn is queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn remote_capacity_facts(&self) -> (u32, Option<bool>) {
+        let idle = {
+            let inner = self.inner.lock().unwrap();
+            if has_live_waiter(&inner) {
+                0
+            } else {
+                inner.entries.values().filter(|e| !e.is_active).count()
+            }
+        };
+        let short = self.memory.get().and_then(|budget| {
+            let sample = budget.probe.sample()?;
+            Some(
+                sample
+                    .available_memory
+                    .is_none_or(|available| available < budget.host_reserve_bytes),
+            )
+        });
+        (u32::try_from(idle).unwrap_or(u32::MAX), short)
+    }
+
+    /// Make room for a remote (executor) launch the way [`Self::acquire`]
+    /// does for a local spawn: while the slot cap or the memory budget would
+    /// deny it, evict an idle process (same claim-before-kill contract and
+    /// re-validation). For the slot cap the LRU one goes; for the budget the
+    /// largest attributed one, credited at its attributed size, and only when
+    /// the idle processes together could clear the overshoot, so a launch
+    /// that would be refused anyway kills nothing. Never queues: when nothing
+    /// idle can be claimed it returns, and [`Self::try_admit`] refuses.
+    /// Admitted remote entries are always active, so they are never
+    /// candidates, and a queued local spawn keeps its priority: nothing is
+    /// taken back while one waits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub async fn reclaim_for_remote<C, R>(&self, try_claim: C, release: R)
+    where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
+        loop {
+            let (candidates, reason, samples) = {
+                let mut inner = self.inner.lock().unwrap();
+                if has_live_waiter(&inner) {
+                    return;
+                }
+                if let Some(denial) = self.budget_denies(&mut inner) {
+                    let samples = self
+                        .memory
+                        .get()
+                        .map(|b| b.probe.agent_samples())
+                        .unwrap_or_default();
+                    let candidates = idle_largest_first(&inner, &samples, self.keep_alive.as_ref());
+                    let reclaimable: u64 = candidates
+                        .iter()
+                        .map(|(id, _)| attributed_bytes(&samples, id))
+                        .sum();
+                    let budget = self.memory.get().map_or(0, |b| b.budget_bytes);
+                    if denial.charged.saturating_sub(reclaimable) >= budget {
+                        return;
+                    }
+                    (candidates, REASON_MEMORY_BUDGET, samples)
+                } else if inner.entries.len() >= self.cap {
+                    (
+                        lru_idle_ordered(&inner, None, self.keep_alive.as_ref()),
+                        REASON_SLOTS,
+                        HashMap::new(),
+                    )
+                } else {
+                    return;
+                }
+            };
+            let mut evicted_one = false;
+            for (id, kill) in candidates {
+                if !try_claim(&id) {
+                    continue;
+                }
+                let guard = ClaimGuard {
+                    release: &release,
+                    id: Some(&id),
+                };
+                let still_idle = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.entries.get(&id).is_some_and(|e| !e.is_active)
+                };
+                if !still_idle {
+                    drop(guard);
+                    continue;
+                }
+                let used = self.size();
+                tracing::info!(
+                    evicted = %id,
+                    used = used,
+                    cap = self.cap,
+                    reason = reason,
+                    "process registry: LRU idle process evicted for a remote launch"
+                );
+                if let Some(ref f) = self.event_fn {
+                    let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
+                    let _ = self.event_tasks.spawn_draining(fut);
+                }
+                kill().await;
+                self.deregister(&id);
+                self.budget_credit_extra_bytes(
+                    attributed_bytes(&samples, &id).saturating_sub(PROVISIONAL_AGENT_BYTES),
+                );
+                drop(guard);
+                evicted_one = true;
+                break;
+            }
+            if !evicted_one {
+                return;
+            }
+        }
+    }
+
     /// Admit a remote (executor) agent against the same slot cap and memory
     /// budget as local spawns, or refuse it at once: a remote launch is never
-    /// queued and never evicts a local process, so the backend's model decides
-    /// what to do next. The admitted entry is marked active, so no local spawn
+    /// queued, so the backend's model decides what to do next. It does not
+    /// evict either; [`Self::reclaim_for_remote`], run first, takes back idle
+    /// local processes. The admitted entry is marked active, so no local spawn
     /// or reap evicts it; [`Self::deregister`] releases it. The budget's
     /// refusal wins when both limits bind, as in [`Self::acquire`].
     ///
@@ -3768,6 +3909,14 @@ impl AgentManager {
     /// Borrow the process registry (lifecycle / diagnostics).
     pub fn registry(&self) -> &ProcessRegistry {
         &self.registry
+    }
+
+    /// Take back idle local processes so a remote launch the shared limits
+    /// would deny can be admitted ([`ProcessRegistry::reclaim_for_remote`]),
+    /// with the same claims a local spawn's eviction uses.
+    pub async fn reclaim_for_remote(&self) {
+        let (try_claim, release) = self.admission_claim_fns();
+        self.registry.reclaim_for_remote(try_claim, release).await;
     }
 
     /// Install the descendant-tree memory probe for read-only visibility

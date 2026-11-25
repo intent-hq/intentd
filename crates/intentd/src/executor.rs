@@ -163,6 +163,8 @@ pub(crate) type HostSample =
 pub(crate) struct LoadState {
     /// The running-agent count the previous check saw.
     pub count: Option<u32>,
+    /// Whether the previous check's report would refuse a launch.
+    pub refuses: bool,
     /// The resources the last push carried.
     pub reported: Option<intent_core::node_link::HostResources>,
     /// When the last push went out.
@@ -399,13 +401,15 @@ impl ExecutorService {
 
     /// Sample the host, then push the report on every live backend link
     /// when the running-agent count differs from the one the previous check
-    /// saw, or when CPU or memory moved [`RESOURCES_THRESHOLD`] points from
+    /// saw, when whether the report would refuse a launch flipped, or when CPU or memory moved [`RESOURCES_THRESHOLD`] points from
     /// the last pushed sample and the last push is [`RESOURCES_PUSH_GAP`]
     /// old, against what the links last got (the first bind's `welcome`
     /// sets the baseline). Nothing is sampled or pushed while no link is
     /// live; a change meanwhile is pushed at the next check with one.
     pub(crate) async fn push_load_change(&self) {
-        let count = self.deps.admission.capacity().running_agents;
+        let capacity = self.deps.admission.capacity();
+        let count = capacity.running_agents;
+        let refuses = capacity.refusal().is_some();
         if !self.has_live_link() {
             // Nothing to push to, and nothing to sample for: the next bind's
             // `welcome` samples afresh and sets the baseline.
@@ -417,6 +421,7 @@ impl ExecutorService {
         let now = std::time::Instant::now();
         let push = {
             let mut state = lock(&self.load);
+            let flipped = std::mem::replace(&mut state.refuses, refuses) != refuses;
             let Some(before) = state.count.replace(count) else {
                 state.reported = sample;
                 return;
@@ -426,7 +431,7 @@ impl ExecutorService {
             }) && state
                 .pushed_at
                 .is_none_or(|at| now.saturating_duration_since(at) >= RESOURCES_PUSH_GAP);
-            let push = before != count || resources_moved;
+            let push = before != count || flipped || resources_moved;
             if push {
                 state.reported = sample;
                 state.pushed_at = Some(now);
@@ -869,6 +874,7 @@ impl ExecutorHost for ExecutorService {
             let mut state = lock(&self.load);
             if state.count.is_none() {
                 state.count = Some(capabilities.capacity.running_agents);
+                state.refuses = capabilities.capacity.refusal().is_some();
                 state.reported = capabilities.resources;
             }
         }
@@ -1012,6 +1018,9 @@ impl Scoped {
 }
 
 impl Admission for Scoped {
+    fn reclaim_idle(&self) -> intent_core::BoxFuture<'static, ()> {
+        self.admission.reclaim_idle()
+    }
     fn try_admit(
         &self,
         agent_id: &intent_core::AgentId,
@@ -1031,6 +1040,10 @@ impl Admission for Scoped {
 pub(crate) struct RegistryAdmission(pub Arc<intent_services::AgentManager>);
 
 impl Admission for RegistryAdmission {
+    fn reclaim_idle(&self) -> intent_core::BoxFuture<'static, ()> {
+        let manager = self.0.clone();
+        Box::pin(async move { manager.reclaim_for_remote().await })
+    }
     fn try_admit(
         &self,
         agent_id: &intent_core::AgentId,
@@ -1043,11 +1056,14 @@ impl Admission for RegistryAdmission {
     fn capacity(&self) -> intent_core::node_link::MachineCapacity {
         let registry = self.0.registry();
         let budget = registry.budget_status();
+        let (reclaimable_agents, host_memory_short) = registry.remote_capacity_facts();
         intent_core::node_link::MachineCapacity {
             running_agents: u32::try_from(registry.size()).unwrap_or(u32::MAX),
             agent_cap: u32::try_from(registry.cap()).unwrap_or(u32::MAX),
             charged_memory_bytes: budget.and_then(|(_, charged, _)| charged).unwrap_or(0),
             memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
+            reclaimable_agents,
+            host_memory_short,
         }
     }
 }
