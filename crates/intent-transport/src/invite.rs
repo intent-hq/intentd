@@ -396,15 +396,14 @@ async fn link_envelope(provider: Option<&Arc<dyn ServerPairingInfo>>) -> Result<
     })?;
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
-    let route = match snapshot.tc_address {
-        Some(tc) => InviteRoute::Tunnel(tc),
-        None => {
-            let hosts = provider.invite_hosts();
-            if hosts.is_empty() {
-                return Err(Error::TunnelDown);
-            }
-            InviteRoute::Public(hosts)
+    let route = if let Some(tc) = snapshot.tc_address {
+        InviteRoute::Tunnel(tc)
+    } else {
+        let hosts = provider.invite_hosts();
+        if hosts.is_empty() {
+            return Err(Error::TunnelDown);
         }
+        InviteRoute::Public(hosts)
     };
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     Ok(LinkEnvelope {
