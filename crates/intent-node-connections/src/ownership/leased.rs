@@ -21,7 +21,6 @@
 //!   claimed before it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,9 +61,11 @@ pub struct LeaseLinkOwnership {
 /// One held link lease, kept (renewed) by its [`LeaseKeeper`].
 struct HeldLink {
     keeper: LeaseKeeper,
-    /// The link generation of the latest claim under this lease: only that
-    /// claim releases it.
-    claimed: AtomicU64,
+    /// The node lease and link generation of the latest claim under this
+    /// lease: only that claim releases it. The generation alone does not
+    /// name a claim: it counts per node lease, and a replacement credential
+    /// gets a new node lease whose generations restart.
+    claimed: Mutex<Option<(LeaseOwner, NodeCounter)>>,
     /// Set once this backend gave the lease up (released it, or found it
     /// lost in a guarded write): the keeper's fence does not fire then.
     given_up: watch::Sender<bool>,
@@ -207,7 +208,7 @@ impl LeaseLinkOwnership {
         };
         let held = Arc::new(HeldLink {
             keeper,
-            claimed: AtomicU64::new(0),
+            claimed: Mutex::default(),
             given_up: watch::channel(false).0,
         });
         lock(&self.links).insert(machine_id.to_owned(), held.clone());
@@ -237,7 +238,7 @@ impl LinkOwnership for LeaseLinkOwnership {
             };
             match generation {
                 Ok(generation) => {
-                    held.claimed.store(generation.0, Ordering::SeqCst);
+                    *lock(&held.claimed) = Some((owner.clone(), generation));
                     Ok(LinkClaim {
                         owner: owner.clone(),
                         epoch: held.keeper.token(),
@@ -347,7 +348,11 @@ impl LinkOwnership for LeaseLinkOwnership {
                 // by a newer dial) leaves it to the one that claimed since.
                 let latest = links.get(&owner.node_id).is_some_and(|held| {
                     held.keeper.token() == claim.epoch
-                        && held.claimed.load(Ordering::SeqCst) == claim.generation.0
+                        && lock(&held.claimed)
+                            .as_ref()
+                            .is_some_and(|(claimed, generation)| {
+                                claimed == owner && *generation == claim.generation
+                            })
                 });
                 if !latest {
                     return;

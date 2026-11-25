@@ -234,6 +234,12 @@ mod tests {
             lease_id: "lease-1".into(),
             incarnation: uuid::Uuid::new_v4().to_string(),
         };
+        register_lease(&store, &owner).await;
+        (dir, store, owner)
+    }
+
+    /// Record `owner`'s node lease of its machine, its link generation at 1.
+    async fn register_lease(store: &Store, owner: &LeaseOwner) {
         let record = NodeRecord {
             id: owner.node_id.clone(),
             head_id: owner.head_id.clone(),
@@ -270,7 +276,6 @@ mod tests {
             .renew_machine_lease(&record, &lease, NodeCounter(1))
             .await
             .unwrap();
-        (dir, store, owner)
     }
 
     #[tokio::test]
@@ -430,6 +435,32 @@ mod tests {
         // A second release of an already released claim does nothing.
         a.release(&new).await;
         assert_eq!(b.fence(&taken).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_credentials_claim_at_the_same_generation_does_not_release() {
+        // A replacement credential gets a new node lease whose generations
+        // restart: its first claim reuses the held lease (same token) at
+        // the same generation number as the old credential's claim.
+        let (_dir, store, owner) = store_with_lease().await;
+        let (a, b) = (leased(&store, TTL), leased(&store, TTL));
+        let old = a.claim(&owner).await.unwrap();
+        let replacement = LeaseOwner {
+            lease_id: "lease-2".into(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            ..owner.clone()
+        };
+        register_lease(&store, &replacement).await;
+        let new = a.claim(&replacement).await.unwrap();
+        assert_eq!(new.epoch, old.epoch);
+        assert_eq!(new.generation, old.generation);
+
+        // The old connector's late cleanup leaves the replacement's lease.
+        a.release(&old).await;
+        assert_eq!(a.fence(&new).await, Ok(()), "the replacement still holds");
+        assert!(b.claim(&replacement).await.is_err());
+        a.release(&new).await;
+        assert!(a.fence(&new).await.is_err(), "its own claim releases it");
     }
 
     #[tokio::test]
