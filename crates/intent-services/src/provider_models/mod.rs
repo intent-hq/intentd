@@ -221,9 +221,55 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "opencode" => fetch_opencode_models().await,
         "grok" => fetch_grok_models().await,
         "cursor" => fetch_cursor_models_at(cursor_binary(None)).await,
+        intent_providers::dsh::PROVIDER_ID => fetch_dsh_models_at(dsh_binary(None)).await,
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
+}
+
+/// The `dsh` a launch would exec: `providers.paths.dsh`, else PATH.
+pub(crate) fn dsh_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    find_provider_binary(
+        intent_providers::dsh::PROVIDER_ID,
+        intent_providers::dsh::COMMAND,
+        explicit_path,
+    )
+}
+
+/// `dsh --profile acp` catalog: the grouped `configOptions[id="model"]`
+/// select (one group per DSH model provider) with the `thought_level`
+/// efforts. Runs with the launch overlay and telemetry opt-out, and with a
+/// login-shell `DEEPSEEK_API_KEY` when the daemon has none, since the list
+/// depends on the key. Never prompts, so nothing is uploaded; DSH keeps an
+/// empty session folder per probe.
+pub(crate) async fn fetch_dsh_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let provider_id = intent_providers::dsh::PROVIDER_ID;
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable(provider_id, "dsh binary not found");
+    };
+    let Some(config) = intent_providers::find_provider(provider_id) else {
+        return ProviderModelsFetch::unavailable(provider_id, "dsh provider not registered");
+    };
+    let args =
+        intent_providers::build_provider_args(config, &intent_providers::ArgInputs::default());
+    let mut cmd = AcpProbeCommand::binary(bin, args);
+    for (key, value) in intent_providers::build_provider_env(config, None, None, None) {
+        cmd = cmd.env(key, value);
+    }
+    if std::env::var_os(intent_providers::dsh::API_KEY_ENV).is_none() {
+        if let Some(key) = intent_core::path_utils::login_shell_credential_env()
+            .get(intent_providers::dsh::API_KEY_ENV)
+        {
+            cmd = cmd.env(intent_providers::dsh::API_KEY_ENV, key.clone());
+        }
+    }
+    finish(
+        provider_id,
+        run_acp_probe(cmd, |value| {
+            parse::parse_acp_config_option_models(value, provider_id)
+        })
+        .await,
+    )
 }
 
 /// `agy acp` catalog: the base models of `configOptions[id="model"]` with the

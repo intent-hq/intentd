@@ -32,7 +32,7 @@ enum Target {
 /// The binary whose `--version` describes the row: the `providers.paths`
 /// override when valid, else auto-detection. Unsloth reports its own CLI
 /// (the secondary), not the shared opencode primary. Rows that are gated,
-/// not installed, npx-launched, or probed elsewhere (Cursor) are skipped.
+/// not installed, npx-launched, or probed elsewhere (Cursor, DSH) are skipped.
 fn probe_target<S: std::hash::BuildHasher>(
     p: &ProviderAvailability,
     provider_paths: &HashMap<String, String, S>,
@@ -41,7 +41,7 @@ fn probe_target<S: std::hash::BuildHasher>(
     if p.gated_off.is_some()
         || !p.installed
         || p.npx_only_package.is_some()
-        || matches!(p.id, "cursor" | "mock")
+        || matches!(p.id, "cursor" | "dsh" | "mock")
     {
         return None;
     }

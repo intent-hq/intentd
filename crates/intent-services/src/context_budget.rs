@@ -89,6 +89,7 @@ const CLEAN_CEILING: &[(&str, usize, usize)] = &[
     ("grok", 27_948, 26_026),
     ("antigravity", 27_669, 25_747),
     ("cursor", 27_897, 25_975),
+    ("dsh", 27_669, 25_747),
     ("mock", 27_669, 25_747),
 ];
 

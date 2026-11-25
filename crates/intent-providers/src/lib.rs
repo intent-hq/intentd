@@ -29,6 +29,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod cursor;
 pub mod discover;
+pub mod dsh;
 pub mod installed_cli;
 pub mod models;
 /// Shared Codex/Claude CLI fixtures; compiled only for test builds.

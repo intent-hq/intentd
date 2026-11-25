@@ -80,6 +80,7 @@ pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "pi",
     "antigravity",
     "cursor",
+    "dsh",
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
@@ -765,6 +766,13 @@ async fn probe_provider(
         "antigravity" => {
             AuthVerdict::plain(crate::provider_models::probe_antigravity_auth(program.into()).await)
         }
+        // DSH has no ACP sign-in; its `deepseek-official` route needs a
+        // DeepSeek API key. Presence check only — no DSH process starts.
+        "dsh" => AuthVerdict::plain(Some(
+            tokio::task::spawn_blocking(crate::dsh_cli::api_key_known)
+                .await
+                .unwrap_or(false),
+        )),
         _ => AuthVerdict::default(),
     }
 }
@@ -862,6 +870,7 @@ fn resolve_probe_binary(
         "pi" => "pi",
         "antigravity" => intent_providers::antigravity::COMMAND,
         "cursor" => intent_providers::cursor::CURSOR_COMMAND,
+        "dsh" => intent_providers::dsh::COMMAND,
         _ => return None,
     };
     let override_applies =
@@ -1073,6 +1082,7 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
              \"claude\" in a terminal, then \"/login\"."
         }
         "cursor" => CURSOR_CREDENTIALS_NOTE,
+        "dsh" => crate::dsh_cli::DSH_CREDENTIALS_NOTE,
         _ => "",
     };
     format!(

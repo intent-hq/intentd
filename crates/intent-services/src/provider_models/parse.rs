@@ -361,6 +361,7 @@ fn acp_model_rows(payload: &Value, provider: &str, candidates: Option<&Vec<Value
     let session_effort_levels = extract_thought_level_values(payload);
     let mut rows: Vec<Value> = candidates
         .iter()
+        .flat_map(grouped_entries)
         .filter_map(|entry| {
             let (id, name, desc) = entry_fields(entry)?;
             Some(with_effort_levels(
@@ -371,6 +372,16 @@ fn acp_model_rows(payload: &Value, provider: &str, candidates: Option<&Vec<Value
         .collect();
     resolve_default_row(&mut rows, extract_model_current_value(payload));
     rows
+}
+
+/// A select entry, or the entries of an ACP option group
+/// (`{ group, name, options: [...] }`, as DeepSeek Harness reports its
+/// providers). Group headers are not models.
+fn grouped_entries(entry: &Value) -> Vec<&Value> {
+    match entry.get("options").and_then(Value::as_array) {
+        Some(inner) if entry.get("group").is_some() => inner.iter().collect(),
+        _ => vec![entry],
+    }
 }
 
 /// The model select's `currentValue` from the probed payload's

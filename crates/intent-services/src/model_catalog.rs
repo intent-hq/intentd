@@ -222,6 +222,49 @@ impl CursorModelSource {
     }
 }
 
+/// The `dsh` a DSH catalog probe runs, resolved once so the cache key and
+/// the probe agree (`providers.paths.dsh` honored). The key also records
+/// whether a DeepSeek API key is known: a signed-out DSH lists only its
+/// built-in fallback model.
+pub(crate) struct DshModelSource {
+    pub binary: Option<PathBuf>,
+    pub version_key: String,
+}
+
+impl DshModelSource {
+    pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        const PREFIX: &str = "dsh-executable-v1:";
+        let key = if crate::dsh_cli::api_key_known() {
+            "key"
+        } else {
+            "nokey"
+        };
+        let binary = crate::provider_models::dsh_binary(explicit_path);
+        let mut version_key = binary.as_ref().map_or_else(
+            || format!("{PREFIX}missing"),
+            |path| {
+                Sha256::digest(path.as_os_str().as_encoded_bytes())
+                    .iter()
+                    .fold(PREFIX.to_string(), |mut acc, byte| {
+                        let _ = write!(acc, "{byte:02x}");
+                        acc
+                    })
+            },
+        );
+        let _ = write!(version_key, ":{key}");
+        Self {
+            binary,
+            version_key,
+        }
+    }
+}
+
+fn dsh_version_key() -> String {
+    DshModelSource::resolve(None).version_key
+}
+
 fn cursor_version_key() -> String {
     CursorModelSource::resolve(None).version_key
 }
@@ -426,6 +469,11 @@ static SOURCES: &[ModelSource] = &[
         provider_id: "cursor",
         version_key: cursor_version_key,
         fetch: || provider_models_fetch("cursor"),
+    },
+    ModelSource {
+        provider_id: intent_providers::dsh::PROVIDER_ID,
+        version_key: dsh_version_key,
+        fetch: || provider_models_fetch(intent_providers::dsh::PROVIDER_ID),
     },
     ModelSource {
         provider_id: "unsloth",

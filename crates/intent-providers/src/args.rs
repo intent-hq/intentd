@@ -1,6 +1,8 @@
 //! Launch argument / environment assembly and PATH enrichment (§6.2, §6.9).
 //!
-//! Pure data helpers — no process spawning or filesystem writes (that is M3.3).
+//! Pure data helpers — no process spawning or filesystem writes (that is M3.3),
+//! except the DSH launch overlay, written by `dsh::launch_overlay_arg` so every
+//! DSH launch path gets it.
 //! Ports the arg assembly from `provider-registry.ts` (`getACPWithProvider`),
 //! the per-provider flag appends from `acp-provider.ts`, `buildProviderEnv`
 //! (`provider-config.ts`), and `getAuggieExecPATH` (`execute-auggie-command.ts`).
@@ -110,6 +112,12 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
         }
     }
 
+    if config.id == crate::dsh::PROVIDER_ID {
+        // Writes the overlay file; see `dsh::launch_overlay_arg`.
+        args.push(crate::dsh::PATCH_FLAG.to_string());
+        args.push(crate::dsh::launch_overlay_arg());
+    }
+
     if inputs.quiet {
         if let Some(flag) = config.quiet_flag {
             if !args.iter().any(|a| a == flag) {
@@ -184,6 +192,7 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   untouched — unless the spawn goes through npx, which always runs a Node
 ///   child ([`build_provider_env_for_spawn`]).
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
+/// - `dsh`: `DSH_TELEMETRY_DISABLED=1` (DSH's launcher telemetry opt-out).
 /// - `codex`: `INITIAL_AGENT_MODE=agent-full-access` unless explicitly set in
 ///   the parent environment. The ACP adapter uses this mode for per-turn
 ///   approval and sandbox overrides; config.toml defaults do not win over it.
@@ -290,6 +299,12 @@ pub fn build_provider_env_for_spawn(
         }
         "cortex" => {
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
+        }
+        crate::dsh::PROVIDER_ID => {
+            env.insert(
+                crate::dsh::TELEMETRY_DISABLED_ENV.to_string(),
+                "1".to_string(),
+            );
         }
         // unsloth spawns the opencode binary, so it shares the
         // OPENCODE_CONFIG_CONTENT assembly and additionally injects its

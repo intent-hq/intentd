@@ -400,6 +400,39 @@ Verified against Cursor CLI 2026.11.05-86047df. Code: `intent-providers/src/curs
   (`ProviderConfig::system_prompt_note`, appended by `rules::with_provider_prompt_note`).
   Task runs map to `Subagent` in the timeline.
 
+## DeepSeek Harness (`dsh --profile acp`)
+
+Verified against dsh 0.2.2-rc.5. Code: `intent-providers/src/dsh.rs`,
+`intent-services/src/dsh_cli.rs`, and the `dsh` arms in `args.rs`, `provider_auth.rs`
+and `provider_models`.
+
+- **Launch overlay** — `build_provider_args` appends `--patch <overlay>`
+  (`dsh::launch_overlay_arg`, written to
+  `~/.local/share/intent/providers/dsh/intent-overlay.yml`), and
+  `build_provider_env_for_spawn` sets `DSH_TELEMETRY_DISABLED=1`. The overlay disables
+  `session-log-deepseek` (session log on official API requests), `session-telemetry-otel`
+  and the native `tool-subagent` / `tool-subagent-fork` / `tool-agent-team` rows. DSH
+  applies `--patch` after the user's profile patches and refuses to start without the
+  file, so a failed write fails closed. This is the one filesystem write in the args
+  builder: every launch path (sessions, probes, one-shot completions) goes through it.
+- **Upload guard** — a patch for an absent row id is ignored, so a DSH rename could turn
+  uploads back on. Discovery and agent start run `dsh --version` (must be a bare semver:
+  another tool named `dsh` exists) and `dsh --profile acp --patch <overlay> --dump-config`;
+  every row from a `@deepseek-ai/dsh-session-log-*` or `…-session-telemetry-*` package must
+  read `disabled: true` (`dsh::check_dump_config`). Otherwise the row is unavailable
+  (`unavailableReason`) and agent start fails. The verdict is cached per binary and
+  version. Refresh `tests/fixtures/dsh-dump-config-*.txt` when verifying a new DSH.
+- **Auth** — `authMethods` is empty; sign-in is a DeepSeek API key (`DEEPSEEK_API_KEY` in
+  the daemon or login-shell env, or `$DSH_HOME/.credentials.yaml` / `.env`). The check
+  reads presence only and starts no process. A signed-out `session/new` succeeds; the
+  prompt fails with "no API key for provider route" (`auth_error_patterns`).
+- **Models** — `session/new` returns a grouped `configOptions[id="model"]` select (one
+  group per DSH model provider) of opaque values such as
+  `["deepseek-official","deepseek-v4-flash"]`; `thought_level` (`reasoning_effort`) is
+  off/low/high/max. The probe keeps an empty session folder in the DSH home.
+- **Resume** — no `loadSession`; DSH offers `session/resume`, which intent-acp does not
+  send yet, so restarts use the recreate + resend fallback.
+
 ## Antigravity
 
 Antigravity runs the user's `agy` CLI as an ACP server: `agy acp` (agy 1.5.0 or

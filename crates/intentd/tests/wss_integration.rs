@@ -10843,6 +10843,7 @@ async fn wss_providers_catalog_round_trip() {
             "grok",
             "antigravity",
             "cursor",
+            "dsh",
             "mock"
         ],
         "one row per registry entry, registry order: {resp}"

@@ -242,6 +242,7 @@ mod automatic_pr_refresh;
 pub mod checkpoint;
 pub mod cursor_cli;
 mod direct_secret_ops;
+pub mod dsh_cli;
 mod fast_mode;
 mod harness;
 mod history_xml;
@@ -39221,6 +39222,15 @@ pub(crate) trait DiscoveryHost {
     fn pi_cli(&self) -> crate::pi_cli::PiCliStatus;
     /// The resolved and probed `cursor-agent`.
     fn cursor_cli(&self, override_path: Option<&str>) -> crate::cursor_cli::CursorCliStatus;
+    /// The resolved and probed `dsh`. Test hosts report nothing resolved.
+    fn dsh_cli(&self, override_path: Option<&str>) -> crate::dsh_cli::DshCliStatus {
+        let _ = override_path;
+        crate::dsh_cli::DshCliStatus {
+            resolved_path: None,
+            version: None,
+            guard: None,
+        }
+    }
     /// A row's binaries for its display version, in precedence order.
     fn locate(&self, provider_id: &str, command: &str, explicit: Option<&str>) -> Vec<PathBuf>;
 }
@@ -39243,6 +39253,9 @@ impl DiscoveryHost for HostDiscovery {
     }
     fn cursor_cli(&self, override_path: Option<&str>) -> crate::cursor_cli::CursorCliStatus {
         crate::cursor_cli::probe_cursor_cli(override_path)
+    }
+    fn dsh_cli(&self, override_path: Option<&str>) -> crate::dsh_cli::DshCliStatus {
+        crate::dsh_cli::probe_dsh_cli(override_path)
     }
     fn locate(&self, provider_id: &str, command: &str, explicit: Option<&str>) -> Vec<PathBuf> {
         provider_version::host_locate(provider_id, command, explicit)
@@ -39311,6 +39324,19 @@ pub(crate) fn discovery_payload<H: DiscoveryHost, S: std::hash::BuildHasher>(
         })
         .then(|| host.cursor_cli(provider_paths.get("cursor").map(String::as_str)));
 
+    // DeepSeek Harness: confirm the binary is DSH and that Intent's overlay
+    // turns off every upload row (`dsh_cli`).
+    let dsh_cli_status = providers
+        .iter()
+        .any(|p| p.id == intent_providers::dsh::PROVIDER_ID && p.gated_off.is_none() && p.installed)
+        .then(|| {
+            host.dsh_cli(
+                provider_paths
+                    .get(intent_providers::dsh::PROVIDER_ID)
+                    .map(String::as_str),
+            )
+        });
+
     let display_versions = provider_version::probe_display_versions(
         &providers,
         provider_paths,
@@ -39344,6 +39370,11 @@ pub(crate) fn discovery_payload<H: DiscoveryHost, S: std::hash::BuildHasher>(
                     obj.insert("unavailableReason".to_string(), serde_json::json!(reason));
                 } else if let Some(status) = &cursor_cli_status {
                     crate::cursor_cli::apply_cursor_cli_fields(&mut obj, &mut installed, status);
+                }
+            }
+            if p.id == intent_providers::dsh::PROVIDER_ID && p.gated_off.is_none() {
+                if let Some(status) = &dsh_cli_status {
+                    crate::dsh_cli::apply_dsh_cli_fields(&mut obj, &mut installed, status);
                 }
             }
             obj.insert("installed".to_string(), serde_json::json!(installed));

@@ -9740,10 +9740,20 @@ impl Services {
                     .map(String::as_str),
             )
         });
+        let dsh = (source.provider_id == intent_providers::dsh::PROVIDER_ID).then(|| {
+            crate::model_catalog::DshModelSource::resolve(
+                self.effective_settings()
+                    .providers
+                    .paths
+                    .get(intent_providers::dsh::PROVIDER_ID)
+                    .map(String::as_str),
+            )
+        });
         let version_key = antigravity
             .as_ref()
             .map(|s| s.version_key.clone())
             .or_else(|| cursor.as_ref().map(|s| s.version_key.clone()))
+            .or_else(|| dsh.as_ref().map(|s| s.version_key.clone()))
             .unwrap_or_else(|| (source.version_key)());
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
@@ -9781,6 +9791,12 @@ impl Services {
                         Box::pin(async move {
                             crate::model_catalog::from_provider_fetch(
                                 crate::provider_models::fetch_cursor_models_at(cursor.binary).await,
+                            )
+                        })
+                    } else if let Some(dsh) = dsh {
+                        Box::pin(async move {
+                            crate::model_catalog::from_provider_fetch(
+                                crate::provider_models::fetch_dsh_models_at(dsh.binary).await,
                             )
                         })
                     } else {

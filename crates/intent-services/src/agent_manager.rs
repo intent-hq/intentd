@@ -4385,6 +4385,26 @@ impl AgentManager {
             .map_err(|e| Error::Internal(format!("Cursor CLI probe task failed: {e}")))?;
             crate::cursor_cli::check_cursor_cli_for_spawn(&status)?;
         }
+        // DeepSeek Harness: refuse a `dsh` that is not DSH, or one whose
+        // composed profile would still upload sessions (`dsh_cli`). Blocking
+        // probe; the guard verdict is cached per binary and version.
+        if opts.provider.id == intent_providers::dsh::PROVIDER_ID {
+            let override_path = self
+                .services
+                .effective_settings()
+                .providers
+                .paths
+                .get(intent_providers::dsh::PROVIDER_ID)
+                .cloned();
+            let binary = opts.provider_binary.map(Path::to_path_buf);
+            let status = tokio::task::spawn_blocking(move || match binary {
+                Some(path) => crate::dsh_cli::probe_dsh_cli_at(Some(path)),
+                None => crate::dsh_cli::probe_dsh_cli(override_path.as_deref()),
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("DSH CLI probe task failed: {e}")))?;
+            crate::dsh_cli::check_dsh_cli_for_spawn(&status)?;
+        }
         let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup
