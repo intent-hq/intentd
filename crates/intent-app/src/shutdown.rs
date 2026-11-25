@@ -45,9 +45,17 @@ pub async fn stop_host_commands(services: &Services, streams: Option<&HostExecSt
 
 /// Finish the settings hooks, record running turns as interrupted (so they
 /// resume on the next start), then stop agent deliveries without retiring
-/// their durable watches.
-pub async fn checkpoint_agents(services: &Services, manager: &AgentManager) {
+/// their durable watches. `phase` is told each timed step as it starts
+/// (`agent_checkpoint`, `agent_deliveries`), then `None` once all ended.
+pub async fn checkpoint_agents(
+    services: &Services,
+    manager: &AgentManager,
+    mut phase: impl FnMut(Option<&'static str>),
+) {
     services.shutdown_settings().await;
+    phase(Some("agent_checkpoint"));
     manager.checkpoint_shutdown().await;
+    phase(Some("agent_deliveries"));
     services.shutdown_agent_deliveries().await;
+    phase(None);
 }

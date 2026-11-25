@@ -453,7 +453,22 @@ pub struct TenantRuntime {
     connections: ClientConnections,
     tasks: Vec<AbortHandle>,
     loops: Vec<AbortHandle>,
+    running: Loops,
     recovery: Recovery,
+}
+
+/// The tenant's loops, stopped by a graceful stop or the self-fence.
+#[derive(Clone, Default)]
+struct Loops(Arc<Mutex<Vec<JoinHandle<()>>>>);
+
+impl Loops {
+    async fn stop(&self) {
+        let loops = std::mem::take(&mut *lock(&self.0));
+        for handle in loops {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 /// The tenant's startup completion reconcile: stopped between operations
@@ -554,7 +569,13 @@ impl TenantRuntime {
             .iter()
             .map(JoinHandle::abort_handle)
             .collect();
-        let mut tasks = Vec::new();
+        // The loops stay with the runtime, so a graceful stop can end them
+        // before it drains the store writers (`Self::stop_loops`).
+        let running = Loops(Arc::new(Mutex::new(std::mem::take(&mut background.loops))));
+        let mut tasks: Vec<AbortHandle> = lock(&running.0)
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect();
         for task in background.into_tasks() {
             tasks.push(task.abort_handle());
             runner.adopt_task(task);
@@ -562,11 +583,13 @@ impl TenantRuntime {
         let stopping = services.clone();
         let recovery = Recovery::default();
         let draining = recovery.clone();
+        let looping = running.clone();
         runner.on_tasks(move || async move {
             // Before the agent manager stops: a wake the reconcile admitted
             // finishes (its durable claim is never stranded); later ones are
             // skipped.
             draining.drain().await;
+            looping.stop().await;
             stopping.shutdown_pty_sessions().await;
             stopping.host_exec_runtime().shutdown().await;
             if let Some(manager) = stopping.agent_manager() {
@@ -577,8 +600,18 @@ impl TenantRuntime {
             connections,
             tasks,
             loops,
+            running,
             recovery,
         }
+    }
+
+    /// Stop every loop's recurrence and wait for each to end, as `intentd`
+    /// stops its loops before it drains its store writers. Admitted work
+    /// keeps its finite writer owner. The self-fence does it again (a no-op
+    /// by then).
+    pub fn stop_loops(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let running = self.running.clone();
+        async move { running.stop().await }
     }
 
     /// Reconcile the completion bookkeeping restored at start

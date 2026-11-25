@@ -547,7 +547,7 @@ impl ServedTenant {
     /// ([`intent_app::shutdown`]), while its writes still land: close its
     /// client connections and admission, join its startup reconcile, stop
     /// its PTYs and host commands, record its running turns as interrupted,
-    /// stop its agent deliveries, then drain its store writers. Run it
+    /// stop its agent deliveries and loops, then drain its store writers. Run it
     /// before firing the fence of a graceful stop; it does nothing once
     /// the fence fired (every write is refused by then). `streams` are the
     /// process's host command streams: pass them only when the process
@@ -562,6 +562,7 @@ impl ServedTenant {
         let agents = self.agents.clone();
         let connections = self.runtime.connections().clone();
         let reconcile = self.runtime.drain_reconcile();
+        let loops = self.runtime.stop_loops();
         async move {
             if fence.is_fenced() {
                 return;
@@ -572,7 +573,8 @@ impl ServedTenant {
             reconcile.await;
             services.shutdown_pty_sessions().await;
             intent_app::shutdown::stop_host_commands(&services, streams).await;
-            intent_app::shutdown::checkpoint_agents(&services, &agents).await;
+            intent_app::shutdown::checkpoint_agents(&services, &agents, |_| {}).await;
+            loops.await;
             services.shutdown_store_writers().await;
             tracing::info!(tenant, closed, "drained the tenant's work");
         }

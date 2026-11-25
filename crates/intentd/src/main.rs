@@ -3543,9 +3543,14 @@ async fn cmd_serve_owned(
     if let Some(tunnel_recycler) = tunnel_recycler {
         tunnel_recycler.abort();
     }
-    let phase = shutdown::Phase::start("agent_checkpoint");
-    intent_app::shutdown::checkpoint_agents(&services, &manager).await;
-    phase.complete();
+    let mut phase: Option<shutdown::Phase> = None;
+    intent_app::shutdown::checkpoint_agents(&services, &manager, |next| {
+        if let Some(done) = phase.take() {
+            done.complete();
+        }
+        phase = next.map(shutdown::Phase::start);
+    })
+    .await;
     let phase = shutdown::Phase::start("startup_recovery_join");
     match startup_recovery.await {
         Ok(()) => phase.complete(),
