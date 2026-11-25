@@ -96,3 +96,119 @@ async fn a_draining_guard_releases_only_the_given_entries() {
     drop(draining);
     assert!(listed(&svc).is_empty());
 }
+
+fn live_ids(svc: &Services, agent: &AgentId) -> Vec<String> {
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get(agent)
+        .map(|queue| queue.iter().map(|m| m.id.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// A row of another process's entry: a real `QueuedMessage` payload that this
+/// process's memory does not hold.
+fn foreign_row(svc: &Services, agent: &AgentId, id: &str) -> intent_store::AgentQueueRow {
+    enqueue(svc, agent, id);
+    let row = svc
+        .queue_rows(agent)
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("the foreign entry's row");
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get_mut(agent)
+        .unwrap()
+        .retain(|m| m.id != id);
+    row
+}
+
+/// The store's merged queue arrives after memory moved on: a local removal
+/// and a local enqueue made during the sync both survive next to the
+/// foreign entry, and a local edit wins over the stored copy.
+#[tokio::test]
+async fn adopting_the_stored_queue_keeps_mutations_made_during_the_sync() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Adopt during sync").await;
+    enqueue(&svc, &agent, "m1");
+    enqueue(&svc, &agent, "m2");
+    let foreign = foreign_row(&svc, &agent, "f1");
+    // What the sync started from, and what the store sent back: our queue
+    // with another process's f1 appended.
+    let from = svc.queue_rows(&agent);
+    let mut merged = from.clone();
+    merged.push(foreign);
+    // Meanwhile: m1 is removed, m2 edited and m3 enqueued here.
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get_mut(&agent)
+        .unwrap()
+        .retain(|m| m.id != "m1");
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get_mut(&agent)
+        .unwrap()
+        .iter_mut()
+        .find(|m| m.id == "m2")
+        .unwrap()
+        .content = "edited meanwhile".into();
+    enqueue(&svc, &agent, "m3");
+
+    svc.adopt_stored_queue(&agent, &from, merged);
+    assert_eq!(live_ids(&svc, &agent), ["m2", "f1", "m3"]);
+    let queue = svc
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&agent)
+        .cloned()
+        .unwrap();
+    assert_eq!(queue[0].content, "edited meanwhile");
+}
+
+/// With memory unchanged during the sync, memory becomes the stored queue,
+/// including another process's removal of an entry this process holds.
+#[tokio::test]
+async fn adopting_the_stored_queue_takes_a_foreign_removal() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Adopt a removal").await;
+    enqueue(&svc, &agent, "m1");
+    enqueue(&svc, &agent, "m2");
+    let from = svc.queue_rows(&agent);
+    let merged: Vec<_> = from.iter().filter(|row| row.id != "m1").cloned().collect();
+    svc.adopt_stored_queue(&agent, &from, merged);
+    assert_eq!(live_ids(&svc, &agent), ["m2"]);
+}
+
+/// A failed claim puts its popped entries back at their place, after the
+/// nearest earlier entry still queued, keeping an enqueue made meanwhile.
+#[tokio::test]
+async fn an_unclaimed_pop_returns_to_its_place() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Restore unclaimed").await;
+    enqueue(&svc, &agent, "m1");
+    enqueue(&svc, &agent, "m2");
+    enqueue(&svc, &agent, "m3");
+    let before = svc
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&agent)
+        .cloned()
+        .unwrap();
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .get_mut(&agent)
+        .unwrap()
+        .retain(|m| m.id != "m1" && m.id != "m3");
+    enqueue(&svc, &agent, "m4");
+    svc.restore_unclaimed(&agent, &before, &["m1".into(), "m3".into()]);
+    assert_eq!(live_ids(&svc, &agent), ["m1", "m2", "m3", "m4"]);
+    // Restoring twice adds nothing.
+    svc.restore_unclaimed(&agent, &before, &["m1".into(), "m3".into()]);
+    assert_eq!(live_ids(&svc, &agent), ["m1", "m2", "m3", "m4"]);
+}

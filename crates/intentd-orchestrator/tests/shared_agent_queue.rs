@@ -143,3 +143,102 @@ async fn two_processes_share_one_agent_queue_and_drain_each_entry_once() {
         assert!(queue_contents(services, &agent).await.is_empty());
     }
 }
+
+/// Makes every agent queue write of `tenant` fail (the queue version row is
+/// written by every sync), until the returned name is passed to `heal`.
+async fn break_queue_writes(pool: &PgPool, tenant: &str) -> String {
+    let name = format!("fail_queue_write_{}", uuid::Uuid::new_v4().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW.tenant_id = '{tenant}' THEN RAISE EXCEPTION 'injected queue write failure'; END IF; \
+         RETURN NEW; END $$"
+    )))
+    .execute(pool)
+    .await
+    .expect("create the fault function");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON agent_queue_version \
+         FOR EACH ROW EXECUTE FUNCTION {name}()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create the fault trigger");
+    name
+}
+
+async fn heal(pool: &PgPool, name: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {name} ON agent_queue_version"
+    )))
+    .execute(pool)
+    .await
+    .expect("drop the fault trigger");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP FUNCTION {name}()")))
+        .execute(pool)
+        .await
+        .expect("drop the fault function");
+}
+
+/// A drain whose claim write fails delivers nothing: the entry stays queued
+/// in memory and in the store (another process still sees it), and a later
+/// drain delivers it exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_claim_write_delivers_nothing_and_a_later_drain_delivers_once() {
+    let Some(pool) = pool().await else { return };
+    let tenant = format!(
+        "claim-fault-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store_a = open(&pool, &tenant, "process-a").await;
+    let agent = AgentId("agent-fault".into());
+    let now = intent_core::now_iso();
+    store_a
+        .insert_agent_session(&AgentSession {
+            id: agent.clone(),
+            workspace_id: WorkspaceId("__chief__".into()),
+            name: "fault".into(),
+            status: AgentStatus::Idle,
+            created_at: now.clone(),
+            updated_at: now,
+            ..AgentSession::default()
+        })
+        .await
+        .expect("seed the agent");
+    let a = Services::new_isolated(store_a);
+    let (entry, _) = a.enqueue_message_for_test(
+        &agent,
+        "only".into(),
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    a.persist_queue_snapshot_for_test(&agent).await;
+
+    let fault = break_queue_writes(&pool, &tenant).await;
+    let claimed = a.claim_next_queued_message_for_test(&agent).await;
+    heal(&pool, &fault).await;
+    assert_eq!(claimed, None, "a failed claim must not be delivered");
+    assert_eq!(
+        queue_contents(&a, &agent).await,
+        ["only"],
+        "still queued here"
+    );
+    let b = Services::new_isolated(open(&pool, &tenant, "process-b").await);
+    assert_eq!(queue_contents(&b, &agent).await, ["only"], "still stored");
+
+    assert_eq!(
+        a.claim_next_queued_message_for_test(&agent).await,
+        Some((entry.id, Vec::new())),
+        "the next drain delivers it"
+    );
+    assert_eq!(
+        b.claim_next_queued_message_for_test(&agent).await,
+        None,
+        "and nobody delivers it again"
+    );
+    for services in [&a, &b] {
+        assert!(queue_contents(services, &agent).await.is_empty());
+    }
+}

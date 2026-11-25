@@ -20584,27 +20584,30 @@ impl Services {
     /// and the in-memory queue is refreshed from the merged result.
     pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
         let _gate = self.agent_queue_persist_gate.lock().await;
-        self.sync_queue_locked(agent_id, &[]).await;
+        if let Err(e) = self.sync_queue_locked(agent_id, &[]).await {
+            tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
+        }
     }
 
     /// The write of [`Services::persist_queue_snapshot`]; the caller holds
     /// `agent_queue_persist_gate`. Returns the `claims` another process
-    /// removed from the stored queue first (always empty on `SQLite`, and
-    /// on a failed write, which is logged like before).
-    async fn sync_queue_locked(&self, agent_id: &AgentId, claims: &[String]) -> Vec<String> {
+    /// removed from the stored queue first (always empty on `SQLite`).
+    ///
+    /// # Errors
+    ///
+    /// The store write failed: nothing was written, so a claim made by this
+    /// write did not happen.
+    async fn sync_queue_locked(
+        &self,
+        agent_id: &AgentId,
+        claims: &[String],
+    ) -> Result<Vec<String>> {
         let rows = self.queue_rows(agent_id);
-        match self.store.sync_agent_queue(agent_id, &rows, claims).await {
-            Ok(sync) => {
-                if let Some(merged) = sync.merged {
-                    self.adopt_stored_queue(agent_id, &rows, merged);
-                }
-                sync.lost
-            }
-            Err(e) => {
-                tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
-                Vec::new()
-            }
+        let sync = self.store.sync_agent_queue(agent_id, &rows, claims).await?;
+        if let Some(merged) = sync.merged {
+            self.adopt_stored_queue(agent_id, &rows, merged);
         }
+        Ok(sync.lost)
     }
 
     /// Bring the in-memory queue up to date with the stored one when another
@@ -20636,8 +20639,12 @@ impl Services {
     /// refresh the queue from the store, `pop`, then write the shrunk queue
     /// claiming the popped `ids`. Returns the popped value with the claimed
     /// ids another process removed first (lost: the caller must not deliver
-    /// them). On a store no other process writes this is just `pop()` and
-    /// nothing is lost; the caller persists the shrink as before.
+    /// them). When the claim write fails (writer lock busy, not the owner,
+    /// I/O), nothing is claimed: the popped entries go back to their place
+    /// in memory, still stored, and this returns `None` so the caller does
+    /// not deliver; a later drain retries. On a store no other process
+    /// writes this is just `pop()` and nothing is lost; the caller persists
+    /// the shrink as before.
     pub(crate) async fn claim_queue_pop<T>(
         &self,
         agent_id: &AgentId,
@@ -20649,13 +20656,52 @@ impl Services {
         }
         let _gate = self.agent_queue_persist_gate.lock().await;
         self.refresh_queue_locked(agent_id).await;
+        let before = self
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default();
         let popped = pop()?;
         let claims = ids(&popped);
-        let lost = self.sync_queue_locked(agent_id, &claims).await;
+        let lost = match self.sync_queue_locked(agent_id, &claims).await {
+            Ok(lost) => lost,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "queue claim write failed; leaving the entries queued");
+                // Retire the draining overlay first, then put the entries back.
+                drop(popped);
+                self.restore_unclaimed(agent_id, &before, &claims);
+                return None;
+            }
+        };
         if !lost.is_empty() {
             tracing::info!(agent = %agent_id, lost = ?lost, "queue entries were drained or removed by another process; not delivering them");
         }
         Some((popped, lost))
+    }
+
+    /// Put back the entries a failed claim popped: each id of `claims`
+    /// missing from memory returns from `before` (the queue just before the
+    /// pop) right after its nearest predecessor there that memory still
+    /// holds, so a mutation that landed meanwhile is kept.
+    fn restore_unclaimed(&self, agent_id: &AgentId, before: &[QueuedMessage], claims: &[String]) {
+        let mut queues = self.agent_queues.lock().unwrap();
+        let queue = queues.entry(agent_id.clone()).or_default();
+        for (index, entry) in before.iter().enumerate() {
+            if !claims.contains(&entry.id) || queue.iter().any(|m| m.id == entry.id) {
+                continue;
+            }
+            let at = before[..index]
+                .iter()
+                .rev()
+                .find_map(|prev| queue.iter().position(|m| m.id == prev.id))
+                .map_or(0, |position| position + 1);
+            queue.insert(at, entry.clone());
+        }
+        if queue.is_empty() {
+            queues.remove(agent_id);
+        }
     }
 
     /// Replace the in-memory queue with `merged`, the store's queue, after a
