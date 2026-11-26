@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.301] - 2026-11-26
+
+### 🚀 Features
+
+- *(node-connections)* Own machine links through store leases ([#3794](https://github.com/intent-hq/intentd/pull/3794))
+- *(providers)* Add DeepSeek Harness (DSH) as an ACP provider ([#3790](https://github.com/intent-hq/intentd/pull/3790))
+
+### 🐛 Bug Fixes
+
+- Honor proxy settings in the GitHub client and extend the test egress guard ([#3792](https://github.com/intent-hq/intentd/pull/3792))
+
+
 ## [0.11.300] - 2026-11-26
 
 ### 🚀 Features
