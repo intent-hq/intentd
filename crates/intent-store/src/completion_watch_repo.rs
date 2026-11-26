@@ -8,10 +8,12 @@
 //! (`agent_subscriptions.rs`) so a watch registered before a restart still
 //! wakes the parent when the child completes after the restart.
 
+use std::time::Duration;
+
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use sqlx::Row;
 
-use crate::Store;
+use crate::{Lease, LeaseKeeper, Store};
 
 /// Persisted completion-watch row (mirrors the in-memory `CompletionWatch`).
 #[derive(Debug, Clone)]
@@ -32,52 +34,89 @@ pub struct PersistedCompletionWatch {
     pub created_at: String,
 }
 
-impl Store {
-    /// Claims the persisted watch `watch_id` for this process's delivery of
-    /// its terminal wake (batch G 2c). `false` means another process holds
-    /// a live claim (same tenant epoch): skip, it is delivering. `true`
-    /// means this process holds the claim, or no row exists (the
-    /// write-through has not landed; the in-process claim decides). A claim
-    /// from an older epoch is stale and taken over; there is no time-based
-    /// expiry, so a slow holder keeps it. Release it with
-    /// [`Store::release_completion_watch_claim`] when delivery does not
-    /// retire the watch. `SQLite` has one process: always `true`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotOwner` when this process lost the tenant, and
-    /// `Error::Internal` if the database operation fails.
-    pub async fn claim_completion_watch(&self, watch_id: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.claim_completion_watch(watch_id).await)
-    }
+/// The lease scope of a completion watch's delivery claim (key: the
+/// watch id).
+pub const COMPLETION_WATCH_LEASE_SCOPE: &str = "completion-watch";
 
-    /// Releases this process's claim on `watch_id` (a no-op when another
-    /// process holds it or nothing does), so a retry can claim it again.
+/// The lease scope of a delegation group's delivery claim (key: the group
+/// id).
+pub const DELEGATION_GROUP_LEASE_SCOPE: &str = "delegation-group";
+
+/// Fails unless `claim` is the delivery claim of (`scope`, `key`), and
+/// returns its lease; `Error::LeaseLost` once the claim was released.
+fn claimed<'a>(
+    claim: &'a tokio::sync::MutexGuard<'_, Option<Lease>>,
+    scope: &str,
+    key: &str,
+) -> Result<&'a Lease> {
+    let Some(lease) = claim.as_ref() else {
+        return Err(Error::LeaseLost(format!(
+            "delivery claim {scope}/{key} was released"
+        )));
+    };
+    if lease.scope() != scope || lease.key() != key {
+        return Err(Error::InvalidParams(format!(
+            "the delivery claim {}/{} does not cover {scope}/{key}",
+            lease.scope(),
+            lease.key()
+        )));
+    }
+    Ok(lease)
+}
+
+impl Store {
+    /// Claims the watch `watch_id` for this process's delivery of its
+    /// terminal wake: the lease (`completion-watch`, `watch_id`) for `ttl`,
+    /// kept by the returned [`LeaseKeeper`] until delivery ends. `None`
+    /// while another holder has it (another process, or another pass):
+    /// retry later, the holder delivers or releases, and a crashed holder's
+    /// claim lapses after its TTL by the database clock. Neither the tenant
+    /// epoch nor the row matter: a tenant takeover leaves a live claim
+    /// alone, and a watch whose row has not landed yet is claimed all the
+    /// same.
+    ///
+    /// Settle with [`Store::retire_completion_watch_after_delivery`], which
+    /// fences on the claim; otherwise [`LeaseKeeper::release`] it so a retry
+    /// can claim it at once.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails.
-    pub async fn release_completion_watch_claim(&self, watch_id: &str) -> Result<()> {
-        dispatch!(self, backend => backend.release_completion_watch_claim(watch_id).await)
+    /// As [`Store::acquire_lease`].
+    pub async fn claim_completion_watch(
+        &self,
+        watch_id: &str,
+        ttl: Duration,
+    ) -> Result<Option<LeaseKeeper>> {
+        // Boxed: delivery passes nest deep, and the acquire is large.
+        Box::pin(LeaseKeeper::acquire(
+            self,
+            COMPLETION_WATCH_LEASE_SCOPE,
+            watch_id,
+            ttl,
+        ))
+        .await
     }
 
     /// [`Store::claim_completion_watch`] for a delegation group's aggregate
-    /// wake.
+    /// wake (`delegation-group`, `group_id`); settle with
+    /// [`Store::settle_delegation_group_after_delivery`].
     ///
     /// # Errors
     ///
-    /// As [`Store::claim_completion_watch`].
-    pub async fn claim_delegation_group(&self, group_id: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.claim_delegation_group(group_id).await)
-    }
-
-    /// [`Store::release_completion_watch_claim`] for a delegation group.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
-    pub async fn release_delegation_group_claim(&self, group_id: &str) -> Result<()> {
-        dispatch!(self, backend => backend.release_delegation_group_claim(group_id).await)
+    /// As [`Store::acquire_lease`].
+    pub async fn claim_delegation_group(
+        &self,
+        group_id: &str,
+        ttl: Duration,
+    ) -> Result<Option<LeaseKeeper>> {
+        // Boxed, as for a watch.
+        Box::pin(LeaseKeeper::acquire(
+            self,
+            DELEGATION_GROUP_LEASE_SCOPE,
+            group_id,
+            ttl,
+        ))
+        .await
     }
 
     /// Atomically retire one fired completion watch and record the delivered
@@ -88,7 +127,14 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Internal`] if the transaction cannot begin, update the
+    /// The transaction guards `claim` (this watch's delivery claim, from
+    /// [`Store::claim_completion_watch`]) and, when it commits, retires the
+    /// claim's lease row too: a holder whose claim lapsed or was taken over
+    /// writes nothing.
+    ///
+    /// Returns [`Error::LeaseLost`] when `claim` is no longer held,
+    /// [`Error::InvalidParams`] when it is not this watch's claim, and
+    /// [`Error::Internal`] if the transaction cannot begin, update the
     /// delivery marker, retire the watch, or commit.
     pub async fn retire_completion_watch_after_delivery(
         &self,
@@ -97,8 +143,11 @@ impl Store {
         child_agent_id: &AgentId,
         completion_identity: Option<&str>,
         delivered_at: &str,
+        claim: &LeaseKeeper,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at).await)
+        let held = claim.lease().await;
+        let lease = claimed(&held, COMPLETION_WATCH_LEASE_SCOPE, watch_id)?;
+        dispatch!(self, backend => Box::pin(backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at, lease)).await)
     }
 
     /// Atomically settle a delivered delegation group: failed children that
@@ -108,14 +157,23 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Internal`] if any settlement statement or the final
+    /// The transaction guards `claim` (the group's delivery claim, from
+    /// [`Store::claim_delegation_group`]) and retires its lease row, as
+    /// [`Store::retire_completion_watch_after_delivery`].
+    ///
+    /// Returns [`Error::LeaseLost`] when `claim` is no longer held,
+    /// [`Error::InvalidParams`] when it is not this group's claim, and
+    /// [`Error::Internal`] if any settlement statement or the final
     /// transaction commit fails.
     pub async fn settle_delegation_group_after_delivery(
         &self,
         group_id: &str,
         retain_children: &[AgentId],
+        claim: &LeaseKeeper,
     ) -> Result<()> {
-        dispatch!(self, backend => backend.settle_delegation_group_after_delivery(group_id, retain_children).await)
+        let held = claim.lease().await;
+        let lease = claimed(&held, DELEGATION_GROUP_LEASE_SCOPE, group_id)?;
+        dispatch!(self, backend => backend.settle_delegation_group_after_delivery(group_id, retain_children, lease).await)
     }
 
     /// Insert a `completion_watch` row, or update its mutable columns on id
@@ -208,27 +266,6 @@ impl Store {
 }
 
 impl crate::SqliteStore {
-    // One process per database file: nothing to claim against.
-    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
-    pub async fn claim_completion_watch(&self, _watch_id: &str) -> Result<bool> {
-        Ok(true)
-    }
-
-    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
-    pub async fn release_completion_watch_claim(&self, _watch_id: &str) -> Result<()> {
-        Ok(())
-    }
-
-    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
-    pub async fn claim_delegation_group(&self, _group_id: &str) -> Result<bool> {
-        Ok(true)
-    }
-
-    #[expect(clippy::unused_async, reason = "mirrors the Postgres claim")]
-    pub async fn release_delegation_group_claim(&self, _group_id: &str) -> Result<()> {
-        Ok(())
-    }
-
     pub async fn retire_completion_watch_after_delivery(
         &self,
         watch_id: &str,
@@ -236,12 +273,14 @@ impl crate::SqliteStore {
         child_agent_id: &AgentId,
         completion_identity: Option<&str>,
         delivered_at: &str,
+        claim: &Lease,
     ) -> Result<()> {
         let pool = self.write_pool().clone();
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("retire completion_watch begin failed: {e}"))
             })?;
+            self.guard_lease(claim)?;
             if let Some(identity) = completion_identity {
                 sqlx::query(
                     "INSERT INTO completion_wake_delivery (
@@ -275,13 +314,16 @@ impl crate::SqliteStore {
             })?;
             Ok(())
         })
-        .await
+        .await?;
+        self.retire_lease(claim);
+        Ok(())
     }
 
     pub async fn settle_delegation_group_after_delivery(
         &self,
         group_id: &str,
         retain_children: &[AgentId],
+        claim: &Lease,
     ) -> Result<()> {
         let pool = self.write_pool().clone();
         let retained: Vec<String> = retain_children.iter().map(|id| id.0.clone()).collect();
@@ -289,6 +331,7 @@ impl crate::SqliteStore {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("settle delegation_group begin failed: {e}"))
             })?;
+            self.guard_lease(claim)?;
             for child_id in &retained {
                 sqlx::query(
                     "UPDATE completion_watch SET group_id = NULL \
@@ -342,7 +385,9 @@ impl crate::SqliteStore {
             })?;
             Ok(())
         })
-        .await
+        .await?;
+        self.retire_lease(claim);
+        Ok(())
     }
 
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {

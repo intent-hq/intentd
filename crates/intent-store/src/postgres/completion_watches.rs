@@ -13,6 +13,7 @@ use sqlx::Row;
 use super::{db, PgStore, WriteTx};
 use crate::completion_watch_repo::PersistedCompletionWatch;
 use crate::delegation_group_repo::PersistedDelegationGroup;
+use crate::lease_repo::Lease;
 use crate::stop_redelivery_repo::StopRedeliveryRow;
 
 const WATCH_COLUMNS: &str = "id, parent_workspace_id, child_workspace_id, parent_agent_id, \
@@ -86,70 +87,6 @@ fn encode<T: serde::Serialize>(value: &T, name: &str) -> Result<String> {
 impl PgStore {
     // ---- completion watches ----------------------------------------------------------
 
-    pub async fn claim_completion_watch(&self, watch_id: &str) -> Result<bool> {
-        self.claim_delivery(ClaimTable::Watch, watch_id).await
-    }
-
-    pub async fn release_completion_watch_claim(&self, watch_id: &str) -> Result<()> {
-        self.release_delivery(ClaimTable::Watch, watch_id).await
-    }
-
-    pub async fn claim_delegation_group(&self, group_id: &str) -> Result<bool> {
-        self.claim_delivery(ClaimTable::Group, group_id).await
-    }
-
-    pub async fn release_delegation_group_claim(&self, group_id: &str) -> Result<()> {
-        self.release_delivery(ClaimTable::Group, group_id).await
-    }
-
-    /// Takes the row's delivery claim at the tenant's current epoch, under
-    /// the writer lock: free, already this process's, or left by an older
-    /// epoch. `false` only when another process holds it at this epoch.
-    async fn claim_delivery(&self, table: ClaimTable, id: &str) -> Result<bool> {
-        let name = table.name();
-        let mut tx = self.begin_write().await?;
-        let epoch = tx.writer().epoch;
-        let claimed = sqlx::query(table.claim_sql())
-            .bind(self.tenant())
-            .bind(id)
-            .bind(epoch)
-            .bind(self.process_token())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("claim {name} failed: {e}")))?
-            .rows_affected()
-            > 0;
-        let won = if claimed {
-            true
-        } else {
-            // No row at all: nothing to order against (the write-through
-            // has not landed), so the in-process claim decides.
-            sqlx::query_scalar::<_, i32>(table.probe_sql())
-                .bind(self.tenant())
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("probe {name} failed: {e}")))?
-                .is_none()
-        };
-        tx.commit().await.map_err(db)?;
-        Ok(won)
-    }
-
-    /// Drops this process's claim on the row; another process's claim stays.
-    async fn release_delivery(&self, table: ClaimTable, id: &str) -> Result<()> {
-        let name = table.name();
-        let mut tx = self.begin_write().await?;
-        sqlx::query(table.release_sql())
-            .bind(self.tenant())
-            .bind(id)
-            .bind(self.process_token())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("release {name} claim failed: {e}")))?;
-        tx.commit().await.map_err(db)
-    }
-
     pub async fn retire_completion_watch_after_delivery(
         &self,
         watch_id: &str,
@@ -157,11 +94,11 @@ impl PgStore {
         child_agent_id: &AgentId,
         completion_identity: Option<&str>,
         delivered_at: &str,
+        claim: &Lease,
     ) -> Result<()> {
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| Error::Internal(format!("retire completion_watch begin failed: {e}")))?;
+        // A process that lost the tenant gets `NotOwner` as it is.
+        let mut tx = self.begin_write().await?;
+        self.guard_lease(&mut tx, claim).await?;
         if let Some(identity) = completion_identity {
             sqlx::query(
                 "INSERT INTO completion_wake_delivery \
@@ -190,6 +127,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("retire completion_watch delete failed: {e}")))?;
+        self.retire_lease(&mut tx, claim).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("retire completion_watch commit failed: {e}")))
@@ -199,12 +137,12 @@ impl PgStore {
         &self,
         group_id: &str,
         retain_children: &[AgentId],
+        claim: &Lease,
     ) -> Result<()> {
         let retained: Vec<&str> = retain_children.iter().map(|id| id.0.as_str()).collect();
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| Error::Internal(format!("settle delegation_group begin failed: {e}")))?;
+        // A process that lost the tenant gets `NotOwner` as it is.
+        let mut tx = self.begin_write().await?;
+        self.guard_lease(&mut tx, claim).await?;
         sqlx::query(
             "UPDATE completion_watch SET group_id = NULL \
              WHERE tenant_id = $1 AND group_id = $2 AND child_agent_id = ANY($3)",
@@ -237,6 +175,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("settle delegation_group delete failed: {e}")))?;
+        self.retire_lease(&mut tx, claim).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("settle delegation_group commit failed: {e}")))
@@ -554,32 +493,6 @@ impl PgStore {
     }
 }
 
-/// The rows a delivery claim can sit on.
-#[derive(Clone, Copy)]
-enum ClaimTable {
-    Watch,
-    Group,
-}
-
-/// Takes the claim ($1 tenant, $2 key, $3 epoch, $4 process token): free,
-/// already this process's, or left by an older epoch.
-const CLAIM_WATCH_SQL: &str = "UPDATE completion_watch SET claim_epoch = $3, claim_token = $4 \
-     WHERE tenant_id = $1 AND id = $2 \
-     AND (claim_token IS NULL OR claim_token = $4 OR claim_epoch < $3)";
-const CLAIM_GROUP_SQL: &str = "UPDATE delegation_group SET claim_epoch = $3, claim_token = $4 \
-     WHERE tenant_id = $1 AND group_id = $2 \
-     AND (claim_token IS NULL OR claim_token = $4 OR claim_epoch < $3)";
-/// Whether the row exists ($1 tenant, $2 key).
-const PROBE_WATCH_SQL: &str = "SELECT 1 FROM completion_watch WHERE tenant_id = $1 AND id = $2";
-const PROBE_GROUP_SQL: &str =
-    "SELECT 1 FROM delegation_group WHERE tenant_id = $1 AND group_id = $2";
-/// Drops the claims of every other process ($1 tenant, $2 process token).
-const CLEAR_FOREIGN_WATCH_CLAIMS_SQL: &str = "UPDATE completion_watch \
-     SET claim_epoch = NULL, claim_token = NULL \
-     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
-const CLEAR_FOREIGN_GROUP_CLAIMS_SQL: &str = "UPDATE delegation_group \
-     SET claim_epoch = NULL, claim_token = NULL \
-     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
 /// Drops the idempotency reservations of every other process ($1 tenant,
 /// $2 process token), so a retry runs the operation again (batch G 2b).
 const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
@@ -589,52 +502,16 @@ const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
 const CLEAR_FOREIGN_GRACE_CLAIMS_SQL: &str = "UPDATE delete_grace \
      SET claim_epoch = NULL, claim_token = NULL \
      WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
-/// Drops this process's claim ($1 tenant, $2 key, $3 process token).
-const RELEASE_WATCH_SQL: &str = "UPDATE completion_watch \
-     SET claim_epoch = NULL, claim_token = NULL \
-     WHERE tenant_id = $1 AND id = $2 AND claim_token = $3";
-const RELEASE_GROUP_SQL: &str = "UPDATE delegation_group \
-     SET claim_epoch = NULL, claim_token = NULL \
-     WHERE tenant_id = $1 AND group_id = $2 AND claim_token = $3";
-
-impl ClaimTable {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Watch => "completion_watch",
-            Self::Group => "delegation_group",
-        }
-    }
-
-    fn claim_sql(self) -> &'static str {
-        match self {
-            Self::Watch => CLAIM_WATCH_SQL,
-            Self::Group => CLAIM_GROUP_SQL,
-        }
-    }
-
-    fn probe_sql(self) -> &'static str {
-        match self {
-            Self::Watch => PROBE_WATCH_SQL,
-            Self::Group => PROBE_GROUP_SQL,
-        }
-    }
-
-    fn release_sql(self) -> &'static str {
-        match self {
-            Self::Watch => RELEASE_WATCH_SQL,
-            Self::Group => RELEASE_GROUP_SQL,
-        }
-    }
-}
 
 impl PgStore {
-    /// On this process's first open of the tenant, drops the delivery claims
-    /// and idempotency reservations other processes left (a crashed or
-    /// stopped daemon): a process that opens the tenant anew takes over their
-    /// deliveries and keyed operations, as a takeover's
-    /// newer epoch does. Without it a claim left at an unchanged epoch (a
-    /// tenant never leased) would block its watch or group for good. Later
-    /// opens in the same process share its token and clear nothing.
+    /// On this process's first open of the tenant, drops the idempotency
+    /// reservations and delete grace claims other processes left (a crashed
+    /// or stopped daemon): a process that opens the tenant anew takes over
+    /// their keyed operations and deletes, as a takeover's newer epoch does.
+    /// Without it a claim left at an unchanged epoch (a tenant never leased)
+    /// would block its row for good. Later opens in the same process share
+    /// its token and clear nothing. Delivery claims are leases and lapse by
+    /// their TTL instead (`completion_watch_repo.rs`).
     ///
     /// Assumption: only the unleased open (`open_postgres`) runs this, and
     /// an unleased tenant is served by one process by design, so every
@@ -652,8 +529,6 @@ impl PgStore {
         let cleared = async {
             let mut tx = self.begin_write().await?;
             for sql in [
-                CLEAR_FOREIGN_WATCH_CLAIMS_SQL,
-                CLEAR_FOREIGN_GROUP_CLAIMS_SQL,
                 CLEAR_FOREIGN_RESERVATIONS_SQL,
                 CLEAR_FOREIGN_GRACE_CLAIMS_SQL,
             ] {
@@ -682,11 +557,11 @@ impl PgStore {
     }
 }
 
-/// Names one process in the rows it claims (delivery claims, batch G 2c): a
-/// random id made when the process first opens the tenant, shared by every
-/// store of the tenant in the process (`tenant_registry`). With a claim's
-/// epoch it tells this process's claim (re-entrant, releasable) from
-/// another's.
+/// Names one process in the rows it claims (idempotency reservations,
+/// delete grace claims, and the `holder` of its leases): a random id made
+/// when the process first opens the tenant, shared by every store of the
+/// tenant in the process (`tenant_registry`). With a claim's epoch it tells
+/// this process's claim (re-entrant, releasable) from another's.
 #[derive(Clone)]
 pub(crate) struct ProcessToken(std::sync::Arc<str>);
 

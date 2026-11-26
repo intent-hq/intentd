@@ -10,7 +10,7 @@
 //! looks right.
 
 use intent_core::{AgentId, AgentSession, AgentStatus, Workspace, WorkspaceId};
-use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup, Store};
+use intent_store::{LeaseKeeper, PersistedCompletionWatch, PersistedDelegationGroup, Store};
 
 use crate::harness::{parity_test, TestDb};
 
@@ -22,6 +22,7 @@ const T3: &str = "2026-01-04T00:00:00.000Z";
 const T4: &str = "2026-01-05T00:00:00.000Z";
 const T5: &str = "2026-01-06T00:00:00.000Z";
 const TIE: &str = "2026-01-07T00:00:00.000Z";
+const CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn wid(id: &str) -> WorkspaceId {
     WorkspaceId(id.into())
@@ -142,6 +143,24 @@ async fn seed_watches(store: &Store, tenant: &str) -> Vec<PersistedCompletionWat
     all
 }
 
+/// The delivery claim on watch `id`, as a delivery holds it.
+async fn watch_claim(store: &Store, id: &str) -> LeaseKeeper {
+    store
+        .claim_completion_watch(id, CLAIM_TTL)
+        .await
+        .unwrap()
+        .expect("the watch is unclaimed")
+}
+
+/// The delivery claim on group `id`, as a delivery holds it.
+async fn group_claim(store: &Store, id: &str) -> LeaseKeeper {
+    store
+        .claim_delegation_group(id, CLAIM_TTL)
+        .await
+        .unwrap()
+        .expect("the group is unclaimed")
+}
+
 parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
     let (p1, p2, c1, c2, c3) = (aid("p1"), aid("p2"), aid("c1"), aid("c2"), aid("c3"));
     sessions(&store, &["p1", "p2", "c1", "c2", "c3"], tenant).await;
@@ -166,11 +185,22 @@ parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
         .await
         .unwrap();
     store
-        .retire_completion_watch_after_delivery("w1", &p1, &c1, None, T5)
+        .retire_completion_watch_after_delivery(
+            "w1",
+            &p1,
+            &c1,
+            None,
+            T5,
+            &watch_claim(&store, "w1").await,
+        )
         .await
         .unwrap();
     store
-        .settle_delegation_group_after_delivery("g1", std::slice::from_ref(&c3))
+        .settle_delegation_group_after_delivery(
+            "g1",
+            std::slice::from_ref(&c3),
+            &group_claim(&store, "g1").await,
+        )
         .await
         .unwrap();
     assert!(store.list_completion_watches().await.unwrap().is_empty());
@@ -231,7 +261,14 @@ parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
     // Retire with a delivery marker, then re-mark on an already-retired watch.
     let ident = format!("ident of {tenant}");
     store
-        .retire_completion_watch_after_delivery("w2", &p1, &c2, Some(&ident), T5)
+        .retire_completion_watch_after_delivery(
+            "w2",
+            &p1,
+            &c2,
+            Some(&ident),
+            T5,
+            &watch_claim(&store, "w2").await,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -239,7 +276,14 @@ parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
         Some(ident)
     );
     store
-        .retire_completion_watch_after_delivery("w2", &p1, &c2, Some("second"), T5)
+        .retire_completion_watch_after_delivery(
+            "w2",
+            &p1,
+            &c2,
+            Some("second"),
+            T5,
+            &watch_claim(&store, "w2").await,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -251,7 +295,14 @@ parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
         Some("second")
     );
     store
-        .retire_completion_watch_after_delivery("wc", &p2, &c2, None, T5)
+        .retire_completion_watch_after_delivery(
+            "wc",
+            &p2,
+            &c2,
+            None,
+            T5,
+            &watch_claim(&store, "wc").await,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -262,11 +313,15 @@ parity_test!(completion_watch_writes_and_settlement, |store, tenant| {
 
     // g1 keeps c3 (ungrouped) and a child it does not hold; w4 goes. g2 keeps none.
     store
-        .settle_delegation_group_after_delivery("g1", &[c3.clone(), aid("c-none")])
+        .settle_delegation_group_after_delivery(
+            "g1",
+            &[c3.clone(), aid("c-none")],
+            &group_claim(&store, "g1").await,
+        )
         .await
         .unwrap();
     store
-        .settle_delegation_group_after_delivery("g2", &[])
+        .settle_delegation_group_after_delivery("g2", &[], &group_claim(&store, "g2").await)
         .await
         .unwrap();
     expected.retain(|w| !["w4", "w6", "w7"].contains(&w.id.as_str()));
@@ -525,10 +580,11 @@ parity_test!(stop_redelivery_round_trip, |store, tenant, db| {
     }
 });
 
-// ---- delivery claims (batch G 2c) --------------------------------------------------------
+// ---- delivery claims ----------------------------------------------------------------
 
 /// A store of `tenant` opened as if by another process named `process`: its
-/// own process-local gates, so only the database orders it against others.
+/// own process token and gates, so only the database orders it against
+/// others.
 async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
     Store::open_postgres_as_process(
         db.app.clone(),
@@ -541,145 +597,396 @@ async fn open_as_process(db: &TestDb, tenant: &str, process: &str) -> Store {
     .expect("open tenant store as another process")
 }
 
-/// Two processes that both see one child's completion (two delivery loops,
-/// or a daemon still delivering while another rehydrated the watch) must
-/// not both wake the parent. Each claims the watch (or the delegation
-/// group) in the database before it delivers: the claim names the tenant's
-/// epoch and the claiming process, so the other process skips until the
-/// claim is released, a newer epoch (a takeover) makes it stale, or a new
-/// process opens the tenant (a restart without a lease). A slow owner never
-/// loses its claim to a timer. `SQLite` has one process and
-/// always grants the claim.
-#[tokio::test]
-async fn a_completion_is_delivered_by_one_process_at_a_time() {
-    let Some(db) = crate::harness::test_db(false).await else {
-        let (store, _dir) = crate::harness::sqlite_store().await;
-        assert!(store.claim_completion_watch("w1").await.unwrap());
-        assert!(store.claim_completion_watch("w1").await.unwrap());
-        assert!(store.claim_delegation_group("g1").await.unwrap());
-        return;
-    };
-    let tenant = "claims";
-    let a = open_as_process(&db, tenant, "process-a").await;
-    let b = open_as_process(&db, tenant, "process-b").await;
-    seed_watches(&a, tenant).await;
+/// The stores a claim test contends with: two processes on Postgres, or two
+/// clones of one `SQLite` store (one process per database file).
+async fn contenders(tenant: &str) -> (Option<TestDb>, Store, Store, Option<tempfile::TempDir>) {
+    if let Some(db) = crate::harness::test_db(false).await {
+        let a = open_as_process(&db, tenant, "process-a").await;
+        let b = open_as_process(&db, tenant, "process-b").await;
+        (Some(db), a, b, None)
+    } else {
+        let (store, dir) = crate::harness::sqlite_store().await;
+        (None, store.clone(), store, Some(dir))
+    }
+}
 
-    for id in ["w1", "g1"] {
-        let claim = |s: &Store| {
-            let s = s.clone();
-            async move {
-                if id.starts_with('w') {
-                    s.claim_completion_watch(id).await.unwrap()
-                } else {
-                    s.claim_delegation_group(id).await.unwrap()
-                }
-            }
-        };
-        let release = |s: &Store| {
-            let s = s.clone();
-            async move {
-                if id.starts_with('w') {
-                    s.release_completion_watch_claim(id).await.unwrap();
-                } else {
-                    s.release_delegation_group_claim(id).await.unwrap();
-                }
-            }
-        };
-        assert!(claim(&a).await, "{id}: the first process claims");
-        assert!(claim(&a).await, "{id}: its own claim is re-entrant");
-        assert!(!claim(&b).await, "{id}: the other process skips");
-        release(&b).await;
-        assert!(
-            !claim(&b).await,
-            "{id}: a release by a non-holder is a no-op"
-        );
-        release(&a).await;
-        assert!(claim(&b).await, "{id}: a released claim can be taken");
-        assert!(!claim(&a).await, "{id}: now held by the other process");
+/// Claims `id` (a watch for a `w…` id, else a group).
+async fn claim(store: &Store, id: &str, ttl: std::time::Duration) -> Option<LeaseKeeper> {
+    if id.starts_with('w') {
+        store.claim_completion_watch(id, ttl).await.unwrap()
+    } else {
+        store.claim_delegation_group(id, ttl).await.unwrap()
+    }
+}
+
+/// Lets the delivery claim on `id` lapse by the database clock, as its TTL
+/// passing would.
+async fn expire_claim(db: &TestDb, tenant: &str, id: &str) {
+    let scope = if id.starts_with('w') {
+        "completion-watch"
+    } else {
+        "delegation-group"
+    };
+    let expired = sqlx::query(
+        "UPDATE lease SET expires_at = clock_timestamp() \
+         WHERE tenant_id = $1 AND scope = $2 AND lease_key = $3 AND lease_id IS NOT NULL",
+    )
+    .bind(tenant)
+    .bind(scope)
+    .bind(id)
+    .execute(&db.admin)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(expired, 1, "{scope}/{id} is held");
+}
+
+/// Every contender (half in each process) starts at one barrier on a
+/// multi-thread runtime; exactly one claims each watch and group, and keeps
+/// it: the claim is not re-entrant, a non-holder cannot take it, and the
+/// holder's release hands it on at once. A watch and a group of one id are
+/// separate claims, and a claim needs no persisted row (the write-through
+/// may not have landed). Both backends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_contender_claims_a_delivery_until_it_releases() {
+    const RACERS: usize = 8;
+    let (db, a, b, _dir) = contenders("claims").await;
+    if db.is_some() {
+        seed_watches(&a, "claims").await;
     }
 
-    // A restarted daemon (a new process; the tenant never leased, so the
-    // epoch is unchanged) takes over the claims the old process left: its
-    // first open of the tenant clears them.
+    for id in ["w1", "g1", "never-persisted"] {
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+        let racers: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let store = if i % 2 == 0 { a.clone() } else { b.clone() };
+                let start = std::sync::Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    (i % 2, claim(&store, id, CLAIM_TTL).await)
+                })
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for racer in racers {
+            let (side, won) = racer.await.unwrap();
+            if let Some(keeper) = won {
+                winners.push((side, keeper));
+            }
+        }
+        assert_eq!(winners.len(), 1, "{id}: exactly one contender claims");
+        let (side, held) = winners.pop().unwrap();
+        let (holder, other) = if side == 0 { (&a, &b) } else { (&b, &a) };
+        assert!(
+            claim(holder, id, CLAIM_TTL).await.is_none(),
+            "{id}: not re-entrant"
+        );
+        assert!(
+            claim(other, id, CLAIM_TTL).await.is_none(),
+            "{id}: the other process waits"
+        );
+        held.release(holder).await;
+        let next = claim(other, id, CLAIM_TTL)
+            .await
+            .unwrap_or_else(|| panic!("{id}: a released claim is free at once"));
+        assert!(next.token() > 1, "{id}: the next holder's token is higher");
+        next.release(other).await;
+    }
+    let watch = a.claim_completion_watch("x1", CLAIM_TTL).await.unwrap();
+    let group = a.claim_delegation_group("x1", CLAIM_TTL).await.unwrap();
+    assert!(
+        watch.is_some() && group.is_some(),
+        "a watch and a group of one id are separate claims"
+    );
+}
+
+/// A holder that crashed mid-delivery (its keeper gone, nothing released)
+/// keeps the claim until its TTL passes by the database clock: no other
+/// process, not even a restarted daemon (whose first open of the tenant no
+/// longer clears claims), can deliver meanwhile. Once it lapsed, the
+/// processes that see the completion race for it and exactly one claims
+/// it; that one retires the watch (and the group) under its claim, and the
+/// claim's lease row goes with the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_holders_claim_lapses_and_one_process_delivers() {
+    const RACERS: usize = 6;
+    let Some(db) = crate::harness::test_db(false).await else {
+        return;
+    };
+    let tenant = "crashed-claims";
+    let crashed = open_as_process(&db, tenant, "process-crashed").await;
+    seed_watches(&crashed, tenant).await;
+    sessions(&crashed, &["p1", "c1", "c3"], tenant).await;
+
+    for id in ["w1", "g1"] {
+        // The crash: the keeper (and its renewer) die without a release.
+        drop(claim(&crashed, id, CLAIM_TTL).await.expect("claim"));
+    }
     let restarted = open_as_process(&db, tenant, "process-restarted").await;
-    assert!(restarted.claim_completion_watch("w1").await.unwrap());
-    assert!(restarted.claim_delegation_group("g1").await.unwrap());
-    assert!(!b.claim_completion_watch("w1").await.unwrap());
+    for id in ["w1", "g1"] {
+        assert!(
+            claim(&restarted, id, CLAIM_TTL).await.is_none(),
+            "{id}: a crashed holder's claim holds until its TTL passed"
+        );
+        expire_claim(&db, tenant, id).await;
+    }
 
-    // No persisted row (the write-through has not landed): nothing to
-    // order against, so the in-process claim alone decides.
-    assert!(a.claim_completion_watch("never-persisted").await.unwrap());
-    assert!(a.claim_delegation_group("never-persisted").await.unwrap());
+    let mut processes = vec![restarted];
+    for i in 1..RACERS {
+        processes.push(open_as_process(&db, tenant, &format!("process-{i}")).await);
+    }
+    for id in ["w1", "g1"] {
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+        let racers: Vec<_> = processes
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, store)| {
+                let start = std::sync::Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    claim(&store, id, CLAIM_TTL).await.map(|keeper| (i, keeper))
+                })
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for racer in racers {
+            winners.extend(racer.await.unwrap());
+        }
+        assert_eq!(winners.len(), 1, "{id}: exactly one process takes it over");
+        let (i, keeper) = winners.pop().unwrap();
+        assert!(
+            keeper.token() >= 2,
+            "{id}: a newer holder than the crashed one"
+        );
+        let delivered_by = format!("process-{i}");
+        if id == "w1" {
+            processes[i]
+                .retire_completion_watch_after_delivery(
+                    "w1",
+                    &aid("p1"),
+                    &aid("c1"),
+                    Some(&delivered_by),
+                    T5,
+                    &keeper,
+                )
+                .await
+                .unwrap();
+        } else {
+            processes[i]
+                .settle_delegation_group_after_delivery("g1", &[], &keeper)
+                .await
+                .unwrap();
+        }
+    }
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lease WHERE tenant_id = $1 \
+         AND scope IN ('completion-watch', 'delegation-group')",
+    )
+    .bind(tenant)
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "settled work leaves no lease row behind");
+    let store = &processes[0];
+    assert!(store
+        .get_completion_wake_delivery(&aid("p1"), &aid("c1"))
+        .await
+        .unwrap()
+        .is_some_and(|by| by.starts_with("process-")));
+    let left: Vec<String> = store
+        .list_completion_watches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert!(!left.contains(&"w1".to_owned()), "w1 retired: {left:?}");
+    assert!(
+        store
+            .list_undelivered_groups(&wid(CHIEF))
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.group_id != "g1"),
+        "g1 settled"
+    );
+}
 
-    // A takeover bumps the tenant's epoch: claims from the old epoch are
-    // stale, so the new owner may deliver what the old one left claimed.
-    let (owner, _lease) = Store::open_postgres_owned_as_process(
+/// A holder whose claim lapsed and was taken over writes nothing: its
+/// retirement and settlement fail `LeaseLost` and leave the watch, the
+/// group and the delivery marker as they were, while the new holder's
+/// succeed. A claim of other work does not cover the row at all.
+#[tokio::test]
+async fn a_holder_that_lost_its_claim_writes_nothing() {
+    let Some(db) = crate::harness::test_db(false).await else {
+        let (store, _dir) = crate::harness::sqlite_store().await;
+        let other = watch_claim(&store, "w-other").await;
+        assert!(matches!(
+            store
+                .retire_completion_watch_after_delivery(
+                    "w1",
+                    &aid("p1"),
+                    &aid("c1"),
+                    None,
+                    T5,
+                    &other
+                )
+                .await,
+            Err(intent_store::Error::InvalidParams(_))
+        ));
+        return;
+    };
+    let tenant = "stale-claims";
+    let stale = open_as_process(&db, tenant, "process-stale").await;
+    let fresh = open_as_process(&db, tenant, "process-fresh").await;
+    seed_watches(&stale, tenant).await;
+    sessions(&stale, &["p1", "c1", "c3"], tenant).await;
+
+    let stale_watch = watch_claim(&stale, "w1").await;
+    let stale_group = group_claim(&stale, "g1").await;
+    assert!(matches!(
+        stale
+            .retire_completion_watch_after_delivery(
+                "w1",
+                &aid("p1"),
+                &aid("c1"),
+                None,
+                T5,
+                &stale_group
+            )
+            .await,
+        Err(intent_store::Error::InvalidParams(_))
+    ));
+    for id in ["w1", "g1"] {
+        expire_claim(&db, tenant, id).await;
+    }
+    let fresh_watch = watch_claim(&fresh, "w1").await;
+    let fresh_group = group_claim(&fresh, "g1").await;
+
+    assert!(matches!(
+        stale
+            .retire_completion_watch_after_delivery(
+                "w1",
+                &aid("p1"),
+                &aid("c1"),
+                Some("stale"),
+                T5,
+                &stale_watch,
+            )
+            .await,
+        Err(intent_store::Error::LeaseLost(_))
+    ));
+    assert!(matches!(
+        stale
+            .settle_delegation_group_after_delivery("g1", &[], &stale_group)
+            .await,
+        Err(intent_store::Error::LeaseLost(_))
+    ));
+    assert_eq!(
+        fresh
+            .get_completion_wake_delivery(&aid("p1"), &aid("c1"))
+            .await
+            .unwrap(),
+        None,
+        "the stale retirement wrote no marker"
+    );
+    assert!(fresh
+        .list_completion_watches()
+        .await
+        .unwrap()
+        .iter()
+        .any(|w| w.id == "w1"));
+    assert!(fresh
+        .list_undelivered_groups(&wid(CHIEF))
+        .await
+        .unwrap()
+        .iter()
+        .any(|g| g.group_id == "g1"));
+
+    fresh
+        .retire_completion_watch_after_delivery(
+            "w1",
+            &aid("p1"),
+            &aid("c1"),
+            Some("fresh"),
+            T5,
+            &fresh_watch,
+        )
+        .await
+        .unwrap();
+    fresh
+        .settle_delegation_group_after_delivery("g1", &[], &fresh_group)
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh
+            .get_completion_wake_delivery(&aid("p1"), &aid("c1"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fresh")
+    );
+}
+
+/// A tenant lease takeover leaves a live delivery claim alone: the new
+/// tenant owner cannot claim the watch or group the old process is
+/// delivering, and the old holder's keeper does not fence. The old
+/// process's settlement still needs the tenant (`NotOwner`), so it
+/// releases, and then the new owner claims and settles.
+#[tokio::test]
+async fn a_tenant_takeover_does_not_reset_a_live_delivery_claim() {
+    let Some(db) = crate::harness::test_db(false).await else {
+        return;
+    };
+    let tenant = "takeover-claims";
+    let old = open_as_process(&db, tenant, "process-old").await;
+    seed_watches(&old, tenant).await;
+    sessions(&old, &["p1", "c1", "c3"], tenant).await;
+    let old_watch = watch_claim(&old, "w1").await;
+    let old_group = group_claim(&old, "g1").await;
+
+    let (owner, _tenant_lease) = Store::open_postgres_owned_as_process(
         db.app.clone(),
         intent_store::postgres::TenantId::new(tenant).unwrap(),
         intent_store::postgres::PostgresOptions::default(),
-        "process-c",
-        "process-c",
+        "process-new",
+        "process-new",
         std::time::Duration::from_secs(60),
         intent_store::OrchestratorOnly::for_tests(),
     )
     .await
     .expect("claim the tenant");
-    // The leased open cleared nothing: the restarted process's claims are
-    // still on the rows, only stale by epoch.
-    for (table, key, id) in [
-        ("completion_watch", "id", "w1"),
-        ("delegation_group", "group_id", "g1"),
-    ] {
-        let (epoch, token): (Option<i64>, Option<String>) =
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT claim_epoch, claim_token FROM {table} WHERE tenant_id = $1 AND {key} = $2"
-            )))
-            .bind(tenant)
-            .bind(id)
-            .fetch_one(&db.admin)
-            .await
-            .unwrap();
-        assert_eq!(epoch, Some(0), "{table} {id}: claimed before any lease");
+    for id in ["w1", "g1"] {
         assert!(
-            token.is_some(),
-            "{table} {id}: a leased open clears no claim"
+            claim(&owner, id, CLAIM_TTL).await.is_none(),
+            "{id}: the takeover did not free the delivery claim"
         );
     }
-    assert!(owner.claim_completion_watch("w1").await.unwrap());
-    assert!(owner.claim_delegation_group("g1").await.unwrap());
+    assert!(!old_watch.is_fired() && !old_group.is_fired());
 
-    // Within the owner's epoch its claim holds against a later leased open
-    // that fails (the lease is live) and against an unleased process,
-    // whose writes are fenced.
-    assert!(Store::open_postgres_owned_as_process(
-        db.app.clone(),
-        intent_store::postgres::TenantId::new(tenant).unwrap(),
-        intent_store::postgres::PostgresOptions::default(),
-        "process-d",
-        "process-d",
-        std::time::Duration::from_secs(60),
-        intent_store::OrchestratorOnly::for_tests(),
-    )
-    .await
-    .is_err());
-    assert!(owner.claim_completion_watch("w1").await.unwrap());
-    let (epoch, token): (Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT claim_epoch, claim_token FROM completion_watch WHERE tenant_id = $1 AND id = $2",
-    )
-    .bind(tenant)
-    .bind("w1")
-    .fetch_one(&db.admin)
-    .await
-    .unwrap();
+    let refused = old
+        .retire_completion_watch_after_delivery("w1", &aid("p1"), &aid("c1"), None, T5, &old_watch)
+        .await;
     assert!(
-        epoch.is_some_and(|e| e > 0) && token.is_some(),
-        "the owner's claim stands"
+        matches!(refused, Err(intent_store::Error::NotOwner(_))),
+        "the old process lost the tenant: {refused:?}"
     );
     assert!(
-        matches!(
-            b.claim_completion_watch("w2").await,
-            Err(intent_store::Error::NotOwner(_))
-        ),
-        "a process that lost the tenant cannot claim at all"
+        claim(&owner, "w1", CLAIM_TTL).await.is_none(),
+        "a refused settlement keeps the claim"
     );
+    old_watch.release(&old).await;
+    old_group.release(&old).await;
+
+    let watch = watch_claim(&owner, "w1").await;
+    let group = group_claim(&owner, "g1").await;
+    owner
+        .retire_completion_watch_after_delivery("w1", &aid("p1"), &aid("c1"), None, T5, &watch)
+        .await
+        .unwrap();
+    owner
+        .settle_delegation_group_after_delivery("g1", &[], &group)
+        .await
+        .unwrap();
 }

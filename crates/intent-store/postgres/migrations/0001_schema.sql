@@ -564,16 +564,8 @@ CREATE TABLE IF NOT EXISTS completion_watch (
     created_at text NOT NULL,
     completion_only bigint NOT NULL DEFAULT 0,
     row_seq bigint NOT NULL,
-    -- Postgres only (orchestrator mode): the delivery claim, so one
-    -- completion wakes the parent once even when two processes see it. A
-    -- process claims the row before it sends the terminal wake and skips
-    -- when another holds it. The claim names the tenant's epoch
-    -- (the tenant lease token, read under the writer lock) and the claiming
-    -- process (a token per process): it is stale only when a newer epoch
-    -- exists (a takeover), never by elapsed time. Retiring the row drops the
-    -- claim; a failed delivery releases it for its retry. NULL: unclaimed.
-    claim_epoch bigint,
-    claim_token text,
+    -- The delivery claim is a lease (scope 'completion-watch', key = id),
+    -- not a column: see crates/intent-store/src/completion_watch_repo.rs.
     PRIMARY KEY (tenant_id, id)
 );
 
@@ -593,9 +585,8 @@ CREATE TABLE IF NOT EXISTS delegation_group (
     created_at text NOT NULL,
     updated_at text NOT NULL,
     row_seq bigint NOT NULL,
-    -- The delivery claim, as on completion_watch.
-    claim_epoch bigint,
-    claim_token text,
+    -- The delivery claim is a lease (scope 'delegation-group', key =
+    -- group_id), as on completion_watch.
     PRIMARY KEY (tenant_id, group_id)
 );
 

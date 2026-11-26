@@ -58,6 +58,8 @@ pub(crate) enum GroupPersistOp {
     Settle {
         group_id: String,
         retain_children: Vec<AgentId>,
+        /// The group's delivery claim; the settlement fences on it.
+        claim: std::sync::Arc<intent_store::LeaseKeeper>,
     },
 }
 
@@ -129,10 +131,14 @@ async fn run_group_persist_lane(
             GroupPersistOp::Settle {
                 group_id,
                 retain_children,
+                claim,
             } => {
                 let result = store
-                    .settle_delegation_group_after_delivery(&group_id, &retain_children)
+                    .settle_delegation_group_after_delivery(&group_id, &retain_children, &claim)
                     .await;
+                // Hand the claim back before the ack, so the caller can
+                // release it.
+                drop(claim);
                 (group_id, result)
             }
         };
@@ -1528,10 +1534,12 @@ impl Services {
         &self,
         group_id: &str,
         retain_children: &[AgentId],
+        claim: std::sync::Arc<intent_store::LeaseKeeper>,
     ) -> Result<()> {
         let ack = self.enqueue_group_persist_acked(GroupPersistOp::Settle {
             group_id: group_id.to_string(),
             retain_children: retain_children.to_vec(),
+            claim,
         });
         Self::await_group_persist(ack).await
     }
