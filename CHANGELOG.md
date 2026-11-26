@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.302] - 2026-11-26
+
+### 🚀 Features
+
+- *(store)* Hold completion-watch and delegation-group delivery claims as leases ([#3801](https://github.com/intent-hq/intentd/pull/3801))
+- *(store)* Express tenant ownership as a lease of scope tenant ([#3800](https://github.com/intent-hq/intentd/pull/3800))
+- *(acp)* Reopen sessions with session/resume when loadSession is absent ([#3802](https://github.com/intent-hq/intentd/pull/3802))
+
+### 🧪 Testing
+
+- Make a new provider's missed lists fail once, locally ([#3798](https://github.com/intent-hq/intentd/pull/3798))
+- Seed legacy private discussion before the daemon starts ([#3799](https://github.com/intent-hq/intentd/pull/3799))
+
+
 ## [0.11.301] - 2026-11-26
 
 ### 🚀 Features
