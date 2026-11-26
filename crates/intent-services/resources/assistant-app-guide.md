@@ -1472,7 +1472,11 @@ testing the feature. For other builds, suggest pasting or attaching a screenshot
 In desktop builds with screenshot markup in agent chat, use the screenshot
 button beside **+** to capture the screen and attach it to your draft. On macOS,
 hover over the button or press **Up Arrow** while it is focused to choose
-**Full screen**, **Window**, or **Region**. Intent remembers the mode for that prompt. The
+**Full screen**, **Window**, or **Region**. Intent remembers the mode for that prompt. In
+**Window** mode, click a window, or press **Tab** (**Shift-Tab** to go back) to step through
+open windows, including ones behind Intent, then press **Return**. When Intent has
+Accessibility permission, **Command-Tab** also steps through windows. Older versions only
+select the window under the pointer. The
 screenshot editor opens after capture. Draw boxes, arrows, or freehand marks, add
 text, blur sensitive details, or crop, then choose **Save changes**. Use **Attach**
 to keep the original or the trash button to discard the capture. If macOS denies
