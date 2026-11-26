@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.307] - 2026-11-26
+
+### 📚 Documentation
+
+- *(guide)* Describe window cycling in the screenshot picker ([#3822](https://github.com/intent-hq/intentd/pull/3822))
+
+
 ## [0.11.306] - 2026-11-26
 
 ### 🐛 Bug Fixes
