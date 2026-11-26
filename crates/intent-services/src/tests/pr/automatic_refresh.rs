@@ -351,3 +351,47 @@ async fn automatic_local_maintenance_preserves_scan_cadence_independently_of_for
     assert!(pr_ops::local_root_maintenance_due(&ws, 3, now));
     assert!(!pr_ops::local_root_maintenance_due(&ws, 1, now));
 }
+
+/// Across processes an automatic refresh is single-flight: while another
+/// process holds the workspace's refresh lease, this one skips without a
+/// forge call (keeping its own interval reservation); once the lease is free
+/// and the interval passed, it refreshes and releases the lease again.
+#[tokio::test]
+async fn a_refresh_another_process_holds_is_skipped_without_a_forge_call() {
+    let forge = Arc::new(StubForge::default());
+    let (_db, svc, ws) = setup(forge.clone(), 0).await;
+    let ttl = std::time::Duration::from_secs(600);
+    let held = svc
+        .store()
+        .acquire_lease("pr-refresh", ws.as_str(), ttl)
+        .await
+        .unwrap()
+        .expect("the other process takes the refresh lease");
+    let skipped = intent_core::with_caller(
+        owner_caller(&svc).await,
+        svc.pr_refresh_automatic(ws.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(skipped["outcome"], "skipped");
+    assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+
+    svc.store().release_lease(held).await.unwrap();
+    svc.age_automatic_pr_refresh(&ws, 60);
+    let refreshed = intent_core::with_caller(
+        owner_caller(&svc).await,
+        svc.pr_refresh_automatic(ws.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refreshed["prNumber"], 42);
+    assert_eq!(forge.seen_get_pr.lock().unwrap().len(), 1);
+    assert!(
+        svc.store()
+            .acquire_lease("pr-refresh", ws.as_str(), ttl)
+            .await
+            .unwrap()
+            .is_some(),
+        "the refresh released its lease"
+    );
+}

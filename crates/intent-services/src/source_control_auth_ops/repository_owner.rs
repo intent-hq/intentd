@@ -48,6 +48,11 @@ pub(crate) struct GitlabCredentialGate {
     /// Turns between native review's own optional-metadata readers: the
     /// consuming currency check and the background monitor observation.
     native_review: Arc<NativeReviewGate>,
+    /// Where a refresh takes its lease (`"gitlab-credential-refresh"`, see
+    /// `try_refresh`): the tenant's store. The mutex above serializes this
+    /// process's writers; the lease serializes refreshes across processes.
+    /// `None` (test fixtures) refreshes without a lease.
+    refresh_leases: Option<intent_store::Store>,
 }
 
 /// A turn is held only while its holder try-locks the ranked optional metadata
@@ -77,11 +82,17 @@ impl Drop for NativeReviewTurn {
 pub(crate) struct GitlabCredentialGuard {
     mutex: Arc<tokio::sync::Mutex<()>>,
     lease: PersistenceLease,
+    refresh_leases: Option<intent_store::Store>,
 }
 
 impl GitlabCredentialGuard {
     pub(crate) fn lease(&self) -> PersistenceLease {
         self.lease.clone()
+    }
+
+    /// The store a refresh under this guard takes its lease on.
+    pub(crate) fn refresh_leases(&self) -> Option<&intent_store::Store> {
+        self.refresh_leases.as_ref()
     }
 }
 
@@ -101,7 +112,15 @@ impl GitlabCredentialGate {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             repository: Arc::new(OnceLock::new()),
             native_review: Arc::default(),
+            refresh_leases: None,
         }
+    }
+
+    /// Refreshes take their cross-process lease on `store`.
+    #[must_use]
+    pub(crate) fn with_refresh_leases(mut self, store: intent_store::Store) -> Self {
+        self.refresh_leases = Some(store);
+        self
     }
 
     /// Wait for the current native-review metadata reader's turn to end. Turns
@@ -141,6 +160,7 @@ impl GitlabCredentialGate {
         GitlabCredentialGuard {
             mutex: self.mutex.clone(),
             lease: Arc::new(self.mutex.clone().lock_owned().await),
+            refresh_leases: self.refresh_leases.clone(),
         }
     }
 
@@ -149,6 +169,7 @@ impl GitlabCredentialGate {
         Ok(GitlabCredentialGuard {
             mutex: self.mutex.clone(),
             lease: Arc::new(self.mutex.clone().try_lock_owned()?),
+            refresh_leases: self.refresh_leases.clone(),
         })
     }
 

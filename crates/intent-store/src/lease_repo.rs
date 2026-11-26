@@ -74,6 +74,19 @@ impl Lease {
         }
     }
 
+    /// A copy naming the same lease (scope, key, id and token), for a guard
+    /// that must not wait on the keeper's lock (`lease_write_guard`).
+    pub(crate) fn identity(&self) -> Self {
+        Self {
+            scope: self.scope.clone(),
+            key: self.key.clone(),
+            id: self.id.clone(),
+            token: self.token,
+            ttl: self.ttl,
+            deadline: self.deadline,
+        }
+    }
+
     /// The lease as acquired with `token` (a store that acquires outside
     /// [`Store::acquire_lease`] sets it).
     #[cfg(feature = "postgres")]

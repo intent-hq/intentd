@@ -302,3 +302,99 @@ async fn expiry_is_set_by_the_database_clock() {
     .unwrap();
     assert_eq!((token, freed), (1, true), "release keeps the row and token");
 }
+
+/// Expires (`scope`, `key`) of `tenant` by the database clock, as if its
+/// holder stopped renewing long ago.
+async fn expire_lease(db: &TestDb, tenant: &str, scope: &str, key: &str) {
+    sqlx::query(
+        "UPDATE lease SET expires_at = clock_timestamp() \
+         WHERE tenant_id = $1 AND scope = $2 AND lease_key = $3",
+    )
+    .bind(tenant)
+    .bind(scope)
+    .bind(key)
+    .execute(&db.admin)
+    .await
+    .unwrap();
+}
+
+/// `LeaseKeeper::guard_writes`: every write the guarded work makes on the
+/// lease's tenant guards the lease in its own transaction. While the lease
+/// is held the writes land; once another process took it, the old holder's
+/// writes fail with `LeaseLost` and change nothing: in the guarded future,
+/// in a task it spawned through `inherit_lease_write_guards`, and in a
+/// blocking secret write under `sync_scope`. Writes outside the guard, and
+/// another tenant's writes inside it, are not fenced by the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guarded_work_writes_nothing_once_its_lease_is_lost() {
+    use intent_store::postgres::{SecretKeyring, TenantSecretStore};
+    use intent_store::{inherit_lease_write_guards, LeaseKeeper, LeaseWriteGuards};
+
+    let Some(db) = crate::harness::test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-write-guard";
+    let a = open_as_process(&db, tenant, "process-a").await;
+    let b = open_as_process(&db, tenant, "process-b").await;
+    let other = open_as_process(&db, "lease-write-guard-other", "process-a").await;
+    let ring = Arc::new(SecretKeyring::new("k1", &[3; 32]).unwrap());
+    let secrets = TenantSecretStore::new(&a, Arc::clone(&ring)).unwrap();
+    let other_secrets = TenantSecretStore::new(&other, ring).unwrap();
+    let key = "work-1";
+
+    let keeper = LeaseKeeper::acquire(&a, SCOPE, key, TTL)
+        .await
+        .unwrap()
+        .expect("free key");
+    keeper
+        .guard_writes(async {
+            assert!(!LeaseWriteGuards::current().is_empty());
+            secrets.store("held", "written").await.unwrap();
+        })
+        .await;
+    assert_eq!(secrets.load("held").await.unwrap().as_deref(), Some("written"));
+    assert!(LeaseWriteGuards::current().is_empty(), "the guard is scoped");
+
+    // Another process takes the lease once it lapsed.
+    expire_lease(&db, tenant, SCOPE, key).await;
+    let taken = b
+        .acquire_lease(SCOPE, key, TTL)
+        .await
+        .unwrap()
+        .expect("the lapsed lease is taken");
+    assert!(taken.token() > keeper.token());
+
+    let late = keeper
+        .guard_writes(async {
+            let direct = secrets.store("late", "direct").await;
+            let inherited = tokio::spawn(inherit_lease_write_guards({
+                let secrets = secrets.clone();
+                async move { secrets.store("late", "spawned").await }
+            }))
+            .await
+            .unwrap();
+            let guards = LeaseWriteGuards::current();
+            let blocking = tokio::task::spawn_blocking({
+                let secrets = secrets.clone();
+                move || guards.sync_scope(|| secrets.store_blocking("late", "blocking"))
+            })
+            .await
+            .unwrap();
+            let other_tenant = other_secrets.store("late", "other tenant").await;
+            (direct, inherited, blocking, other_tenant)
+        })
+        .await;
+    for (how, result) in [("direct", late.0), ("spawned", late.1), ("blocking", late.2)] {
+        assert!(
+            matches!(result, Err(Error::LeaseLost(_))),
+            "{how}: a lost lease fails the write: {result:?}"
+        );
+    }
+    late.3.expect("another tenant's write does not guard this lease");
+    assert_eq!(secrets.load("late").await.unwrap(), None, "nothing landed");
+
+    secrets
+        .store("late", "unguarded")
+        .await
+        .expect("a write outside the guard is not fenced by the lease");
+}

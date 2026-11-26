@@ -1550,11 +1550,20 @@ impl PgStore {
                             return Err(e);
                         }
                     }
-                    return Ok(WriteTx {
+                    let mut tx = WriteTx {
                         tx,
                         _slot: slot,
                         writer,
-                    });
+                    };
+                    // Work under a lease writes only while it holds it
+                    // (`lease_write_guard`); lease writes and claims do not.
+                    if fence == Fence::Check {
+                        if let Err(e) = self.guard_scoped_leases(&mut tx).await {
+                            let _ = tx.rollback().await;
+                            return Err(e);
+                        }
+                    }
+                    return Ok(tx);
                 }
                 Err(e) if is_lock_timeout(&e) => {
                     let _ = tx.rollback().await;

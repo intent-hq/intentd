@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use tokio::sync::{watch, Mutex, MutexGuard};
 
+use crate::lease_write_guard::GuardedLease;
 use crate::{Lease, Store};
 
 /// The shortest pause between failed renewals.
@@ -58,6 +59,8 @@ pub struct LeaseKeeper {
     lease: Arc<Mutex<Option<Lease>>>,
     fence: LeaseFence,
     renewer: tokio::task::JoinHandle<()>,
+    /// The lease as [`Self::guard_writes`] guards it.
+    guard: Arc<GuardedLease>,
 }
 
 /// Fires once the kept lease is lost; clones share one fence.
@@ -110,7 +113,13 @@ impl LeaseKeeper {
     /// Keeps `lease`, renewing it for its TTL at each half TTL.
     #[must_use]
     pub fn keep(store: Store, lease: Lease) -> Self {
-        Self::keep_with(store, lease)
+        let tenant = store.lease_guard_tenant();
+        let mut keeper = Self::keep_with(store, lease);
+        keeper.guard = Arc::new(GuardedLease {
+            tenant,
+            lease: keeper.guard.lease.identity(),
+        });
+        keeper
     }
 
     /// [`Self::keep`], renewing through `renewer`.
@@ -129,6 +138,10 @@ impl LeaseKeeper {
         let scope = lease.scope().to_owned();
         let key = lease.key().to_owned();
         let token = lease.token();
+        let guard = Arc::new(GuardedLease {
+            tenant: None,
+            lease: lease.identity(),
+        });
         let lease = Arc::new(Mutex::new(Some(lease)));
         let renewer =
             intent_core::spawn_daemon(renew_until_lost(renewer, Arc::clone(&lease), margin, tx));
@@ -139,6 +152,7 @@ impl LeaseKeeper {
             lease,
             fence: LeaseFence(rx),
             renewer,
+            guard,
         }
     }
 
@@ -175,6 +189,14 @@ impl LeaseKeeper {
     /// Waits until the fence fires. Cancel-safe.
     pub async fn fired(&self) {
         self.fence.fired().await;
+    }
+
+    /// Runs `fut` so that every Postgres write it makes on this lease's
+    /// tenant guards the lease in its own transaction: once the lease is
+    /// lost, the write fails with `Error::LeaseLost` and changes nothing.
+    /// See `lease_write_guard` for what it covers.
+    pub fn guard_writes<F: Future>(&self, fut: F) -> impl Future<Output = F::Output> {
+        crate::lease_write_guard::guard_scope(Arc::clone(&self.guard), fut)
     }
 
     /// The kept lease, for a write that guards it (`guard_lease`); `None`

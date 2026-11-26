@@ -159,6 +159,17 @@ impl PgStore {
         }
     }
 
+    /// Inside a write transaction: guards every lease of this tenant that
+    /// the running work guards (`LeaseKeeper::guard_writes`), as
+    /// [`Self::guard_lease`]. Called by `begin_write` under the writer lock.
+    pub(crate) async fn guard_scoped_leases(&self, tx: &mut WriteTx) -> Result<()> {
+        let guards = crate::LeaseWriteGuards::current();
+        for lease in guards.for_tenant(self.tenant()) {
+            self.guard_lease(tx, lease).await?;
+        }
+        Ok(())
+    }
+
     /// Inside a write transaction that guarded `lease`: deletes its row,
     /// for work whose key is never used again (a delivered completion watch
     /// or delegation group, keyed by its UUID). The key's token then starts

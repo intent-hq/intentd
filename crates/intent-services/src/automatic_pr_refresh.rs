@@ -2,20 +2,30 @@
 //! Reserve before I/O, including failures, so reconnects and concurrent windows
 //! cannot turn a failed refresh into an unbounded retry loop.
 //!
+//! Admission has two parts. This process's [`Admission`] keeps the interval
+//! budget per (workspace, root) key. A lease (`"pr-refresh"`, one key per
+//! workspace or root) makes the refresh single-flight across every process
+//! of the tenant: a process that finds it held skips, because another
+//! process is refreshing that key now. The refresh's store writes guard the
+//! lease ([`LeaseKeeper::guard_writes`]), so a process that lost it writes
+//! nothing late.
+//!
 //! The `agent:idle` worker ([`Services::spawn_idle_pr_refresh_loop`]) reuses
 //! the same admission: when an agent finishes, its workspace's branch PR, its
 //! registered git roots, and its stale PR monitors are checked once, unless
 //! the shared clock says they were checked within the idle gate.
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::events::AGENT_IDLE;
 use intent_core::{Error, Result, WorkspaceId, WorkspaceStatus};
+use intent_store::LeaseKeeper;
 use tokio::time::Instant;
 
 use crate::events::SubscriptionFilter;
-use crate::{pr_discovery, pr_ops, Services};
+use crate::{pr_discovery, pr_ops, work_leases, Services};
 
 /// The idle gate's floor: an idle refresh never re-checks a workspace, root,
 /// or PR monitor that any automatic path checked less than 60 s ago.
@@ -36,9 +46,50 @@ pub(crate) struct Admission {
     attempts: HashMap<Key, Attempt>,
 }
 
+/// An admitted automatic refresh: this process's reservation of the key.
+/// The refresh runs through [`Self::run`], which also takes the key's lease.
 pub(crate) struct Permit {
     admission: Arc<Mutex<Admission>>,
     key: Key,
+    store: intent_store::Store,
+}
+
+impl Permit {
+    /// Runs `refresh` under the key's lease, with its store writes guarding
+    /// the lease, then releases it. `None` (and `refresh` never runs) while
+    /// another process holds the lease, or when the store cannot answer: the
+    /// reservation stays, so this process tries again after the interval.
+    pub(crate) async fn run<F: Future>(self, refresh: F) -> Option<F::Output> {
+        let lease_key = work_leases::pr_refresh_key(&self.key.0, self.key.1.as_deref());
+        let lease = match LeaseKeeper::acquire(
+            &self.store,
+            work_leases::PR_REFRESH_SCOPE,
+            &lease_key,
+            work_leases::WORK_LEASE_TTL,
+        )
+        .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(
+                    key = %lease_key,
+                    "automatic PR refresh: another process is refreshing this key; skipped"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    key = %lease_key,
+                    %error,
+                    "automatic PR refresh: could not take the refresh lease; skipped"
+                );
+                return None;
+            }
+        };
+        let out = lease.guard_writes(refresh).await;
+        lease.release(&self.store).await;
+        Some(out)
+    }
 }
 
 impl Drop for Permit {
@@ -74,6 +125,10 @@ impl Admission {
 }
 
 impl Services {
+    /// Admits one automatic refresh of `workspace_id` (or its git root
+    /// `root_id`): `None` while this process refreshed the key within
+    /// `interval_secs` or is refreshing it. Across processes the refresh is
+    /// single-flight through [`Permit::run`].
     pub(crate) fn admit_automatic_pr_refresh(
         &self,
         workspace_id: &WorkspaceId,
@@ -91,6 +146,7 @@ impl Services {
         Some(Permit {
             admission: self.automatic_pr_refresh.clone(),
             key,
+            store: self.store.clone(),
         })
     }
 
@@ -101,6 +157,22 @@ impl Services {
                 attempt.started -= Duration::from_secs(seconds);
             }
         }
+    }
+
+    /// Test hook: the automatic refresh of `pr.refreshAutomatic`, without
+    /// its membership check; the outcome as on the wire.
+    ///
+    /// # Errors
+    /// As the refresh.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn refresh_workspace_pr_automatically_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<&'static str> {
+        self.refresh_workspace_pr_automatically(workspace_id)
+            .await
+            .map(pr_ops::PrRefreshOutcome::as_wire_str)
     }
 
     pub(crate) async fn refresh_workspace_pr_automatically(
@@ -129,14 +201,17 @@ impl Services {
                 intent_core::with_caller(
                     caller,
                     intent_core::caller::with_wire_credential(wire, async move {
-                        let _permit = permit;
                         // Deliberately not `explicitly_refresh`: automatic retries must
                         // also respect provider-scoped failure caching and budgets.
-                        let outcome = crate::pr_discovery::automatically_refresh(
-                            interval_secs,
-                            services.refresh_workspace_pr_cached(&workspace_id),
-                        )
-                        .await;
+                        let Some(outcome) = permit
+                            .run(crate::pr_discovery::automatically_refresh(
+                                interval_secs,
+                                services.refresh_workspace_pr_cached(&workspace_id),
+                            ))
+                            .await
+                        else {
+                            return Ok(pr_ops::PrRefreshOutcome::Skipped);
+                        };
                         if let Err(intent_core::Error::RateLimited(detail)) = &outcome {
                             if let Ok(sc) = pr_ops::resolve_source_control(
                                 services.source_control.clone(),
@@ -263,12 +338,18 @@ impl Services {
         let admitted = (!self.sweeps_rate_limited())
             .then(|| self.admit_automatic_pr_refresh(&ws.id, None, gate))
             .flatten();
-        if let Some(_permit) = admitted {
-            let refreshed = pr_discovery::automatically_refresh(
-                gate,
-                self.refresh_workspace_pr_with_sc(ws.clone(), &sc),
-            )
-            .await;
+        let refreshed = match admitted {
+            Some(permit) => {
+                permit
+                    .run(pr_discovery::automatically_refresh(
+                        gate,
+                        self.refresh_workspace_pr_with_sc(ws.clone(), &sc),
+                    ))
+                    .await
+            }
+            None => None,
+        };
+        if let Some(refreshed) = refreshed {
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
