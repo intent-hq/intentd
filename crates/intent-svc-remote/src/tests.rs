@@ -1287,6 +1287,7 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
 struct Revocable {
     local: intent_node_connections::LocalOwnership,
     owned_from: std::sync::atomic::AtomicU64,
+    claims_held: tokio::sync::watch::Sender<bool>,
 }
 
 impl Revocable {
@@ -1294,6 +1295,7 @@ impl Revocable {
         Arc::new(Self {
             local: intent_node_connections::LocalOwnership::new(store.clone()),
             owned_from: std::sync::atomic::AtomicU64::new(0),
+            claims_held: tokio::sync::watch::Sender::new(false),
         })
     }
 
@@ -1302,6 +1304,16 @@ impl Revocable {
         self.owned_from
             .store(generation.0, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// New claims wait until [`Self::release_claims`], so a test can read
+    /// state before the connector's reconnect claims the link back.
+    fn hold_claims(&self) {
+        self.claims_held.send_replace(true);
+    }
+
+    fn release_claims(&self) {
+        self.claims_held.send_replace(false);
+    }
 }
 
 impl intent_node_connections::LinkOwnership for Revocable {
@@ -1309,7 +1321,11 @@ impl intent_node_connections::LinkOwnership for Revocable {
         &'a self,
         owner: &'a intent_core::nodes::LeaseOwner,
     ) -> intent_core::BoxFuture<'a, intent_core::Result<intent_node_connections::LinkClaim>> {
-        self.local.claim(owner)
+        Box::pin(async move {
+            let mut held = self.claims_held.subscribe();
+            let _ = held.wait_for(|held| !*held).await;
+            self.local.claim(owner).await
+        })
     }
 
     fn fence<'a>(
@@ -1374,22 +1390,25 @@ async fn a_fenced_ack_is_not_written_and_closes_the_link() {
 
     // Another process claims the next generation: this link's next ack is
     // neither written nor sent, and head closes the link.
+    // Claims are held so the reconnect cannot persist under its new claim
+    // before the fenced state is read.
     let taken = NodeCounter(first.hello.binding.generation.0 + 1);
     ownership.taken_until(taken);
+    ownership.hold_claims();
     first.journal(note(2, &agent, "two")).await;
     assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
     closed_without_writes(&mut first, NodeCounter(2)).await;
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(1));
+    ownership.release_claims();
 
-    // This process claims the link back with a newer generation: the hello
-    // offers only the ack it wrote, the replay is deduplicated and acked.
-    let mut second = machine.accept().await;
+    // This process claims the link back with a newer generation, and only
+    // then persists what it ingested: under the new claim, so the hello
+    // offers it and the machine replays nothing head already took in.
+    let second = machine.accept().await;
     assert!(second.hello.binding.generation >= taken);
-    assert_eq!(second.hello.acked_seq, NodeCounter(1));
-    second.journal(note(2, &agent, "two")).await;
-    second.replay_complete(2).await;
-    second.acked(2).await;
+    assert_eq!(second.hello.acked_seq, NodeCounter(2));
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(2));
+    second.replay_complete(2).await;
     node.shutdown();
 }
 
@@ -1435,6 +1454,152 @@ async fn a_fenced_welcome_claims_and_stops_nothing() {
     let mut served = served;
     served.acked(1).await;
     node.shutdown();
+}
+
+/// Leased ownership (as the orchestrator uses) on a live link: when the
+/// lease is lost mid-link (renewals fail until it lapses, then another
+/// process takes it), head closes the link at once with no ack, its redial
+/// waits out the other holder, and a clean stop frees the lease.
+#[tokio::test]
+async fn a_leased_link_closes_once_its_lease_is_lost_and_releases_it_on_stop() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    // Long enough that a renewal (every ttl/2) slipping on a loaded runner
+    // does not lapse the lease while it is meant to be held.
+    let ttl = Duration::from_secs(2);
+    let ownership = Arc::new(intent_node_connections::LeaseLinkOwnership::new(
+        backend.store().clone(),
+        uuid::Uuid::new_v4().to_string().into(),
+        ttl,
+    ));
+    let mut owned = tuning();
+    owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
+    let node = backend.bare_with(&machine, owned).await;
+    let machine_id = node.status().node_id;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+
+    let mut first = machine.accept().await;
+    first.replay_complete(0).await;
+    first.journal(note(1, &agent, "one")).await;
+    first.acked(1).await;
+    // Held past its TTL: the keeper renews it.
+    tokio::time::sleep(ttl * 2).await;
+    first.journal(note(2, &agent, "two")).await;
+    assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
+    first.acked(2).await;
+
+    // Cut off from the store: the lease lapses and another process takes
+    // it. Once renewal finds that, the link closes without waiting for a
+    // write.
+    ownership.stall_renewals().await;
+    let other = tokio::time::timeout(intentd_test_support::test_timeout(ttl * 10), async {
+        loop {
+            if let Some(lease) = backend
+                .store()
+                .acquire_lease(
+                    intent_node_connections::LINK_LEASE_SCOPE,
+                    &machine_id,
+                    ttl * 20,
+                )
+                .await
+                .unwrap()
+            {
+                break lease;
+            }
+            // timing-guard: poll interval while the stalled lease lapses
+            tokio::time::sleep(ttl / 8).await;
+        }
+    })
+    .await
+    .expect("the stalled lease lapses and is taken over");
+    // Back in touch: the next renewal finds the lease taken.
+    ownership.resume_renewals();
+    closed_without_writes(&mut first, NodeCounter(3)).await;
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(2));
+
+    // Once the other holder lets go, this process claims the link again with
+    // a higher epoch and a newer generation.
+    backend.store().release_lease(other).await.unwrap();
+    let second = machine.accept().await;
+    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    assert_eq!(second.hello.acked_seq, NodeCounter(2));
+
+    // A stopped connector releases its lease at once.
+    node.shutdown();
+    tokio::time::timeout(wait(), async {
+        loop {
+            if backend
+                .store()
+                .acquire_lease(intent_node_connections::LINK_LEASE_SCOPE, &machine_id, ttl)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stopped connector released the link lease");
+}
+
+/// Credential replacement under leased ownership on a machine with no
+/// running agent: the old connector is not awaited, and the replacement
+/// claims (reusing this process's lease) and binds before the old one's
+/// cleanup runs. That cleanup must not release the lease the replacement
+/// now links under, nor close its link.
+#[tokio::test]
+async fn a_replaced_leased_connector_stopping_late_keeps_the_replacements_link() {
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
+    let ttl = Duration::from_secs(2);
+    let ownership = Arc::new(intent_node_connections::LeaseLinkOwnership::new(
+        backend.store().clone(),
+        uuid::Uuid::new_v4().to_string().into(),
+        ttl,
+    ));
+    let owned = || {
+        let mut owned = tuning();
+        owned.ownership = crate::connector::OwnershipSeam(Some(ownership.clone()));
+        owned
+    };
+    // The old connector is linked, with no agent.
+    let old = backend.bare_with(&machine, owned()).await;
+    let machine_id = old.status().node_id;
+    old.connect().await.unwrap();
+    let mut first = machine.accept().await;
+
+    // Its replacement claims and binds while it still runs.
+    let new = backend.bare_with(&machine, owned()).await;
+    let agent = AgentId::new();
+    let runtime = new.attach(&agent, &workspace());
+    let mut second = machine.accept().await;
+    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    second.replay_complete(0).await;
+    second.journal(note(1, &agent, "one")).await;
+    assert_eq!(texts(&runtime, 1).await, ["one"]);
+    second.acked(1).await;
+
+    // Only now does the old connector stop and run its cleanup.
+    old.shutdown();
+    first.closed_by_head().await;
+    // timing-guard: negative path: give a wrongful release time to close the link
+    tokio::time::sleep(ttl).await;
+
+    second.journal(note(2, &agent, "two")).await;
+    second.acked(2).await;
+    assert!(
+        backend
+            .store()
+            .acquire_lease(intent_node_connections::LINK_LEASE_SCOPE, &machine_id, ttl)
+            .await
+            .unwrap()
+            .is_none(),
+        "the replacement still holds the link lease"
+    );
+    new.shutdown();
 }
 
 /// The head's domain as a recording of what the connector calls back with.

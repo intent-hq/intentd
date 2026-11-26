@@ -1020,3 +1020,73 @@ async fn a_machine_lease_is_renewed_for_a_new_credential_and_ended_on_removal() 
         "ending is idempotent"
     );
 }
+
+/// The link writes made under a link lease guard it in their transaction:
+/// once the lease lapsed and another holder took it, the old holder's
+/// generation, ack and welcome change nothing.
+#[tokio::test]
+async fn link_writes_under_a_lost_lease_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("nodes.db")).await.unwrap();
+    let (_node, lease, _assignment) = ready(&store).await;
+    let owner = &lease.owner;
+    let ttl = std::time::Duration::from_millis(200);
+    let stale = store
+        .acquire_lease("machine-link", &owner.node_id, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = store
+        .next_node_link_generation_under_lease(owner, &stale)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .advance_node_lease_ack_under_lease(owner, NodeCounter(2), &stale)
+            .await
+            .unwrap(),
+        NodeCounter(2)
+    );
+    tokio::time::sleep(ttl * 2).await;
+    let fresh = store
+        .acquire_lease("machine-link", &owner.node_id, ttl * 50)
+        .await
+        .unwrap()
+        .expect("the lapsed lease is free");
+    let lost = |result: Result<()>| matches!(result, Err(Error::LeaseLost(_)));
+    assert!(lost(
+        store
+            .next_node_link_generation_under_lease(owner, &stale)
+            .await
+            .map(drop)
+    ));
+    assert!(lost(
+        store
+            .advance_node_lease_ack_under_lease(owner, NodeCounter(9), &stale)
+            .await
+            .map(drop)
+    ));
+    assert!(lost(
+        store
+            .record_node_welcome_under_lease(
+                owner,
+                NodeOs::Macos,
+                NodeArch::Aarch64,
+                3,
+                "9.9.9",
+                &stale
+            )
+            .await
+            .map(drop)
+    ));
+    let kept = store.get_node_lease(owner).await.unwrap();
+    assert_eq!(kept.link_generation, generation);
+    assert_eq!(kept.ack_seq, NodeCounter(2));
+    assert!(
+        store
+            .next_node_link_generation_under_lease(owner, &fresh)
+            .await
+            .unwrap()
+            > generation
+    );
+}

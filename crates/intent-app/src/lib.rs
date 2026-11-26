@@ -78,6 +78,11 @@ pub trait StartupExt {
     /// machine is needed.
     fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>);
 
+    /// Orchestrator mode: own machine links through store leases, so any
+    /// process of the tenant can hold any link. The desktop never calls it
+    /// and keeps owning every link it dials.
+    fn use_leased_link_ownership(&self);
+
     /// Start the connector to every exposed machine that may still run this
     /// backend's agents, so it reconnects in the background and claims them.
     fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send;
@@ -90,6 +95,10 @@ impl StartupExt for Services {
 
     fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>) {
         intent_svc_remote::RemoteServicesExt::configure_remote_machines(self, tailcat_bin);
+    }
+
+    fn use_leased_link_ownership(&self) {
+        intent_svc_remote::RemoteServicesExt::use_leased_link_ownership(self);
     }
 
     fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send {

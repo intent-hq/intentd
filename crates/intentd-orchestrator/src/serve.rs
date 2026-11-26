@@ -422,6 +422,9 @@ async fn recover_tenant(
     // Set before the pending-delete sweep, whose deletes send machines
     // their final stops.
     services.configure_remote_machines(Some(intent_core::tailcat::resolve_tailcat_bin()));
+    // Any process of the tenant may own a machine link: each link holds its
+    // own store lease, which fences the previous holder's link writes.
+    services.use_leased_link_ownership();
     if live() {
         if let Err(error) = services.finish_pending_deletes(|| fence.is_fenced()).await {
             tracing::warn!(%error, "pending delete sweep failed");

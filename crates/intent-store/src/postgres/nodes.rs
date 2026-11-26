@@ -292,8 +292,15 @@ impl PgStore {
         Ok(record)
     }
 
-    pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
+    pub async fn next_node_link_generation(
+        &self,
+        owner: &LeaseOwner,
+        guard: Option<&crate::Lease>,
+    ) -> Result<NodeCounter> {
         let mut tx = self.begin_write().await?;
+        if let Some(lease) = guard {
+            self.guard_lease(&mut tx, lease).await?;
+        }
         let mut record = self.lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));
@@ -353,8 +360,12 @@ impl PgStore {
         arch: NodeArch,
         max_agents: u32,
         version: &str,
+        guard: Option<&crate::Lease>,
     ) -> Result<NodeLease> {
         let mut tx = self.begin_write().await?;
+        if let Some(lease) = guard {
+            self.guard_lease(&mut tx, lease).await?;
+        }
         let mut record = self.lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));
@@ -381,8 +392,12 @@ impl PgStore {
         &self,
         owner: &LeaseOwner,
         seq: NodeCounter,
+        guard: Option<&crate::Lease>,
     ) -> Result<NodeCounter> {
         let mut tx = self.begin_write().await?;
+        if let Some(lease) = guard {
+            self.guard_lease(&mut tx, lease).await?;
+        }
         let record = self.lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));

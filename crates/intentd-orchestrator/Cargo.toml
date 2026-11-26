@@ -51,6 +51,8 @@ rustls-pki-types = "1"
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 intent-store = { workspace = true, features = ["test-support"] }
+# The link-ownership test drives the leased link ownership directly.
+intent-node-connections = { workspace = true, features = ["test-support"] }
 intentd-test-support = { path = "../intentd-test-support" }
 # The startup parity guard (tests/startup_parity.rs) scans intentd's main.rs.
 regex = "1.12"

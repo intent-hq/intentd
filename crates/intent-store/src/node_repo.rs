@@ -348,7 +348,21 @@ impl Store {
     /// # Errors
     /// Rejects terminal/stale leases, exhausted counters or database errors.
     pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
-        dispatch!(self, backend => backend.next_node_link_generation(owner).await)
+        dispatch!(self, backend => backend.next_node_link_generation(owner, None).await)
+    }
+
+    /// [`Self::next_node_link_generation`] for the holder of `lease` (the
+    /// machine's link lease): the lease is guarded in the same write
+    /// transaction, so a process that lost it advances nothing.
+    /// # Errors
+    /// `Error::LeaseLost` when `lease` is no longer held; otherwise as
+    /// [`Self::next_node_link_generation`].
+    pub async fn next_node_link_generation_under_lease(
+        &self,
+        owner: &LeaseOwner,
+        lease: &crate::Lease,
+    ) -> Result<NodeCounter> {
+        dispatch!(self, backend => backend.next_node_link_generation(owner, Some(lease)).await)
     }
 
     /// Drain the static registration and revoke new dispatch, retaining every
@@ -504,8 +518,15 @@ impl crate::SqliteStore {
         Ok(record)
     }
 
-    pub async fn next_node_link_generation(&self, owner: &LeaseOwner) -> Result<NodeCounter> {
+    pub async fn next_node_link_generation(
+        &self,
+        owner: &LeaseOwner,
+        guard: Option<&crate::Lease>,
+    ) -> Result<NodeCounter> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
+        if let Some(lease) = guard {
+            self.guard_lease(lease)?;
+        }
         let mut record = lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));
@@ -873,7 +894,24 @@ impl Store {
         max_agents: u32,
         version: &str,
     ) -> Result<NodeLease> {
-        dispatch!(self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version).await)
+        dispatch!(self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version, None).await)
+    }
+
+    /// [`Self::record_node_welcome`] for the holder of `lease`, guarded in
+    /// the same write transaction.
+    /// # Errors
+    /// `Error::LeaseLost` when `lease` is no longer held; otherwise as
+    /// [`Self::record_node_welcome`].
+    pub async fn record_node_welcome_under_lease(
+        &self,
+        owner: &LeaseOwner,
+        os: NodeOs,
+        arch: NodeArch,
+        max_agents: u32,
+        version: &str,
+        lease: &crate::Lease,
+    ) -> Result<NodeLease> {
+        dispatch!(self, backend => backend.record_node_welcome(owner, os, arch, max_agents, version, Some(lease)).await)
     }
 
     /// Persist that head has ingested every journal record up to `seq`. The
@@ -885,7 +923,22 @@ impl Store {
         owner: &LeaseOwner,
         seq: NodeCounter,
     ) -> Result<NodeCounter> {
-        dispatch!(self, backend => backend.advance_node_lease_ack(owner, seq).await)
+        dispatch!(self, backend => backend.advance_node_lease_ack(owner, seq, None).await)
+    }
+
+    /// [`Self::advance_node_lease_ack`] for the holder of `lease`, guarded
+    /// in the same write transaction: a process that lost the machine's link
+    /// persists no ack.
+    /// # Errors
+    /// `Error::LeaseLost` when `lease` is no longer held; otherwise as
+    /// [`Self::advance_node_lease_ack`].
+    pub async fn advance_node_lease_ack_under_lease(
+        &self,
+        owner: &LeaseOwner,
+        seq: NodeCounter,
+        lease: &crate::Lease,
+    ) -> Result<NodeCounter> {
+        dispatch!(self, backend => backend.advance_node_lease_ack(owner, seq, Some(lease)).await)
     }
 
     /// Record that `agent.agent_id` runs on `agent.node_id` under
@@ -1004,8 +1057,12 @@ impl crate::SqliteStore {
         arch: NodeArch,
         max_agents: u32,
         version: &str,
+        guard: Option<&crate::Lease>,
     ) -> Result<NodeLease> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
+        if let Some(lease) = guard {
+            self.guard_lease(lease)?;
+        }
         let mut record = lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));
@@ -1032,8 +1089,12 @@ impl crate::SqliteStore {
         &self,
         owner: &LeaseOwner,
         seq: NodeCounter,
+        guard: Option<&crate::Lease>,
     ) -> Result<NodeCounter> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
+        if let Some(lease) = guard {
+            self.guard_lease(lease)?;
+        }
         let record = lease(&mut tx, owner).await?;
         if record.state.is_terminal() {
             return Err(invalid("terminal lease"));

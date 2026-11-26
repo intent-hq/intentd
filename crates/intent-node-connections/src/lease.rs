@@ -159,13 +159,20 @@ impl HeadLease {
         &self.owner
     }
 
-    /// Check the claim before a durable write for the link bound at
-    /// `generation` (`None`: a write between links). Before the first claim
-    /// there is nothing to check.
-    async fn fence(&self, generation: Option<NodeCounter>) -> std::result::Result<(), Fenced> {
+    /// The latest dial's claim, for a durable write for the link bound at
+    /// `generation` (`None`: a write between links); `None` before the
+    /// first claim, when there is nothing to check.
+    ///
+    /// # Errors
+    ///
+    /// [`Fenced`] when a newer dial superseded that link.
+    fn current_claim(
+        &self,
+        generation: Option<NodeCounter>,
+    ) -> std::result::Result<Option<LinkClaim>, Fenced> {
         let claim = lock(&self.claim).clone();
         let Some(claim) = claim else {
-            return Ok(());
+            return Ok(None);
         };
         if generation.is_some_and(|generation| generation != claim.generation) {
             return Err(Fenced {
@@ -173,7 +180,34 @@ impl HeadLease {
                 epoch: claim.epoch,
             });
         }
-        self.ownership.fence(&claim).await
+        Ok(Some(claim))
+    }
+
+    /// Resolves once the claim the link bound at `generation` dialed with
+    /// is lost; at once when a newer dial superseded it.
+    pub fn lost(
+        &self,
+        generation: NodeCounter,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let claim = lock(&self.claim).clone();
+        let ownership = self.ownership.clone();
+        async move {
+            match claim {
+                Some(claim) if claim.generation == generation => ownership.lost(&claim).await,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Give the link up (the connector stopped, went idle or no longer
+    /// wants it): the next dial claims it again. A no-op before the first
+    /// claim, and once a newer claim of the machine replaced this one.
+    pub async fn release(&self) {
+        let claim = lock(&self.claim).clone();
+        if let Some(claim) = claim {
+            self.ownership.release(&claim).await;
+        }
     }
 
     /// The persisted journal ack.
@@ -225,7 +259,10 @@ impl HeadLease {
     }
 
     /// Claim the link (durably advancing the generation), then build the
-    /// hello offering it.
+    /// hello offering it. The claim comes first so the ack below is written
+    /// under it: an ack written before it would be fenced by the previous
+    /// claim (released when the link went idle) or, before the first claim,
+    /// written with no ownership check.
     /// The hello acks only what is persisted: the node deletes the records
     /// it acks, so offering `ingested` before it is saved could lose records
     /// a restarted head still needs. Head first tries to persist `ingested`;
@@ -236,6 +273,9 @@ impl HeadLease {
     ///
     /// When the claim or the lease's agents and homes cannot be read.
     pub async fn next_hello(&self, ingested: NodeCounter) -> Result<LinkHello> {
+        let claim = self.ownership.claim(&self.owner).await?;
+        let generation = claim.generation;
+        *lock(&self.claim) = Some(claim);
         let acked = match self.persist_ack(ingested, None).await {
             Ok(acked) => acked,
             Err(error) => {
@@ -243,9 +283,6 @@ impl HeadLease {
                 self.acked().await?
             }
         };
-        let claim = self.ownership.claim(&self.owner).await?;
-        let generation = claim.generation;
-        *lock(&self.claim) = Some(claim);
         let lease_agents = self.lease_agents().await?;
         let lease_homes = self.lease_homes().await?;
         Ok(LinkHello {
@@ -317,20 +354,28 @@ impl HeadLease {
         welcome: &LinkWelcome,
         generation: NodeCounter,
     ) -> std::result::Result<(), LinkWrite> {
-        self.fence(Some(generation))
-            .await
+        let claim = self
+            .current_claim(Some(generation))
             .map_err(LinkWrite::Fenced)?;
-        self.store
-            .record_node_welcome(
-                &self.owner,
-                welcome.capabilities.platform.os,
-                welcome.capabilities.platform.arch,
-                welcome.capabilities.capacity.agent_cap,
-                &welcome.capabilities.intentd_version,
-            )
-            .await
-            .map(drop)
-            .map_err(LinkWrite::Failed)
+        match claim {
+            Some(claim) => {
+                self.ownership
+                    .record_welcome(&self.store, &claim, welcome)
+                    .await
+            }
+            None => self
+                .store
+                .record_node_welcome(
+                    &self.owner,
+                    welcome.capabilities.platform.os,
+                    welcome.capabilities.platform.arch,
+                    welcome.capabilities.capacity.agent_cap,
+                    &welcome.capabilities.intentd_version,
+                )
+                .await
+                .map(drop)
+                .map_err(LinkWrite::Failed),
+        }
     }
 
     /// Persist that every record up to `seq` is ingested, for the link bound
@@ -352,16 +397,20 @@ impl HeadLease {
         {
             return Err(Error::Internal("injected ack write failure".into()).into());
         }
-        self.fence(generation).await.map_err(LinkWrite::Fenced)?;
-        Ok(self.store.advance_node_lease_ack(&self.owner, seq).await?)
+        match self.current_claim(generation).map_err(LinkWrite::Fenced)? {
+            Some(claim) => self.ownership.persist_ack(&self.store, &claim, seq).await,
+            None => Ok(self.store.advance_node_lease_ack(&self.owner, seq).await?),
+        }
     }
 }
 
-/// This backend's ownership of its machine links: the desktop's, where this
-/// process owns every link, unless a test replaced it.
+/// This backend's ownership of its machine links: [`Tuning::ownership`]
+/// when set (the orchestrator's leases, or a test's), else the desktop's,
+/// where this process owns every link.
+///
+/// [`Tuning::ownership`]: crate::connector::Tuning::ownership
 #[must_use]
 pub fn ownership(store: &Store, tuning: &crate::connector::Tuning) -> Arc<dyn LinkOwnership> {
-    #[cfg(any(test, feature = "test-support"))]
     if let Some(ownership) = &tuning.ownership.0 {
         return ownership.clone();
     }

@@ -109,6 +109,10 @@ pub struct RemoteFeature {
     git: GitStore,
     /// The `hello.headSession` every link of this backend offers.
     head_session: HeadSession,
+    /// Who owns this backend's machine links, shared by every connector:
+    /// set by the orchestrator ([`RemoteServicesExt::use_leased_link_ownership`]);
+    /// unset on the desktop, where this process owns every link.
+    link_ownership: Mutex<Option<Arc<dyn intent_node_connections::LinkOwnership>>>,
     /// Taken by every change of the ordered machine list
     /// ([`order`]): one per backend, so two tenants never wait on each
     /// other.
@@ -321,6 +325,9 @@ impl RemoteFeature {
     pub(crate) fn tuning(&self) -> connector::Tuning {
         let mut tuning = lock(&self.tuning).clone().unwrap_or_default();
         tuning.head_session = Some(self.head_session.0.clone());
+        if tuning.ownership.0.is_none() {
+            tuning.ownership.0.clone_from(&lock(&self.link_ownership));
+        }
         tuning
     }
 
@@ -583,6 +590,13 @@ pub trait RemoteServicesExt {
     /// routes are tried.
     fn configure_remote_machines(&self, tailcat_bin: Option<PathBuf>);
 
+    /// Own this backend's machine links through store leases
+    /// ([`intent_node_connections::LeaseLinkOwnership`]), so any process of
+    /// the tenant can hold any link, instead of this process owning every
+    /// link. The orchestrator calls it before the first connector starts:
+    /// a running connector keeps the ownership it started with.
+    fn use_leased_link_ownership(&self);
+
     /// At daemon start: start the connector to every exposed machine that
     /// may still run this backend's agents, so it reconnects in the
     /// background and claims them. Returns the machines started.
@@ -596,6 +610,17 @@ impl RemoteServicesExt for Services {
     fn configure_remote_machines(&self, tailcat_bin: Option<PathBuf>) {
         if let Some(feature) = self.remote_feature() {
             *lock(&feature.tailcat_bin) = tailcat_bin;
+        }
+    }
+
+    fn use_leased_link_ownership(&self) {
+        if let Some(feature) = self.remote_feature() {
+            *lock(&feature.link_ownership) =
+                Some(Arc::new(intent_node_connections::LeaseLinkOwnership::new(
+                    self.store().clone(),
+                    feature.head_session.0.clone(),
+                    intent_node_connections::LINK_LEASE_TTL,
+                )));
         }
     }
 
