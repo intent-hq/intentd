@@ -170,13 +170,13 @@ mod lease_repo;
 mod lease_write_guard;
 pub use lease_keeper::{LeaseFence, LeaseKeeper};
 mod lifecycle_leases;
+pub use lease_write_guard::{inherit_lease_write_guards, LeaseWriteGuards};
 #[cfg(any(test, feature = "test-support"))]
 pub use lifecycle_leases::contended_lease_attempts_for_tests;
 pub use lifecycle_leases::{
     LifecycleLease, AGENT_RETIREMENT_SCOPE, ARCHIVE_FENCE_SCOPE, LIFECYCLE_LEASE_TTL,
     WORKSPACE_DELETION_SCOPE, WORKSPACE_RETIREMENT_SCOPE,
 };
-pub use lease_write_guard::{inherit_lease_write_guards, LeaseWriteGuards};
 mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
