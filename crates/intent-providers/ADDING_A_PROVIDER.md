@@ -455,6 +455,10 @@ and `provider_models`.
   the daemon or login-shell env, or `$DSH_HOME/.credentials.yaml` / `.env`). The check
   reads presence only and starts no process. A signed-out `session/new` succeeds; the
   prompt fails with "no API key for provider route" (`auth_error_patterns`).
+- **Key profiles** — a key saved in `$DSH_HOME/.credentials.yaml` beats `DEEPSEEK_API_KEY`
+  from the environment, so the `ProfileSpec` gives a key profile its own `DSH_HOME`
+  (`~/.intent/dsh-api-key/<profileId>-<digest>`). Auth status, the model probe and the
+  upload guard all judge that overlay (`dsh_cli::launch_env(Some(profile))`).
 - **Models** — `session/new` returns a grouped `configOptions[id="model"]` select (one
   group per DSH model provider) of opaque values such as
   `["deepseek-official","deepseek-v4-flash"]`; `thought_level` (`reasoning_effort`) is

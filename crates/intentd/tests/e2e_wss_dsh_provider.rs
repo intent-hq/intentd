@@ -868,3 +868,130 @@ async fn dsh_failed_resume_falls_back_to_new_session_over_wss() {
     assert!(body.contains(HISTORY_RESEND), "history resent: {body}");
     assert!(body.contains("check git status"), "{body}");
 }
+
+/// A DeepSeek API key profile signs DSH in without the user's own key: its
+/// auth status, model list and agent launches carry the key and run in the
+/// profile's own DSH home, so a key saved by `dsh web` cannot override it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dsh_api_key_profile_over_wss() {
+    let Some(fx) = start("itd-wss-dsh-profile-", None, &[]).await else {
+        return;
+    };
+    let mut rpc = connect_ws(fx.port, fx.cfg.clone()).await;
+
+    let catalog = wss_rpc(&mut rpc, 1, "providers.catalog", json!({})).await;
+    assert_eq!(row(&catalog["providers"], "dsh")["supportsProfiles"], true);
+
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "dsh", "name": "DeepSeek key", "env": [
+            { "key": "DEEPSEEK_API_KEY", "kind": "set", "value": "sk-profile-secret" },
+        ] }),
+    )
+    .await;
+    assert!(!created.to_string().contains("sk-profile-secret"));
+    let reference = created["profile"]["providerRef"]
+        .as_str()
+        .expect("providerRef")
+        .to_string();
+
+    let auth = wss_rpc(
+        &mut rpc,
+        3,
+        "host.providerAuthStatus",
+        json!({ "providerId": reference, "force": true }),
+    )
+    .await;
+    assert_eq!(auth["providers"][0]["authenticated"], true, "{auth}");
+    let base = wss_rpc(
+        &mut rpc,
+        4,
+        "host.providerAuthStatus",
+        json!({ "providerId": "dsh", "force": true }),
+    )
+    .await;
+    assert_eq!(base["providers"][0]["authenticated"], false, "{base}");
+
+    let models = wss_rpc(
+        &mut rpc,
+        5,
+        "models.list",
+        json!({ "providerId": reference, "forceRefresh": true }),
+    )
+    .await;
+    assert_eq!(
+        models["models"].as_array().map(Vec::len),
+        Some(2),
+        "the key profile sees the keyed catalog: {models}"
+    );
+
+    let workspace = wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.create",
+        json!({ "title": "DSH profile", "noPrompt": true }),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].as_str().unwrap().to_string();
+    let mut events = connect_ws(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": workspace_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        7,
+        "agent.create",
+        json!({ "workspaceId": workspace_id, "name": "DSH key", "provider": reference }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    wss_rpc(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "check git status" }),
+    )
+    .await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let Some(Ok(Message::Text(text))) = events.next().await else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let event = &frame["params"]["event"];
+                if event["data"]["agentId"] != agent_id.as_str() {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("agent:failed") => panic!("dsh profile turn failed: {event}"),
+                    Some("agent:idle") => break,
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await
+    .expect("the DSH profile turn must finish");
+
+    let key_home = fx.data_dir.join("home/.intent/dsh-api-key");
+    let keyed: Vec<Value> = mock_log(&fx.log)
+        .into_iter()
+        .filter(|f| f["dir"] == "launch" && f["msg"]["hasKey"] == true)
+        .collect();
+    assert!(!keyed.is_empty(), "profile launches carry the key");
+    for launch in &keyed {
+        let home = launch["msg"]["dshHome"].as_str().unwrap_or_default();
+        assert!(
+            Path::new(home).starts_with(&key_home),
+            "a key launch runs in the profile's DSH home: {launch}"
+        );
+    }
+}

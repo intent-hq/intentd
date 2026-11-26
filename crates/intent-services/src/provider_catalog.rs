@@ -114,7 +114,15 @@ mod tests {
     /// gated-off base (Droid without its env var) is hidden by `visible`.
     #[test]
     fn supports_profiles_follows_the_profile_spec() {
-        let bases = ["auggie", "claude-code", "codex", "cursor", "droid", "grok"];
+        let bases = [
+            "auggie",
+            "claude-code",
+            "codex",
+            "cursor",
+            "droid",
+            "dsh",
+            "grok",
+        ];
         let v = catalog(&|_| false);
         for provider in intent_providers::ACP_PROVIDERS {
             assert_eq!(

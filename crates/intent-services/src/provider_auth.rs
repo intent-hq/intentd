@@ -767,12 +767,16 @@ async fn probe_provider(
             AuthVerdict::plain(crate::provider_models::probe_antigravity_auth(program.into()).await)
         }
         // DSH has no ACP sign-in; its `deepseek-official` route needs a
-        // DeepSeek API key. Presence check only — no DSH process starts.
-        "dsh" => AuthVerdict::plain(Some(
-            tokio::task::spawn_blocking(crate::dsh_cli::api_key_known)
-                .await
-                .unwrap_or(false),
-        )),
+        // DeepSeek API key (a key profile's overlay carries it). Presence
+        // check only — no DSH process starts.
+        "dsh" => {
+            let env = crate::dsh_cli::launch_env(overlay.as_ref());
+            AuthVerdict::plain(Some(
+                tokio::task::spawn_blocking(move || crate::dsh_cli::api_key_known_in(&env))
+                    .await
+                    .unwrap_or(false),
+            ))
+        }
         _ => AuthVerdict::default(),
     }
 }

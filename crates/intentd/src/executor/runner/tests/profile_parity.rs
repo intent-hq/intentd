@@ -30,6 +30,7 @@ enum Provider {
     Droid,
     Auggie,
     Cursor,
+    Dsh,
 }
 
 /// Every kind the profile dialog saves (cloudlands-fe
@@ -52,13 +53,14 @@ enum Kind {
 }
 
 impl Provider {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Claude,
         Self::Codex,
         Self::Grok,
         Self::Droid,
         Self::Auggie,
         Self::Cursor,
+        Self::Dsh,
     ];
 
     fn base(self) -> &'static str {
@@ -69,6 +71,7 @@ impl Provider {
             Self::Droid => "droid",
             Self::Auggie => "auggie",
             Self::Cursor => "cursor",
+            Self::Dsh => "dsh",
         }
     }
 }
@@ -130,8 +133,9 @@ impl Kind {
                 ("CURSOR_API_KEY", Some("key_parity")),
                 ("CURSOR_AUTH_TOKEN", None),
             ],
+            (Provider::Dsh, Self::ApiKey) => vec![("DEEPSEEK_API_KEY", Some("sk-parity"))],
             (
-                Provider::Grok | Provider::Droid | Provider::Cursor,
+                Provider::Grok | Provider::Droid | Provider::Cursor | Provider::Dsh,
                 Self::Token | Self::DifferentLogin,
             )
             | (Provider::Auggie, Self::ApiKey | Self::DifferentLogin) => return None,
@@ -160,6 +164,7 @@ impl Kind {
             (Provider::Cursor, Self::ApiKey) if !default => {
                 Some(("CURSOR_CONFIG_DIR", ".intent/cursor-api-key/"))
             }
+            (Provider::Dsh, Self::ApiKey) if !default => Some(("DSH_HOME", ".intent/dsh-api-key/")),
             (Provider::Codex, Self::DifferentLogin) => {
                 Some(("CODEX_HOME", "intent/profiles/codex/work"))
             }

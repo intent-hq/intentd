@@ -271,7 +271,24 @@
       "installedCli": null,
       "cliRequirement": null,
       "cliVersionGate": null,
-      "profile": null
+      "profile": {
+        "credentialKeys": [
+          "DEEPSEEK_API_KEY"
+        ],
+        "accountDirKeys": [
+          "DSH_HOME"
+        ],
+        "apiKeyHome": {
+          "key": "DEEPSEEK_API_KEY",
+          "homeKey": "DSH_HOME",
+          "dirName": "dsh-api-key",
+          "launchEnv": []
+        },
+        "credentialLaunchEnv": [],
+        "reservedKeys": [
+          "DSH_TELEMETRY_DISABLED"
+        ]
+      }
     },
     {
       "id": "mock",

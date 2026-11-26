@@ -1037,6 +1037,24 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/guide/providers.md",
         ),
         short_name: "DSH",
+        // A key saved in `$DSH_HOME/.credentials.yaml` beats
+        // `DEEPSEEK_API_KEY` from the environment (dsh 0.2.2-rc.5), so a key
+        // profile runs in its own DSH home.
+        profile: Some(ProfileSpec {
+            credential_keys: &[crate::dsh::API_KEY_ENV],
+            account_dir_keys: &[crate::dsh::HOME_ENV],
+            api_key_home: Some(ApiKeyHome {
+                key: crate::dsh::API_KEY_ENV,
+                home_key: crate::dsh::HOME_ENV,
+                dir_name: "dsh-api-key",
+                launch_env: &[],
+            }),
+            credential_launch_env: &[],
+            reserved_keys: &[(
+                crate::dsh::TELEMETRY_DISABLED_ENV,
+                "Intent always sets it to turn off DeepSeek Harness telemetry",
+            )],
+        }),
         ..ProviderConfig::empty(crate::dsh::PROVIDER_ID, "DeepSeek Harness", crate::dsh::COMMAND)
     },
     ProviderConfig {
