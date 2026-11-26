@@ -456,13 +456,11 @@ async fn host_app_detection_services_over_wss() {
     }
 }
 
-/// Registered providers `host.providerAuthStatus` does not report.
-const NOT_AUTH_PROBED: &[&str] = &[
-    // No auth probe is implemented for the Cortex adapter.
-    "cortex", // Rides opencode's binary and sign-in (`primary_binary_provider_id`).
-    "unsloth", // The scripted test agent; nothing to sign in to.
-    "mock",
-];
+/// Registered providers `host.providerAuthStatus` does not report: cortex
+/// (no auth probe is implemented for its adapter), unsloth (rides opencode's
+/// binary and sign-in, `primary_binary_provider_id`) and mock (the scripted
+/// test agent, nothing to sign in to).
+const NOT_AUTH_PROBED: &[&str] = &["cortex", "unsloth", "mock"];
 
 /// host.providerAuthStatus over the real WSS wire: full sweep, scoped call,
 /// and the unknown-provider invalid-params error (PROTOCOL §9).
