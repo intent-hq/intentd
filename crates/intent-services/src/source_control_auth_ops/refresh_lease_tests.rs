@@ -14,6 +14,12 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 use super::{try_refresh, RefreshFailure};
+
+tokio::task_local! {
+    /// Test seam: inside its scope, the refresh's first read of the stored
+    /// refresh token (its version) fails; every later read succeeds.
+    pub(super) static FAIL_VERSION_READ: ();
+}
 use crate::Services;
 
 /// A GitLab token endpoint that records each refresh token it is shown,
@@ -263,4 +269,26 @@ async fn a_refused_stored_token_is_still_unrecoverable() {
         refreshing.await.unwrap(),
         Err(RefreshFailure::Unrecoverable)
     ));
+}
+
+/// A refresh that cannot read the stored refresh token's version does not
+/// exchange it: GitLab would consume the token, and the persist could not
+/// tell its own pair from a peer's. The stored pair stays usable.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_version_read_exchanges_nothing() {
+    let server = token_server(vec![rotated("access-1", "refresh-1")]).await;
+    let (_dir, services) = processes(1).await;
+    let refreshed = FAIL_VERSION_READ
+        .scope((), refresh(&services[0], &server.host))
+        .await;
+    assert!(matches!(refreshed, Err(RefreshFailure::Transient)));
+    assert!(server.exchanged.lock().unwrap().is_empty(), "no exchange");
+    assert_eq!(
+        stored(&services[0], REFRESH_SECRET_ACCOUNT).as_deref(),
+        Some("refresh-0")
+    );
+    assert_eq!(
+        stored(&services[0], SECRET_ACCOUNT).as_deref(),
+        Some("access-0")
+    );
 }

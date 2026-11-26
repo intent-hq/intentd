@@ -1165,7 +1165,25 @@ async fn refresh_under_lease(
 ) -> std::result::Result<(), RefreshFailure> {
     // The pair's version: the refresh token stored now, under the lease.
     let store_before = store.clone();
-    let before = stored_refresh_token(&store).await.ok().flatten();
+    let before = stored_refresh_token(&store).await;
+    #[cfg(test)]
+    let before = if refresh_lease_tests::FAIL_VERSION_READ
+        .try_with(|()| ())
+        .is_ok()
+    {
+        Err(())
+    } else {
+        before
+    };
+    // Without the version nothing can tell a later persist apart from a
+    // peer's: never exchange (and so consume) the token then.
+    let Ok(before) = before else {
+        tracing::warn!(
+            host = host.host(),
+            "gitlab token refresh: the stored refresh token could not be read; not refreshing"
+        );
+        return Err(RefreshFailure::Transient);
+    };
     let refresh_operand = if let Some(write) = &write {
         Some(
             write
