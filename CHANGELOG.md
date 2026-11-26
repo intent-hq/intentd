@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.306] - 2026-11-26
+
+### 🐛 Bug Fixes
+
+- *(services)* Guard the delivery wake send with its lease ([#3810](https://github.com/intent-hq/intentd/pull/3810))
+
+
 ## [0.11.305] - 2026-11-26
 
 ### 🚀 Features
