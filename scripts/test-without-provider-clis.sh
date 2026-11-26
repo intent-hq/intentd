@@ -50,7 +50,24 @@ PROVIDER_CLIS=(
 )
 NODE_TOOLS=(node npx npm corepack)
 # Provider home folders: native installers, credentials and adapter state.
-PROVIDER_HOMES=(.augment .claude .codex .cursor .dsh .factory .grok .local/share/cursor-agent .opencode .pi .unsloth)
+# Keep in sync with each registry row's `home_dirs`; intent-providers'
+# `hide_list_covers_every_provider_home` test fails when a folder is missing.
+PROVIDER_HOMES=(
+  .augment
+  .claude
+  .codex
+  .cursor
+  .dsh
+  .factory
+  .gemini
+  .grok
+  .local/share/cursor-agent
+  .local/share/opencode
+  .opencode
+  .pi
+  .snowflake
+  .unsloth
+)
 
 die() {
   echo "test-without-provider-clis: $*" >&2
