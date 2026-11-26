@@ -213,6 +213,11 @@ impl CloudState {
         self.transition_lock(machine_id).lock_owned().await
     }
 
+    /// The machine's pause/resume lock, unless a pause or resume holds it.
+    fn try_transition(&self, machine_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.transition_lock(machine_id).try_lock_owned().ok()
+    }
+
     /// Whether a pause or resume of the machine is under way.
     fn in_transition(&self, machine_id: &str) -> bool {
         self.transition_lock(machine_id).try_lock().is_err()

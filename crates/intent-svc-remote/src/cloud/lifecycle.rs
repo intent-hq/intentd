@@ -54,6 +54,9 @@ const REAP_GRACE_MINUTES: u32 = 15;
 /// settings and timers, in milliseconds.
 const MINUTE_MS_ENV: &str = "INTENTD_E2B_MINUTE_MS";
 const DAY_MS_ENV: &str = "INTENTD_E2B_DAY_MS";
+/// Test seam: the run cap in settings minutes, so a test can keep planned
+/// pauses out of steps that do not test them.
+const RUN_CAP_MINUTES_ENV: &str = "INTENTD_E2B_RUN_CAP_MINUTES";
 /// Test seam: a wait between an idle pause's home pushes and the pause, in
 /// milliseconds, so a test can try to use the sandbox in between.
 const AFTER_PUSH_MS_ENV: &str = "INTENTD_E2B_AFTER_PUSH_MS";
@@ -74,11 +77,13 @@ pub(crate) enum Loss {
     Outdated,
 }
 
-/// The lifecycle's clock: the length of a settings minute and day.
+/// The lifecycle's clock: the length of a settings minute and day, and
+/// the run cap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Clock {
     minute: Duration,
     day: Duration,
+    run_cap_minutes: u32,
 }
 
 impl Clock {
@@ -93,6 +98,11 @@ impl Clock {
         Self {
             minute: ms(MINUTE_MS_ENV, 60_000),
             day: ms(DAY_MS_ENV, 86_400_000),
+            run_cap_minutes: std::env::var(RUN_CAP_MINUTES_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(RUN_CAP_MINUTES),
         }
     }
 
@@ -102,6 +112,10 @@ impl Clock {
 
     fn days(self, n: u32) -> Duration {
         self.day * n
+    }
+
+    fn run_cap(self) -> Duration {
+        self.minutes(self.run_cap_minutes)
     }
 
     /// How often the supervisor checks the machines.
@@ -1147,8 +1161,7 @@ async fn check(
             }
             let idle = activity.last_busy.elapsed() >= clock.minutes(saved.idle_pause_minutes);
             let capped = activity.capped
-                || (client.caps_run()
-                    && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES));
+                || (client.caps_run() && since(cloud.running_since.as_deref()) >= clock.run_cap());
             if idle || capped {
                 spawn_pause(
                     svc,
@@ -1164,17 +1177,34 @@ async fn check(
                 spawn_kill(svc, feature, client, row);
             }
         }
-        // A transition a backend restart cut: finish it.
-        CloudSandboxState::Pausing if settled => {
-            spawn_pause(svc, client, &row.id, PauseFor::Restart);
-        }
-        CloudSandboxState::Resuming if settled => {
-            feature.cloud.park(&row.id);
-            set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
+        // A transition a backend restart cut: finish it. `row` was read
+        // before this check, so a pause or resume may have ended since:
+        // act only on the state read again under the transition lock.
+        CloudSandboxState::Pausing | CloudSandboxState::Resuming if settled => {
+            let Some(transition) = feature.cloud.try_transition(&row.id) else {
+                return;
+            };
+            match current_state(svc, &row.id).await {
+                Some(CloudSandboxState::Pausing) => {
+                    drop(transition);
+                    spawn_pause(svc, client, &row.id, PauseFor::Restart);
+                }
+                Some(CloudSandboxState::Resuming) => {
+                    feature.cloud.park(&row.id);
+                    set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
+                }
+                _ => {}
+            }
         }
         CloudSandboxState::Stopping if settled => spawn_kill(svc, feature, client, row),
         CloudSandboxState::Pausing | CloudSandboxState::Resuming | CloudSandboxState::Stopping => {}
     }
+}
+
+/// Machine `machine_id`'s sandbox state as stored now.
+async fn current_state(svc: &Services, machine_id: &str) -> Option<CloudSandboxState> {
+    let row = svc.store().get_exposed_machine(machine_id).await.ok()??;
+    row.cloud.map(|cloud| cloud.state)
 }
 
 /// Keep the sandbox's timeout ahead.
