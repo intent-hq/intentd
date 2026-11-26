@@ -21,6 +21,8 @@ touch; treat the full list as the definition of done for a new provider.
       (`derive_tool_name` / `tool_kind_word`, `crates/intent-acp/src/session.rs`)
 - [x] Codex native-subagent denial through the selected npx runtime (§6)
 - [ ] Policy items for new providers: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
+- [ ] Every hand-reviewed list joined: one `NO_FAIL_FAST=1 make test-changed` run names
+      them all (see "Lists a new provider must join")
 - [ ] Unit tests per area + WSS e2e (`crates/intentd/tests/`), gates green
       (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
 - [ ] End-to-end smoke test via `make dev` (see last section)
@@ -315,6 +317,31 @@ Per-area expectations (all in the intentd repo):
 
 Gates before any PR: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
 (from the monorepo root: `make check` and `make test`).
+
+## Lists a new provider must join
+
+Most provider facts derive from `ACP_PROVIDERS`, but some lists are reviewed by hand on
+purpose: each records a decision about the new provider, so a missing entry fails a test.
+Add the registry row, then run `NO_FAIL_FAST=1 make test-changed` from the monorepo root
+**once** before pushing. A change to `config.rs` selects every check below: the source
+lints run on any `crates/` change, the registry and surface checks are `intent-providers`
+and `intent-services` tests, and `.config/e2e-test-map.txt` maps `config.rs` to the host
+e2e module. One local run then names every list to update, instead of one list per CI
+round (intentd#3790 took five). Run a single check with the command in its row (from the
+monorepo root).
+
+| List | What to decide | Check |
+|---|---|---|
+| `SITES` in `crates/intent-services/tests/provider_spawn_gate_lint.rs` | A new `intent-services/src` file that starts a process (auth or model probe): a provider spawn with its gate, or another process | `make test-select E='binary_id(=intent-services::provider_spawn_gate_lint)'` |
+| `SITES` in `crates/intent-core/tests/workload_spawn_lint.rs` | The same spawning file, in any crate: workload (spawn through `Workload`) or internal (with why) | `make test-select E='binary_id(=intent-core::workload_spawn_lint)'` |
+| `PROVIDER_CLIS` in `scripts/test-without-provider-clis.sh` | The provider's commands, so hermetic runs hide them | `make test-select E='test(hide_list_covers_every_provider_cli)'` |
+| `PROVIDER_HOMES` in the same script | The provider's home or credentials folder (e.g. `.dsh`) | None: review by hand |
+| `session_mcp_servers_partition` and `config_option_model_partition` in `crates/intent-providers/src/tests.rs` | Whether the provider takes `mcpServers` in `session/new`, and sets the model with `session/set_config_option` | `make test-select E='binary_id(=intent-providers) & test(/_partition/)'` |
+| `registry_first_provider_and_lookups` and `disableable_and_always_enabled_partition_registry` in the same file | The registry order, and whether the provider can be disabled (`can_be_disabled`) | `make test-select E='binary_id(=intent-providers) & test(/registry/)'` |
+| `crates/intent-providers/tests/goldens/provider_registry.json` | The row's packages, hints, CLI requirement and profile, as reviewed JSON | `make test-select E='binary_id(=intent-providers::provider_registry_golden)'`; regenerate with `INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-providers --test provider_registry_golden` |
+| `session_surface_goldens` rows in `crates/intent-services/src/session_surface_goldens.rs` | The provider's frozen tool description and system prompt (a new provider only adds rows) | `make test-select E='test(session_surface_goldens)'`; refresh with `INTENTD_UPDATE_GOLDENS=1` in front |
+| `CLEAN_CEILING` in `crates/intent-services/src/context_budget.rs` | The provider's prompt and tool size ceiling (copy the measured row the failure prints) | `make test-select E='test(context_budget_report)'` |
+| `AUTH_PROBE_PROVIDERS` in `crates/intent-services/src/provider_auth.rs`, or `NOT_AUTH_PROBED` in `crates/intentd/tests/e2e_wss_host.rs` | Whether `host.providerAuthStatus` probes the provider. The e2e test takes its expected list from the registry, so a provider in neither list fails it | `make test-select E='binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_host::host_provider_auth_status_over_wss$/)'` |
 
 ## 8. Smoke test (dogfooding)
 
