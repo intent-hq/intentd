@@ -341,6 +341,50 @@ async fn seed_workspace(data_dir: &Path) -> (String, String) {
     (ws.0, member.id.0)
 }
 
+/// Seed pre-existing private history through persistence, since the live API
+/// cannot create private discussions. This runs before the daemon starts: a
+/// second writer racing the live daemon fails at random with "database is
+/// locked" (`SQLite` codes 5/517) under load. The author is the primary
+/// principal — the token-authenticated human caller the test later asserts —
+/// built the way `discussion.send` builds a human author.
+async fn seed_legacy_private_history(
+    data_dir: &Path,
+    workspace: &str,
+    member: &str,
+) -> (String, intent_core::PrincipalId) {
+    use intent_core::discussion::{DiscussionAuthor, DiscussionTarget};
+    use intent_core::{PrincipalId, WorkspaceId};
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open legacy fixture store");
+    let caller = store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    let author = DiscussionAuthor {
+        principal_id: Some(caller.id.clone()),
+        agent_id: None,
+        login: caller.login,
+        display_name: caller.display_name,
+        avatar_url: caller.avatar_url,
+    };
+    let (private, _) = store
+        .send_discussion_message(
+            &WorkspaceId(workspace.to_owned()),
+            "legacy-private",
+            "Private seed",
+            &author,
+            &DiscussionTarget {
+                recipient_principal_ids: Some(vec![PrincipalId(member.to_owned())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed legacy private history");
+    store.close().await;
+    (private.conversation.id, caller.id)
+}
+
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -444,6 +488,8 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     };
     let data_dir = temp_data_dir();
     let (workspace, member) = seed_workspace(data_dir.path()).await;
+    let (private_id, seeded_author) =
+        seed_legacy_private_history(data_dir.path(), &workspace, &member).await;
     let log = data_dir.path().join("mock-prompts.jsonl");
     let history_and_reply = format!(
         r"
@@ -582,6 +628,11 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     .await;
     let quiet = assert_no_turn(&mut sub).await;
     assert_discussion_event(&quiet, &ordinary["message"]);
+    assert_eq!(
+        ordinary["message"]["author"]["principalId"],
+        json!(seeded_author),
+        "the legacy private history must be authored by the live human caller"
+    );
     assert!(
         prompt_log(&log).is_empty(),
         "ordinary traffic reached the provider"
@@ -643,27 +694,8 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     assert!(refused_create.get("result").is_none(), "{refused_create}");
     assert_eq!(refused_create["error"]["code"], -32602, "{refused_create}");
 
-    // Seed pre-existing history through persistence, since the live API cannot
-    // create private discussions. Agent targeting still fails for a participant.
-    let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
-        .await
-        .expect("open legacy fixture store");
-    let (private, _) = store
-        .send_discussion_message(
-            &intent_core::WorkspaceId(workspace.clone()),
-            "legacy-private",
-            "Private seed",
-            &serde_json::from_value(ordinary["message"]["author"].clone())
-                .expect("authenticated human author"),
-            &intent_core::discussion::DiscussionTarget {
-                recipient_principal_ids: Some(vec![intent_core::PrincipalId(member.clone())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("seed legacy private history");
-    store.close().await;
-    let private_id = &private.conversation.id;
+    // Agent targeting still fails for a participant of the legacy private
+    // history seeded before startup.
     let refused = wss_response(
         &mut rpc,
         8,
