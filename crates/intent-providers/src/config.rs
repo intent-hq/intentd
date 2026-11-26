@@ -316,6 +316,11 @@ pub struct ProviderConfig {
     /// lifecycle, `unsloth_server.rs`) — reporting availability off
     /// `opencode` alone is misleading when the Unsloth CLI isn't installed.
     pub requires_secondary_binary: Option<&'static str>,
+    /// Folders under the user's home where the provider's CLI keeps its
+    /// native install, sign-in and state (e.g. `.codex`). Hermetic test runs
+    /// hide each one (`PROVIDER_HOMES` in `scripts/test-without-provider-clis.sh`);
+    /// `hide_list_covers_every_provider_home` fails when one is missing there.
+    pub home_dirs: &'static [&'static str],
     /// When true, ACP `terminal/create` requests from this provider are spawned
     /// via a shell (`/bin/sh -c` on POSIX; PowerShell `-Command` / `cmd /c` on
     /// Windows) rather than as raw argv. Needed for agents that pack a full
@@ -512,6 +517,7 @@ impl ProviderConfig {
             npx_only_package: None,
             npx_only_honors_path_override: false,
             requires_secondary_binary: None,
+            home_dirs: &[],
             terminal_requires_shell: false,
             requests_agent_workers: false,
             truncates_tool_descriptions: false,
@@ -595,6 +601,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             credential_launch_env: &[],
             reserved_keys: &[],
         }),
+        home_dirs: &[".augment"],
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
@@ -653,6 +660,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             credential_launch_env: &[],
             reserved_keys: &[],
         }),
+        home_dirs: &[".claude"],
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -724,6 +732,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             credential_launch_env: &[],
             reserved_keys: &[],
         }),
+        home_dirs: &[".codex"],
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {
@@ -746,6 +755,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // cortex sessions — flipping `truncates_tool_descriptions` here would
         // inject the full ws.* reference for tools cortex cannot call. Flip it
         // together with bridge delivery: intent-hq/monorepo#3303.
+        // Snowflake connections (credentials) and Cortex settings.
+        home_dirs: &[".snowflake"],
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
@@ -758,6 +769,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some("https://opencode.ai/docs#configure"),
         fallback_npx_package: Some(OPENCODE_NPX_PACKAGE),
         short_name: "OpenCode",
+        // Native installer bin, and the XDG data folder holding `auth.json`.
+        home_dirs: &[".opencode", ".local/share/opencode"],
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
     ProviderConfig {
@@ -781,6 +794,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // cycle, so the bounded `host.providerTestPrompt` probe would time
         // out spuriously.
         supports_test_prompt: false,
+        home_dirs: &[".unsloth"],
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {
@@ -804,6 +818,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),
         short_name: "Pi",
+        home_dirs: &[".pi"],
         ..ProviderConfig::empty("pi", "Pi", "pi-acp")
     },
     ProviderConfig {
@@ -846,6 +861,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             credential_launch_env: &[],
             reserved_keys: &[],
         }),
+        home_dirs: &[".factory"],
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -904,6 +920,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             credential_launch_env: &[],
             reserved_keys: &[],
         }),
+        home_dirs: &[".grok"],
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
@@ -929,6 +946,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // No spawn-time tool removal: `agy acp` has no disable-tool flag.
         // Role restrictions are prompt-only; MCP-side filtering still covers
         // workspace tools.
+        home_dirs: &[crate::antigravity::DEFAULT_GEMINI_DIR],
         ..ProviderConfig::empty(
             "antigravity",
             "Google Antigravity",
@@ -1003,6 +1021,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
                 "Intent sets it so an API key profile never uses a stored Cursor login",
             )],
         }),
+        home_dirs: &[".cursor", ".local/share/cursor-agent"],
         ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {
@@ -1055,6 +1074,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
                 "Intent always sets it to turn off DeepSeek Harness telemetry",
             )],
         }),
+        home_dirs: &[crate::dsh::DEFAULT_HOME_DIR],
         ..ProviderConfig::empty(crate::dsh::PROVIDER_ID, "DeepSeek Harness", crate::dsh::COMMAND)
     },
     ProviderConfig {
