@@ -322,6 +322,16 @@ impl LocalLeases {
         }
     }
 
+    /// Drops the key's slot while it names `lease`; see
+    /// `SqliteStore::retire_lease`.
+    fn retire(&self, lease: &Lease) {
+        let mut leases = self.lock();
+        let slot = Self::slot(lease);
+        if leases.get(&slot).is_some_and(|s| Self::names(s, lease)) {
+            leases.remove(&slot);
+        }
+    }
+
     fn is_held(&self, lease: &Lease) -> bool {
         let now = Instant::now();
         self.lock()
@@ -364,6 +374,12 @@ impl crate::SqliteStore {
         } else {
             Err(lease.lost())
         }
+    }
+
+    /// After a write guarded by `lease` committed: forgets the key, for
+    /// work whose key is never used again (as Postgres `retire_lease`).
+    pub(crate) fn retire_lease(&self, lease: &Lease) {
+        self.leases.retire(lease);
     }
 
     // A lost lease fails before the transaction opens, so the paused-clock

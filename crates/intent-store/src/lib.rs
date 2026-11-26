@@ -200,7 +200,9 @@ pub use agent_repo::{
     MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP, PROVIDER_RETURN_METADATA_KEY,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
-pub use completion_watch_repo::PersistedCompletionWatch;
+pub use completion_watch_repo::{
+    PersistedCompletionWatch, COMPLETION_WATCH_LEASE_SCOPE, DELEGATION_GROUP_LEASE_SCOPE,
+};
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;

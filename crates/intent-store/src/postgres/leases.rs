@@ -22,7 +22,7 @@ use std::time::Duration;
 use intent_core::{Error, Result};
 
 use super::{db, Fence, PgStore, WriteTx};
-use crate::lease_repo::{ttl_millis, Lease};
+use crate::lease_repo::{ttl_millis, Lease, TENANT_SCOPE};
 
 /// Acquires ($1 tenant, $2 scope, $3 key) for lease $4 of process $5 for
 /// $6 ms when no row exists or the row is released or expired by the
@@ -58,6 +58,12 @@ const RELEASE_SQL: &str = "UPDATE lease \
 const HELD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM lease \
      WHERE tenant_id = $1 AND scope = $2 AND lease_key = $3 \
      AND lease_id = $4 AND token = $5 AND expires_at > clock_timestamp())";
+
+/// Deletes ($1 tenant, $2 scope, $3 key) while it names lease $4 with
+/// token $5: the work under the key is done for good.
+const RETIRE_SQL: &str = "DELETE FROM lease \
+     WHERE tenant_id = $1 AND scope = $2 AND lease_key = $3 \
+     AND lease_id = $4 AND token = $5";
 
 /// [`HELD_SQL`] as a row lock: `FOR SHARE` makes an acquire, renewal or
 /// release of the key wait until the guarding transaction ends.
@@ -151,6 +157,30 @@ impl PgStore {
         } else {
             Err(lease.lost())
         }
+    }
+
+    /// Inside a write transaction that guarded `lease`: deletes its row,
+    /// for work whose key is never used again (a delivered completion watch
+    /// or delegation group, keyed by its UUID). The key's token then starts
+    /// over, which no holder can tell: every holder is matched on its own
+    /// lease id too. Commits with `tx`. Never the tenant lease: only the
+    /// tenant claim and its release write that row (`lease.rs`).
+    pub(crate) async fn retire_lease(&self, tx: &mut WriteTx, lease: &Lease) -> Result<()> {
+        if lease.scope() == TENANT_SCOPE {
+            return Err(Error::InvalidParams(
+                "the tenant lease is never retired".to_owned(),
+            ));
+        }
+        sqlx::query(RETIRE_SQL)
+            .bind(self.tenant())
+            .bind(lease.scope())
+            .bind(lease.key())
+            .bind(lease.lease_id())
+            .bind(lease.db_token())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Error::Internal(format!("retire lease failed: {e}")))?;
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]

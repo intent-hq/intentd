@@ -3603,9 +3603,16 @@ async fn shrink_after_delivery_claim_does_not_recreate_settled_group_row() {
     // Same lane interleaving as `settle_delegation_group_persisted` racing a
     // shrink: Settle is queued, the shrink lands while it is in flight, then
     // the ack is awaited and the group leaves the registry.
+    let claim = svc
+        .store()
+        .claim_delegation_group(&gid, Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("the group is unclaimed");
     let ack = svc.enqueue_group_persist_acked(GroupPersistOp::Settle {
         group_id: gid.clone(),
         retain_children: Vec::new(),
+        claim: Arc::new(claim),
     });
     assert!(svc.remove_child_from_group(&gid, &child_a));
     Services::await_group_persist(ack).await.expect("settle");
@@ -27766,6 +27773,102 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     .expect("re-armed delivery completes")
     .expect("re-armed delivery task");
     assert_eq!(parent_message_count(&svc, &a).await, 2);
+}
+
+/// A delivery claim left by a holder that crashed (held, never renewed or
+/// released) blocks the terminal wake only until it lapses. The pass that
+/// finds the watch claimed schedules a retry instead of skipping for good;
+/// once the claim lapsed the retry claims the watch, wakes the parent once
+/// and retires the watch with the claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_holders_delivery_claim_lapses_and_the_retry_wakes_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new_isolated(store.clone());
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let watch_id = svc.find_watches_for_child(&b)[0].id.clone();
+
+    // The crashed holder's claim: held for far longer than this test runs
+    // until the test lets it lapse below.
+    let mut crashed = store
+        .acquire_lease(
+            intent_store::COMPLETION_WATCH_LEASE_SCOPE,
+            &watch_id,
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("acquire")
+        .expect("the crashed holder claims the watch");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "a held claim delivers nothing"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "the watch stays armed"
+    );
+    assert!(
+        svc.completion_delivery_retries
+            .lock()
+            .unwrap()
+            .contains_key(&b.0),
+        "the pass hands the watch to a retry instead of skipping it for good"
+    );
+
+    // The crash: nobody renews, so the claim lapses (a 1 ms TTL stands in
+    // for the TTL running out).
+    assert!(store
+        .renew_lease(&mut crashed, Duration::from_millis(1))
+        .await
+        .unwrap());
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !svc.find_watches_for_child(&b).is_empty()
+                || svc
+                    .completion_delivery_retries
+                    .lock()
+                    .unwrap()
+                    .contains_key(&b.0)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("the retry delivers once the claim lapsed");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "exactly one terminal wake"
+    );
+    assert!(
+        !store.lease_is_held(&crashed).await.unwrap(),
+        "the crashed holder's claim is gone"
+    );
+    assert!(
+        store
+            .claim_completion_watch(&watch_id, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_some(),
+        "the retired watch left no claim behind"
+    );
 }
 
 /// Split-snapshot regression (intent-hq/intent#4367 review): with two

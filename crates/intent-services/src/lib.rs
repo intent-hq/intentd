@@ -1770,6 +1770,11 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// already bound — so it is deliberately not wrapped in this timeout.
 pub(crate) const PR_REFRESH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The TTL of a completion-watch or delegation-group delivery claim. The
+/// holder renews it at half the TTL while it delivers, so it bounds only
+/// how long a crashed holder's claim keeps another process waiting.
+pub(crate) const DELIVERY_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The forge base every test constructor starts with — the GitHub API, the
 /// GitHub login (device flow) and the GitLab API origin: loopback port 0,
 /// which nothing can listen on, so an unmocked forge call fails locally.
@@ -8896,21 +8901,12 @@ impl Services {
             })
     }
 
-    /// Releases this process's database delivery claim on a watch whose
-    /// terminal delivery will be retried (batch G 2c). Best-effort: a claim
-    /// left behind blocks only other processes, and only until a newer
-    /// tenant epoch; this process can always claim it again.
-    async fn release_watch_claim(&self, watch_id: &str) {
-        if let Err(e) = self.store.release_completion_watch_claim(watch_id).await {
-            tracing::warn!(watch = %watch_id, error = %e, "completion watch claim release failed");
-        }
-    }
-
-    /// [`Services::release_watch_claim`] for a delegation group.
-    async fn release_group_claim(&self, group_id: &str) {
-        if let Err(e) = self.store.release_delegation_group_claim(group_id).await {
-            tracing::warn!(group = %group_id, error = %e, "delegation group claim release failed");
-        }
+    /// Releases a delivery claim (a watch's or group's lease) whose delivery
+    /// ended without settling it, so the retry, here or in another process,
+    /// can claim it at once. Best effort: a failed release lapses by the
+    /// claim's TTL.
+    async fn release_delivery_claim(&self, claim: lease_keeper::LeaseKeeper) {
+        Box::pin(claim.release(&self.store)).await;
     }
 
     fn release_watch_delivery(&self, child_id: &AgentId, watch_id: &str) {
@@ -10623,19 +10619,34 @@ impl Services {
                 );
                 continue;
             }
-            // Batch G 2c: the in-process claim above orders passes of THIS
-            // process; the database claim orders processes (another daemon
-            // that rehydrated the same watch, or one still delivering after
-            // a takeover). It is held until the watch retires or a failed
-            // delivery below releases it for the retry.
-            match self.store.claim_completion_watch(&watch.id).await {
-                Ok(true) => {}
-                Ok(false) => {
+            // The in-process claim above orders passes of THIS process; the
+            // delivery claim (a lease on the watch) orders processes: another
+            // daemon that rehydrated the same watch, or one still delivering
+            // after a tenant takeover. It is kept (renewed) until the watch
+            // retires, which fences on it, or a failed delivery below
+            // releases it for the retry. A holder that crashed leaves it to
+            // lapse after its TTL.
+            let claim = match self
+                .store
+                .claim_completion_watch(&watch.id, DELIVERY_CLAIM_TTL)
+                .await
+            {
+                Ok(Some(claim)) => claim,
+                Ok(None) => {
+                    // Another holder delivers, or crashed: retry until it
+                    // retired the watch (the retry then finds the delivery
+                    // marker or the stable wake id) or its claim lapsed.
                     tracing::info!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         watch = %watch.id,
-                        "terminal delivery claimed by another process, skipping"
+                        "terminal delivery claimed by another holder; retry scheduled"
+                    );
+                    ungrouped_delivery_failed = true;
+                    self.schedule_completion_delivery_retry(
+                        child_id.clone(),
+                        event.clone(),
+                        watch_ids,
                     );
                     continue;
                 }
@@ -10654,13 +10665,27 @@ impl Services {
                     );
                     continue;
                 }
-            }
+            };
             // Test seam: park in the claim→send window so a test can run a
             // concurrent delivery pass for the same child while this one
             // holds the claim.
             if let Some(park) = &self.completion_claim_park {
                 park.entered.notify_one();
                 park.release.notified().await;
+            }
+            // A claim lost before the send (renewals failed past its TTL,
+            // so another holder may have it) delivers nothing here.
+            if claim.is_fired() {
+                tracing::warn!(
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    reason = ?claim.fence().reason(),
+                    "delivery claim lost before the terminal wake; retry scheduled"
+                );
+                self.release_delivery_claim(claim).await;
+                ungrouped_delivery_failed = true;
+                self.schedule_completion_delivery_retry(child_id.clone(), event.clone(), watch_ids);
+                continue;
             }
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
@@ -10779,6 +10804,7 @@ impl Services {
                         self.restore_flushed_report_message(&watch.parent_agent_id, entry)
                             .await;
                     }
+                    self.release_delivery_claim(claim).await;
                     continue;
                 }
                 tracing::warn!(
@@ -10801,7 +10827,7 @@ impl Services {
                     self.restore_flushed_report_message(&watch.parent_agent_id, entry)
                         .await;
                 }
-                self.release_watch_claim(&watch.id).await;
+                self.release_delivery_claim(claim).await;
                 ungrouped_delivery_failed = true;
                 self.schedule_completion_delivery_retry(
                     child_id.clone(),
@@ -10819,20 +10845,26 @@ impl Services {
                     child_id,
                     record_identity,
                     &delivered_at,
+                    &claim,
                 )
                 .await
             {
+                // Also a lost claim (`LeaseLost`): another holder may be
+                // delivering; the retry converges on the stable wake id.
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
                     watch = %watch.id,
                     "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
                 );
-                self.release_watch_claim(&watch.id).await;
+                self.release_delivery_claim(claim).await;
                 ungrouped_delivery_failed = true;
                 self.schedule_completion_delivery_retry(child_id.clone(), retry_event, watch_ids);
                 continue;
             }
+            // Retirement deleted the claim's lease row with the watch:
+            // nothing is left to release.
+            drop(claim);
             self.remove_watch_after_delivery_commit(&watch.id);
             // A genuine completion/failure/deletion wake delivered — the
             // child's monitoring-idle waiting period (if any) is over, so
@@ -11120,20 +11152,27 @@ impl Services {
         let Some(group) = self.take_group_if_ready(group_id) else {
             return;
         };
-        // Batch G 2c: the database claim orders processes, as for an
-        // ungrouped watch; held until the group settles or a failed
-        // delivery below releases it for the retry.
-        match self.store.claim_delegation_group(group_id).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // The delivery claim (a lease on the group) orders processes, as
+        // for an ungrouped watch; kept until the group settles, which
+        // fences on it, or a failed delivery below releases it for the
+        // retry.
+        let claim = match self
+            .store
+            .claim_delegation_group(group_id, DELIVERY_CLAIM_TTL)
+            .await
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                // Another holder delivers, or crashed: retry until it
+                // settled the group (the retry's send then finds the stable
+                // wake id) or its claim lapsed.
                 tracing::info!(
                     parent = %group.parent_agent_id.0,
                     group = %group_id,
-                    "aggregated wake claimed by another process, skipping"
+                    "aggregated wake claimed by another holder; retry scheduled"
                 );
-                // Stay marked delivered here: the holder delivers and
-                // settles the group, or retries itself; a takeover (newer
-                // epoch) rehydrates the group from its row.
+                self.release_group_delivery(group_id);
+                self.schedule_completion_group_delivery_retry(group_id.to_string());
                 return;
             }
             Err(e) => {
@@ -11147,7 +11186,7 @@ impl Services {
                 self.schedule_completion_group_delivery_retry(group_id.to_string());
                 return;
             }
-        }
+        };
         let workspace_id = &group.workspace_id;
         let failed_children = failed_group_children(&group);
         let wake = format_group_wake(&group);
@@ -11191,6 +11230,20 @@ impl Services {
             }
         }
         crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+        // A claim lost by now (renewals failed past its TTL, so another
+        // holder may have it) delivers nothing here; checked before any
+        // report is retracted, so nothing needs restoring.
+        if claim.is_fired() {
+            tracing::warn!(
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                "delivery claim lost before the aggregated wake; retry scheduled"
+            );
+            self.release_delivery_claim(claim).await;
+            self.release_group_delivery(group_id);
+            self.schedule_completion_group_delivery_retry(group_id.to_string());
+            return;
+        }
         // Debounce combine, grouped mirror of the ungrouped retract in
         // `deliver_completion_to_watches`: a report parked while the child's
         // watch was still ungrouped is superseded by the aggregate wake when
@@ -11260,6 +11313,7 @@ impl Services {
                     self.restore_flushed_report_message(&group.parent_agent_id, entry)
                         .await;
                 }
+                self.release_delivery_claim(claim).await;
                 self.release_group_delivery(group_id);
                 return;
             }
@@ -11281,26 +11335,38 @@ impl Services {
                 self.restore_flushed_report_message(&group.parent_agent_id, entry)
                     .await;
             }
-            self.release_group_claim(group_id).await;
+            self.release_delivery_claim(claim).await;
             self.release_group_delivery(group_id);
             self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
         }
-        if let Err(e) = self
-            .settle_delegation_group_persisted(group_id, &failed_children)
-            .await
-        {
+        // The settlement runs on the group persistence lane, which shares
+        // the claim until it acked.
+        let claim = Arc::new(claim);
+        let settled = self
+            .settle_delegation_group_persisted(group_id, &failed_children, Arc::clone(&claim))
+            .await;
+        if let Err(e) = settled {
             tracing::warn!(
                 error = %e,
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
                 "aggregated wake is durable but group settlement failed; stable-id retry scheduled"
             );
-            self.release_group_claim(group_id).await;
+            // Also a lost claim (`LeaseLost`): another holder may be
+            // delivering; the retry converges on the stable wake id.
+            match Arc::try_unwrap(claim) {
+                Ok(claim) => self.release_delivery_claim(claim).await,
+                // Still shared (the lane did not hand it back): it lapses
+                // by its TTL.
+                Err(shared) => drop(shared),
+            }
             self.release_group_delivery(group_id);
             self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
         }
+        // Settlement deleted the claim's lease row with the group.
+        drop(claim);
         let retained = self.finalize_group_delivery(group_id, &failed_children);
         if retained > 0 {
             tracing::info!(
