@@ -203,7 +203,7 @@ fn proxied_pool(
 /// The unauthenticated device-flow login client for `base` (github.com in
 /// production): the shared proxy-aware pool, `Accept: application/json` as
 /// octocrab's `authenticate_as_device` requires, and octocrab's default
-/// retries.
+/// retries and redirect following.
 pub(crate) fn login_client(base: &str) -> Result<octocrab::Octocrab> {
     login_client_with(
         base,
@@ -224,6 +224,7 @@ fn login_client_with(
         .map_err(|e| Error::Config(format!("invalid github login base uri: {e}")))?;
     let pool = proxied_pool(connect_timeout, read_write_timeout, proxies)?;
     let retry = tower::retry::Retry::new(RetryConfig::Simple(3), pool);
+    let redirects = redirect_layer().layer(retry);
     let headers = ExtraHeadersLayer::new(Arc::new(vec![
         (
             http::header::USER_AGENT,
@@ -234,7 +235,7 @@ fn login_client_with(
             HeaderValue::from_static("application/json"),
         ),
     ]))
-    .layer(retry);
+    .layer(redirects);
     let service = BaseUriLayer::new(base).layer(headers);
     octocrab::OctocrabBuilder::new_empty()
         .with_service(service.map_err(|e| -> BoxError { Box::new(e) }))
@@ -1040,7 +1041,8 @@ mod tests {
 
     /// The device-flow login client honors the proxy env like the API
     /// client: github.com is tunnelled through the proxy, while a `NO_PROXY`
-    /// login host connects directly and still gets `Accept: application/json`.
+    /// login host connects directly, follows a redirect like octocrab's default
+    /// client and still gets `Accept: application/json`.
     #[tokio::test]
     async fn the_login_client_tunnels_through_the_proxy() {
         let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1051,21 +1053,44 @@ mod tests {
             .await
             .unwrap();
         let fixture_base = format!("http://{}", fixture.local_addr().unwrap());
+        // The login host first redirects (as the old octocrab client
+        // followed), then answers with codes.
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut stream, _) = fixture.accept().await.unwrap();
-            let head = request(&mut stream).await.unwrap_or_default();
-            let body = r#"{"device_code":"dc","user_code":"UC-1","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#;
-            let _ = stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                        body.len()
+            loop {
+                let Some(head) = request(&mut stream).await else {
+                    return;
+                };
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0_u8; length];
+                stream.read_exact(&mut body).await.unwrap();
+                if head.starts_with("POST /login/device/code ") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nlocation: /moved/device/code\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                let body = r#"{"device_code":"dc","user_code":"UC-1","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#;
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await;
-            let _ = seen_tx.send(head);
+                    .await;
+                let _ = seen_tx.send(head);
+                return;
+            }
         });
         let matcher = || {
             Matcher::builder()
@@ -1090,6 +1115,10 @@ mod tests {
                 .expect("a NO_PROXY login host connects directly");
         assert_eq!(codes.user_code, "UC-1");
         let head = seen_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            head.contains(" /moved/device/code "),
+            "followed the redirect: {head}"
+        );
         assert!(head.contains("accept: application/json"), "{head}");
 
         let proxied = login_client_with(
