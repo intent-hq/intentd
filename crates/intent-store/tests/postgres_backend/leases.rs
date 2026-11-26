@@ -352,8 +352,14 @@ async fn guarded_work_writes_nothing_once_its_lease_is_lost() {
             secrets.store("held", "written").await.unwrap();
         })
         .await;
-    assert_eq!(secrets.load("held").await.unwrap().as_deref(), Some("written"));
-    assert!(LeaseWriteGuards::current().is_empty(), "the guard is scoped");
+    assert_eq!(
+        secrets.load("held").await.unwrap().as_deref(),
+        Some("written")
+    );
+    assert!(
+        LeaseWriteGuards::current().is_empty(),
+        "the guard is scoped"
+    );
 
     // Another process takes the lease once it lapsed.
     expire_lease(&db, tenant, SCOPE, key).await;
@@ -384,13 +390,18 @@ async fn guarded_work_writes_nothing_once_its_lease_is_lost() {
             (direct, inherited, blocking, other_tenant)
         })
         .await;
-    for (how, result) in [("direct", late.0), ("spawned", late.1), ("blocking", late.2)] {
+    for (how, result) in [
+        ("direct", late.0),
+        ("spawned", late.1),
+        ("blocking", late.2),
+    ] {
         assert!(
             matches!(result, Err(Error::LeaseLost(_))),
             "{how}: a lost lease fails the write: {result:?}"
         );
     }
-    late.3.expect("another tenant's write does not guard this lease");
+    late.3
+        .expect("another tenant's write does not guard this lease");
     assert_eq!(secrets.load("late").await.unwrap(), None, "nothing landed");
 
     secrets
