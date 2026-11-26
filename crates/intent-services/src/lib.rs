@@ -1063,6 +1063,11 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_claim_park`.
     completion_claim_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test park seam for the probe→write window of a parent wake: parks
+    /// the send after its stable-id idempotency probe and right before the
+    /// wake is written, so a test can let the delivery claim lapse there.
+    /// `None` in production.
+    completion_send_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the flipped-completion
     /// take→publish window: parks the pass that consumed the child's flips
     /// from the store before it publishes them to the overlapping passes,
@@ -1979,6 +1984,7 @@ impl Services {
             #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
             completion_claim_park: None,
+            completion_send_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
             unread_settle_entry_park: None,
@@ -3338,6 +3344,14 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_claim_park = Some(park);
+        self
+    }
+
+    /// Test seam: park a parent wake send between its idempotency probe and
+    /// the wake write, so a test can let the delivery claim lapse there.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_completion_send_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.completion_send_park = Some(park);
         self
     }
 
@@ -11501,6 +11515,12 @@ impl Services {
                     "messageId": id,
                 }));
             }
+        }
+        // Test seam: park after the idempotency probe, right before the
+        // wake is written, so a test can let the delivery claim lapse there.
+        if let Some(park) = &self.completion_send_park {
+            park.entered.notify_one();
+            park.release.notified().await;
         }
         if let Some(manager) = self.agent_manager() {
             manager

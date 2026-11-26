@@ -226,6 +226,50 @@ impl Services {
         self.with_completion_claim_park(park)
     }
 
+    /// Test seam: `with_completion_send_park`.
+    #[must_use]
+    pub fn with_completion_send_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_completion_send_park(park)
+    }
+
+    /// Test seam: `register_completion_watch_durable`.
+    pub async fn register_completion_watch_durable_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+        group_id: Option<String>,
+    ) -> Result<String> {
+        self.register_completion_watch_durable(
+            workspace_id,
+            workspace_id,
+            parent_agent_id,
+            "parent".into(),
+            child_agent_id,
+            group_id,
+        )
+        .await
+    }
+
+    /// Test seam: the ids of `find_watches_for_child`.
+    #[must_use]
+    pub fn watch_ids_for_child_for_test(&self, child_agent_id: &AgentId) -> Vec<String> {
+        self.find_watches_for_child(child_agent_id)
+            .into_iter()
+            .map(|watch| watch.id)
+            .collect()
+    }
+
+    /// Test seam: whether a completion delivery retry is pending for the
+    /// child.
+    #[must_use]
+    pub fn completion_retry_pending_for_test(&self, child_agent_id: &AgentId) -> bool {
+        self.completion_delivery_retries
+            .lock()
+            .expect("completion retry registry poisoned")
+            .contains_key(&child_agent_id.0)
+    }
+
     /// Test seam: `execution_call`.
     pub fn execution_call_for_test<'a, T: Send + 'a>(
         &'a self,
