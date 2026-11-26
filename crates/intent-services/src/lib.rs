@@ -480,6 +480,9 @@ pub(crate) struct DeliveryGuards {
     /// Test seam: parks a strict watch registration between its lookups and
     /// its guarded insert. Unset in production.
     pub(crate) registration_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a poisoned-queue migration right before it takes
+    /// the persist gate. Unset in production.
+    pub(crate) migration_park: OnceLock<Arc<CompletionClassifyPark>>,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.

@@ -545,3 +545,187 @@ async fn a_cancelled_guarded_enqueue_leaves_nothing_to_persist() {
         "the shutdown queue save stored no unguarded wake"
     );
 }
+
+/// A quarantined (poisoned) parent whose completion wake is being queued
+/// under its delivery claim, while `agent.wakeOrCreate` migrates the
+/// parent's queue to a replacement.
+struct PoisonedMigration {
+    a: Services,
+    store: Store,
+    parent: AgentId,
+    replacement: AgentId,
+    enqueue: Arc<CompletionClassifyPark>,
+    migration: Arc<CompletionClassifyPark>,
+    delivering: tokio::task::JoinHandle<()>,
+    migrating: tokio::task::JoinHandle<intent_core::Result<usize>>,
+}
+
+/// Parks the wake's guarded enqueue (holding the persist gate, write
+/// pending), then starts the migration and lets it run up to the gate.
+async fn poisoned_migration(pool: &PgPool, label: &str) -> PoisonedMigration {
+    let tenant = format!(
+        "{label}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = open(pool, &tenant, "process-a").await;
+    let (parent, child, replacement) = (
+        AgentId("parent".into()),
+        AgentId("child".into()),
+        AgentId("replacement".into()),
+    );
+    for (id, name, status) in [
+        (&parent, "parent", AgentStatus::RuntimeIdle),
+        (&child, "child", AgentStatus::Active),
+        (&replacement, "replacement", AgentStatus::RuntimeIdle),
+    ] {
+        store
+            .insert_agent_session(&session(id, name, status))
+            .await
+            .expect("seed an agent");
+    }
+    let (enqueue, migration) = (
+        Arc::new(CompletionClassifyPark::default()),
+        Arc::new(CompletionClassifyPark::default()),
+    );
+    let a = Services::new_isolated(store.clone())
+        .with_guarded_enqueue_park_for_test(enqueue.clone())
+        .with_migration_park_for_test(migration.clone());
+    let manager = Arc::new(AgentManager::new(
+        a.clone(),
+        Arc::new(BusEventSink::new(EventBus::new(store.clone()))),
+        4,
+    ));
+    a.attach_agent_manager(&manager);
+    a.register_completion_watch_durable_for_test(
+        &WorkspaceId::chief(),
+        parent.clone(),
+        child.clone(),
+        None,
+    )
+    .await
+    .expect("register the watch");
+    let now = intent_core::now_iso();
+    // A session-fatal stop reason quarantines the parent: its wake is
+    // parked in the queue before send_message's detached boundary.
+    store
+        .set_agent_session_status(
+            &WorkspaceId::chief(),
+            &parent,
+            AgentStatus::Error,
+            false,
+            &now,
+            Some(Some("Please start a new session to continue.".into())),
+        )
+        .await
+        .expect("quarantine the parent");
+    store
+        .set_agent_session_status(
+            &WorkspaceId::chief(),
+            &child,
+            AgentStatus::RuntimeIdle,
+            false,
+            &now,
+            None,
+        )
+        .await
+        .expect("the child completes");
+
+    let event = idle_event(&child);
+    let delivering = tokio::spawn({
+        let a = a.clone();
+        async move { a.handle_completion_event_for_test(&event).await }
+    });
+    tokio::time::timeout(wait(), enqueue.entered.notified())
+        .await
+        .expect("the wake is queued, its guarded write pending");
+    assert_eq!(a.queue_snapshot_for_test(&parent).len(), 1);
+    let migrating = tokio::spawn({
+        let (a, parent, replacement) = (a.clone(), parent.clone(), replacement.clone());
+        async move {
+            a.migrate_queue_and_gc_poisoned_session_for_test(
+                &parent,
+                &replacement,
+                &WorkspaceId::chief(),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(wait(), migration.entered.notified())
+        .await
+        .expect("the migration starts");
+    migration.release.notify_one();
+    PoisonedMigration {
+        a,
+        store,
+        parent,
+        replacement,
+        enqueue,
+        migration,
+        delivering,
+        migrating,
+    }
+}
+
+/// The guarded enqueue is cancelled while the migration waits for the
+/// persist gate: the migration then finds nothing to move, and neither the
+/// poisoned parent's queue nor the replacement's stores the rejected wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_migration_never_moves_a_pending_guarded_wake() {
+    let Some(pool) = pool().await else { return };
+    let m = poisoned_migration(&pool, "migrate-cancel").await;
+    m.delivering.abort();
+    assert!(m.delivering.await.expect_err("cancelled").is_cancelled());
+    let moved = tokio::time::timeout(wait(), m.migrating)
+        .await
+        .expect("the migration ends")
+        .expect("the migration task")
+        .expect("the migration");
+    assert_eq!(moved, 0, "nothing settled was left to move");
+    for agent in [&m.parent, &m.replacement] {
+        assert!(
+            m.a.queue_snapshot_for_test(agent).is_empty(),
+            "no wake in memory for {}",
+            agent.0
+        );
+        assert_eq!(
+            stored_queue_len(&m.store, agent).await,
+            0,
+            "no wake stored for {}",
+            agent.0
+        );
+    }
+    drop(m.enqueue);
+    drop(m.migration);
+}
+
+/// The guarded write commits while the migration waits for the persist
+/// gate: the migration then moves the committed wake, which is stored on
+/// the replacement and drainable there (not left pending).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_migration_moves_a_committed_guarded_wake_drainable() {
+    let Some(pool) = pool().await else { return };
+    let m = poisoned_migration(&pool, "migrate-commit").await;
+    m.enqueue.release.notify_one();
+    tokio::time::timeout(wait(), m.delivering)
+        .await
+        .expect("the delivery ends")
+        .expect("the delivery task");
+    let moved = tokio::time::timeout(wait(), m.migrating)
+        .await
+        .expect("the migration ends")
+        .expect("the migration task")
+        .expect("the migration");
+    assert_eq!(moved, 1, "the committed wake moves");
+    assert_eq!(stored_queue_len(&m.store, &m.parent).await, 0);
+    assert_eq!(
+        stored_queue_len(&m.store, &m.replacement).await,
+        1,
+        "stored on the replacement"
+    );
+    assert!(
+        m.a.dequeue_message_draining_for_test(&m.replacement)
+            .is_some(),
+        "and drainable there"
+    );
+    drop(m.migration);
+}

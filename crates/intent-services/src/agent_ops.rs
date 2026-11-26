@@ -21574,14 +21574,19 @@ impl Services {
             Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        // Drain in-memory, keeping the original entries for rollback should
-        // the durable move fail below. The append onto the target happens
-        // OUTSIDE the persist gate: a concurrent enqueue to the target in the
-        // window before the move commits can write-through a snapshot that
-        // already carries the migrated ids while the poisoned rows still
-        // exist — a global-PK conflict that fails that best-effort
-        // write-through with a benign WARN (the move right below commits the
-        // correct snapshot).
+        // The whole migration (in-memory drain, durable move, rollback) runs
+        // under the persist gate. A guarded enqueue holds that gate from its
+        // in-memory insert until its guarded write settles, so this never
+        // moves an entry whose write is still pending: it waits until the
+        // entry is committed (and drainable) or gone (rejected or
+        // cancelled). Test seam: park right before taking the gate.
+        if let Some(park) = self.delivery_guards.migration_park.get() {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        let gate = self.agent_queue_persist_gate.lock().await;
+        // Keep the original entries for rollback should the durable move
+        // fail below.
         let drained: Vec<QueuedMessage> = {
             let mut guard = self
                 .agent_queues
@@ -21609,13 +21614,11 @@ impl Services {
             // crash window with the messages on NEITHER queue.) The snapshot
             // is taken inside the persist gate, same ordering contract as
             // `persist_queue_snapshot`.
-            let moved = {
-                let _gate = self.agent_queue_persist_gate.lock().await;
-                let rows = self.queue_rows(target_id);
-                self.store
-                    .move_agent_queue(poisoned_id, target_id, &rows)
-                    .await
-            };
+            let rows = self.queue_rows(target_id);
+            let moved = self
+                .store
+                .move_agent_queue(poisoned_id, target_id, &rows)
+                .await;
             if let Err(e) = moved {
                 // Roll back the in-memory drain and skip GC: the messages
                 // remain durable on the poisoned queue (rows untouched) and
@@ -21638,6 +21641,11 @@ impl Services {
                     .splice(0..0, drained);
                 return Err(e);
             }
+        }
+        // Released before the publish and the poisoned agent's delete,
+        // which persist queues themselves.
+        drop(gate);
+        if migrated > 0 {
             // Re-arm release timers for migrated held entries against the
             // TARGET agent (mirrors the boot-rehydration re-arm): the timer
             // armed at enqueue time captured the poisoned agent id, so left

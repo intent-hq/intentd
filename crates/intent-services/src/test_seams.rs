@@ -238,6 +238,25 @@ impl Services {
         self.with_guarded_enqueue_park(park)
     }
 
+    /// Test seam: park a poisoned-queue migration right before it takes the
+    /// queue persist gate.
+    #[must_use]
+    pub fn with_migration_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.migration_park.set(park);
+        self
+    }
+
+    /// Test seam: `migrate_queue_and_gc_poisoned_session`.
+    pub async fn migrate_queue_and_gc_poisoned_session_for_test(
+        &self,
+        poisoned_id: &AgentId,
+        target_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize> {
+        self.migrate_queue_and_gc_poisoned_session(poisoned_id, target_id, workspace_id)
+            .await
+    }
+
     /// Test seam: `persist_shutdown_queues`.
     pub async fn persist_shutdown_queues_for_test(&self) {
         self.persist_shutdown_queues().await;
