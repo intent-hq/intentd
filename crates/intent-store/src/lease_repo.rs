@@ -28,9 +28,12 @@
 //!   and its TTL has not passed: a lapsed lease guards nothing until it is
 //!   renewed.
 //!
-//! While the tenant lease still exists, Postgres lease writes take the
-//! tenant writer lock (`begin_write_as(Fence::LeaseOnly)`) for the writer-lock
-//! lint and its ordering, without its owner check.
+//! Postgres lease writes take the tenant writer lock
+//! (`begin_write_as(Fence::LeaseOnly)`) for the writer-lock lint and its
+//! ordering, without its owner check.
+//!
+//! The tenant lease is the lease of scope [`TENANT_SCOPE`]. Only the tenant
+//! claim (`postgres/lease.rs`) acquires it, so this API refuses the scope.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -55,8 +58,12 @@ pub struct Lease {
     deadline: Instant,
 }
 
+/// The scope of the tenant lease (`postgres/lease.rs`), which only the
+/// tenant claim acquires: the generic API refuses it.
+pub(crate) const TENANT_SCOPE: &str = "tenant";
+
 impl Lease {
-    fn new(scope: &str, key: &str, ttl: Duration, started: Instant) -> Self {
+    pub(crate) fn new(scope: &str, key: &str, ttl: Duration, started: Instant) -> Self {
         Self {
             scope: scope.to_owned(),
             key: key.to_owned(),
@@ -65,6 +72,22 @@ impl Lease {
             ttl,
             deadline: started + ttl,
         }
+    }
+
+    /// The lease as acquired with `token` (a store that acquires outside
+    /// [`Store::acquire_lease`] sets it).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn acquired(mut self, token: u64) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// Record a renewal for `ttl` that started at `started` (a renewer
+    /// outside [`Store::renew_lease`] calls it).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn renewed(&mut self, started: Instant, ttl: Duration) {
+        self.ttl = ttl;
+        self.deadline = started + ttl;
     }
 
     /// What kind of work is leased (for example `token-usage-scan`).
@@ -141,6 +164,12 @@ fn validate(scope: &str, ttl: Duration) -> Result<()> {
     if scope.is_empty() {
         return Err(Error::InvalidParams(
             "a lease needs a non-empty scope".to_owned(),
+        ));
+    }
+    if scope == TENANT_SCOPE {
+        return Err(Error::InvalidParams(
+            "the tenant lease is taken only by claiming the tenant (Store::claim_tenant)"
+                .to_owned(),
         ));
     }
     ttl_millis(ttl).map(|_| ())
@@ -517,6 +546,13 @@ mod tests {
             store.acquire_lease("scan", "", Duration::ZERO).await,
             Err(Error::InvalidParams(_))
         ));
+        assert!(
+            matches!(
+                store.acquire_lease(TENANT_SCOPE, "", TTL).await,
+                Err(Error::InvalidParams(_))
+            ),
+            "only the tenant claim takes the tenant lease"
+        );
         let mut held = store.acquire_lease("scan", "", TTL).await.unwrap().unwrap();
         assert!(matches!(
             store.renew_lease(&mut held, Duration::ZERO).await,

@@ -214,16 +214,17 @@ const UNLOCKED_TABLE_WRITES: &[(&str, &str, &str, &str)] = &[
     (
         "lease.rs",
         "renew_lease",
-        "tenant_lease",
-        "the lease heartbeat renews outside the writer lock so a busy tenant cannot starve \
-         it; it matches owner and epoch, and a claim locks the lease row",
+        "lease",
+        "the tenant lease keeper renews outside the writer lock so a busy tenant cannot starve \
+         it; it matches the claim's lease id and token, and a claim locks the lease row",
     ),
     (
         "lease.rs",
         "release_lease",
-        "tenant_lease",
-        "a clean shutdown ends the lease outside the writer lock, after the claim's fence fired \
-         and its writes settled; it matches owner and epoch and never extends the lease",
+        "lease",
+        "a clean shutdown ends the tenant lease outside the writer lock, after the claim's fence \
+         fired and its writes settled; it matches the claim's lease id and token and never \
+         extends the lease",
     ),
 ];
 
@@ -2440,16 +2441,17 @@ fn rule5_messages_and_keys_fit_the_finding() {
     assert!(used.contains(&("sub/mod.rs".to_owned(), "b".to_owned())));
 }
 
-/// Who may move the tenant fence or write the lease, as `(const, function)`
-/// in `src/postgres/lease.rs`: each SQL const that writes `tenant_lease` or
-/// sets `tenant_writer`'s owner and epoch, and the one function that runs
-/// it. `Fence::Skip` (a writer lock without the fence check) is for the
-/// claim alone.
+/// Who may move the tenant fence or write the tenant lease, as `(const,
+/// function)` in `src/postgres/lease.rs`: each SQL const that writes the
+/// `lease` row of scope `'tenant'` (or sets `tenant_writer` columns), and
+/// the one function that runs it. `Fence::Skip` (a writer lock without the
+/// fence check) is for the claim alone. The generic lease API binds its
+/// scope and refuses `tenant` (`lease_repo::TENANT_SCOPE`), so its SQL
+/// never moves the fence.
 const FENCE_MOVERS: &[(&str, &str)] = &[
-    ("LEASE_TAKE_SQL", "claim_lease"),
-    ("FENCE_MOVE_SQL", "claim_lease"),
-    ("LEASE_RENEW_SQL", "renew_lease"),
-    ("LEASE_RELEASE_SQL", "release_lease"),
+    ("TENANT_ACQUIRE_SQL", "claim_lease"),
+    ("TENANT_RENEW_SQL", "renew_lease"),
+    ("TENANT_RELEASE_SQL", "release_lease"),
 ];
 const FENCE_SKIPPER: &str = "claim_lease";
 
@@ -2478,11 +2480,12 @@ fn moves_the_fence(sql: &str) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    sql.contains("into tenant_lease")
-        || sql.contains("update tenant_lease")
-        || sql.contains("delete from tenant_lease")
+    let writes_lease = sql.contains("into lease ")
+        || sql.contains("update lease ")
+        || sql.contains("delete from lease ");
+    (writes_lease && sql.contains("'tenant'"))
         || (sql.contains("update tenant_writer") && sql.contains(" set "))
-        || sql.contains("into tenant_writer (tenant_id, owner_instance")
+        || (sql.contains("into tenant_writer (") && !sql.contains("into tenant_writer (tenant_id)"))
 }
 
 impl<'ast> syn::visit::Visit<'ast> for FenceUses {
@@ -2586,29 +2589,28 @@ fn only_the_claim_moves_the_fence_and_only_claim_renewal_and_release_write_the_l
     assert!(
         problems.is_empty(),
         "only lease.rs's claim_lease may move the fence or skip its check, only \
-         claim_lease, renew_lease and release_lease may write tenant_lease (FENCE_MOVERS), \
+         claim_lease, renew_lease and release_lease may write the tenant lease (FENCE_MOVERS), \
          and only leases.rs's LEASE_ONLY_USERS may use Fence::LeaseOnly:\n{}",
         problems.join("\n")
     );
     let lease = std::fs::read_to_string(src().join("postgres/lease.rs")).expect("read lease.rs");
     let renew = lease
-        .split("const LEASE_RENEW_SQL")
+        .split("const TENANT_RENEW_SQL")
         .nth(1)
         .and_then(|rest| rest.split(';').next())
-        .expect("LEASE_RENEW_SQL");
+        .expect("TENANT_RENEW_SQL");
     assert!(
-        renew.contains("owner_instance = $2 AND epoch = $3"),
-        "the renewal must match the claim's owner and epoch: {renew}"
+        renew.contains("lease_id = $2 AND token = $3"),
+        "the renewal must match the claim's lease id and token: {renew}"
     );
     let release = lease
-        .split("const LEASE_RELEASE_SQL")
+        .split("const TENANT_RELEASE_SQL")
         .nth(1)
         .and_then(|rest| rest.split(';').next())
-        .expect("LEASE_RELEASE_SQL");
+        .expect("TENANT_RELEASE_SQL");
     assert!(
-        release.contains("owner_instance = $2 AND epoch = $3")
-            && release.contains("LEAST(expires_at,"),
-        "the release must match the claim's owner and epoch and never extend the lease: \
+        release.contains("lease_id = $2 AND token = $3") && release.contains("LEAST(expires_at,"),
+        "the release must match the claim's lease id and token and never extend the lease: \
          {release}"
     );
 }
@@ -2617,8 +2619,8 @@ fn only_the_claim_moves_the_fence_and_only_claim_renewal_and_release_write_the_l
 fn the_fence_lint_flags_a_new_fence_mover() {
     let lease = PathBuf::from("src/postgres/lease.rs");
     let other = PathBuf::from("src/postgres/notes.rs");
-    let ok = "const FENCE_MOVE_SQL: &str = \"UPDATE tenant_writer SET epoch = $2 WHERE tenant_id = $1\";\n\
-              fn claim_lease() { let _ = (Fence::Skip, FENCE_MOVE_SQL); }\n";
+    let ok = "const TENANT_ACQUIRE_SQL: &str = \"INSERT INTO lease (tenant_id, scope) VALUES ($1, 'tenant')\";\n\
+              fn claim_lease() { let _ = (Fence::Skip, TENANT_ACQUIRE_SQL); }\n";
     assert!(fence_problems(&[(lease.clone(), ok.to_owned())]).is_empty());
     let leases = PathBuf::from("src/postgres/leases.rs");
     let lease_only = "fn lease_renew() { let _ = Fence::LeaseOnly; }\n";
@@ -2629,15 +2631,19 @@ fn the_fence_lint_flags_a_new_fence_mover() {
         (&leases, "fn other() { let _ = Fence::LeaseOnly; }\n"),
         (&other, "fn lease_renew() { let _ = Fence::LeaseOnly; }\n"),
         (&lease, "fn claim_lease() { let _ = Fence::LeaseOnly; }\n"),
-        (&lease, "fn other() { let _ = FENCE_MOVE_SQL; }\n"),
-        (&lease, "fn renew_lease() { let _ = LEASE_TAKE_SQL; }\n"),
+        (&lease, "fn other() { let _ = TENANT_ACQUIRE_SQL; }\n"),
+        (&lease, "fn renew_lease() { let _ = TENANT_ACQUIRE_SQL; }\n"),
         (
             &other,
-            "fn bump() { q(\"UPDATE tenant_writer SET epoch = epoch + 1 WHERE tenant_id = $1\"); }\n",
+            "fn bump() { q(\"UPDATE tenant_writer SET last_row_seq = 0 WHERE tenant_id = $1\"); }\n",
+        ),
+        (
+            &leases,
+            "fn lease_renew() { q(\"UPDATE lease SET expires_at = now() WHERE tenant_id = $1 AND scope = 'tenant'\"); }\n",
         ),
         (
             &other,
-            "fn renew() { q(\"UPDATE tenant_lease SET expires_at = now() WHERE tenant_id = $1\"); }\n",
+            "fn renew() { q(\"UPDATE lease SET expires_at = now() WHERE tenant_id = $1 AND scope = 'tenant'\"); }\n",
         ),
     ] {
         assert!(

@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use intent_store::postgres::{
-    self, LeaseHeartbeat, PgPool, PostgresOptions, TenantId, LEASE_RENEW_INTERVAL, LEASE_TTL,
+    self, PgPool, PostgresOptions, TenantId, TenantLeaseKeeper, LEASE_TTL,
 };
 use intent_store::{OrchestratorOnly, Store};
 use intentd_orchestrator::CLAIM_WAIT_ENV;
@@ -39,16 +39,17 @@ fn wait() -> Duration {
     intentd_test_support::test_timeout(LEASE_TTL + Duration::from_secs(60))
 }
 
-/// The tenant's lease row: owner, epoch, and whether it has expired.
+/// The tenant's lease row: owner (`""` once released), epoch, and whether
+/// it has expired.
 async fn lease(pool: &PgPool, tenant: &str) -> Option<(String, i64, bool)> {
     sqlx::query_as(
-        "SELECT owner_instance, epoch, expires_at <= clock_timestamp() FROM tenant_lease \
-         WHERE tenant_id = $1",
+        "SELECT COALESCE(holder, ''), token, expires_at <= clock_timestamp() FROM lease \
+         WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
     )
     .bind(tenant)
     .fetch_optional(pool)
     .await
-    .expect("read tenant_lease")
+    .expect("read the tenant lease")
 }
 
 /// Start the orchestrator binary serving `tenants` as `instance`, its output
@@ -124,8 +125,8 @@ async fn waiting(log: &Path) {
 }
 
 /// Another instance claims `tenant` and keeps renewing until the returned
-/// heartbeat is dropped.
-async fn hold(pool: &PgPool, tenant: &str, instance: &str) -> (Store, LeaseHeartbeat, i64) {
+/// keeper is dropped.
+async fn hold(pool: &PgPool, tenant: &str, instance: &str) -> (Store, TenantLeaseKeeper, i64) {
     let (store, claim) = Store::open_postgres_owned(
         pool.clone(),
         TenantId::new(tenant).unwrap(),
@@ -136,8 +137,9 @@ async fn hold(pool: &PgPool, tenant: &str, instance: &str) -> (Store, LeaseHeart
     )
     .await
     .expect("the holder claims the tenant");
-    let heartbeat = LeaseHeartbeat::spawn(store.clone(), &claim, LEASE_TTL, LEASE_RENEW_INTERVAL);
-    (store, heartbeat, claim.epoch)
+    let epoch = claim.epoch;
+    let keeper = TenantLeaseKeeper::spawn(store.clone(), claim);
+    (store, keeper, epoch)
 }
 
 #[track_caller]
@@ -187,9 +189,10 @@ async fn a_restart_after_a_crash_waits_out_the_lease_then_claims() {
         &[],
     );
     assert_eq!(claimed_by(&pool, &tenant, &b).await, epoch + 1);
-    // It claimed only once the dead instance's lease lapsed.
+    // It claimed only once the dead instance's lease lapsed: its last
+    // renewal was due before half the TTL had passed.
     assert!(
-        killed.elapsed() >= LEASE_TTL.saturating_sub(LEASE_RENEW_INTERVAL),
+        killed.elapsed() >= LEASE_TTL / 2,
         "claimed after {:?}, before the lease could expire",
         killed.elapsed()
     );
@@ -209,7 +212,7 @@ async fn while_the_holder_renews_it_exits_1_after_the_bound() {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (tenant, a, b) = names(&run);
     let dir = tempfile::tempdir().unwrap();
-    let (_store, _heartbeat, epoch) = hold(&pool, &tenant, &a).await;
+    let (_store, _keeper, epoch) = hold(&pool, &tenant, &a).await;
 
     let started = Instant::now();
     let mut waiter = start(
@@ -240,7 +243,7 @@ async fn sigterm_while_waiting_exits_0_and_leaves_the_lease() {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (tenant, a, b) = names(&run);
     let dir = tempfile::tempdir().unwrap();
-    let (_store, _heartbeat, epoch) = hold(&pool, &tenant, &a).await;
+    let (_store, _keeper, epoch) = hold(&pool, &tenant, &a).await;
 
     let log = dir.path().join("b.log");
     let mut waiter = start(&url, &tenant, &b, dir.path(), &log, &[]);
@@ -265,27 +268,27 @@ async fn a_lease_released_while_waiting_is_claimed_at_once() {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (tenant, a, b) = names(&run);
     let dir = tempfile::tempdir().unwrap();
-    let (_store, heartbeat, epoch) = hold(&pool, &tenant, &a).await;
+    let (_store, keeper, epoch) = hold(&pool, &tenant, &a).await;
 
     let log = dir.path().join("b.log");
     let mut waiter = start(&url, &tenant, &b, dir.path(), &log, &[]);
     waiting(&log).await;
     // The holder's lease as it stood, so the claim can be ordered against it.
     let held_until: i64 = sqlx::query_scalar(
-        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM tenant_lease \
-         WHERE tenant_id = $1",
+        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM lease \
+         WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
     )
     .bind(&tenant)
     .fetch_one(&pool)
     .await
     .unwrap();
-    heartbeat.fence().fire("the holder stops");
-    assert!(heartbeat.release().await.expect("release"), "released");
+    keeper.fence().fire("the holder stops");
+    assert!(keeper.release().await.expect("release"), "released");
     assert_eq!(claimed_by(&pool, &tenant, &b).await, epoch + 1);
     // Claimed before the released lease would have expired (database clock).
     let claimed_at: i64 = sqlx::query_scalar(
-        "SELECT (extract(epoch FROM renewed_at) * 1000)::bigint FROM tenant_lease \
-         WHERE tenant_id = $1",
+        "SELECT (extract(epoch FROM acquired_at) * 1000)::bigint FROM lease \
+         WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
     )
     .bind(&tenant)
     .fetch_one(&pool)
@@ -312,7 +315,7 @@ async fn sigterm_while_waiting_releases_the_tenants_already_served() {
     let (held, a, b) = names(&run);
     let free = format!("free-{run}");
     let dir = tempfile::tempdir().unwrap();
-    let (_store, _heartbeat, epoch) = hold(&pool, &held, &a).await;
+    let (_store, _keeper, epoch) = hold(&pool, &held, &a).await;
 
     let log = dir.path().join("b.log");
     let mut waiter = start(&url, &format!("{free},{held}"), &b, dir.path(), &log, &[]);
@@ -322,9 +325,10 @@ async fn sigterm_while_waiting_releases_the_tenants_already_served() {
     let exited = waiter.wait_with_timeout(wait()).unwrap().unwrap();
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(exited.code(), Some(0), "{text}");
+    // Released: free (no holder) and expired, keeping its token.
     assert_eq!(
         lease(&pool, &free).await,
-        Some((b, served_epoch, true)),
+        Some((String::new(), served_epoch, true)),
         "{text}"
     );
     assert_eq!(lease(&pool, &held).await, Some((a, epoch, false)));

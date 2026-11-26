@@ -303,13 +303,13 @@ const FAKE_NEKI: &str = "CREATE SCHEMA __neki; \
     CREATE FUNCTION __neki.wait_for_ddl(bigint, bigint, interval) RETURNS void \
       LANGUAGE plpgsql AS $$ BEGIN END $$;";
 
-/// The migration that adds `tenant_lease`, the table the sharded run found
-/// unbound: the one schema file.
+/// The migration that adds `lease` (the tenant lease's table; the sharded
+/// run found its predecessor `tenant_lease` unbound): the one schema file.
 const TENANT_LEASE_MIGRATION: i64 = 1;
 
 /// The sharded Neki run on #3642: the topology bound every tenant table but
-/// `tenant_lease`, so claims (which lock `tenant_writer` and `tenant_lease`
-/// in one single-shard transaction) would fail for every tenant off the
+/// the tenant lease's (then `tenant_lease`, now `lease`), so claims (which
+/// lock `tenant_writer` and the lease row in one single-shard transaction) would fail for every tenant off the
 /// default shard. On Neki, migrate must stop before it marks the migration
 /// that adds such a table complete, so the gate keeps daemons out until the
 /// table is bound, and finish it on the re-run once it is.
@@ -321,7 +321,7 @@ async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
     exec(&admin, FAKE_NEKI.to_owned()).await;
     exec(
         &admin,
-        "INSERT INTO __neki.unbound VALUES ('tenant_lease')".to_owned(),
+        "INSERT INTO __neki.unbound VALUES ('lease')".to_owned(),
     )
     .await;
 
@@ -331,7 +331,7 @@ async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
         .to_string();
     assert!(
         err.contains(&format!("migration {TENANT_LEASE_MIGRATION} "))
-            && err.contains("not bound: tenant_lease")
+            && err.contains("not bound: lease")
             && err.contains("tenant_data")
             && err.contains("set_data_topology"),
         "{err}"
@@ -343,9 +343,9 @@ async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
     let gap = postgres::neki_topology_gap(&admin)
         .await
         .expect("read the topology")
-        .expect("tenant_lease is unbound");
+        .expect("lease is unbound");
     assert_eq!(gap.shard_group, "tenant_data");
-    assert_eq!(gap.unbound, vec!["tenant_lease".to_owned()]);
+    assert_eq!(gap.unbound, vec!["lease".to_owned()]);
     assert_eq!(gap.schema, "public");
 
     // The operator binds it; the re-run runs no statement again and
@@ -367,7 +367,7 @@ async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
     // though the ledger is complete.
     exec(
         &admin,
-        "INSERT INTO __neki.unbound VALUES ('tenant_lease')".to_owned(),
+        "INSERT INTO __neki.unbound VALUES ('lease')".to_owned(),
     )
     .await;
     let drift = postgres::migrate(&admin)
@@ -375,7 +375,7 @@ async fn migrate_stops_while_the_neki_topology_leaves_a_tenant_table_unbound() {
         .expect_err("a later gap fails the job")
         .to_string();
     assert!(
-        drift.contains("migrations are applied, but") && drift.contains("tenant_lease"),
+        drift.contains("migrations are applied, but") && drift.contains("lease"),
         "{drift}"
     );
 }

@@ -64,11 +64,12 @@ async fn without_a_usable_key_the_binary_exits_before_claiming_a_tenant() {
         assert_eq!(out.status.code(), Some(1), "{log}");
         assert!(log.contains(expected), "{log}");
     }
-    let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_lease WHERE tenant_id = $1")
-        .bind(&tenant)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let leases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM lease WHERE tenant_id = $1 AND scope = 'tenant'")
+            .bind(&tenant)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(leases, 0, "no tenant was claimed");
     assert!(
         !home.path().join("intent").exists()

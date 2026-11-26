@@ -35,10 +35,12 @@ const RETRY_MIN: Duration = Duration::from_millis(50);
 const RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// A renewal's result: as [`Store::renew_lease`].
-type Renewal<'a> = Pin<Box<dyn Future<Output = intent_core::Result<bool>> + Send + 'a>>;
+pub(crate) type Renewal<'a> = Pin<Box<dyn Future<Output = intent_core::Result<bool>> + Send + 'a>>;
 
-/// What the renewer renews through: the store, or a test double.
-trait Renew: Send + Sync + 'static {
+/// What the renewer renews through: the store, the tenant lease
+/// (`postgres/lease.rs`), or a test double. A renewer other than the store
+/// records a kept renewal on the lease itself (`Lease::renewed`).
+pub(crate) trait Renew: Send + Sync + 'static {
     fn renew<'a>(&'a self, lease: &'a mut Lease, ttl: Duration) -> Renewal<'a>;
 }
 
@@ -113,12 +115,23 @@ impl LeaseKeeper {
 
     /// [`Self::keep`], renewing through `renewer`.
     fn keep_with(renewer: impl Renew, lease: Lease) -> Self {
+        Self::keep_with_margin(renewer, lease, Duration::ZERO)
+    }
+
+    /// [`Self::keep_with`], with the fence firing once no renewal succeeded
+    /// by the lease's local deadline minus `margin` (capped at half the
+    /// TTL), while the lease is still held: work under it stops before
+    /// another process can acquire it. Each renewal is bounded by that
+    /// deadline too.
+    pub(crate) fn keep_with_margin(renewer: impl Renew, lease: Lease, margin: Duration) -> Self {
+        let margin = margin.min(lease.ttl() / 2);
         let (tx, rx) = watch::channel(None);
         let scope = lease.scope().to_owned();
         let key = lease.key().to_owned();
         let token = lease.token();
         let lease = Arc::new(Mutex::new(Some(lease)));
-        let renewer = intent_core::spawn_daemon(renew_until_lost(renewer, Arc::clone(&lease), tx));
+        let renewer =
+            intent_core::spawn_daemon(renew_until_lost(renewer, Arc::clone(&lease), margin, tx));
         Self {
             scope,
             key,
@@ -171,6 +184,15 @@ impl LeaseKeeper {
         self.lease.lock().await
     }
 
+    /// Stops renewing and hands the lease back without releasing it, for a
+    /// holder that releases it its own way (the tenant lease). `None` when
+    /// it was already taken.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn stop(self) -> Option<Lease> {
+        self.renewer.abort();
+        self.lease.lock().await.take()
+    }
+
     /// Stops renewing and frees the lease at once (a clean stop). Best
     /// effort: a failed release lapses after the TTL.
     pub async fn release(self, store: &Store) {
@@ -194,14 +216,16 @@ impl Drop for LeaseKeeper {
     }
 }
 
-/// The renewer: at each half TTL renews the lease for its TTL. A renewal
+/// The renewer: halfway to each fence deadline (at each half TTL with no
+/// margin) renews the lease for its TTL. A renewal
 /// that reports the lease lost fires the fence; one that fails is retried
-/// (backing off) until it succeeds or the lease ran out, which fires it.
-/// A renewal that does not answer within the lease's remaining time fires
-/// it too: the lease can no longer be proven held.
+/// (backing off) until it succeeds or the lease ran out (its remaining time
+/// reached `margin`), which fires it. A renewal that does not answer within
+/// that time fires it too: the lease can no longer be proven held.
 async fn renew_until_lost(
     store: impl Renew,
     lease: Arc<Mutex<Option<Lease>>>,
+    margin: Duration,
     fence: watch::Sender<Option<String>>,
 ) {
     let mut retry = RETRY_MIN;
@@ -209,21 +233,24 @@ async fn renew_until_lost(
         let wait = {
             let held = lease.lock().await;
             let Some(held) = held.as_ref() else { return };
-            held.remaining().saturating_sub(held.ttl() / 2)
+            // Halfway to the fence deadline (the TTL less the margin), so
+            // half that time is left to retry: half the TTL with no margin.
+            let due_left = margin + held.ttl().saturating_sub(margin) / 2;
+            held.remaining().saturating_sub(due_left)
         };
         tokio::time::sleep(wait).await;
         let mut held = lease.lock().await;
         let Some(current) = held.as_mut() else { return };
         let ttl = current.ttl();
-        let left = current.remaining();
+        let left = current.remaining().saturating_sub(margin);
         // Bounded by the lease's own remaining time: past it the lease is unproven.
         let Ok(renewed) = tokio::time::timeout(left, store.renew(current, ttl)).await else {
             tracing::warn!(
                 scope = current.scope(),
-                "lease renewal did not answer before expiry; fencing"
+                "lease renewal did not answer before the fence deadline; fencing"
             );
             fence.send_replace(Some(
-                "lease renewal did not answer before the lease expired".to_owned(),
+                "lease renewal did not answer before the lease's fence deadline".to_owned(),
             ));
             return;
         };
@@ -231,18 +258,22 @@ async fn renew_until_lost(
             Ok(true) => retry = RETRY_MIN,
             Ok(false) => {
                 tracing::info!(scope = current.scope(), "lease lost");
-                fence.send_replace(Some("lease lost to another holder".to_owned()));
+                fence.send_replace(Some(
+                    "lease lost: another holder took it, or its holder stopped renewing".to_owned(),
+                ));
                 return;
             }
             Err(e) => {
-                let left = current.remaining();
+                let left = current.remaining().saturating_sub(margin);
                 if left.is_zero() {
                     tracing::warn!(
                         scope = current.scope(),
                         error = %e,
-                        "lease renewal failed past expiry; fencing"
+                        "lease renewal kept failing until the fence deadline; fencing"
                     );
-                    fence.send_replace(Some(format!("lease renewal failed past expiry: {e}")));
+                    fence.send_replace(Some(format!(
+                        "lease renewal kept failing until the lease's deadline: {e}"
+                    )));
                     return;
                 }
                 tracing::warn!(scope = current.scope(), error = %e, "lease renewal failed; retrying");
@@ -365,6 +396,46 @@ mod tests {
             guard.is_some(),
             "the fence fired but the lease is still kept"
         );
+    }
+
+    /// With a fence margin the fence fires while the lease is still held
+    /// (paused clock: the hung renewal's bound decides alone).
+    #[tokio::test]
+    async fn a_fence_margin_fires_while_the_lease_is_still_held() {
+        let (store, _dir) = sqlite().await;
+        tokio::time::pause();
+        let ttl = Duration::from_secs(60);
+        let margin = Duration::from_secs(10);
+        let lease = store.acquire_lease("scan", "", ttl).await.unwrap().unwrap();
+        let keeper = LeaseKeeper::keep_with_margin(HungRenewal, lease, margin);
+        keeper.fired().await;
+        let guard = keeper.lease().await;
+        let lease = guard.as_ref().expect("still kept");
+        // The timer rounds to whole milliseconds.
+        assert!(
+            lease.remaining() + Duration::from_millis(1) >= margin,
+            "fired with {:?} left, under the {margin:?} margin",
+            lease.remaining()
+        );
+        assert!(store.lease_is_held(lease).await.unwrap());
+    }
+
+    /// A margin of half the TTL still leaves time to renew: the renewal is
+    /// due halfway to the fence deadline, not at half the TTL.
+    #[tokio::test]
+    async fn a_keeper_with_a_margin_renews_before_its_deadline() {
+        let (store, _dir) = sqlite().await;
+        tokio::time::pause();
+        let ttl = Duration::from_secs(60);
+        let lease = store.acquire_lease("scan", "", ttl).await.unwrap().unwrap();
+        let keeper = LeaseKeeper::keep_with_margin(store.clone(), lease, ttl / 2);
+        // timing-guard: paused clock; ten TTLs pass only through renewals
+        tokio::time::sleep(ttl * 10).await;
+        assert!(!keeper.is_fired(), "{:?}", keeper.fence().reason());
+        assert!(store
+            .lease_is_held(keeper.lease().await.as_ref().unwrap())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

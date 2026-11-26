@@ -1,9 +1,11 @@
 //! The fenced tenant lease: one orchestrator process owns a tenant at a
-//! time. A claim succeeds when the tenant has no lease or its lease expired,
-//! and bumps the tenant's epoch; every write then compares the locked
-//! `tenant_writer` row's owner and epoch with its store's claim, so a write
-//! by a process that lost the tenant fails `Error::NotOwner` and writes
-//! nothing, also when it waited behind the takeover for the writer lock.
+//! time. It is the store lease of scope `tenant`. A claim succeeds when the
+//! tenant has no lease or its lease expired or was released, and bumps the
+//! lease token (the tenant's epoch); every write then compares the tenant
+//! lease, read once it holds the writer lock, with its store's claim, so a
+//! write by a process that lost the tenant fails `Error::NotOwner` and
+//! writes nothing, also when it waited behind the takeover for the writer
+//! lock. Leases of other scopes do not move on a takeover.
 //!
 //! Each "process" here is a store opened through the `*_as_process` test
 //! seams: its own process-local gates and claim, as between two daemons.
@@ -11,7 +13,7 @@
 use std::time::Duration;
 
 use intent_store::postgres::{
-    self, LeaseHeartbeat, LeaseState, PgPool, PostgresOptions, TenantClaim, TenantId, TenantLease,
+    self, PgPool, PostgresOptions, TenantClaim, TenantId, TenantLease, TenantLeaseKeeper,
     WriterLimits,
 };
 use intent_store::{Error, Store};
@@ -70,38 +72,38 @@ async fn open_unclaimed(pool: &PgPool, tenant: &str, process: &str) -> intent_st
     .await
 }
 
-/// The tenant's lease and writer rows as `(owner, epoch)` pairs, read on
-/// the admin pool.
-async fn owner_rows(
-    admin: &PgPool,
-    tenant: &str,
-) -> (Option<(String, i64)>, (Option<String>, i64)) {
-    let lease =
-        sqlx::query_as("SELECT owner_instance, epoch FROM tenant_lease WHERE tenant_id = $1")
-            .bind(tenant)
-            .fetch_optional(admin)
-            .await
-            .expect("read tenant_lease");
-    let writer =
-        sqlx::query_as("SELECT owner_instance, epoch FROM tenant_writer WHERE tenant_id = $1")
-            .bind(tenant)
-            .fetch_one(admin)
-            .await
-            .expect("read tenant_writer");
-    (lease, writer)
+/// The tenant lease row, after `SELECT <columns>`.
+const TENANT_LEASE_ROW: &str =
+    " FROM lease WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''";
+
+fn tenant_lease_query(columns: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!("SELECT {columns}{TENANT_LEASE_ROW}"))
+}
+
+/// The tenant lease row as `(holder, token)`, read on the admin pool.
+async fn owner_rows(admin: &PgPool, tenant: &str) -> Option<(Option<String>, i64)> {
+    sqlx::query_as(tenant_lease_query("holder, token"))
+        .bind(tenant)
+        .fetch_optional(admin)
+        .await
+        .expect("read the tenant lease")
+}
+
+#[expect(clippy::unnecessary_wraps, reason = "compared with owner_rows")]
+fn held_by(instance: &str, epoch: i64) -> Option<(Option<String>, i64)> {
+    Some((Some(instance.to_owned()), epoch))
 }
 
 /// Wait until the tenant's lease has expired by the database clock.
 async fn wait_for_expiry(admin: &PgPool, tenant: &str) {
     tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
         loop {
-            let expired: bool = sqlx::query_scalar(
-                "SELECT expires_at <= clock_timestamp() FROM tenant_lease WHERE tenant_id = $1",
-            )
-            .bind(tenant)
-            .fetch_one(admin)
-            .await
-            .expect("read lease expiry");
+            let expired: bool =
+                sqlx::query_scalar(tenant_lease_query("expires_at <= clock_timestamp()"))
+                    .bind(tenant)
+                    .fetch_one(admin)
+                    .await
+                    .expect("read lease expiry");
             if expired {
                 return;
             }
@@ -146,13 +148,7 @@ async fn the_first_claim_owns_the_tenant_at_epoch_one() {
     assert_eq!(lease.instance, "proc-a");
     assert_eq!(lease.epoch, 1);
     assert!(lease.expires_at > time::OffsetDateTime::now_utc());
-    assert_eq!(
-        owner_rows(&db.admin, tenant).await,
-        (
-            Some(("proc-a".to_owned(), 1)),
-            (Some("proc-a".to_owned()), 1)
-        )
-    );
+    assert_eq!(owner_rows(&db.admin, tenant).await, held_by("proc-a", 1));
     // The owner writes, and the open provisioned the tenant under its claim.
     store.set_setting("userRules", "\"a\"").await.unwrap();
     assert!(store.daemon_id().await.is_ok());
@@ -301,13 +297,7 @@ async fn after_the_owner_stops_renewing_another_takes_over_and_the_old_owner_is_
         .unwrap();
     assert_eq!(second.epoch, first.epoch + 1);
     assert_eq!(second.instance, "proc-b");
-    assert_eq!(
-        owner_rows(&db.admin, tenant).await,
-        (
-            Some(("proc-b".to_owned(), 2)),
-            (Some("proc-b".to_owned()), 2)
-        )
-    );
+    assert_eq!(owner_rows(&db.admin, tenant).await, held_by("proc-b", 2));
     let before = tenant_rows(&db.admin, tenant).await;
 
     // The old owner's write fails and writes nothing.
@@ -381,10 +371,9 @@ async fn renew_extends_the_expiry_and_keeps_the_epoch() {
         "{renewed} vs {}",
         lease.expires_at
     );
-    let (row_epoch, row_expiry_ms): (i64, i64) = sqlx::query_as(
-        "SELECT epoch, (extract(epoch FROM expires_at) * 1000)::bigint FROM tenant_lease \
-         WHERE tenant_id = $1",
-    )
+    let (row_epoch, row_expiry_ms): (i64, i64) = sqlx::query_as(tenant_lease_query(
+        "token, (extract(epoch FROM expires_at) * 1000)::bigint",
+    ))
     .bind(tenant)
     .fetch_one(&db.admin)
     .await
@@ -417,68 +406,85 @@ async fn an_unclaimed_store_has_no_lease_to_renew() {
     );
 }
 
-#[tokio::test]
-async fn the_heartbeat_renews_and_reports_a_lost_lease() {
-    let Some(db) = test_db(false).await else {
-        return;
-    };
-    let tenant = "lease-heartbeat";
-    let (store, lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
-        .await
-        .unwrap();
-    let mut heartbeat = LeaseHeartbeat::spawn(store, &lease, LONG_TTL, Duration::from_millis(50));
-    let mut state = heartbeat.state();
-    // It renews: the expiry moves forward.
+/// A keeper's claim TTL: renewals come about every 1.25 s (halfway to the
+/// fence deadline, a sixth of the TTL before expiry), with as long again to
+/// retry before the fence fires.
+const KEEPER_TTL: Duration = Duration::from_secs(3);
+
+/// Wait until the tenant lease's expiry moves past `after` (epoch ms): a
+/// renewal landed.
+async fn wait_for_renewal(admin: &PgPool, tenant: &str, after: i64) -> i64 {
     tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
         loop {
-            state.changed().await.expect("heartbeat runs");
-            if let LeaseState::Held { expires_at } = *state.borrow() {
-                if expires_at > lease.expires_at {
-                    return;
-                }
+            let now = lease_expiry_ms(admin, tenant).await;
+            if now > after {
+                return now;
             }
+            // timing-guard: poll interval while waiting for the keeper's next renewal
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the heartbeat renews");
+    .expect("the keeper renews")
+}
 
-    // Another process takes the tenant (as a takeover would): the next
-    // renewal fails and the heartbeat surfaces it and stops.
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "BEGIN; \
-         UPDATE tenant_writer SET owner_instance = 'proc-b', epoch = epoch + 1 \
-         WHERE tenant_id = '{tenant}'; \
-         UPDATE tenant_lease SET owner_instance = 'proc-b', epoch = epoch + 1 \
-         WHERE tenant_id = '{tenant}'; \
-         COMMIT;"
+/// Another process takes the tenant lease, as a claim would.
+async fn take_over(admin: &PgPool, tenant: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE lease SET holder = 'proc-b', lease_id = 'taken', token = token + 1{}",
+        TENANT_LEASE_ROW.replacen(" FROM lease", "", 1)
     )))
-    .execute(&db.admin)
+    .bind(tenant)
+    .execute(admin)
     .await
-    .unwrap();
-    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), heartbeat.lost())
+    .expect("take the tenant lease over");
+}
+
+#[tokio::test]
+async fn the_keeper_renews_and_reports_a_lost_lease() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-keeper";
+    let (store, lease) = open_owned(&db.app, tenant, "proc-a", KEEPER_TTL)
         .await
-        .expect("the heartbeat reports the loss");
-    assert!(matches!(lost, Error::NotOwner(_)), "{lost:?}");
-    assert!(matches!(*heartbeat.state().borrow(), LeaseState::Lost(_)));
+        .unwrap();
+    let claimed = lease_expiry_ms(&db.admin, tenant).await;
+    let mut keeper = TenantLeaseKeeper::spawn(store, lease);
+    // It renews: the expiry moves forward.
+    wait_for_renewal(&db.admin, tenant, claimed).await;
+    assert!(keeper.lost_reason().is_none());
+
+    // Another process takes the tenant: the next renewal fails and the
+    // keeper surfaces it and stops.
+    take_over(&db.admin, tenant).await;
+    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), keeper.lost())
+        .await
+        .expect("the keeper reports the loss");
+    match lost {
+        Error::NotOwner(message) => assert!(
+            message.contains("taken over"),
+            "lost to the takeover, not a lapse: {message}"
+        ),
+        other => panic!("expected NotOwner, got {other:?}"),
+    }
+    assert!(keeper.fence().is_fenced());
 }
 
 /// The lease row's expiry has passed by the database clock.
 async fn lease_expired(admin: &PgPool, tenant: &str) -> bool {
-    sqlx::query_scalar(
-        "SELECT expires_at <= clock_timestamp() FROM tenant_lease WHERE tenant_id = $1",
-    )
-    .bind(tenant)
-    .fetch_one(admin)
-    .await
-    .expect("read lease expiry")
+    sqlx::query_scalar(tenant_lease_query("expires_at <= clock_timestamp()"))
+        .bind(tenant)
+        .fetch_one(admin)
+        .await
+        .expect("read lease expiry")
 }
 
 /// The lease row's expiry, in epoch milliseconds.
 async fn lease_expiry_ms(admin: &PgPool, tenant: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM tenant_lease \
-         WHERE tenant_id = $1",
-    )
+    sqlx::query_scalar(tenant_lease_query(
+        "(extract(epoch FROM expires_at) * 1000)::bigint",
+    ))
     .bind(tenant)
     .fetch_one(admin)
     .await
@@ -512,14 +518,8 @@ async fn a_released_lease_is_claimed_at_once_with_the_next_epoch() {
     fence.fire("stopping");
     assert!(old.release_tenant_lease(first.epoch).await.unwrap());
     assert!(lease_expired(&db.admin, tenant).await);
-    // The row still names the old claim until someone claims.
-    assert_eq!(
-        owner_rows(&db.admin, tenant).await,
-        (
-            Some(("proc-a".to_owned(), 1)),
-            (Some("proc-a".to_owned()), 1)
-        )
-    );
+    // The row is free and keeps its token, so the next claim's is higher.
+    assert_eq!(owner_rows(&db.admin, tenant).await, Some((None, 1)));
 
     // Long before the 60 s TTL: another process claims at once, epoch + 1.
     let (new, second) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
@@ -631,31 +631,28 @@ async fn a_release_waits_for_a_write_that_passed_the_fence() {
 }
 
 #[tokio::test]
-async fn the_heartbeat_releases_its_lease_after_the_fence_fired() {
+async fn the_keeper_releases_its_lease_after_the_fence_fired() {
     let Some(db) = test_db(false).await else {
         return;
     };
-    let tenant = "lease-release-heartbeat";
+    let tenant = "lease-release-keeper";
     let (store, lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
         .await
         .unwrap();
-    let heartbeat = LeaseHeartbeat::spawn(
-        store.clone(),
-        &lease,
-        LONG_TTL,
-        postgres::LEASE_RENEW_INTERVAL,
-    );
+    let epoch = lease.epoch;
+    let keeper = TenantLeaseKeeper::spawn(store.clone(), lease);
+    assert_eq!(keeper.epoch(), epoch);
     assert!(matches!(
-        heartbeat.release().await,
+        keeper.release().await,
         Err(Error::InvalidParams(_))
     ));
-    heartbeat.fence().fire("stopping");
-    assert!(heartbeat.release().await.unwrap());
+    keeper.fence().fire("stopping");
+    assert!(keeper.release().await.unwrap());
     assert!(lease_expired(&db.admin, tenant).await);
     let (_next, next) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
         .await
         .expect("claimed at once");
-    assert_eq!(next.epoch, lease.epoch + 1);
+    assert_eq!(next.epoch, epoch + 1);
 }
 
 #[tokio::test]
@@ -684,18 +681,20 @@ async fn sqlite_stores_have_no_tenant_lease() {
 #[test]
 fn the_lease_constants_suit_the_neki_router_timeouts() {
     // Neki's router ends a transaction idle for 5 min and a session idle for
-    // 30 min; renewals are single statements well inside both, and a
-    // renewal is due several times per TTL.
+    // 30 min; renewals are single statements well inside both, due before
+    // half the TTL, and the fence margin is a sixth of it.
     assert!(postgres::LEASE_TTL <= Duration::from_secs(60));
-    assert!(postgres::LEASE_RENEW_INTERVAL * 3 <= postgres::LEASE_TTL);
-    assert!(postgres::LEASE_RENEW_INTERVAL < Duration::from_secs(5 * 60));
+    assert!(postgres::LEASE_TTL / 2 < Duration::from_secs(5 * 60));
+    assert_eq!(postgres::LEASE_FENCE_MARGIN * 6, postgres::LEASE_TTL);
 }
 
-/// Sessions of `admin`'s database waiting for a `tenant_lease` row lock.
+/// Sessions of `admin`'s database waiting for a `lease` row lock (a claim's
+/// acquire or a renewal).
 async fn lease_lock_waiters(admin: &PgPool) -> usize {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
-         AND datname = current_database() AND query LIKE '%tenant_lease%'",
+         AND datname = current_database() \
+         AND (query LIKE '%INTO lease %' OR query LIKE '%UPDATE lease %')",
     )
     .fetch_one(admin)
     .await
@@ -712,18 +711,6 @@ async fn wait_for_lease_waiters(admin: &PgPool, n: usize) {
     })
     .await
     .unwrap_or_else(|_| panic!("{n} sessions wait for the lease row lock"));
-}
-
-/// When the lease was last renewed, by the database clock (epoch ms).
-async fn renewed_at(admin: &PgPool, tenant: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT (extract(epoch FROM renewed_at) * 1000)::bigint FROM tenant_lease \
-         WHERE tenant_id = $1",
-    )
-    .bind(tenant)
-    .fetch_one(admin)
-    .await
-    .expect("read renewed_at")
 }
 
 /// Until another process claims, an expired lease is still this process's:
@@ -761,11 +748,13 @@ async fn a_renewal_queued_behind_a_takeover_fails_not_owner() {
 
     // Hold the lease row so the takeover queues on it first, then the renewal.
     let mut holder = db.admin.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE")
-        .bind(tenant)
-        .fetch_one(&mut *holder)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1{TENANT_LEASE_ROW} FOR UPDATE"
+    )))
+    .bind(tenant)
+    .fetch_one(&mut *holder)
+    .await
+    .unwrap();
     let pool = db.app.clone();
     let takeover = tokio::spawn(async move { open_owned(&pool, tenant, "proc-b", LONG_TTL).await });
     wait_for_lease_waiters(&db.admin, 1).await;
@@ -777,19 +766,13 @@ async fn a_renewal_queued_behind_a_takeover_fails_not_owner() {
     let (_new, lease) = takeover.await.unwrap().expect("the takeover claims");
     assert_eq!(lease.epoch, 2);
     assert_not_owner(renewal.await.unwrap(), "the queued renewal");
-    assert_eq!(
-        owner_rows(&db.admin, tenant).await,
-        (
-            Some(("proc-b".to_owned(), 2)),
-            (Some("proc-b".to_owned()), 2)
-        )
-    );
+    assert_eq!(owner_rows(&db.admin, tenant).await, held_by("proc-b", 2));
 }
 
 /// Renewals that keep failing for another reason (here, a closed pool) are
 /// retried until the lease's local deadline, then reported as a lapse.
 #[tokio::test]
-async fn the_heartbeat_reports_a_lapse_when_renewals_keep_failing() {
+async fn the_keeper_reports_a_lapse_when_renewals_keep_failing() {
     let Some(db) = test_db(false).await else {
         return;
     };
@@ -798,54 +781,190 @@ async fn the_heartbeat_reports_a_lapse_when_renewals_keep_failing() {
     let (store, lease) = open_owned(&pool, tenant, "proc-a", SHORT_TTL)
         .await
         .unwrap();
-    let mut heartbeat = LeaseHeartbeat::spawn(store, &lease, SHORT_TTL, Duration::from_millis(50));
+    let mut keeper = TenantLeaseKeeper::spawn(store, lease);
     pool.close().await;
-    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), heartbeat.lost())
+    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), keeper.lost())
         .await
-        .expect("the heartbeat reports the lapse");
+        .expect("the keeper reports the lapse");
     match lost {
-        Error::NotOwner(message) => assert!(message.contains("lapsed"), "{message}"),
+        Error::NotOwner(message) => assert!(message.contains("renewal"), "{message}"),
         other => panic!("expected a NotOwner lapse, got {other:?}"),
     }
-    assert!(matches!(*heartbeat.state().borrow(), LeaseState::Lost(_)));
+    assert!(keeper.lost_reason().is_some());
 }
 
 /// A `lost()` wait that is cancelled (as in a `select!` on shutdown) leaves
-/// the heartbeat in place, and dropping the heartbeat stops renewals, so
-/// the lease can lapse and another process take over.
+/// the keeper in place, and dropping the keeper stops renewals, so the
+/// lease can lapse and another process take over.
 #[tokio::test]
-async fn dropping_the_heartbeat_after_a_cancelled_wait_stops_renewals() {
+async fn dropping_the_keeper_after_a_cancelled_wait_stops_renewals() {
     let Some(db) = test_db(false).await else {
         return;
     };
     let tenant = "lease-drop";
-    let (store, lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+    let (store, lease) = open_owned(&db.app, tenant, "proc-a", KEEPER_TTL)
         .await
         .unwrap();
-    let interval = Duration::from_millis(50);
-    let mut heartbeat = LeaseHeartbeat::spawn(store, &lease, LONG_TTL, interval);
-    let mut state = heartbeat.state();
-    tokio::time::timeout(test_timeout(Duration::from_secs(30)), state.changed())
-        .await
-        .expect("a renewal")
-        .expect("heartbeat runs");
-    // A cancelled wait: the heartbeat keeps running and can still report.
+    let claimed = lease_expiry_ms(&db.admin, tenant).await;
+    let mut keeper = TenantLeaseKeeper::spawn(store, lease);
+    let renewed = wait_for_renewal(&db.admin, tenant, claimed).await;
+    // A cancelled wait: the keeper keeps running and can still report.
     assert!(
-        tokio::time::timeout(test_timeout(interval * 2), heartbeat.lost())
+        tokio::time::timeout(test_timeout(Duration::from_millis(100)), keeper.lost())
             .await
             .is_err(),
         "the lease is held, so lost() is still pending"
     );
-    tokio::time::timeout(test_timeout(Duration::from_secs(30)), state.changed())
-        .await
-        .expect("renewals go on after the cancelled wait")
-        .expect("heartbeat runs");
+    wait_for_renewal(&db.admin, tenant, renewed).await;
 
-    drop(heartbeat);
-    // timing-guard: let a renewal already on the wire when the task was aborted settle
-    tokio::time::sleep(interval * 2).await;
-    let before = renewed_at(&db.admin, tenant).await;
-    // timing-guard: several renew intervals with no heartbeat, to see that none renews
-    tokio::time::sleep(interval * 10).await;
-    assert_eq!(renewed_at(&db.admin, tenant).await, before);
+    drop(keeper);
+    // With no keeper the lease lapses (a renewal already on the wire when
+    // the task was aborted can extend it once at most), and another
+    // process takes the tenant over.
+    wait_for_expiry(&db.admin, tenant).await;
+    let (_next, next) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .expect("the lapsed lease is claimed");
+    assert_eq!(next.epoch, 2);
+}
+
+/// The fence holds only at READ COMMITTED: under REPEATABLE READ a writer's
+/// snapshot predates its lock wait and would show the old tenant lease, so
+/// a writer at any other isolation level is refused before it writes.
+#[tokio::test]
+async fn a_writer_not_at_read_committed_is_refused() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-isolation";
+    let (owner, _) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    owner.set_setting("userRules", "\"a\"").await.unwrap();
+    let before = tenant_rows(&db.admin, tenant).await;
+    // A database whose sessions default to REPEATABLE READ (test database
+    // only): new connections inherit it.
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER DATABASE \"{name}\" SET default_transaction_isolation = 'repeatable read'"
+    )))
+    .execute(&db.admin)
+    .await
+    .expect("set the database default");
+    let repeatable = postgres::connect(&db.url, 2).await.unwrap();
+    match open_owned(&repeatable, tenant, "proc-b", LONG_TTL).await {
+        Err(Error::Internal(message)) => {
+            assert!(message.contains("READ COMMITTED"), "{message}");
+        }
+        Err(other) => panic!("expected the isolation refusal, got {other:?}"),
+        Ok(_) => panic!("a REPEATABLE READ writer claimed the tenant"),
+    }
+    assert_eq!(tenant_rows(&db.admin, tenant).await, before);
+}
+
+/// How many processes race for one tenant.
+const CONTENDERS: usize = 8;
+
+/// Processes that claim the tenant at once: exactly one owns it, at the
+/// first epoch; every other sees `AlreadyOwned` naming the winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_have_one_winner() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-race";
+    let mut stores = Vec::new();
+    for n in 0..CONTENDERS {
+        stores.push(
+            open_unclaimed(&db.app, tenant, &format!("proc-{n}"))
+                .await
+                .unwrap(),
+        );
+    }
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+    let claims: Vec<_> = stores
+        .into_iter()
+        .enumerate()
+        .map(|(n, store)| {
+            let start = std::sync::Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                let claim = store.claim_tenant(&format!("proc-{n}"), LONG_TTL).await;
+                (n, store, claim.expect("a claim answers"))
+            })
+        })
+        .collect();
+    let mut winners = Vec::new();
+    let mut refused = Vec::new();
+    for claim in claims {
+        match claim.await.unwrap() {
+            (n, store, TenantClaim::TenantOwned(lease)) => winners.push((n, store, lease)),
+            (_, _, TenantClaim::AlreadyOwned { owner, .. }) => refused.push(owner),
+        }
+    }
+    assert_eq!(winners.len(), 1, "one claim wins");
+    let (n, store, lease) = winners.pop().unwrap();
+    let winner = format!("proc-{n}");
+    assert_eq!(lease.epoch, 1);
+    assert!(refused.iter().all(|owner| *owner == winner), "{refused:?}");
+    assert_eq!(owner_rows(&db.admin, tenant).await, held_by(&winner, 1));
+    store.set_setting("userRules", "\"won\"").await.unwrap();
+}
+
+/// A tenant takeover moves only the tenant lease: a lease of another scope
+/// the old owner holds keeps its holder, token and expiry, stays held and
+/// renewable, and the new owner cannot acquire it.
+#[tokio::test]
+async fn a_takeover_moves_only_the_tenant_lease() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-takeover-scopes";
+    let (old, _) = open_owned(&db.app, tenant, "proc-a", SHORT_TTL)
+        .await
+        .unwrap();
+    let mut link = old
+        .acquire_lease("machine-link", "m1", LONG_TTL)
+        .await
+        .unwrap()
+        .expect("a free key");
+    let others = || async {
+        sqlx::query_as::<_, (String, String, Option<String>, Option<String>, i64, i64)>(
+            "SELECT scope, lease_key, holder, lease_id, token, \
+             (extract(epoch FROM expires_at) * 1000)::bigint \
+             FROM lease WHERE tenant_id = $1 AND scope <> 'tenant' ORDER BY scope, lease_key",
+        )
+        .bind(tenant)
+        .fetch_all(&db.admin)
+        .await
+        .expect("read the other leases")
+    };
+    let before = others().await;
+    assert_eq!(before.len(), 1);
+    wait_for_expiry(&db.admin, tenant).await;
+
+    let (new, second) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .unwrap();
+    assert_eq!(second.epoch, 2);
+    assert_eq!(others().await, before, "the takeover left the other leases");
+    assert!(new.lease_is_held(&link).await.unwrap());
+    assert!(new
+        .acquire_lease("machine-link", "m1", LONG_TTL)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        old.renew_lease(&mut link, LONG_TTL).await.unwrap(),
+        "the old owner keeps its link lease"
+    );
+    assert_eq!(link.token(), 1);
+    // The tenant fence still refuses the old owner's tenant writes.
+    assert_not_owner(
+        old.set_setting("userRules", "\"stale\"").await,
+        "the old owner's write",
+    );
 }

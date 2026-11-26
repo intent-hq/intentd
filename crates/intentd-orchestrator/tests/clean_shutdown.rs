@@ -31,16 +31,17 @@ fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(60))
 }
 
-/// The tenant's lease row: owner, epoch, and whether it has expired.
-async fn lease(pool: &PgPool, tenant: &str) -> Option<(String, i64, bool)> {
+/// The tenant's lease row: owner (`None` once released), epoch, and
+/// whether it has expired.
+async fn lease(pool: &PgPool, tenant: &str) -> Option<(Option<String>, i64, bool)> {
     sqlx::query_as(
-        "SELECT owner_instance, epoch, expires_at <= clock_timestamp() FROM tenant_lease \
-         WHERE tenant_id = $1",
+        "SELECT holder, token, expires_at <= clock_timestamp() FROM lease \
+         WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
     )
     .bind(tenant)
     .fetch_optional(pool)
     .await
-    .expect("read tenant_lease")
+    .expect("read the tenant lease")
 }
 
 #[tokio::test]
@@ -75,7 +76,7 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
     let claimed = tokio::time::timeout(wait(), async {
         loop {
             if let Some(row) = lease(&pool, &tenant).await {
-                if row.0 == instance {
+                if row.0.as_deref() == Some(instance.as_str()) {
                     return row;
                 }
             }
@@ -99,9 +100,9 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
         .expect("the orchestrator exits on SIGTERM");
     assert_eq!(exited.code(), Some(0), "a clean stop exits 0: {exited:?}");
 
-    // Released: expired now, long before the 30 s TTL, still naming the old
-    // owner until someone claims.
-    assert_eq!(lease(&pool, &tenant).await, Some((instance, epoch, true)));
+    // Released: free and expired now, long before the 30 s TTL, keeping its
+    // token so the next claim's epoch is higher.
+    assert_eq!(lease(&pool, &tenant).await, Some((None, epoch, true)));
     let (standby, next) = Store::open_postgres_owned(
         pool.clone(),
         TenantId::new(&tenant).unwrap(),

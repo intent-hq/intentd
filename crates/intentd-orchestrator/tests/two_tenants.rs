@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use intent_app::tenant;
 use intent_core::tenant_fence::FenceStep;
-use intent_store::postgres::{self, LeaseState, PgPool};
+use intent_store::postgres::{self, PgPool};
 use intent_store::OrchestratorOnly;
 use intentd_orchestrator::serve::{serve_tenant, LeaseTiming};
 
@@ -54,7 +54,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     // A short lease for A, so its fence fires soon once renewals stop.
     let short = LeaseTiming {
         ttl: Duration::from_secs(4),
-        interval: Duration::from_millis(100),
+        margin: Duration::from_millis(500),
     };
     let mut a = serve_tenant(
         pool.clone(),
@@ -90,11 +90,14 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     // Block A's renewals only: hold A's lease row lock in an open
     // transaction, so every renewal waits until the heartbeat gives up.
     let mut blocker = pool.begin().await.expect("begin");
-    sqlx::query("SELECT 1 FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE")
-        .bind(&a_tenant)
-        .execute(&mut *blocker)
-        .await
-        .expect("lock A's lease row");
+    sqlx::query(
+        "SELECT 1 FROM lease WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = '' \
+         FOR UPDATE",
+    )
+    .bind(&a_tenant)
+    .execute(&mut *blocker)
+    .await
+    .expect("lock A's lease row");
 
     let report = tokio::time::timeout(wait(), a.stopped())
         .await
@@ -118,10 +121,7 @@ async fn a_tenant_whose_renewals_stop_is_fenced_alone() {
     );
 
     assert!(!b.fence().is_fenced(), "B keeps its lease");
-    assert!(matches!(
-        *b.heartbeat().state().borrow(),
-        LeaseState::Held { .. }
-    ));
+    assert!(b.lease().lost_reason().is_none(), "B's keeper still renews");
     assert_eq!(
         b.runtime().loops_running(),
         tenant::TENANT_LOOPS,

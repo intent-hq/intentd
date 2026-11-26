@@ -63,7 +63,8 @@ async fn wait_for_expiry(admin: &PgPool, tenant: &str) {
     tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
         loop {
             let expired: bool = sqlx::query_scalar(
-                "SELECT expires_at <= clock_timestamp() FROM tenant_lease WHERE tenant_id = $1",
+                "SELECT expires_at <= clock_timestamp() FROM lease \
+                 WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
             )
             .bind(tenant)
             .fetch_one(admin)

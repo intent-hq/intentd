@@ -5,7 +5,7 @@
 //! (`intent_store::postgres::lease`). Each claim of the lease gets its own
 //! [`TenantFence`]. It fires, once and for good, when:
 //!
-//! - the lease heartbeat cannot renew by the lease's expiry minus a margin,
+//! - the lease keeper cannot renew by the lease's expiry minus a margin,
 //!   is told the lease was taken over (`NotOwner`), or is dropped;
 //! - any write or renewal of the tenant in this process meets `NotOwner`
 //!   (another process claimed the tenant);

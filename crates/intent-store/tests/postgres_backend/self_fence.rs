@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use intent_core::tenant_fence::{FenceStep, SelfFence};
 use intent_core::{ActorType, EventActor, WorkspaceId};
 use intent_store::postgres::{
-    LeaseHeartbeat, PgPool, PostgresOptions, TenantId, TenantLease, WriterLimits,
+    PgPool, PostgresOptions, TenantId, TenantLease, TenantLeaseKeeper, WriterLimits,
 };
 use intent_store::{Error, NewEvent, Store, TenantFence};
 use intentd_test_support::test_timeout;
@@ -79,6 +79,19 @@ async fn event_rows(admin: &PgPool, tenant: &str) -> i64 {
         .expect("count event rows")
 }
 
+/// Another process takes the tenant lease, as a claim would.
+async fn take_over(admin: &PgPool, tenant: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {} SET holder = 'proc-b', lease_id = 'taken', token = token + 1 WHERE {}",
+        "lease",
+        TENANT_LEASE.trim_start_matches("lease WHERE ")
+    )))
+    .bind(tenant)
+    .execute(admin)
+    .await
+    .expect("take the tenant lease over");
+}
+
 #[track_caller]
 fn assert_not_owner<T: std::fmt::Debug>(result: intent_store::Result<T>, what: &str) -> String {
     match result {
@@ -93,12 +106,15 @@ async fn wait_fenced(fence: &TenantFence) {
         .expect("the fence fires");
 }
 
+/// The tenant lease row's filter (`$1` the tenant).
+const TENANT_LEASE: &str = "lease WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''";
+
 /// How long the tenant's lease has left by the database clock, in ms
 /// (negative once expired).
 async fn lease_left_ms(admin: &PgPool, tenant: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT (extract(epoch FROM expires_at - clock_timestamp()) * 1000)::bigint \
-         FROM tenant_lease WHERE tenant_id = $1",
+         FROM lease WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = ''",
     )
     .bind(tenant)
     .fetch_one(admin)
@@ -120,21 +136,15 @@ async fn blocked_renewals_fence_the_tenant_before_its_lease_expires() {
     let ttl = Duration::from_secs(4);
     let margin = Duration::from_secs(2);
     let (store, lease) = open_owned(&db.app, tenant, "proc-a", ttl).await;
-    let heartbeat = LeaseHeartbeat::spawn_with_margin(
-        store.clone(),
-        &lease,
-        ttl,
-        Duration::from_millis(100),
-        margin,
-    );
-    let fence = heartbeat.fence();
+    let keeper = TenantLeaseKeeper::spawn_with_margin(store.clone(), lease, margin);
+    let fence = keeper.fence();
     assert!(!fence.is_fenced());
     assert!(
         store
             .tenant_fence()
             .expect("a claimed store has a fence")
             .same_as(&fence),
-        "the heartbeat fires the store's own fence"
+        "the keeper fires the store's own fence"
     );
 
     // The tenant's serving side: each close records whether the lease was
@@ -179,11 +189,13 @@ async fn blocked_renewals_fence_the_tenant_before_its_lease_expires() {
 
     // Block every renewal: hold the lease row lock in an open transaction.
     let mut blocker = db.admin.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM tenant_lease WHERE tenant_id = $1 FOR UPDATE")
-        .bind(tenant)
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {TENANT_LEASE} FOR UPDATE"
+    )))
+    .bind(tenant)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
     let blocked_at = Instant::now();
 
     wait_fenced(&fence).await;
@@ -259,7 +271,7 @@ async fn blocked_renewals_fence_the_tenant_before_its_lease_expires() {
 }
 
 /// A write that meets `NotOwner` (another process took the tenant over)
-/// fires the fence at once, with no heartbeat running.
+/// fires the fence at once, with no keeper running.
 #[tokio::test]
 async fn a_not_owner_write_fires_the_fence() {
     let Some(db) = test_db(false).await else {
@@ -269,13 +281,7 @@ async fn a_not_owner_write_fires_the_fence() {
     let (store, _lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL).await;
     let fence = store.tenant_fence().expect("claimed");
     store.insert_event(&event(0)).await.unwrap();
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "UPDATE tenant_writer SET owner_instance = 'proc-b', epoch = epoch + 1 \
-         WHERE tenant_id = '{tenant}'"
-    )))
-    .execute(&db.admin)
-    .await
-    .unwrap();
+    take_over(&db.admin, tenant).await;
     assert!(!fence.is_fenced());
     assert_not_owner(
         store.insert_event(&event(1)).await,
@@ -299,13 +305,7 @@ async fn a_not_owner_renewal_fires_the_fence() {
     let tenant = "fence-renewal";
     let (store, _lease) = open_owned(&db.app, tenant, "proc-a", LONG_TTL).await;
     let fence = store.tenant_fence().expect("claimed");
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "UPDATE tenant_lease SET owner_instance = 'proc-b', epoch = epoch + 1 \
-         WHERE tenant_id = '{tenant}'"
-    )))
-    .execute(&db.admin)
-    .await
-    .unwrap();
+    take_over(&db.admin, tenant).await;
     assert_not_owner(
         store.renew_tenant_lease(LONG_TTL).await,
         "a renewal after takeover",
@@ -313,7 +313,7 @@ async fn a_not_owner_renewal_fires_the_fence() {
     assert!(fence.is_fenced());
 }
 
-/// A fence fired by the caller (or the heartbeat) refuses every later write
+/// A fence fired by the caller (or the keeper) refuses every later write
 /// and renewal locally, though the database still names this process; a
 /// new claim (after the lease expires) gets a new, unfired fence.
 #[tokio::test]
@@ -349,18 +349,18 @@ async fn a_fired_fence_holds_until_a_new_claim() {
     assert!(fence.is_fenced(), "the old claim's fence stays fired");
 }
 
-/// Dropping the heartbeat stops renewals, so the tenant is fenced: the
+/// Dropping the keeper stops renewals, so the tenant is fenced: the
 /// process can no longer promise to renew before the lease expires.
 #[tokio::test]
-async fn dropping_the_heartbeat_fires_the_fence() {
+async fn dropping_the_keeper_fires_the_fence() {
     let Some(db) = test_db(false).await else {
         return;
     };
     let (store, lease) = open_owned(&db.app, "fence-drop", "proc-a", LONG_TTL).await;
-    let heartbeat = LeaseHeartbeat::spawn(store.clone(), &lease, LONG_TTL, Duration::from_secs(10));
-    let fence = heartbeat.fence();
+    let keeper = TenantLeaseKeeper::spawn(store.clone(), lease);
+    let fence = keeper.fence();
     assert!(!fence.is_fenced());
-    drop(heartbeat);
+    drop(keeper);
     assert!(fence.is_fenced());
     assert_not_owner(
         store.insert_event(&event(0)).await,
@@ -444,42 +444,41 @@ async fn a_write_queued_before_the_fire_is_refused_and_settled_waits_for_it() {
     assert_eq!(event_rows(&db.admin, tenant).await, 0);
 }
 
-/// A renew interval longer than the time left before the renew deadline
-/// still renews before the deadline: the heartbeat never fences a healthy
-/// lease without trying to renew it.
+/// A healthy lease with a wide margin is renewed before its fence
+/// deadline: the keeper never fences a healthy lease without renewing it.
 #[tokio::test]
-async fn the_heartbeat_renews_before_a_deadline_closer_than_its_interval() {
+async fn the_keeper_renews_before_its_fence_deadline() {
     let Some(db) = test_db(false).await else {
         return;
     };
-    let ttl = Duration::from_secs(3);
-    let (store, lease) = open_owned(&db.app, "fence-short-deadline", "proc-a", ttl).await;
-    let heartbeat = LeaseHeartbeat::spawn_with_margin(
-        store,
-        &lease,
-        ttl,
-        Duration::from_secs(60),
-        Duration::from_millis(500),
-    );
-    let fence = heartbeat.fence();
+    let tenant = "fence-short-deadline";
+    // Renewal due after 1.5 s, with 1.5 s to retry before the fence.
+    let ttl = Duration::from_secs(4);
+    let (store, lease) = open_owned(&db.app, tenant, "proc-a", ttl).await;
+    let claimed = lease.expires_at;
+    let keeper = TenantLeaseKeeper::spawn_with_margin(store, lease, ttl / 4);
+    let fence = keeper.fence();
     // timing-guard: outlive two TTLs; with no renewal the fence would fire within one
     tokio::time::sleep(ttl * 2).await;
     assert!(!fence.is_fenced(), "{:?}", fence.reason());
-    let state = heartbeat.state().borrow().clone();
-    match state {
-        intent_store::postgres::LeaseState::Held { expires_at } => {
-            assert!(expires_at > lease.expires_at, "it renewed");
-        }
-        lost @ intent_store::postgres::LeaseState::Lost(_) => {
-            panic!("expected a held lease, got {lost:?}")
-        }
-    }
+    assert!(keeper.lost_reason().is_none());
+    let expires_ms: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT (extract(epoch FROM expires_at) * 1000)::bigint FROM {TENANT_LEASE}"
+    )))
+    .bind(tenant)
+    .fetch_one(&db.admin)
+    .await
+    .unwrap();
+    assert!(
+        i128::from(expires_ms) > claimed.unix_timestamp_nanos() / 1_000_000,
+        "it renewed"
+    );
 }
 
-/// A heartbeat started for a lease the process has since replaced with a
+/// A keeper started for a lease the process has since replaced with a
 /// newer claim stops at once and never fences the newer claim.
 #[tokio::test]
-async fn a_heartbeat_for_a_stale_lease_leaves_the_new_claim_alone() {
+async fn a_keeper_for_a_stale_lease_leaves_the_new_claim_alone() {
     let Some(db) = test_db(false).await else {
         return;
     };
@@ -493,30 +492,14 @@ async fn a_heartbeat_for_a_stale_lease_leaves_the_new_claim_alone() {
         intent_store::postgres::TenantClaim::TenantOwned(_)
     ));
     let current = store.tenant_fence().expect("claimed again");
-    let mut heartbeat =
-        LeaseHeartbeat::spawn(store.clone(), &stale, LONG_TTL, Duration::from_millis(50));
-    assert!(!heartbeat.fence().same_as(&current));
-    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), heartbeat.lost())
+    let mut keeper = TenantLeaseKeeper::spawn(store.clone(), stale);
+    assert!(!keeper.fence().same_as(&current));
+    let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), keeper.lost())
         .await
-        .expect("the stale heartbeat stops");
+        .expect("the stale keeper stops");
     assert!(matches!(lost, Error::NotOwner(_)), "{lost:?}");
-    drop(heartbeat);
+    drop(keeper);
     assert!(!current.is_fenced(), "{:?}", current.reason());
-    store.insert_event(&event(0)).await.unwrap();
-}
-
-/// `stop()` ends renewals without firing the fence (a clean shutdown that
-/// stops writing on its own); dropping the heartbeat fires it.
-#[tokio::test]
-async fn stopping_the_heartbeat_does_not_fire_the_fence() {
-    let Some(db) = test_db(false).await else {
-        return;
-    };
-    let (store, lease) = open_owned(&db.app, "fence-stop", "proc-a", LONG_TTL).await;
-    let heartbeat = LeaseHeartbeat::spawn(store.clone(), &lease, LONG_TTL, Duration::from_secs(10));
-    let fence = heartbeat.fence();
-    heartbeat.stop();
-    assert!(!fence.is_fenced(), "{:?}", fence.reason());
     store.insert_event(&event(0)).await.unwrap();
 }
 

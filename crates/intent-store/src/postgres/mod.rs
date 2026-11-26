@@ -56,8 +56,8 @@ pub use sqlx::postgres::PgPool;
 
 pub(crate) use agents::PreparedPgMonitorMessage;
 pub use lease::{
-    LeaseHeartbeat, LeaseHeld, LeaseState, OwnedOpen, TenantClaim, TenantLease, LEASE_FENCE_MARGIN,
-    LEASE_RENEW_INTERVAL, LEASE_TTL,
+    LeaseHeld, OwnedOpen, TenantClaim, TenantLease, TenantLeaseKeeper, LEASE_FENCE_MARGIN,
+    LEASE_TTL,
 };
 pub use neki_topology::{neki_topology_gap, NekiTopologyGap};
 pub use secrets::{SecretKeyring, TenantSecretStore, SECRET_KEY_LEN};
@@ -1217,31 +1217,39 @@ const WRITER_LIMITS_SQL: &str = "SELECT set_config('lock_timeout', $1, true), \
 /// tenant's shard (an advisory lock reads no table and carries no shard key).
 /// No row: the tenant has not written since the table was added.
 ///
-/// It returns the row's fence (owner instance and epoch, see [`WriterRow`]).
-/// The fence is compared in Rust, never in the `WHERE`: a stale epoch there
-/// would read as "no row" and send the writer down the seed path. At READ
-/// COMMITTED a `FOR UPDATE` that waited returns the newest committed
-/// version of the row, so a writer that queued behind a takeover sees the
-/// new owner.
+/// The tenant's fence (the tenant lease, see [`WriterRow`]) is read by the
+/// next statement, [`WRITER_RESET_SQL`], not here: a join or subquery in
+/// this statement would read the lease as of this statement's snapshot,
+/// taken before a wait for the lock, so a writer that queued behind a claim
+/// would see the old claim. At READ COMMITTED the next statement takes a
+/// new snapshot, after the lock was granted, and so sees every claim that
+/// committed before (a claim holds this lock until it commits).
 ///
-/// It also sets `intent.writer_tenant` to the tenant for the rest of the
+/// It sets `intent.writer_tenant` to the tenant for the rest of the
 /// transaction, in the same statement and so on the same shard as the lock.
 /// The `row_seq` trigger (`0001_schema.sql`) refuses an insert unless it names
 /// the row's tenant, so a row numbered from the tenant counter is always
-/// numbered under the lock. ([`WriterRow`] ignores that column.)
+/// numbered under the lock.
 #[doc(hidden)]
-pub const WRITER_LOCK_SQL: &str = "SELECT owner_instance, epoch, \
+pub const WRITER_LOCK_SQL: &str = "SELECT \
      set_config('intent.writer_tenant', tenant_id, true) AS writer_tenant \
      FROM tenant_writer WHERE tenant_id = $1 FOR UPDATE";
 
-/// A tenant's fence as its locked `tenant_writer` row holds it: the
-/// instance that owns the tenant (`None`: never claimed) and the tenant's
-/// epoch, which every claim bumps.
+/// A tenant's fence as a writer read it once it held the writer lock: the
+/// tenant lease (the `lease` row of scope `tenant`, see `lease.rs`).
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, sqlx::FromRow)]
 pub struct WriterRow {
+    /// The claim holding the tenant lease; `None` when released or never
+    /// claimed.
+    pub lease_id: Option<String>,
+    /// The instance that holds it (`None` when released or never claimed).
     pub owner_instance: Option<String>,
+    /// The tenant's epoch: the tenant lease token, which every claim bumps;
+    /// 0 when no process ever claimed the tenant.
     pub epoch: i64,
+    /// The writer transaction's isolation level (`read committed`).
+    pub isolation: String,
 }
 
 /// Seeds the tenant's `tenant_writer` row ($1). On a conflict with a
@@ -1249,8 +1257,21 @@ pub struct WriterRow {
 const WRITER_SEED_SQL: &str =
     "INSERT INTO tenant_writer (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING";
 
-/// Resets `lock_timeout` ($1) once the writer holds the lock.
-const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
+/// Resets `lock_timeout` ($1) once the writer holds the lock, and reads the
+/// tenant ($2)'s fence, the tenant lease, in the same statement: it is the
+/// first statement after the lock was granted, so its snapshot sees every
+/// claim committed before (see [`WRITER_LOCK_SQL`]). One row; the lease
+/// columns are NULL (epoch 0) when the tenant was never claimed.
+///
+/// It also reports the transaction's isolation level: the fence holds only
+/// at READ COMMITTED (a REPEATABLE READ snapshot is taken before the lock
+/// wait and would show the old lease), so [`PgStore::begin_write`] refuses
+/// any other level.
+const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true) AS reset, \
+     current_setting('transaction_isolation') AS isolation, \
+     l.lease_id, l.holder AS owner_instance, COALESCE(l.token, 0) AS epoch \
+     FROM (SELECT 1 AS one) AS once \
+     LEFT JOIN lease AS l ON l.tenant_id = $2 AND l.scope = 'tenant' AND l.lease_key = ''";
 
 /// Neki's default, cross-shard mode, for [`migrate`]'s connection (a
 /// session setting: Neki refuses it inside a transaction); see
@@ -1260,9 +1281,10 @@ const MULTI_SHARD_SQL: &str = "SET __neki.tx_mode = 'multi'";
 /// Takes `tenant`'s writer lock in the transaction on `conn`: sets the
 /// writer limits (`lock_timeout` = `attempt` for this attempt), seeds the
 /// tenant's lock row if it has none, locks it, then resets `lock_timeout`
-/// to `limits.lock_attempt` for the rest of the transaction. A wait past
-/// `attempt` fails with SQLSTATE 55P03. Returns the locked row's fence; the
-/// caller checks it ([`PgStore::begin_write`] does).
+/// to `limits.lock_attempt` for the rest of the transaction, reading the
+/// tenant's fence (the tenant lease) in that statement. A wait past
+/// `attempt` fails with SQLSTATE 55P03. Returns the fence; the caller checks
+/// it ([`PgStore::begin_write`] does).
 ///
 /// # Errors
 /// The failed statement's error.
@@ -1279,27 +1301,25 @@ pub async fn lock_tenant_writer(
         .bind(millis(limits.idle_in_transaction_timeout))
         .execute(&mut *conn)
         .await?;
-    let locked = sqlx::query_as::<_, WriterRow>(WRITER_LOCK_SQL)
+    let locked = sqlx::query(WRITER_LOCK_SQL)
         .bind(tenant)
         .fetch_optional(&mut *conn)
         .await?;
-    let row = if let Some(row) = locked {
-        row
-    } else {
+    if locked.is_none() {
         sqlx::query(WRITER_SEED_SQL)
             .bind(tenant)
             .execute(&mut *conn)
             .await?;
-        sqlx::query_as::<_, WriterRow>(WRITER_LOCK_SQL)
+        sqlx::query(WRITER_LOCK_SQL)
             .bind(tenant)
             .fetch_one(&mut *conn)
-            .await?
-    };
-    sqlx::query(WRITER_RESET_SQL)
+            .await?;
+    }
+    sqlx::query_as::<_, WriterRow>(WRITER_RESET_SQL)
         .bind(millis(limits.lock_attempt))
-        .execute(&mut *conn)
-        .await?;
-    Ok(row)
+        .bind(tenant)
+        .fetch_one(&mut *conn)
+        .await
 }
 
 fn is_lock_timeout(e: &sqlx::Error) -> bool {
@@ -1454,13 +1474,14 @@ impl PgStore {
     /// budget-cut value) for any other lock the transaction waits on; those
     /// failures stay `Internal`.
     ///
-    /// **Fence.** With the lock held, the writer compares the locked row's
-    /// owner and epoch with this process's claim on the tenant (`lease`).
+    /// **Fence.** With the lock held, the writer reads the tenant lease and
+    /// compares its lease id and token with this process's claim on the
+    /// tenant (`lease`).
     /// A store whose process claimed the tenant writes only while the row
     /// still names that claim; a store that never claimed writes only while
     /// no process ever claimed the tenant. Otherwise the transaction rolls
     /// back and the call fails with [`Error::NotOwner`], having written
-    /// nothing. The row is read after the lock is granted, at READ
+    /// nothing. The lease is read after the lock is granted, at READ
     /// COMMITTED, so a writer that waited behind a takeover sees it.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         self.begin_write_as(Fence::Check).await
@@ -1511,6 +1532,15 @@ impl PgStore {
                 Ok(_) if started.elapsed() > limits.wait_budget => {
                     let _ = tx.rollback().await;
                     return Err(writer_busy(self.tenant(), started.elapsed()));
+                }
+                Ok(writer) if writer.isolation != "read committed" => {
+                    let _ = tx.rollback().await;
+                    return Err(Error::Internal(format!(
+                        "tenant {}: a writer runs at {} isolation; the tenant fence needs READ \
+                         COMMITTED (check default_transaction_isolation); nothing was written",
+                        self.tenant(),
+                        writer.isolation
+                    )));
                 }
                 Ok(writer) => {
                     if fence == Fence::Check {
