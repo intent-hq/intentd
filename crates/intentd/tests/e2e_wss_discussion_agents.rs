@@ -725,6 +725,11 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     )
     .await;
     assert_eq!(private_history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        private_history["messages"][0]["author"]["principalId"],
+        json!(seeded_author),
+        "the participant reading the legacy history is its seeded author"
+    );
 
     // The first explicit address grants context and drives the real mock turn.
     let request = json!({"workspaceId":workspace,"conversationId":"default",
