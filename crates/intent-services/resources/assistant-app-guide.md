@@ -2244,9 +2244,10 @@ version differs from this guide; do not infer launcher support from daemon versi
 
 Behind a proxy, set `HTTPS_PROXY` (and `NO_PROXY` for hosts to reach directly) in the
 daemon's environment before `intentd start`: GitHub and GitLab requests and the `git`
-command then go through it. `http://`, `https://` and `socks5://` proxy addresses work.
-The GitHub sign-in step (device code) and some built-in push and checkout steps still
-connect directly. Older versions may differ: their GitHub requests ignored proxy settings.
+command then go through it, including the GitHub sign-in step (device code).
+`http://`, `https://` and `socks5://` proxy addresses work. Some built-in push and
+checkout steps still connect directly. Older versions may differ: their GitHub
+requests, or only their GitHub sign-in step, ignored proxy settings.
 
 `intentd agents` lists the daemon's running agents: name, workspace, provider and
 model, owner, memory and process count, then the total and sample time. `--json`
