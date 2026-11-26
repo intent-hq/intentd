@@ -159,3 +159,8 @@ crates/intent-services/src/test_support/mock_chat_upstream.rs intentd::suite_wss
 # proxy env sent fake tokens to api.github.com).
 crates/intent-sourcecontrol/src/github_transport.rs  intentd::suite_e2e  e2e_test_egress_guard
 crates/intentd-test-support/src/egress.rs            intentd::suite_e2e  e2e_test_egress_guard
+
+# The device-flow login client shares the GitHub transport's pool; the WSS
+# device-flow suite drives it end to end against a mock login host.
+crates/intent-sourcecontrol/src/device_flow.rs       intentd::suite_wss_repo  e2e_wss_github_device_flow
+crates/intent-sourcecontrol/src/github_transport.rs  intentd::suite_wss_repo  e2e_wss_github_device_flow
