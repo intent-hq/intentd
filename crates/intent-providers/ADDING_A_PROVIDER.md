@@ -367,10 +367,7 @@ Run the intentd ones together with
 Then add the base's row to the "Profile-capable bases" table in the monorepo
 `docs/protocol/methods/provider-profiles.md` (credentials, account folder, launch-only
 step), and a "`<base>` only:" row in its "Reserved keys" table for each `reserved_keys`
-entry and for any key `launch_wired_keys` (`crates/intent-services/src/provider_profiles.rs`)
-reserves for that base alone. The check reads `reserved_keys` from the golden; it knows the
-launch-wired ones only from its own list (`LAUNCH_WIRED` in
-`scripts/check-provider-profile-bases.mjs`), so update that list too. Land that docs PR first: `make check-provider-profile-bases` (a consumer check, so it
+entry. Land that docs PR first: `make check-provider-profile-bases` (a consumer check, so it
 also runs on this repo's PRs) compares both tables with the `profile` field of
 `tests/goldens/provider_registry.json` and fails while the base is missing. The account
 folder rules in that document link to the table, so they need no edit.

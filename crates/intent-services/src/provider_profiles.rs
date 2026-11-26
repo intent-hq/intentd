@@ -478,15 +478,14 @@ pub(crate) fn parse_env_writes(env: &Value) -> Result<Vec<EnvWrite>> {
         .collect()
 }
 
-/// Keys Intent writes into provider launches as session wiring, built from the
-/// same constants the launch code injects with: git commit identity and the
-/// credential-helper `GIT_CONFIG_PARAMETERS` (every provider), and the Codex
-/// permission mode. A profile cannot set or unset them.
-fn launch_wired_keys(base_provider: &str) -> impl Iterator<Item = &'static str> {
+/// Keys Intent writes into every provider launch as session wiring, built from
+/// the same constants the launch code injects with: git commit identity and
+/// the credential-helper `GIT_CONFIG_PARAMETERS`. A profile cannot set or unset
+/// them. A key one base alone writes belongs in its `ProfileSpec::reserved_keys`.
+fn launch_wired_keys() -> impl Iterator<Item = &'static str> {
     intent_git::identity::GIT_IDENTITY_ENV_VARS
         .into_iter()
         .chain([intent_git::auth::GIT_CONFIG_PARAMETERS_ENV])
-        .chain((base_provider == "codex").then_some(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV))
 }
 
 /// Why a key is reserved, or `None` when the key may be saved.
@@ -517,7 +516,7 @@ pub(crate) fn reserved_key_reason(key: &str, base_provider: &str) -> Option<Stri
         "HOME" | "USERPROFILE" => {
             format!("Intent reads {upper} to find the shared installation; {account_hint}")
         }
-        _ if launch_wired_keys(base_provider).any(|k| k.eq_ignore_ascii_case(key)) => {
+        _ if launch_wired_keys().any(|k| k.eq_ignore_ascii_case(key)) => {
             "Intent sets this at launch (session wiring and commit identity)".to_string()
         }
         _ if upper.starts_with("INTENT_") || upper.starts_with("INTENTD_") => {
