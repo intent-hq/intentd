@@ -261,6 +261,19 @@ impl DshModelSource {
     }
 }
 
+/// The base version part of a named profile's catalog cache key: Cursor and
+/// DSH follow the configured executable (`providers.paths.<base>`) their
+/// profile probe runs, other bases their source's own key.
+pub(crate) fn profile_base_version_key(base: &str, override_path: Option<&str>) -> String {
+    match base {
+        "cursor" => CursorModelSource::resolve(override_path).version_key,
+        intent_providers::dsh::PROVIDER_ID => DshModelSource::resolve(override_path).version_key,
+        _ => source_for(base)
+            .map(|source| (source.version_key)())
+            .unwrap_or_default(),
+    }
+}
+
 fn dsh_version_key() -> String {
     DshModelSource::resolve(None).version_key
 }
