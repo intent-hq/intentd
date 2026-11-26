@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.11.302"
+version = "0.11.303"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
