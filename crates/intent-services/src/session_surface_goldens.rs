@@ -106,6 +106,13 @@ const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
         "220273303306a122e130b914bd99d4067fa16d8536f3840210ce6d24576633b5",
     ),
     (
+        "dsh",
+        448_018,
+        "f87c561e631a93f5ba2652acabf2bdc956aceee37642b5b6820aef9ecf01bed6",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
+    ),
+    (
         "mock",
         448_018,
         "f87c561e631a93f5ba2652acabf2bdc956aceee37642b5b6820aef9ecf01bed6",
@@ -350,6 +357,13 @@ const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
     ),
     (
         "cursor",
+        53_579,
+        "254a525edb239f92b4c7aa386240e04fb443ec6133ab61919e53f2d7a18a1a9a",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "dsh",
         53_579,
         "254a525edb239f92b4c7aa386240e04fb443ec6133ab61919e53f2d7a18a1a9a",
         12,

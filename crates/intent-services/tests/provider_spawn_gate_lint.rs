@@ -93,6 +93,10 @@ const SITES: &[(&str, Spawn)] = &[
         "cursor_cli.rs",
         Spawn::Provider(&[DISCOVERY, REPORT, STATUSES]),
     ),
+    (
+        "dsh_cli.rs",
+        Spawn::Provider(&[DISCOVERY, REPORT, STATUSES, MODELS, SPAWN]),
+    ),
     ("enhance_ops.rs", Spawn::Provider(&[ENHANCE, MACHINE])),
     (
         "host_exec.rs",

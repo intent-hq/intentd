@@ -23,6 +23,7 @@ fn registry_first_provider_and_lookups() {
             "grok",
             "antigravity",
             "cursor",
+            "dsh",
             "mock"
         ]
     );
@@ -347,6 +348,7 @@ fn session_mcp_servers_partition() {
         "grok",
         "antigravity",
         "cursor",
+        "dsh",
     ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
@@ -366,7 +368,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor", "dsh"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -396,8 +398,8 @@ fn config_option_model_partition() {
         );
         assert_eq!(
             p.config_option_model_required,
-            matches!(id, "codex" | "antigravity"),
-            "{id}: only codex and antigravity fail setup on a rejected model"
+            matches!(id, "codex" | "antigravity" | "dsh"),
+            "{id}: only codex, antigravity and dsh fail setup on a rejected model"
         );
     }
     // claude-code and pi additionally have no CLI model flag and no
@@ -1179,6 +1181,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "grok",
             "antigravity",
             "cursor",
+            "dsh",
             "mock"
         ]
     );
@@ -1953,5 +1956,47 @@ fn profile_spec_drives_the_profile_bases_consistently() {
     let cursor = crate::profile_spec("cursor").unwrap();
     for (key, _) in cursor.credential_launch_env {
         assert!(cursor.reserved_keys.iter().any(|(k, _)| k == key), "{key}");
+    }
+}
+
+#[test]
+fn dsh_launch_args_carry_the_upload_overlay_and_telemetry_opt_out() {
+    let dsh = find_provider(crate::dsh::PROVIDER_ID).unwrap();
+    let args = build_provider_args(
+        dsh,
+        &ArgInputs {
+            model: Some("[\"deepseek-official\",\"deepseek-v4-pro\"]"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(&args[..3], ["--profile", "acp", "--patch"]);
+    assert_eq!(
+        args.len(),
+        4,
+        "the model is applied as a config option, not a flag: {args:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args[3]).unwrap(),
+        crate::dsh::OVERLAY
+    );
+
+    let env = build_provider_env(dsh, None, None, None);
+    assert_eq!(
+        env.get("DSH_TELEMETRY_DISABLED").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        env.contains_key("NODE_OPTIONS"),
+        "dsh is a Node CLI: {env:?}"
+    );
+    for other in ACP_PROVIDERS
+        .iter()
+        .filter(|p| p.id != crate::dsh::PROVIDER_ID)
+    {
+        assert!(
+            !build_provider_args(other, &ArgInputs::default()).contains(&"--patch".to_string()),
+            "{}",
+            other.id
+        );
     }
 }

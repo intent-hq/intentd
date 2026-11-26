@@ -19,6 +19,39 @@ use super::probe::ProbeError;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[test]
+fn dsh_catalog_flattens_grouped_model_options() {
+    let payload = serde_json::from_str(include_str!("dsh-session-new.json")).unwrap();
+    let rows = parse_acp_config_option_models(&payload, "dsh");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["id"].as_str().unwrap(), row["name"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                "deepseek-v4-flash"
+            ),
+            (
+                "[\"deepseek-official\",\"deepseek-v4-pro\"]",
+                "deepseek-v4-pro"
+            ),
+            ("[\"anthropic\",\"claude-sonnet-4-5\"]", "claude-sonnet-4-5"),
+        ]
+    );
+    for row in &rows {
+        assert_eq!(row["provider"], "dsh");
+        assert_eq!(row["effortLevels"], json!(["off", "low", "high", "max"]));
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["isDefault"] == true)
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["deepseek-v4-flash"]
+    );
+}
+
+#[test]
 fn antigravity_catalog_lists_base_models_with_thought_levels() {
     let payload = serde_json::from_str(include_str!("antigravity-session-new.json")).unwrap();
     let rows = parse_acp_config_option_models(&payload, "antigravity");

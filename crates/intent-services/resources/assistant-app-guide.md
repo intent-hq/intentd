@@ -590,7 +590,7 @@ pages in the main process** on (older versions may differ).
 OpenCode, Claude Code, Codex and Grok need no install when Node.js
 is present (Auggie too, once enabled; see Auggie visibility below). Without their CLI, Intent runs them from npm: through npx, or for
 Claude Code and Codex through Intent's own bundled copy, downloaded at the first launch.
-Cursor, Antigravity, Pi and Unsloth still need their own install. An
+Cursor, Antigravity, DeepSeek Harness, Pi and Unsloth still need their own install. An
 installed CLI is always used first, with its version checks and update prompts. A card
 running from npm shows **Log in**, which runs the login command through npx. OpenCode's
 free models need no account, so when onboarding finds no other provider installed,
@@ -1026,6 +1026,24 @@ the `agy` executable.
 Antigravity agents use the user's own agy settings, hooks, and MCP servers. Model
 lists and sign-in checks run in a separate agy data folder, so they do not appear in
 the user's agy history. Choose the thinking level as the reasoning effort.
+
+## Use DeepSeek Harness as an agent provider
+
+<!-- Sources: packages/intentd/crates/intent-providers/src/{config,dsh}.rs; packages/intentd/crates/intent-services/src/{dsh_cli.rs,provider_auth.rs,provider_models/mod.rs}. -->
+DeepSeek Harness (DSH) is DeepSeek's open-source coding agent. It is an opt-in provider:
+enable it in **Settings → Providers** (`/settings?tab=providers#providers`). DSH itself
+is a developer preview from DeepSeek, and new DSH versions can change how it behaves.
+It needs the `dsh` CLI on the daemon host (`npm i -g @deepseek-ai/dsh`, Node.js 24.9 or
+later) and a DeepSeek API key: set `DEEPSEEK_API_KEY` in the daemon's environment, or
+save the key in `dsh web` under **Settings → Models**. A DeepSeek account sign-in is
+not used. A custom path in **Providers** must point to the `dsh` executable. Older
+versions of the app may not list DSH.
+
+Intent turns off DSH's session-log upload and telemetry for the agents it starts, and
+DSH's own subagent tools; model requests still go to the model service you chose.
+**Providers** shows DSH as unavailable when the `dsh` found is another tool, or when
+Intent cannot turn off the upload in that DSH version. Your own `dsh web` runs are not
+changed. Choose the reasoning effort (off, low, high, max) as for other providers.
 
 ## Run Intent in a browser from a cloud machine
 

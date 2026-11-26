@@ -75,6 +75,8 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
     // Cursor CLI API key. Exact name only: `CURSOR_CONFIG_DIR` /
     // `CURSOR_DATA_DIR` select config and state folders, not credentials.
     "CURSOR_API_KEY",
+    // DeepSeek Harness (`dsh`) API key for its `deepseek-official` route.
+    "DEEPSEEK_API_KEY",
     "AWS_PROFILE",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -87,8 +89,15 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
 /// Credential env vars captured by name prefix. See the inclusion criterion
 /// on [`CREDENTIAL_ENV_EXACT`].
 #[cfg(unix)]
-const CREDENTIAL_ENV_PREFIXES: &[&str] =
-    &["AUGGIE_", "OPENCODE_", "DROID_", "CORTEX_", "GROK_", "PI_"];
+const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
+    "AUGGIE_",
+    "OPENCODE_",
+    "DROID_",
+    "CORTEX_",
+    "GROK_",
+    "PI_",
+    "DSH_",
+];
 
 /// Whether an env var name is on the credential allow-list.
 #[cfg(unix)]

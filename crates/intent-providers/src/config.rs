@@ -1006,6 +1006,40 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {
+        // `dsh` is a Node CLI (`#!/usr/bin/env node`, Node >= 24.9).
+        runtime: ProviderRuntime::Node,
+        // `--profile acp` is DSH's ACP stdio server. `build_provider_args`
+        // appends `--patch <overlay>` (`crate::dsh`): no session-log upload,
+        // no telemetry, no native subagent tools. Verified on 0.2.2-rc.5.
+        base_args: crate::dsh::ACP_ARGS,
+        can_be_disabled: true,
+        // No `_meta` system-prompt path.
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // `session/new` and `session/resume` accept stdio and HTTP
+        // `mcpServers`.
+        supports_session_mcp_servers: true,
+        // `configOptions[id="model"]` is a grouped select of opaque values
+        // (`["deepseek-official","deepseek-v4-flash"]`); `thought_level`
+        // (`reasoning_effort`) carries the effort. A saved model DSH no
+        // longer offers fails setup instead of running on the default.
+        supports_config_option_model: true,
+        config_option_model_required: true,
+        // `authMethods` is empty and `authenticate` is a no-op. Sign-in is
+        // a DeepSeek API key, checked from the environment and DSH home.
+        supports_authenticate: false,
+        // A signed-out prompt fails with -32603 "… no API key for provider
+        // route …"; `session/new` succeeds signed out.
+        auth_error_patterns: Some(&["no api key for provider route"]),
+        // `dsh web` → Settings → Models stores the key in
+        // `$DSH_HOME/.credentials.yaml`.
+        login_command_hint: Some("dsh web"),
+        login_docs_url: Some(
+            "https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/guide/providers.md",
+        ),
+        short_name: "DSH",
+        ..ProviderConfig::empty(crate::dsh::PROVIDER_ID, "DeepSeek Harness", crate::dsh::COMMAND)
+    },
+    ProviderConfig {
         runtime: ProviderRuntime::Node,
         supports_authenticate: true,
         can_be_disabled: true,

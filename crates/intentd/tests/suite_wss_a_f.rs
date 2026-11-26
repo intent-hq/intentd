@@ -35,6 +35,7 @@ mod e2e_wss_display_status;
 mod e2e_wss_display_status_git_root_prs;
 mod e2e_wss_display_status_hooks;
 mod e2e_wss_display_status_needs_attention;
+mod e2e_wss_dsh_provider;
 mod e2e_wss_egress_conflation;
 mod e2e_wss_event_subscription;
 mod e2e_wss_executor_credentials;

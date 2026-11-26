@@ -221,9 +221,69 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "opencode" => fetch_opencode_models().await,
         "grok" => fetch_grok_models().await,
         "cursor" => fetch_cursor_models_at(cursor_binary(None)).await,
+        intent_providers::dsh::PROVIDER_ID => fetch_dsh_models_at(dsh_binary(None)).await,
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
+}
+
+/// The `dsh` a launch would exec: `providers.paths.dsh`, else PATH.
+pub(crate) fn dsh_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    find_provider_binary(
+        intent_providers::dsh::PROVIDER_ID,
+        intent_providers::dsh::COMMAND,
+        explicit_path,
+    )
+}
+
+/// `dsh --profile acp` catalog: the grouped `configOptions[id="model"]`
+/// select (one group per DSH model provider) with the `thought_level`
+/// efforts. Runs only after the upload guard passes, under the same launch
+/// environment the guard judged (overlay, telemetry opt-out, login-shell
+/// `DEEPSEEK_API_KEY` and `DSH_HOME` gap-fill; the list depends on the key).
+/// Never prompts; DSH keeps an empty session folder per probe.
+pub(crate) async fn fetch_dsh_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let provider_id = intent_providers::dsh::PROVIDER_ID;
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable(provider_id, "dsh binary not found");
+    };
+    let Some(config) = intent_providers::find_provider(provider_id) else {
+        return ProviderModelsFetch::unavailable(provider_id, "dsh provider not registered");
+    };
+    let probe_bin = bin.clone();
+    let status = match tokio::task::spawn_blocking(move || {
+        crate::dsh_cli::probe_dsh_cli_at(Some(probe_bin), None)
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            return ProviderModelsFetch::unavailable(
+                provider_id,
+                format!("dsh probe task failed: {e}"),
+            );
+        }
+    };
+    if let Some(reason) = status.unavailable_reason() {
+        return ProviderModelsFetch::unavailable(provider_id, reason);
+    }
+    let args =
+        intent_providers::build_provider_args(config, &intent_providers::ArgInputs::default());
+    let mut cmd = AcpProbeCommand::binary(bin, args);
+    let env = crate::dsh_cli::launch_env(None);
+    for key in env.removes() {
+        cmd = cmd.env_remove(key);
+    }
+    for (key, value) in env.sets() {
+        cmd = cmd.env(key, value);
+    }
+    finish(
+        provider_id,
+        run_acp_probe(cmd, |value| {
+            parse::parse_acp_config_option_models(value, provider_id)
+        })
+        .await,
+    )
 }
 
 /// `agy acp` catalog: the base models of `configOptions[id="model"]` with the
