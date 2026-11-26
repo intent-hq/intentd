@@ -544,7 +544,7 @@ impl Services {
         // Test seam: park between the lookups above and the guarded insert,
         // so a test can let the pair's lease lapse there.
         #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(park) = &self.watch_registration_park {
+        if let Some(park) = self.delivery_guards.registration_park.get() {
             park.entered.notify_one();
             park.release.notified().await;
         }

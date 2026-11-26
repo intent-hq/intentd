@@ -464,6 +464,24 @@ pub struct CompletionClassifyPark {
     pub release: tokio::sync::Notify,
 }
 
+/// Shared state of lease-guarded delivery (`Services::delivery_guards`).
+#[derive(Default)]
+pub(crate) struct DeliveryGuards {
+    /// Message ids being queued under a delivery claim right now
+    /// (`Services::enqueue_under_claim`): the queue insert reads it to mark
+    /// the new entry `write_pending` in the same critical section.
+    pub(crate) guarded_enqueues: Mutex<HashSet<String>>,
+    /// Test seam: parks a parent wake send after its stable-id probe and
+    /// right before the wake is written. Unset in production.
+    pub(crate) send_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a guarded enqueue between its in-memory insert and
+    /// its guarded write. Unset in production.
+    pub(crate) enqueue_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a strict watch registration between its lookups and
+    /// its guarded insert. Unset in production.
+    pub(crate) registration_park: OnceLock<Arc<CompletionClassifyPark>>,
+}
+
 /// Provenance retained when a synthetic completion has to defer again.
 #[derive(Clone, Copy)]
 enum InterimIdleProvenance {
@@ -665,18 +683,9 @@ pub struct Services {
     /// processes are ordered by the store (writer lock + queue version), not
     /// by this lock.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Message ids being queued under a delivery claim right now
-    /// (`Services::enqueue_under_claim`): the queue insert reads it to mark
-    /// the new entry `write_pending` in the same critical section.
-    guarded_enqueues: Arc<Mutex<HashSet<String>>>,
-    /// Test seam: parks a guarded enqueue between the in-memory insert and
-    /// its guarded write. `None` in production.
-    #[cfg(any(test, feature = "test-hooks"))]
-    guarded_enqueue_park: Option<Arc<CompletionClassifyPark>>,
-    /// Test seam: parks a strict watch registration between its lookups and
-    /// its guarded insert. `None` in production.
-    #[cfg(any(test, feature = "test-hooks"))]
-    watch_registration_park: Option<Arc<CompletionClassifyPark>>,
+    /// The lease-guarded delivery's shared state: one field, so `Services`
+    /// (cloned into large futures such as `workspace.create`) stays small.
+    delivery_guards: Arc<DeliveryGuards>,
     /// Serializes every `agent:queue:updated` publish
     /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
     /// *inside* this async lock, immediately before the bus write, so a
@@ -1046,11 +1055,6 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_claim_park`.
     completion_claim_park: Option<Arc<CompletionClassifyPark>>,
-    /// Test park seam for the probe→write window of a parent wake: parks
-    /// the send after its stable-id idempotency probe and right before the
-    /// wake is written, so a test can let the delivery claim lapse there.
-    /// `None` in production.
-    completion_send_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the flipped-completion
     /// take→publish window: parks the pass that consumed the child's flips
     /// from the store before it publishes them to the overlapping passes,
@@ -1890,11 +1894,7 @@ impl Services {
             draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
-            guarded_enqueues: Arc::default(),
-            #[cfg(any(test, feature = "test-hooks"))]
-            guarded_enqueue_park: None,
-            #[cfg(any(test, feature = "test-hooks"))]
-            watch_registration_park: None,
+            delivery_guards: Arc::default(),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             desktop: Arc::new(desktop::Runtime::default()),
@@ -1971,7 +1971,6 @@ impl Services {
             #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
             completion_claim_park: None,
-            completion_send_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
             unread_settle_entry_park: None,
@@ -3341,23 +3340,20 @@ impl Services {
     /// Test seam: park a strict watch registration between its lookups and
     /// its guarded insert.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn with_watch_registration_park(
-        mut self,
-        park: Arc<CompletionClassifyPark>,
-    ) -> Self {
-        self.watch_registration_park = Some(park);
+    pub(crate) fn with_watch_registration_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.registration_park.set(park);
         self
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn with_guarded_enqueue_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
-        self.guarded_enqueue_park = Some(park);
+    pub(crate) fn with_guarded_enqueue_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.enqueue_park.set(park);
         self
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn with_completion_send_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
-        self.completion_send_park = Some(park);
+    pub(crate) fn with_completion_send_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.send_park.set(park);
         self
     }
 
@@ -11522,7 +11518,7 @@ impl Services {
         }
         // Test seam: park after the idempotency probe, right before the
         // wake is written, so a test can let the delivery claim lapse there.
-        if let Some(park) = &self.completion_send_park {
+        if let Some(park) = self.delivery_guards.send_park.get() {
             park.entered.notify_one();
             park.release.notified().await;
         }

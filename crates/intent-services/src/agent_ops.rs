@@ -655,6 +655,45 @@ fn decode_user_message_index_token(token: &str) -> Result<i64> {
 // helper the delivery paths render fresh at flush time.
 pub(crate) mod ready_delta;
 
+/// A new queue entry of a guarded enqueue (`Services::enqueue_under_claim`)
+/// whose guarded write has not committed: while armed, dropping it removes
+/// the entry from memory, and a recovery-send marker naming it.
+struct PendingGuardedEntry<'a> {
+    services: &'a Services,
+    agent_id: &'a AgentId,
+    entry_id: String,
+    armed: bool,
+}
+
+impl Drop for PendingGuardedEntry<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut queues = self
+                .services
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            if let Some(queue) = queues.get_mut(self.agent_id) {
+                queue.retain(|m| m.id != self.entry_id);
+                if queue.is_empty() {
+                    queues.remove(self.agent_id);
+                }
+            }
+        }
+        let mut parked = self
+            .services
+            .parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned");
+        if parked.get(self.agent_id) == Some(&self.entry_id) {
+            parked.remove(self.agent_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -18937,73 +18976,58 @@ impl Services {
         // guarded write decides: not one that takes the persist gate held
         // here, and not one that does not (`agent.sendQueuedMessageNow`,
         // the worker's drains), which skip or refuse a pending entry.
-        self.guarded_enqueues
+        self.delivery_guards
+            .guarded_enqueues
             .lock()
             .expect("guarded enqueue registry poisoned")
             .insert(message_id.to_owned());
         let enqueued = enqueue();
-        self.guarded_enqueues
+        self.delivery_guards
+            .guarded_enqueues
             .lock()
             .expect("guarded enqueue registry poisoned")
             .remove(message_id);
         let enqueued = enqueued?;
+        // Until the guarded write commits, the new entry is provisional:
+        // dropping this guard (the write failed, or this future was
+        // cancelled, e.g. by shutdown cancelling the delivery task) removes
+        // it from memory before the persist gate is released, so no later
+        // unguarded write (a write-through, the shutdown queue save) can
+        // store it. Declared after the gate, so it drops first.
+        let mut pending = PendingGuardedEntry {
+            services: self,
+            agent_id,
+            entry_id: enqueued.0.id.clone(),
+            armed: !existed,
+        };
         let rows = self.queue_rows(agent_id);
         #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(park) = &self.guarded_enqueue_park {
+        if let Some(park) = self.delivery_guards.enqueue_park.get() {
             park.entered.notify_one();
             park.release.notified().await;
         }
         // Boxed: this awaits inside every send_message branch.
-        match Box::pin(
+        let sync = Box::pin(
             self.store
                 .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0),
         )
-        .await
-        {
-            Ok(sync) => {
-                if let Some(merged) = sync.merged {
-                    self.adopt_stored_queue(agent_id, &rows, merged);
-                }
-                if let Some(entry) = self
-                    .agent_queues
-                    .lock()
-                    .expect("agent queue registry poisoned")
-                    .get_mut(agent_id)
-                    .and_then(|queue| queue.iter_mut().find(|m| m.id == enqueued.0.id))
-                {
-                    entry.write_pending = false;
-                }
-                let (mut queued, position) = enqueued;
-                queued.write_pending = false;
-                Ok((queued, position))
-            }
-            Err(e) => {
-                if !existed {
-                    {
-                        let mut queues = self
-                            .agent_queues
-                            .lock()
-                            .expect("agent queue registry poisoned");
-                        if let Some(queue) = queues.get_mut(agent_id) {
-                            queue.retain(|m| m.id != enqueued.0.id);
-                            if queue.is_empty() {
-                                queues.remove(agent_id);
-                            }
-                        }
-                    }
-                    // A recovery send's marker names the entry just removed
-                    // (a stale marker is dropped by its next claim anyway).
-                    let mut parked = self
-                        .parked_recovery_sends
-                        .lock()
-                        .expect("parked recovery send registry poisoned");
-                    if parked.get(agent_id) == Some(&enqueued.0.id) {
-                        parked.remove(agent_id);
-                    }
-                }
-                Err(e)
-            }
+        .await?;
+        pending.armed = false;
+        if let Some(merged) = sync.merged {
+            self.adopt_stored_queue(agent_id, &rows, merged);
         }
+        if let Some(entry) = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get_mut(agent_id)
+            .and_then(|queue| queue.iter_mut().find(|m| m.id == enqueued.0.id))
+        {
+            entry.write_pending = false;
+        }
+        let (mut queued, position) = enqueued;
+        queued.write_pending = false;
+        Ok((queued, position))
     }
 
     fn submission_replay_locked(
@@ -19126,6 +19150,7 @@ impl Services {
         // sendToTask (whose legacy runtime delivery uses Automatic origin).
         intent_core::browser_message::accept_browser_message(agent_id, &id);
         let write_pending = self
+            .delivery_guards
             .guarded_enqueues
             .lock()
             .expect("guarded enqueue registry poisoned")

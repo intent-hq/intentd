@@ -13,7 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::{ActorType, AgentId, AgentSession, AgentStatus, Event, EventActor, WorkspaceId};
+use intent_core::{
+    ActorType, AgentId, AgentSession, AgentStatus, Event, EventActor, Workspace, WorkspaceId,
+};
 use intent_services::events::EventBus;
 use intent_services::{AgentManager, BusEventSink, CompletionClassifyPark, Services};
 use intent_store::postgres::{self, PgPool, PostgresOptions, TenantId};
@@ -453,4 +455,93 @@ async fn a_registration_that_lost_its_pair_lease_reuses_the_winners_watch() {
         .map(|w| w.id)
         .collect();
     assert_eq!(stored, [winner], "one watch for the pair");
+}
+
+/// A guarded enqueue cancelled while its write is pending leaves nothing
+/// behind: a parent in an archived workspace gets its wake parked in the
+/// queue before `send_message`'s detached boundary, so shutdown cancelling
+/// the delivery task drops the enqueue there. The pending entry must leave
+/// memory with it, or the shutdown queue save (an unguarded write) would
+/// store a wake that never passed its delivery lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_guarded_enqueue_leaves_nothing_to_persist() {
+    let Some(pool) = pool().await else { return };
+    let tenant = format!(
+        "wake-cancel-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = open(&pool, &tenant, "process-a").await;
+    let ws = WorkspaceId("archived-ws".into());
+    let now = intent_core::now_iso();
+    store
+        .insert_workspace(&Workspace {
+            id: ws.clone(),
+            title: "archived".into(),
+            branch: "main".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("seed the workspace");
+    let (parent, child) = (AgentId("parent".into()), AgentId("child".into()));
+    for (id, name, status) in [
+        (&parent, "parent", AgentStatus::RuntimeIdle),
+        (&child, "child", AgentStatus::Active),
+    ] {
+        store
+            .insert_agent_session(&AgentSession {
+                workspace_id: ws.clone(),
+                ..session(id, name, status)
+            })
+            .await
+            .expect("seed an agent");
+    }
+    let park = Arc::new(CompletionClassifyPark::default());
+    let a = Services::new_isolated(store.clone()).with_guarded_enqueue_park_for_test(park.clone());
+    let manager = Arc::new(AgentManager::new(
+        a.clone(),
+        Arc::new(BusEventSink::new(EventBus::new(store.clone()))),
+        4,
+    ));
+    a.attach_agent_manager(&manager);
+    a.register_completion_watch_durable_for_test(&ws, parent.clone(), child.clone(), None)
+        .await
+        .expect("register the watch");
+    store
+        .archive_workspace_detaching_guests(&ws, &now)
+        .await
+        .expect("archive the workspace");
+    store
+        .set_agent_session_status(&ws, &child, AgentStatus::RuntimeIdle, false, &now, None)
+        .await
+        .expect("the child completes");
+
+    let mut event = idle_event(&child);
+    event.workspace_id = ws.clone();
+    let delivering = tokio::spawn({
+        let a = a.clone();
+        async move { a.handle_completion_event_for_test(&event).await }
+    });
+    tokio::time::timeout(wait(), park.entered.notified())
+        .await
+        .expect("the wake is parked in the queue, its guarded write pending");
+    assert_eq!(a.queue_snapshot_for_test(&parent).len(), 1);
+
+    // Shutdown cancels the delivery task with the write still pending.
+    delivering.abort();
+    assert!(delivering
+        .await
+        .expect_err("the delivery was cancelled")
+        .is_cancelled());
+    assert!(
+        a.queue_snapshot_for_test(&parent).is_empty(),
+        "the cancelled enqueue took its entry out of memory"
+    );
+    a.persist_shutdown_queues_for_test().await;
+    assert_eq!(
+        stored_queue_len(&store, &parent).await,
+        0,
+        "the shutdown queue save stored no unguarded wake"
+    );
 }

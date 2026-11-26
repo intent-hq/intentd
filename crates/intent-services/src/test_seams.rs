@@ -238,6 +238,11 @@ impl Services {
         self.with_guarded_enqueue_park(park)
     }
 
+    /// Test seam: `persist_shutdown_queues`.
+    pub async fn persist_shutdown_queues_for_test(&self) {
+        self.persist_shutdown_queues().await;
+    }
+
     /// Test seam: `agent_send_queued_message_now_op`.
     pub async fn agent_send_queued_message_now_op_for_test(
         &self,
