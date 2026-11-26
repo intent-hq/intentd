@@ -4,7 +4,8 @@
 //! Network-guarded: the default assertions exercise only the router param
 //! validation and the in-service param parsing, which run **without any GitHub
 //! call**. A real read is performed only when `INTENTD_GH_LIVE_TEST=1` and a
-//! token (`GITHUB_TOKEN`/`GH_TOKEN`) are present.
+//! token (`GITHUB_TOKEN`/`GH_TOKEN`) are present; it also needs
+//! `INTENTD_TEST_ALLOW_EGRESS=1`, which turns off the suite's dead test proxy.
 
 #![cfg(unix)]
 
@@ -110,7 +111,10 @@ async fn uds_github_param_validation_and_routing() {
         assert!(pull["htmlUrl"].is_string());
         assert!(pull["headRef"].is_string());
     } else {
-        eprintln!("uds_github: skipping live read (set INTENTD_GH_LIVE_TEST=1 + token)");
+        eprintln!(
+            "uds_github: skipping live read (set INTENTD_GH_LIVE_TEST=1, \
+             INTENTD_TEST_ALLOW_EGRESS=1 + token)"
+        );
     }
 
     let _ = tx.send(());

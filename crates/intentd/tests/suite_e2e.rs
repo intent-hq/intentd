@@ -36,6 +36,7 @@ mod e2e_services_agent_queue;
 mod e2e_services_note_ops;
 mod e2e_sitter_staged_restart;
 mod e2e_startup_ordering;
+mod e2e_test_egress_guard;
 mod e2e_transport;
 mod hermetic_serve_command;
 mod pi_mcp_extension_node;

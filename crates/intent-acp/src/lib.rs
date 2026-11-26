@@ -118,4 +118,6 @@ mod tests_call_ledger;
 #[ctor::ctor(unsafe)]
 fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+    // Dead local proxy: see `intentd_test_support::block_test_egress`.
+    intentd_test_support::block_test_egress();
 }

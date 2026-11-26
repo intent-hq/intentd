@@ -153,3 +153,9 @@ crates/intent-store/src/browser_sender_repo.rs intentd::suite_wss_a_f e2e_wss_br
 # Composer autocomplete (input.autocomplete) over the secure transport.
 crates/intent-services/src/autocomplete_ops.rs intentd::suite_wss_g_r e2e_wss_input_autocomplete
 crates/intent-services/src/test_support/mock_chat_upstream.rs intentd::suite_wss_g_r e2e_wss_input_autocomplete
+
+# Test egress guard: a spawned daemon's GitHub transport must honor the dead
+# test proxy that intentd-test-support installs (a forge client that ignored
+# proxy env sent fake tokens to api.github.com).
+crates/intent-sourcecontrol/src/github_transport.rs  intentd::suite_e2e  e2e_test_egress_guard
+crates/intentd-test-support/src/egress.rs            intentd::suite_e2e  e2e_test_egress_guard

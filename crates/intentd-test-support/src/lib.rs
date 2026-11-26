@@ -33,6 +33,9 @@
 //! - [`test_timeout`]: the one place test budgets read
 //!   `INTENTD_TEST_TIMEOUT_MULTIPLIER`, so hang guards stretch on slow
 //!   coverage runners instead of flaking (`fixed_deadline_lint`).
+//! - [`block_test_egress`] / [`apply_test_egress`]: route a test binary and
+//!   the daemons it spawns through a dead local proxy, so a forgotten fake
+//!   forge server fails at once instead of reaching GitHub or GitLab.
 //!
 //! # The reaped-pid caveat
 //!
@@ -54,6 +57,7 @@
 //! (intent-hq/intent#4284).
 
 mod barrier;
+mod egress;
 #[cfg(unix)]
 mod guarded_child;
 mod link_protocol;
@@ -63,6 +67,10 @@ pub mod source_lint;
 mod timeout;
 
 pub use barrier::{Barrier, DEFAULT_HOLD_DEADLINE};
+pub use egress::{
+    apply_test_egress, block_test_egress, test_egress_allowed, ALLOW_TEST_EGRESS_ENV,
+    TEST_EGRESS_ENV, TEST_NPM_ENV,
+};
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
 pub use link_protocol::assert_link_supports;

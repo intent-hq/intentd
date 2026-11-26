@@ -8,9 +8,17 @@ use crate::{
 };
 use http::{HeaderValue, Uri};
 use http_body_util::BodyExt;
+use hyper_rustls::MaybeHttpsStream;
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
+    client::legacy::{
+        connect::{
+            proxy::{SocksV4, SocksV5, Tunnel},
+            HttpConnector,
+        },
+        Client,
+    },
+    client::proxy::matcher::Matcher,
+    rt::{TokioExecutor, TokioIo},
 };
 use octocrab::{
     service::middleware::{
@@ -19,11 +27,87 @@ use octocrab::{
     },
     OctoBody,
 };
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc, task::Poll};
 use tower::{Layer, Service, ServiceExt};
 
 type Pool =
-    Client<hyper_timeout::TimeoutConnector<hyper_rustls::HttpsConnector<HttpConnector>>, OctoBody>;
+    Client<hyper_timeout::TimeoutConnector<hyper_rustls::HttpsConnector<ProxyConnector>>, OctoBody>;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type ProxyStream = MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>;
+
+/// TCP connector that honors the standard proxy env (`HTTPS_PROXY`,
+/// `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`, read when the transport is built)
+/// like reqwest and `git` do. A proxied host gets an HTTP `CONNECT` tunnel
+/// (over TLS to an `https://` proxy) or a SOCKS handshake, so TLS to GitHub
+/// and the bearer token stay end to end.
+#[derive(Clone)]
+struct ProxyConnector {
+    direct: HttpConnector,
+    to_proxy: hyper_rustls::HttpsConnector<HttpConnector>,
+    proxies: Arc<Matcher>,
+}
+
+impl Service<Uri> for ProxyConnector {
+    type Response = ProxyStream;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<ProxyStream, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), BoxError>> {
+        self.direct.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let Some(proxy) = self.proxies.intercept(&dst) else {
+            let connecting = self.direct.call(dst);
+            return Box::pin(async move {
+                Ok::<_, BoxError>(MaybeHttpsStream::Http(connecting.await?))
+            });
+        };
+        // The tunnels default a portless target to 443; keep plain HTTP on 80.
+        let dst = match (dst.scheme_str(), dst.port(), dst.host()) {
+            (Some("http"), None, Some(host)) => format!("http://{host}:80").parse().unwrap_or(dst),
+            _ => dst,
+        };
+        let proxy_uri = || proxy.uri().clone();
+        match proxy.uri().scheme_str() {
+            Some("http" | "https") => {
+                let mut tunnel = Tunnel::new(proxy_uri(), self.to_proxy.clone());
+                if let Some(auth) = proxy.basic_auth() {
+                    tunnel = tunnel.with_auth(auth.clone());
+                }
+                let connecting = tunnel.call(dst);
+                Box::pin(async move { Ok::<_, BoxError>(connecting.await?) })
+            }
+            Some(scheme @ ("socks5" | "socks5h")) => {
+                let mut socks =
+                    SocksV5::new(proxy_uri(), self.direct.clone()).local_dns(scheme == "socks5");
+                if let Some((user, pass)) = proxy.raw_auth() {
+                    socks = socks.with_auth(user.to_owned(), pass.to_owned());
+                }
+                let connecting = socks.call(dst);
+                Box::pin(
+                    async move { Ok::<_, BoxError>(MaybeHttpsStream::Http(connecting.await?)) },
+                )
+            }
+            Some(scheme @ ("socks4" | "socks4a")) => {
+                let connecting = SocksV4::new(proxy_uri(), self.direct.clone())
+                    .local_dns(scheme == "socks4")
+                    .call(dst);
+                Box::pin(
+                    async move { Ok::<_, BoxError>(MaybeHttpsStream::Http(connecting.await?)) },
+                )
+            }
+            other => {
+                let error = format!("unsupported proxy scheme {other:?}");
+                Box::pin(async move { Err(error.into()) })
+            }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum AttemptError {
@@ -97,7 +181,13 @@ pub(crate) struct Transport {
 
 impl Transport {
     pub fn new(token: Option<&str>, base: Option<&str>) -> Result<Self> {
-        Self::with_timeouts(token, base, CONNECT_TIMEOUT, READ_WRITE_TIMEOUT)
+        Self::with_timeouts(
+            token,
+            base,
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            Matcher::from_env(),
+        )
     }
 
     fn with_timeouts(
@@ -105,6 +195,7 @@ impl Transport {
         base: Option<&str>,
         connect_timeout: std::time::Duration,
         read_write_timeout: std::time::Duration,
+        proxies: Matcher,
     ) -> Result<Self> {
         let base: Uri = base
             .unwrap_or("https://api.github.com")
@@ -114,12 +205,19 @@ impl Transport {
             .map(|t| HeaderValue::from_str(&format!("Bearer {t}")))
             .transpose()
             .map_err(|_| Error::Config("invalid github credential header".into()))?;
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|_| Error::Config("cannot load TLS roots".into()))?
-            .https_or_http()
-            .enable_http1()
-            .build();
+        let mut direct = HttpConnector::new();
+        direct.enforce_http(false);
+        let tls = || {
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .map_err(|_| Error::Config("cannot load TLS roots".into()))
+                .map(|builder| builder.https_or_http().enable_http1())
+        };
+        let connector = tls()?.wrap_connector(ProxyConnector {
+            direct: direct.clone(),
+            to_proxy: tls()?.wrap_connector(direct),
+            proxies: Arc::new(proxies),
+        });
         let mut connector = hyper_timeout::TimeoutConnector::new(connector);
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_read_timeout(Some(read_write_timeout));
@@ -612,6 +710,7 @@ mod tests {
             Some(&base),
             Duration::from_secs(1),
             Duration::from_millis(25),
+            Matcher::builder().build(),
         )
         .unwrap();
         let traffic = Traffic::default();
@@ -656,6 +755,7 @@ mod tests {
             Some(&base),
             Duration::from_secs(1),
             Duration::from_millis(50),
+            Matcher::builder().build(),
         )
         .unwrap();
         let traffic = Traffic::default();
@@ -710,5 +810,178 @@ mod tests {
     #[tokio::test]
     async fn traffic_stalled_body_counts_one_error_without_retrying() {
         body_failure_keeps_captured_context(true).await;
+    }
+
+    /// The pool honors the standard proxy env like reqwest and `git`: a forge
+    /// host is tunnelled through the proxy (so a test's dead proxy stops a
+    /// forgotten fake server, and a corporate proxy reaches GitHub), while a
+    /// `NO_PROXY` host connects directly.
+    #[tokio::test]
+    async fn proxied_hosts_tunnel_through_the_proxy_and_no_proxy_hosts_connect_directly() {
+        let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_uri = format!("http://{}", proxy.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let head = request(&mut stream).await.unwrap_or_default();
+            let _ = seen_tx.send(head);
+            let _ = stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+        let fixture = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fixture_base = format!("http://{}", fixture.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = fixture.accept().await {
+                tokio::spawn(async move {
+                    while request(&mut stream).await.is_some() {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n[]")
+                            .await;
+                    }
+                });
+            }
+        });
+        let matcher = || {
+            hyper_util::client::proxy::matcher::Matcher::builder()
+                .all(proxy_uri.clone())
+                .no("127.0.0.1")
+                .build()
+        };
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(10));
+
+        let direct = Transport::with_timeouts(
+            Some("test-secret"),
+            Some(&fixture_base),
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            matcher(),
+        )
+        .unwrap();
+        let listed: serde_json::Value = tokio::time::timeout(
+            budget,
+            direct
+                .client(false, None)
+                .get("/repos/o/r/pulls", None::<&()>),
+        )
+        .await
+        .expect("NO_PROXY fixture answers in time")
+        .expect("NO_PROXY host connects directly");
+        assert_eq!(listed, serde_json::json!([]));
+
+        let proxied = Transport::with_timeouts(
+            Some("test-secret"),
+            Some("https://api.github.com"),
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            matcher(),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            budget,
+            proxied
+                .comparison_client()
+                .get::<serde_json::Value, _, _>("/user", None::<&()>),
+        )
+        .await
+        .expect("a refused tunnel fails in time");
+        assert!(result.is_err(), "the proxy refused the tunnel: {result:?}");
+        let head = tokio::time::timeout(budget, seen_rx)
+            .await
+            .expect("the proxy saw the request")
+            .unwrap();
+        assert!(
+            head.starts_with("CONNECT api.github.com:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            !head.contains("test-secret"),
+            "the token stays inside the tunnel: {head}"
+        );
+    }
+
+    /// Calls api.github.com through `proxy_uri`; true when the call failed.
+    fn get_user_via(proxy_uri: String) -> tokio::task::JoinHandle<bool> {
+        tokio::spawn(async move {
+            let transport = Transport::with_timeouts(
+                Some("test-secret"),
+                Some("https://api.github.com"),
+                CONNECT_TIMEOUT,
+                READ_WRITE_TIMEOUT,
+                Matcher::builder().all(proxy_uri).build(),
+            )
+            .unwrap();
+            transport
+                .comparison_client()
+                .get::<serde_json::Value, _, _>("/user", None::<&()>)
+                .await
+                .is_err()
+        })
+    }
+
+    /// `ALL_PROXY=socks5h://…` gets a SOCKS5 handshake naming the host for
+    /// the proxy to resolve, not an HTTP `CONNECT` it cannot parse.
+    #[tokio::test]
+    async fn a_socks5h_proxy_gets_a_socks_handshake_resolved_on_the_proxy() {
+        let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let call = get_user_via(format!("socks5h://{}", proxy.local_addr().unwrap()));
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(10));
+        let (head, target) = tokio::time::timeout(budget, async {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5, "a SOCKS5 greeting: {greeting:?}");
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut head = [0_u8; 5];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut target = vec![0_u8; usize::from(head[4]) + 2];
+            stream.read_exact(&mut target).await.unwrap();
+            let _ = stream.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+            (head, target)
+        })
+        .await
+        .expect("the proxy saw a SOCKS request");
+        assert_eq!(head[..4], [5, 1, 0, 3], "CONNECT by domain name");
+        let (host, port) = target.split_at(target.len() - 2);
+        assert_eq!(host, b"api.github.com");
+        assert_eq!(port, 443_u16.to_be_bytes());
+        let failed = tokio::time::timeout(budget, call).await.unwrap().unwrap();
+        assert!(failed, "the proxy refused the connection");
+    }
+
+    /// An `https://` proxy gets TLS first, so the `CONNECT` line and the
+    /// proxy credentials never cross the network in cleartext.
+    #[tokio::test]
+    async fn an_https_proxy_gets_tls_before_the_connect_request() {
+        let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let call = get_user_via(format!("https://user:pw@{}", proxy.local_addr().unwrap()));
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(10));
+        let first = tokio::time::timeout(budget, async {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let mut first = vec![0_u8; 1024];
+            let n = stream.read(&mut first).await.unwrap();
+            first.truncate(n);
+            first
+        })
+        .await
+        .expect("the proxy saw the connection");
+        let text = String::from_utf8_lossy(&first);
+        assert_eq!(first.first(), Some(&0x16), "a TLS ClientHello: {text}");
+        assert!(
+            !text.contains("CONNECT") && !text.contains("Proxy-Authorization"),
+            "{text}"
+        );
+        let failed = tokio::time::timeout(budget, call).await.unwrap().unwrap();
+        assert!(failed, "the proxy closed the connection");
     }
 }

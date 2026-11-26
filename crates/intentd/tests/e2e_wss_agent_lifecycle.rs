@@ -7834,7 +7834,9 @@ async fn terminal_create_env_over_wss() {
         &mut rpc,
         6,
         "terminal.readOutput",
-        json!({ "workspaceId": ws_id, "terminalId": terminal_id, "maxLines": 100 }),
+        // The whole `env` dump: a CI runner's environment exceeds 250 lines,
+        // so a short tail can miss the marker.
+        json!({ "workspaceId": ws_id, "terminalId": terminal_id, "maxLines": 2000 }),
     )
     .await;
     assert!(

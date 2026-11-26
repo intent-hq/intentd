@@ -43,6 +43,9 @@ async fn loopback_fixture() -> u16 {
 
 #[tokio::test]
 async fn public_host_fails_on_the_dead_proxy_while_loopback_fixtures_answer() {
+    if intentd_test_support::test_egress_allowed() {
+        return;
+    }
     let client = reqwest::Client::new();
     let port = loopback_fixture().await;
     for host in ["127.0.0.1", "localhost"] {
@@ -75,6 +78,9 @@ async fn public_host_fails_on_the_dead_proxy_while_loopback_fixtures_answer() {
 
 #[tokio::test]
 async fn git_subprocess_is_sent_to_the_dead_proxy() {
+    if intentd_test_support::test_egress_allowed() {
+        return;
+    }
     let output = tokio::time::timeout(
         budget(),
         tokio::process::Command::new("git")

@@ -48,34 +48,11 @@ fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
-/// Dead local proxy for every lib test. A test that forgets its fake forge
-/// server fails at once on this proxy instead of reaching the real GitHub or
-/// GitLab, whatever host the code picked (intentd#3743 and intentd#3758 each
-/// closed one host). reqwest clients and `git` children honor these vars;
-/// loopback fixtures pass through `NO_PROXY` only on `127.0.0.1`, `localhost`
-/// (and `*.localhost`) and `::1`. Not covered: clients built with
-/// `.no_proxy()` and libgit2 transports without auto proxy (native checkout
-/// and push in `intent-git`), which refuse proxies by design; children
-/// spawned with `env_clear()`; and `git` under an `http.proxy` config setting,
-/// which wins over these vars.
-pub(crate) const TEST_EGRESS_ENV: [(&str, &str); 8] = [
-    ("HTTPS_PROXY", DEAD_PROXY),
-    ("https_proxy", DEAD_PROXY),
-    ("HTTP_PROXY", DEAD_PROXY),
-    ("http_proxy", DEAD_PROXY),
-    ("ALL_PROXY", DEAD_PROXY),
-    ("all_proxy", DEAD_PROXY),
-    ("NO_PROXY", LOOPBACK),
-    ("no_proxy", LOOPBACK),
-];
-const DEAD_PROXY: &str = "http://127.0.0.1:0";
-const LOOPBACK: &str = "127.0.0.1,localhost,::1";
-
+/// Dead local proxy for every lib test: see
+/// [`intentd_test_support::block_test_egress`].
 #[ctor::ctor(unsafe)]
 fn block_test_egress() {
-    for (key, value) in TEST_EGRESS_ENV {
-        std::env::set_var(key, value);
-    }
+    intentd_test_support::block_test_egress();
 }
 
 /// Guard for tests that mutate debounce env vars to prevent parallel test
