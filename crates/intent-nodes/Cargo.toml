@@ -1,6 +1,6 @@
 [package]
 name = "intent-nodes"
-version = "0.11.299"
+version = "0.11.300"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.300] - 2026-11-26
+
+### 🚀 Features
+
+- *(store)* Add an owner-agnostic lease primitive and move work claims onto it ([#3793](https://github.com/intent-hq/intentd/pull/3793))
+
+
 ## [0.11.299] - 2026-11-25
 
 ### 🐛 Bug Fixes
