@@ -19,6 +19,9 @@ tokio::task_local! {
     /// Test seam: inside its scope, the refresh's first read of the stored
     /// refresh token (its version) fails; every later read succeeds.
     pub(super) static FAIL_VERSION_READ: ();
+    /// Test seam: inside its scope, runs right after the refresh read the
+    /// stored refresh token's version (before the exchange).
+    pub(super) static AFTER_VERSION_READ: Arc<dyn Fn() + Send + Sync>;
 }
 use crate::Services;
 
@@ -290,5 +293,49 @@ async fn a_failed_version_read_exchanges_nothing() {
     assert_eq!(
         stored(&services[0], SECRET_ACCOUNT).as_deref(),
         Some("access-0")
+    );
+}
+
+/// A peer reconnect between the version read and the exchange: the refresh
+/// exchanges only the token it read (never the peer's new one), and the
+/// version check then keeps the peer's pair, so no consumed token is left
+/// stored.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_before_the_exchange_is_never_consumed() {
+    let server = token_server(vec![rotated("access-1", "refresh-1")]).await;
+    let (_dir, services) = processes(1).await;
+    let peer = services[0].gitlab_secret_store.clone();
+    let reconnect: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        peer.store(SECRET_ACCOUNT, "access-new").unwrap();
+        peer.store(REFRESH_SECRET_ACCOUNT, "refresh-new").unwrap();
+    });
+    let refreshing = tokio::spawn({
+        let svc = services[0].clone();
+        let host = server.host.clone();
+        async move {
+            AFTER_VERSION_READ
+                .scope(reconnect, refresh(&svc, &host))
+                .await
+        }
+    });
+    server.entered.notified().await;
+    server.release.notify_one();
+    assert!(matches!(
+        refreshing.await.unwrap(),
+        Err(RefreshFailure::Transient)
+    ));
+    assert_eq!(
+        *server.exchanged.lock().unwrap(),
+        ["refresh-0"],
+        "only the token read as the version was exchanged"
+    );
+    assert_eq!(
+        stored(&services[0], REFRESH_SECRET_ACCOUNT).as_deref(),
+        Some("refresh-new"),
+        "the peer's unconsumed pair stands"
+    );
+    assert_eq!(
+        stored(&services[0], SECRET_ACCOUNT).as_deref(),
+        Some("access-new")
     );
 }

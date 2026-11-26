@@ -18,11 +18,10 @@ use std::sync::Arc;
 
 use intent_core::events::SOURCE_CONTROL_AUTH_CHANGED;
 use intent_core::{now_iso, Error, FileSecretStore, IdentityProofErrorKind, Result, WorkspaceId};
-use intent_sourcecontrol::gitlab_auth::{
-    refresh_grant, stored_credential, validate_pat, GitlabWriteObserver,
-};
+use intent_sourcecontrol::gitlab_auth::{stored_credential, validate_pat, GitlabWriteObserver};
 use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
 use intent_sourcecontrol::identity_proof::provider::{CreatedProof, ProofProvider};
+use intent_sourcecontrol::ExposeSecret as _;
 use intent_sourcecontrol::{
     GitlabDeviceFlow, GitlabExchange, GitlabHost, GitlabUser, StoredCredential, UserIdentity,
 };
@@ -1184,13 +1183,26 @@ async fn refresh_under_lease(
         );
         return Err(RefreshFailure::Transient);
     };
+    #[cfg(test)]
+    if let Ok(hook) = refresh_lease_tests::AFTER_VERSION_READ.try_with(Arc::clone) {
+        hook();
+    }
+    // The token exchanged is exactly the version: the owner's attested
+    // operand must equal it, and the legacy path exchanges it as read. A
+    // pair a peer stored after the version read is never consumed here.
     let refresh_operand = if let Some(write) = &write {
-        Some(
-            write
-                .refresh_operand(&store, guard.lease())
-                .await
-                .map_err(RefreshFailure::Local)?,
-        )
+        let operand = write
+            .refresh_operand(&store, guard.lease())
+            .await
+            .map_err(RefreshFailure::Local)?;
+        if before.as_deref() != Some(operand.expose_secret()) {
+            tracing::warn!(
+                host = host.host(),
+                "gitlab token refresh: the stored pair changed before the exchange; keeping it"
+            );
+            return Err(RefreshFailure::Transient);
+        }
+        Some(operand)
     } else {
         None
     };
@@ -1214,8 +1226,19 @@ async fn refresh_under_lease(
             ))?,
         )
         .await
+    } else if let Some(token) = &before {
+        intent_sourcecontrol::gitlab_auth::refresh_grant_with_operand(
+            host,
+            client_id,
+            store,
+            intent_sourcecontrol::SecretString::from(token.clone()),
+        )
+        .await
     } else {
-        refresh_grant(host, client_id, store).await
+        Err(intent_sourcecontrol::Error::Auth(format!(
+            "no gitlab refresh token stored for {}",
+            host.host()
+        )))
     };
     if result.is_err() {
         if let Some(write) = &write {
