@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.304] - 2026-11-26
+
+### 🚀 Features
+
+- *(services)* Hold lifecycle gates as leases across processes ([#3808](https://github.com/intent-hq/intentd/pull/3808))
+
+
 ## [0.11.303] - 2026-11-26
 
 ### 🚀 Features
