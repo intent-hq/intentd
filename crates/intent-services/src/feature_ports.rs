@@ -1276,7 +1276,7 @@ pub trait AgentWakePort: Send + Sync + 'static {
     /// The per-agent gate that serializes retirement with restore; hold its
     /// lock to keep `agent_id` from retiring meanwhile. Take it before any
     /// archive fence (see [`crate::lock_order`]).
-    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> crate::OrderedGate;
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> crate::RetirementGate;
 
     /// Whether `status` is terminal: the agent can no longer receive wakes.
     fn is_terminal_status(&self, status: AgentStatus) -> bool;
@@ -1344,8 +1344,8 @@ impl AgentWakePort for UnavailableAgentWake {
         None
     }
 
-    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> crate::OrderedGate {
-        crate::OrderedGate::default()
+    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> crate::RetirementGate {
+        crate::RetirementGate::default()
     }
 
     fn is_terminal_status(&self, _status: AgentStatus) -> bool {
@@ -3169,7 +3169,13 @@ mod tests {
         port.publish_queue_updated(&svc, &agent).await;
         assert!(port.queue_drainer(&svc).is_none());
         let first = port.retirement_gate(&svc, &agent);
-        let _held = first.try_lock().expect("a fresh gate");
+        let _held = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            first.lock(),
+        )
+        .await
+        .expect("a fresh gate is free")
+        .expect("no lease without a shared store");
         assert!(port.is_terminal_status(intent_core::AgentStatus::Idle));
         let disabled = std::collections::BTreeMap::from([("claude".to_owned(), false)]);
         assert!(!port.provider_is_disabled("claude", Some(&disabled)));

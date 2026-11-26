@@ -416,7 +416,10 @@ impl AgentResource for TempFolders {
         // Detach under the fence so an unarchive's keep runs after it, and
         // only while this archive is still current. The archive path
         // deletes the detached folders once its fence is released.
-        let _fence = svc.archive_fence.acquire(&sweep.workspace_id).await;
+        let _fence = svc
+            .archive_fence
+            .acquire_or_local(&sweep.workspace_id)
+            .await;
         let still_archived = match svc.store.get_workspace(&sweep.workspace_id).await {
             Ok(row) => row.archived && row.archived_at == sweep.archived_at,
             Err(e) => {

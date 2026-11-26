@@ -563,6 +563,9 @@ impl PgStore {
         s: &AgentSession,
         task_graph_enabled: bool,
     ) -> Result<std::result::Result<(), sqlx::Error>> {
+        // A create in a workspace another process is deleting fails here.
+        self.refuse_if_workspace_deleting(tx, &s.workspace_id)
+            .await?;
         let sql = format!(
             "INSERT INTO agent_session (tenant_id, {SESSION_COLUMNS}) VALUES ($1, \
              $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \

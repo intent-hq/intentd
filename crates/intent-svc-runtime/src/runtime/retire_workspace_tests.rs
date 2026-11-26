@@ -368,7 +368,7 @@ async fn script_mutations_after_retire_returns_are_refused_and_write_nothing() {
 async fn terminal_create_racing_retire_spawns_nothing() {
     let f = fixture().await;
     let ws = create_workspace(&f).await;
-    let guard = f.svc.feature_archive_fence().acquire(&ws.id).await;
+    let guard = f.svc.feature_archive_fence().acquire(&ws.id).await.unwrap();
     let create = intent_core::spawn_daemon({
         let svc = f.svc.clone();
         let id = ws.id.clone();

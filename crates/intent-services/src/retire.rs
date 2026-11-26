@@ -186,7 +186,7 @@ impl Services {
         // Nothing below waits on a turn (`stop_many` aborts workers) or takes
         // the fence (script stops only take script locks), so a turn start
         // blocked on this fence cannot deadlock it.
-        let fence = self.archive_fence.acquire(&id).await;
+        let fence = self.archive_fence.acquire(&id).await?;
         // Automatic retire re-checks under the fence (archive ↔ unarchive
         // serialize on it), BEFORE anything is torn down: an unarchive that
         // landed after the sweep listed the workspace always wins, and its

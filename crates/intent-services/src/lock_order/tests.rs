@@ -20,14 +20,14 @@ async fn the_documented_order_is_allowed() {
     let starting = turn_start();
     let _r = retirement.lock().await;
     let _t = starting.lock().await;
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
 }
 
 #[tokio::test]
 #[should_panic(expected = "lock order violation: RetirementGate")]
 async fn a_retirement_gate_under_an_archive_fence_panics() {
     let fence = Arc::new(ArchiveFence::default());
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
     let _r = OrderedGate::default().lock().await;
 }
 
@@ -35,7 +35,7 @@ async fn a_retirement_gate_under_an_archive_fence_panics() {
 #[should_panic(expected = "lock order violation: TurnStartGate")]
 async fn a_turn_start_gate_under_an_archive_fence_panics() {
     let fence = Arc::new(ArchiveFence::default());
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
     let _t = turn_start().lock().await;
 }
 
@@ -57,7 +57,7 @@ async fn the_check_fires_before_waiting_on_a_held_gate() {
             .await
             .unwrap()
     };
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
     let _r = gate.lock().await;
     drop(other);
 }
@@ -67,7 +67,7 @@ async fn in_order_paths_joined_in_one_task_are_allowed() {
     let fence = Arc::new(ArchiveFence::default());
     let in_order = || async {
         let _r = OrderedGate::default().lock().await;
-        let _f = fence.acquire(&ws()).await;
+        let _f = fence.acquire(&ws()).await.unwrap();
         tokio::task::yield_now().await;
     };
     tokio::join!(in_order(), in_order());
@@ -78,7 +78,7 @@ async fn in_order_paths_joined_in_one_task_are_allowed() {
 async fn a_hold_whose_earlier_lock_was_released_counts() {
     let fence = Arc::new(ArchiveFence::default());
     let first = OrderedGate::default().lock().await;
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
     drop(first);
     let _r = OrderedGate::default().lock().await;
 }
@@ -88,14 +88,14 @@ async fn a_hold_whose_earlier_lock_was_released_counts() {
 async fn a_turn_start_gate_under_a_fence_taken_under_a_retirement_gate_panics() {
     let fence = Arc::new(ArchiveFence::default());
     let _r = OrderedGate::default().lock().await;
-    let _f = fence.acquire(&ws()).await;
+    let _f = fence.acquire(&ws()).await.unwrap();
     let _t = turn_start().lock().await;
 }
 
 #[tokio::test]
 async fn a_released_hold_no_longer_counts() {
     let fence = Arc::new(ArchiveFence::default());
-    drop(fence.acquire(&ws()).await);
+    drop(fence.acquire(&ws()).await.unwrap());
     drop(turn_start().lock().await);
     let _r = OrderedGate::default().lock().await;
 }
@@ -108,7 +108,7 @@ async fn a_lock_held_by_another_task_does_not_count() {
     let holder = {
         let fence = Arc::clone(&fence);
         tokio::spawn(async move {
-            let _f = fence.acquire(&ws()).await;
+            let _f = fence.acquire(&ws()).await.unwrap();
             held_tx.send(()).unwrap();
             release_rx.await.ok();
         })

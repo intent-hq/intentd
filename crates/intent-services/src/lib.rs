@@ -86,7 +86,7 @@ mod executor_ops;
 pub mod host_resources;
 mod link_traffic_ops;
 pub mod lock_order;
-pub use lock_order::{OrderedGate, OrderedGuard};
+pub use lock_order::{OrderedGate, OrderedGuard, RetirementGate, RetirementGuard};
 mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
@@ -1884,6 +1884,8 @@ impl Services {
         let repository_connection_directory = Arc::new(
             repository_credentials::RepositoryConnectionDirectory::new(daemon_boot_id.clone()),
         );
+        let archive_fence = Arc::new(ArchiveFence::with_store(store.clone()));
+        let agent_retirement_gates = agent_ops::AgentRetirementGates::with_store(store.clone());
         let services = Self {
             store,
             assets_root: None,
@@ -1901,7 +1903,7 @@ impl Services {
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             desktop: Arc::new(desktop::Runtime::default()),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
-            agent_retirement_gates: agent_ops::AgentRetirementGates::default(),
+            agent_retirement_gates,
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -1980,7 +1982,7 @@ impl Services {
             fold_hit_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
-            archive_fence: Arc::new(ArchiveFence::default()),
+            archive_fence,
             archive_tail_park: None,
             archive_predrop_park: None,
             queue_mutation_gate_park: None,
@@ -16338,41 +16340,101 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// Lock order: retirement gate → turn-start gate → archive fence. Nothing
 /// holding this fence may wait on a gate; debug builds panic when one does
 /// (see [`lock_order`]).
+///
+/// On a store that other processes share (Postgres), a hold also holds the
+/// workspace's lease of scope [`intent_store::ARCHIVE_FENCE_SCOPE`], taken
+/// after the local lock, so an archive or unarchive in another process waits
+/// too (`intent_store::lifecycle_leases`).
 #[derive(Default)]
 pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    store: Option<Store>,
 }
 
 impl ArchiveFence {
+    /// A fence that also holds `store`'s archive-fence lease per hold.
+    #[must_use]
+    pub fn with_store(store: Store) -> Self {
+        Self {
+            locks: Mutex::default(),
+            store: Some(store),
+        }
+    }
+
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
     /// the tail's own re-acquire). Debug builds record the hold for the
-    /// lock-order check (see [`lock_order`]).
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "internal doc-hidden feature API, not a public library API"
-    )]
+    /// lock-order check (see [`lock_order`]). On a shared store it then
+    /// waits for the workspace's archive-fence lease.
+    ///
+    /// # Errors
+    ///
+    /// The lease could not be read (the database did not answer); nothing
+    /// is held.
     #[track_caller]
     pub fn acquire<'a>(
+        self: &'a Arc<Self>,
+        workspace_id: &'a WorkspaceId,
+    ) -> impl std::future::Future<Output = Result<ArchiveFenceGuard>> + Send + 'a {
+        let at = std::panic::Location::caller();
+        async move {
+            let mut held = self.hold_local(workspace_id, at).await;
+            if let Some(store) = &self.store {
+                held.lease = store
+                    .hold_lifecycle_lease(intent_store::ARCHIVE_FENCE_SCOPE, workspace_id.as_str())
+                    .await?;
+            }
+            Ok(held)
+        }
+    }
+
+    /// [`Self::acquire`] for a post-commit tail that cannot fail: when the
+    /// lease cannot be read it logs and holds the local lock alone, which
+    /// still orders this process's archive and unarchive.
+    #[track_caller]
+    pub(crate) fn acquire_or_local<'a>(
         self: &'a Arc<Self>,
         workspace_id: &'a WorkspaceId,
     ) -> impl std::future::Future<Output = ArchiveFenceGuard> + Send + 'a {
         let at = std::panic::Location::caller();
         async move {
-            let lock = self
-                .locks
-                .lock()
-                .expect("archive fence registry poisoned")
-                .entry(workspace_id.clone())
-                .or_default()
-                .clone();
-            let guard = lock.lock_owned().await;
-            ArchiveFenceGuard {
-                fence: Arc::clone(self),
-                key: workspace_id.clone(),
-                guard: Some(guard),
-                _order: lock_order::hold(lock_order::Rank::ArchiveFence, at),
+            let mut held = self.hold_local(workspace_id, at).await;
+            if let Some(store) = &self.store {
+                match store
+                    .hold_lifecycle_lease(intent_store::ARCHIVE_FENCE_SCOPE, workspace_id.as_str())
+                    .await
+                {
+                    Ok(lease) => held.lease = lease,
+                    Err(e) => tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "archive fence lease unavailable; holding the local fence only"
+                    ),
+                }
             }
+            held
+        }
+    }
+
+    async fn hold_local(
+        self: &Arc<Self>,
+        workspace_id: &WorkspaceId,
+        at: &'static std::panic::Location<'static>,
+    ) -> ArchiveFenceGuard {
+        let lock = self
+            .locks
+            .lock()
+            .expect("archive fence registry poisoned")
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone();
+        let guard = lock.lock_owned().await;
+        ArchiveFenceGuard {
+            fence: Arc::clone(self),
+            key: workspace_id.clone(),
+            guard: Some(guard),
+            lease: intent_store::LifecycleLease::local(),
+            _order: lock_order::hold(lock_order::Rank::ArchiveFence, at),
         }
     }
 }
@@ -16383,7 +16445,19 @@ pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// The cross-process half; released (in the background) on drop.
+    lease: intent_store::LifecycleLease,
     _order: lock_order::LockHold,
+}
+
+impl ArchiveFenceGuard {
+    /// The fencing token of the archive-fence lease this hold took; `None`
+    /// on a store only this process uses (or when a tail held the local
+    /// fence alone).
+    #[must_use]
+    pub fn lease_token(&self) -> Option<u64> {
+        self.lease.token()
+    }
 }
 
 impl Drop for ArchiveFenceGuard {
@@ -18649,6 +18723,14 @@ impl Services {
             // creates/sends finish first; unrelated workspaces stay writable.
             // Keep the permit through cleanup and terminal event publication.
             let _deletion = services.workspace_mutations.delete(&id).await;
+            // Other processes of a shared store (Postgres): holding the
+            // deletion lease makes their creates and sends in this workspace
+            // fail, and orders after every one they already committed, so
+            // the session snapshot below sees them. A duplicate delete in
+            // another process waits here. Held until this delete returns.
+            let _deletion_lease = store
+                .hold_lifecycle_lease(intent_store::WORKSPACE_DELETION_SCOPE, id.as_str())
+                .await?;
             services
                 .ports
                 .runtime()
@@ -21433,7 +21515,7 @@ impl WorkspaceApi for Services {
             // holds the fence from its row flip through the folder sweep, so
             // placement (which creates `.intent/` dirs) can never recreate a
             // swept checkout.
-            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            let _archive = self.archive_fence.acquire(&workspace_id).await?;
             self.refuse_if_retired(&workspace_id).await?;
             self.place_attachment_registered(
                 workspace_id,
@@ -37058,7 +37140,7 @@ impl Services {
         let (flipped, revived) = {
             let _fence = match held_fence {
                 Some(fence) => fence,
-                None => self.archive_fence_after_archive_script(&id).await,
+                None => self.archive_fence_after_archive_script(&id).await?,
             };
             let current = store.get_workspace(&id).await?;
             let (flipped, revived) = if current.is_retired() {
@@ -37255,7 +37337,18 @@ impl Services {
         match self.store.get_workspace(workspace_id).await {
             // Waits for a running archive script: this turn may unarchive.
             Ok(ws) if ws.archived => {
-                Some(self.archive_fence_after_archive_script(workspace_id).await)
+                match self.archive_fence_after_archive_script(workspace_id).await {
+                    Ok(fence) => Some(fence),
+                    // Same as a read failure: the turn proceeds unfenced.
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %workspace_id.as_str(),
+                            error = %e,
+                            "turn start: archive fence lease unavailable; turn proceeds unfenced"
+                        );
+                        None
+                    }
+                }
             }
             _ => None,
         }
@@ -40442,7 +40535,7 @@ impl Services {
             // detached principal can interleave with the tail's drop — the
             // tail never drops a message a CURRENT member queued nor
             // announces the removal of a member who is seated again.
-            let fence = this.archive_fence.acquire(&id).await;
+            let fence = this.archive_fence.acquire(&id).await?;
             // The archive script runs only on a real Active → Archived flip,
             // decided under the fence so a repeated or concurrent archive
             // never reruns the cleanup.
@@ -40667,7 +40760,7 @@ impl Services {
                 // row still carries this call's `archivedAt`; the flip and
                 // its delta happen under the same fence, so the two
                 // announcements can never cross.
-                let fence = this.archive_fence.acquire(&ws.id).await;
+                let fence = this.archive_fence.acquire_or_local(&ws.id).await;
                 let still_archived = match store.get_workspace(&ws.id).await {
                     Ok(row) => row.archived && row.archived_at == ws.archived_at,
                     Err(e) => {
