@@ -182,7 +182,20 @@ impl PgStore {
     }
 
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
+        self.upsert_completion_watch_guarded(w, None).await
+    }
+
+    /// [`Self::upsert_completion_watch`], guarding `guard` (when given) in
+    /// the write transaction first: a lost lease writes nothing.
+    pub async fn upsert_completion_watch_guarded(
+        &self,
+        w: &PersistedCompletionWatch,
+        guard: Option<&Lease>,
+    ) -> Result<()> {
         let mut tx = self.begin_write().await?;
+        if let Some(lease) = guard {
+            self.guard_lease(&mut tx, lease).await?;
+        }
         sqlx::query(
             "INSERT INTO completion_watch (tenant_id, id, parent_workspace_id, \
              child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, \
@@ -218,21 +231,22 @@ impl PgStore {
         &self,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
-    ) -> Result<Option<String>> {
-        let mut tx = self.begin().await?;
-        let id = sqlx::query_scalar(
-            "SELECT id FROM completion_watch WHERE tenant_id = $1 \
+    ) -> Result<Option<PersistedCompletionWatch>> {
+        let sql = format!(
+            "SELECT {WATCH_COLUMNS} FROM completion_watch WHERE tenant_id = $1 \
              AND parent_agent_id = $2 AND child_agent_id = $3 AND group_id IS NULL \
-             ORDER BY created_at COLLATE \"C\", row_seq LIMIT 1",
-        )
-        .bind(self.tenant())
-        .bind(&parent_agent_id.0)
-        .bind(&child_agent_id.0)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| Error::Internal(format!("find completion watch: {e}")))?;
+             ORDER BY created_at COLLATE \"C\", row_seq LIMIT 1"
+        );
+        let mut tx = self.begin().await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(self.tenant())
+            .bind(&parent_agent_id.0)
+            .bind(&child_agent_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("find completion watch: {e}")))?;
         tx.commit().await.map_err(db)?;
-        Ok(id)
+        row.as_ref().map(decode_watch_row).transpose()
     }
 
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {

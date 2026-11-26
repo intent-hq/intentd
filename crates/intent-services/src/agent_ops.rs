@@ -1967,6 +1967,11 @@ pub struct QueuedMessage {
     /// True on a draining overlay until its transcript row is durable.
     #[serde(skip)]
     pub provisional: bool,
+    /// A parent wake queued under a delivery claim whose guarded queue
+    /// write has not committed yet: no drain may take it until the write
+    /// decides (see `Services::enqueue_under_claim`). Never persisted.
+    #[serde(skip)]
+    pub(crate) write_pending: bool,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -2411,6 +2416,7 @@ impl QueuedMessage {
     )]
     pub fn ready_to_send(&self) -> bool {
         !self.editing
+            && !self.write_pending
             && !self.is_held()
             && !intent_core::human_author::is_unbound_historical_human(
                 self.message_metadata.as_ref(),
@@ -18913,8 +18919,27 @@ impl Services {
             .expect("agent queue registry poisoned")
             .get(agent_id)
             .is_some_and(|queue| queue.iter().any(|m| m.matches_submission(message_id)));
-        let enqueued = enqueue()?;
+        // A new entry is inserted with `write_pending` set (read under the
+        // queue lock that inserts it), so no drain takes it before the
+        // guarded write decides: not one that takes the persist gate held
+        // here, and not one that does not (`agent.sendQueuedMessageNow`,
+        // the worker's drains), which skip or refuse a pending entry.
+        self.guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .insert(message_id.to_owned());
+        let enqueued = enqueue();
+        self.guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .remove(message_id);
+        let enqueued = enqueued?;
         let rows = self.queue_rows(agent_id);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(park) = &self.guarded_enqueue_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         match self
             .store
             .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0)
@@ -18924,19 +18949,41 @@ impl Services {
                 if let Some(merged) = sync.merged {
                     self.adopt_stored_queue(agent_id, &rows, merged);
                 }
-                Ok(enqueued)
+                if let Some(entry) = self
+                    .agent_queues
+                    .lock()
+                    .expect("agent queue registry poisoned")
+                    .get_mut(agent_id)
+                    .and_then(|queue| queue.iter_mut().find(|m| m.id == enqueued.0.id))
+                {
+                    entry.write_pending = false;
+                }
+                let (mut queued, position) = enqueued;
+                queued.write_pending = false;
+                Ok((queued, position))
             }
             Err(e) => {
                 if !existed {
-                    let mut queues = self
-                        .agent_queues
-                        .lock()
-                        .expect("agent queue registry poisoned");
-                    if let Some(queue) = queues.get_mut(agent_id) {
-                        queue.retain(|m| m.id != enqueued.0.id);
-                        if queue.is_empty() {
-                            queues.remove(agent_id);
+                    {
+                        let mut queues = self
+                            .agent_queues
+                            .lock()
+                            .expect("agent queue registry poisoned");
+                        if let Some(queue) = queues.get_mut(agent_id) {
+                            queue.retain(|m| m.id != enqueued.0.id);
+                            if queue.is_empty() {
+                                queues.remove(agent_id);
+                            }
                         }
+                    }
+                    // A recovery send's marker names the entry just removed
+                    // (a stale marker is dropped by its next claim anyway).
+                    let mut parked = self
+                        .parked_recovery_sends
+                        .lock()
+                        .expect("parked recovery send registry poisoned");
+                    if parked.get(agent_id) == Some(&enqueued.0.id) {
+                        parked.remove(agent_id);
                     }
                 }
                 Err(e)
@@ -19063,6 +19110,11 @@ impl Services {
         // The receipt is scoped to human wire front doors, including
         // sendToTask (whose legacy runtime delivery uses Automatic origin).
         intent_core::browser_message::accept_browser_message(agent_id, &id);
+        let write_pending = self
+            .guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .contains(&id);
         let queued = QueuedMessage {
             monitor_turn,
             delivery_groups: None,
@@ -19093,6 +19145,7 @@ impl Services {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending,
             submission_order: self
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -19239,6 +19292,7 @@ impl Services {
                     editing_message_id: None,
                     latest_human_submission_at: None,
                     provisional: false,
+                    write_pending: false,
                     submission_order: 0,
                 };
                 queue.push(queued.clone());
@@ -20490,6 +20544,12 @@ impl Services {
                 {
                     refused = Some(Error::Forbidden(
                         "monitor updates require their original delivery route".into(),
+                    ));
+                    return None;
+                }
+                if queue[idx].write_pending {
+                    refused = Some(Error::StoreBusy(
+                        "the queued message is still being written; retry".into(),
                     ));
                     return None;
                 }

@@ -232,6 +232,46 @@ impl Services {
         self.with_completion_send_park(park)
     }
 
+    /// Test seam: `with_guarded_enqueue_park`.
+    #[must_use]
+    pub fn with_guarded_enqueue_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_guarded_enqueue_park(park)
+    }
+
+    /// Test seam: `agent_send_queued_message_now_op`.
+    pub async fn agent_send_queued_message_now_op_for_test(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        self.agent_send_queued_message_now_op(agent_id, message_id)
+            .await
+    }
+
+    /// Test seam: `with_watch_registration_park`.
+    #[must_use]
+    pub fn with_watch_registration_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_watch_registration_park(park)
+    }
+
+    /// Test seam: `register_completion_watch_strict_durable` (an ask-only
+    /// watch, parent and child in `workspace_id`).
+    pub async fn register_completion_watch_strict_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        self.register_completion_watch_strict_durable(
+            workspace_id,
+            workspace_id,
+            parent_agent_id,
+            "parent".into(),
+            child_agent_id,
+        )
+        .await
+    }
+
     /// Test seam: `register_completion_watch_durable`.
     pub async fn register_completion_watch_durable_for_test(
         &self,

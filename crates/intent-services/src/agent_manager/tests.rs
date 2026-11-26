@@ -8072,6 +8072,7 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         editing_message_id: None,
         latest_human_submission_at: None,
         provisional: false,
+        write_pending: false,
         submission_order: 0,
     }
 }
@@ -17825,6 +17826,7 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         editing_message_id: None,
         latest_human_submission_at: None,
         provisional: false,
+        write_pending: false,
         submission_order: 0,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
@@ -22860,6 +22862,7 @@ mod stale_redrive_tests {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending: false,
             submission_order: 0,
         }
     }
@@ -23405,6 +23408,7 @@ mod dequeue_wait_tests {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending: false,
             submission_order: 0,
         }
     }
@@ -28148,6 +28152,7 @@ mod flush_queued_messages_tests {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending: false,
             submission_order: 0,
         }
     }

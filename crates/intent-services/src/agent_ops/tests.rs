@@ -5959,6 +5959,70 @@ async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
     );
 }
 
+/// A stored ungrouped watch for the pair that this process does not hold
+/// (another process registered it, or it is the leftover row of a watch
+/// this process removed whose best-effort delete has not landed) is reused
+/// by strict ask registration AND held here, so this process delivers it:
+/// trusting the row alone would leave a removed watch's row with no
+/// deliverer and the asker waiting forever.
+#[tokio::test]
+async fn strict_ask_registration_holds_a_stored_watch_it_did_not_have() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.store()
+        .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
+            id: "stored-watch".into(),
+            parent_workspace_id: ws.clone(),
+            child_workspace_id: ws.clone(),
+            parent_agent_id: parent.clone(),
+            parent_agent_name: "Parent".into(),
+            child_agent_id: child.clone(),
+            group_id: None,
+            report_delivered: false,
+            wake_on_attention: false,
+            completion_only: true,
+            created_at: now_iso(),
+        })
+        .await
+        .expect("seed the stored watch");
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    let id = svc
+        .register_completion_watch_strict_durable(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+        )
+        .await
+        .expect("register ask-only watch");
+    assert_eq!(id, "stored-watch", "the stored watch is reused");
+    assert_eq!(
+        svc.find_watches_for_child(&child)
+            .iter()
+            .map(|w| w.id.as_str())
+            .collect::<Vec<_>>(),
+        ["stored-watch"],
+        "and held by this process"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "this process delivers the reused watch"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+}
+
 #[tokio::test]
 async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
     let (_t, svc, target_ws) = setup().await;
@@ -36329,6 +36393,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         editing_message_id: None,
         latest_human_submission_at: None,
         provisional: false,
+        write_pending: false,
         submission_order: 0,
     };
 
@@ -36928,6 +36993,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending: false,
             submission_order: 0,
         },
     );
@@ -37392,6 +37458,7 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         editing_message_id: None,
         latest_human_submission_at: None,
         provisional: false,
+        write_pending: false,
         submission_order: 0,
     }
 }

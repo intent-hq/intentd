@@ -665,6 +665,18 @@ pub struct Services {
     /// processes are ordered by the store (writer lock + queue version), not
     /// by this lock.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Message ids being queued under a delivery claim right now
+    /// (`Services::enqueue_under_claim`): the queue insert reads it to mark
+    /// the new entry `write_pending` in the same critical section.
+    guarded_enqueues: Arc<Mutex<HashSet<String>>>,
+    /// Test seam: parks a guarded enqueue between the in-memory insert and
+    /// its guarded write. `None` in production.
+    #[cfg(any(test, feature = "test-hooks"))]
+    guarded_enqueue_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a strict watch registration between its lookups and
+    /// its guarded insert. `None` in production.
+    #[cfg(any(test, feature = "test-hooks"))]
+    watch_registration_park: Option<Arc<CompletionClassifyPark>>,
     /// Serializes every `agent:queue:updated` publish
     /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
     /// *inside* this async lock, immediately before the bus write, so a
@@ -1878,6 +1890,11 @@ impl Services {
             draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            guarded_enqueues: Arc::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            guarded_enqueue_park: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            watch_registration_park: None,
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             desktop: Arc::new(desktop::Runtime::default()),
@@ -3319,6 +3336,25 @@ impl Services {
 
     /// Test seam: park a parent wake send between its idempotency probe and
     /// the wake write, so a test can let the delivery claim lapse there.
+    /// Test seam: park a guarded enqueue between its in-memory insert and
+    /// its guarded queue write.
+    /// Test seam: park a strict watch registration between its lookups and
+    /// its guarded insert.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_watch_registration_park(
+        mut self,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.watch_registration_park = Some(park);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_guarded_enqueue_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.guarded_enqueue_park = Some(park);
+        self
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_completion_send_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_send_park = Some(park);

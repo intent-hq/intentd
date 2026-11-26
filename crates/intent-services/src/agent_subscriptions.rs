@@ -52,6 +52,10 @@ const WATCH_REGISTRATION_LEASE_SCOPE: &str = "completion-watch-registration";
 /// next one.
 const WATCH_REGISTRATION_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Registrations of one pair that lost their lease before the insert try
+/// again this many times in all (each under a fresh lease).
+const WATCH_REGISTRATION_ATTEMPTS: u32 = 3;
+
 /// How often a registration waiting for its pair's lease tries again.
 const WATCH_REGISTRATION_LEASE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -406,22 +410,35 @@ impl Services {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
         // One registration per (parent, child) pair at a time, in this
         // process and across processes sharing the store: the pair's lease.
-        let registration = self
-            .acquire_watch_registration_lease(&parent_agent_id, &child_agent_id)
-            .await?;
-        let registered = self
-            .register_completion_watch_strict_leased(
-                parent_workspace_id,
-                child_workspace_id,
-                parent_agent_id,
-                parent_agent_name,
-                child_agent_id,
-            )
-            .await;
-        if let Err(e) = self.store.release_lease(registration).await {
-            tracing::debug!(error = %e, "watch registration lease release failed; it lapses by TTL");
+        // The insert guards it, so a registration that lost it (paused past
+        // its TTL while another took the pair over) writes nothing and runs
+        // again under a fresh lease, finding the winner's watch.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let registration = self
+                .acquire_watch_registration_lease(&parent_agent_id, &child_agent_id)
+                .await?;
+            let registered = self
+                .register_completion_watch_strict_leased(
+                    parent_workspace_id,
+                    child_workspace_id,
+                    parent_agent_id.clone(),
+                    parent_agent_name.clone(),
+                    child_agent_id.clone(),
+                    &registration,
+                )
+                .await;
+            if let Err(e) = self.store.release_lease(registration).await {
+                tracing::debug!(error = %e, "watch registration lease release failed; it lapses by TTL");
+            }
+            match registered {
+                Err(Error::LeaseLost(reason)) if attempt < WATCH_REGISTRATION_ATTEMPTS => {
+                    tracing::info!(%reason, "watch registration lease lost before the insert; registering again");
+                }
+                other => return other,
+            }
         }
-        registered
     }
 
     /// Waits for the registration lease of the (`parent`, `child`) pair
@@ -470,6 +487,7 @@ impl Services {
         parent_agent_id: AgentId,
         parent_agent_name: String,
         child_agent_id: AgentId,
+        registration: &intent_store::Lease,
     ) -> Result<String> {
         if let Some(existing) = self
             .agent_subscriptions
@@ -485,13 +503,28 @@ impl Services {
         {
             return Ok(existing.id.clone());
         }
-        // Another process registered the pair: its watch delivers.
-        if let Some(existing) = self
+        // A stored watch for the pair that this process does not hold:
+        // another process registered it, or it is the row of a watch this
+        // process removed whose best-effort delete has not landed (or
+        // failed). Hold it here too, so this process delivers it either way:
+        // trusting the row alone would leave a removed watch's row with no
+        // deliverer. Two holders are ordered by the watch's delivery claim
+        // and the stable wake id.
+        if let Some(stored) = self
             .store
             .find_ungrouped_completion_watch(&parent_agent_id, &child_agent_id)
             .await?
         {
-            return Ok(existing);
+            let watch = persisted_to_completion_watch(&stored);
+            let id = watch.id.clone();
+            let mut registry = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if !registry.subscriptions.iter().any(|w| w.id == id) {
+                registry.subscriptions.push(watch);
+            }
+            return Ok(id);
         }
         let watch = CompletionWatch {
             id: Uuid::new_v4().to_string(),
@@ -508,8 +541,15 @@ impl Services {
             delivered_report_ts: None,
         };
         let id = watch.id.clone();
+        // Test seam: park between the lookups above and the guarded insert,
+        // so a test can let the pair's lease lapse there.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(park) = &self.watch_registration_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         self.store
-            .upsert_completion_watch(&completion_watch_to_persisted(&watch))
+            .upsert_completion_watch_guarded(&completion_watch_to_persisted(&watch), registration)
             .await?;
         self.agent_subscriptions
             .lock()

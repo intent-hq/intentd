@@ -10000,6 +10000,14 @@ impl AgentManager {
             // nobody else will consume the marker — probe now.
             self.redrive_parked_recovery_send(&agent_id, &workspace_id)
                 .await;
+            // A wake queued under a delivery claim was not drainable until
+            // its guarded write committed: a turn that ended meanwhile
+            // skipped it, so drain now (a no-op while a turn holds the slot).
+            if delivery_claim.is_some() {
+                self.clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
             return Ok(result);
         };
         // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
@@ -19414,6 +19422,7 @@ async fn publish_error_status_and_requeue(
             edit_prepended: String::new(),
             editing_message_id: None,
             provisional: false,
+            write_pending: false,
             submission_order: options.queued_submission_order,
             correlation_order_known: options.queued_correlation_order_known,
             latest_human_submission_at: options.latest_human_submission_at.clone(),
