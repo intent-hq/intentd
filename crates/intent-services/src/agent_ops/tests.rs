@@ -1101,7 +1101,7 @@ async fn user_retire_of_top_level_agent_waits_on_the_workspace_gate() {
     let target = create_agent(&svc, &ws, "Target").await;
     let _peer = create_agent(&svc, &ws, "Peer").await;
     let gate = svc.agent_retirement_gates.for_workspace(&ws);
-    let held = gate.lock().await;
+    let held = gate.lock().await.unwrap();
     let pending = {
         let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
         tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
@@ -1177,7 +1177,7 @@ async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
     let target = create_agent(&svc, &ws, "Target").await;
     let peer = create_agent(&svc, &ws, "Peer").await;
     let gate = svc.agent_retirement_gates.for_workspace(&ws);
-    let held = gate.lock().await;
+    let held = gate.lock().await.unwrap();
     let late = {
         let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
         tokio::spawn(async move { self_retire(&svc, &ws, &target).await })

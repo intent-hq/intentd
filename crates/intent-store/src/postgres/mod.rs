@@ -80,6 +80,7 @@ mod hooks;
 mod idempotency;
 mod lease;
 mod leases;
+mod lifecycle_leases;
 mod mcp_oauth;
 mod neki_topology;
 mod nodes;

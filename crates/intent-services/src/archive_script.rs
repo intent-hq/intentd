@@ -206,12 +206,12 @@ impl Services {
     pub(crate) async fn archive_fence_after_archive_script(
         &self,
         id: &WorkspaceId,
-    ) -> crate::ArchiveFenceGuard {
+    ) -> intent_core::Result<crate::ArchiveFenceGuard> {
         loop {
             self.wait_for_archive_script(id).await;
-            let fence = self.archive_fence.acquire(id).await;
+            let fence = self.archive_fence.acquire(id).await?;
             if self.archive_script_gates.gate(id).try_lock().is_ok() {
-                return fence;
+                return Ok(fence);
             }
             drop(fence);
         }

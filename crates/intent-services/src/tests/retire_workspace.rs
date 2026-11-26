@@ -978,7 +978,7 @@ async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_wa
         .expect("archive");
 
     // Hold the fence so the op stops at it, after its first (stale) read.
-    let guard = svc.archive_fence.acquire(&ws.id).await;
+    let guard = svc.archive_fence.acquire(&ws.id).await.unwrap();
     let op = intent_core::spawn_daemon({
         let svc = svc.clone();
         let id = ws.id.clone();
@@ -1036,7 +1036,7 @@ async fn manual_retire_does_not_stop_scripts_of_a_workspace_unarchived_while_wai
         .await
         .expect("archive");
 
-    let guard = svc.archive_fence.acquire(&ws.id).await;
+    let guard = svc.archive_fence.acquire(&ws.id).await.unwrap();
     let op = intent_core::spawn_daemon({
         let svc = svc.clone();
         let id = ws.id.clone();
@@ -1302,7 +1302,7 @@ async fn place_attachment_racing_retire_places_nothing() {
     use base64::Engine as _;
     let f = fixture().await;
     let ws = create_workspace(&f).await;
-    let guard = f.svc.archive_fence.acquire(&ws.id).await;
+    let guard = f.svc.archive_fence.acquire(&ws.id).await.unwrap();
     let place = intent_core::spawn_daemon({
         let svc = f.svc.clone();
         let id = ws.id.clone();

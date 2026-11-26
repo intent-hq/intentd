@@ -249,6 +249,11 @@ impl TurnStartGates {
 /// archive fence. Never wait on one of these gates while holding a turn-start
 /// gate or an archive fence; debug builds panic when code does (see
 /// [`crate::lock_order`]).
+///
+/// On a store that other processes share (Postgres), each hold also holds a
+/// lease after the local lock (scope `agent-retirement` per agent,
+/// `workspace-retirement` per workspace), so the same transition in another
+/// process waits too (`intent_store::lifecycle_leases`).
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
@@ -257,6 +262,7 @@ pub(crate) struct AgentRetirementGates {
     /// [`Services::agent_retire_op`] cannot be raced by two top-level agents
     /// retiring at once (each would otherwise see the other still active).
     workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    store: Option<intent_store::Store>,
 }
 
 /// How long deleting a remote agent waits for its machine to acknowledge
@@ -264,17 +270,43 @@ pub(crate) struct AgentRetirementGates {
 const REMOTE_SCRIPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentRetirementGates {
-    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> crate::OrderedGate {
-        crate::OrderedGate::new(
-            crate::lock_order::Rank::RetirementGate,
-            weak_gate(&self.gates, agent_id),
+    /// Gates that also hold `store`'s lifecycle leases.
+    pub(crate) fn with_store(store: intent_store::Store) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> crate::RetirementGate {
+        crate::RetirementGate::new(
+            crate::OrderedGate::new(
+                crate::lock_order::Rank::RetirementGate,
+                weak_gate(&self.gates, agent_id),
+            ),
+            self.store.clone().map(|store| {
+                (
+                    store,
+                    intent_store::AGENT_RETIREMENT_SCOPE,
+                    agent_id.as_str().to_owned(),
+                )
+            }),
         )
     }
 
-    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> crate::OrderedGate {
-        crate::OrderedGate::new(
-            crate::lock_order::Rank::RetirementGate,
-            weak_gate(&self.workspaces, workspace_id),
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> crate::RetirementGate {
+        crate::RetirementGate::new(
+            crate::OrderedGate::new(
+                crate::lock_order::Rank::RetirementGate,
+                weak_gate(&self.workspaces, workspace_id),
+            ),
+            self.store.clone().map(|store| {
+                (
+                    store,
+                    intent_store::WORKSPACE_RETIREMENT_SCOPE,
+                    workspace_id.as_str().to_owned(),
+                )
+            }),
         )
     }
 }
@@ -8043,7 +8075,7 @@ impl Services {
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
             let retirement = self.agent_retirement_gates.for_agent(&agent_id);
-            let _retirement = retirement.lock().await;
+            let _retirement = retirement.lock().await?;
             self.ports
                 .runtime()
                 .cancel_script_monitors(self, session_ws, Some(&agent_id), "owner-deleted")
@@ -8290,7 +8322,7 @@ impl Services {
         let session = {
             // An idempotent retry also waits for the winning retire's cleanup.
             let gate = self.agent_retirement_gates.for_agent(&agent_id);
-            let _retirement = gate.lock().await;
+            let _retirement = gate.lock().await?;
             self.store.get_agent_session_summary(&agent_id).await?
         };
         if let Some(ws) = workspace_id.as_ref() {
@@ -8326,7 +8358,7 @@ impl Services {
             let gate = self
                 .agent_retirement_gates
                 .for_workspace(&session.workspace_id);
-            let guard = gate.lock().await;
+            let guard = gate.lock().await?;
             // A concurrent retire of this same target may have won while
             // this call waited for the workspace gate: report it as an
             // idempotent retry, not as a last-agent refusal.
@@ -8464,7 +8496,7 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let gate = self.agent_retirement_gates.for_agent(&session.id);
-        let _retirement = gate.lock().await;
+        let _retirement = gate.lock().await?;
         let now = now_iso();
         // Unread state observed BEFORE the retire write (derived + stored
         // flag): a retired session drops out of the unread derivation, so
@@ -8585,7 +8617,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         let gate = self.agent_retirement_gates.for_agent(&agent_id);
-        let _retirement = gate.lock().await;
+        let _retirement = gate.lock().await?;
         let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {

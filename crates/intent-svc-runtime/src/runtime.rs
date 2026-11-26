@@ -606,8 +606,8 @@ impl RuntimePort for RuntimeFeature {
             // Lock order: retirement gate, then archive fence
             // (`intent_services::lock_order`).
             let retirement = svc.feature_agent_wake().retirement_gate(svc, &agent_id);
-            let _retirement = retirement.lock().await;
-            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
+            let _retirement = retirement.lock().await?;
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await?;
             let key = (workspace_id.clone(), script_id.clone());
             let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
             let reply = svc
@@ -951,7 +951,7 @@ impl RuntimePort for RuntimeFeature {
             // the row and sweeps the workspace's PTYs under the same fence,
             // so a create admitted before the flip finishes spawning before
             // the sweep lists terminals, and one after it is refused.
-            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await?;
             svc.refuse_if_retired(&workspace_id).await?;
             // On an orchestrator a workspace with a home runs its terminals
             // there (nodeProtocol 19).

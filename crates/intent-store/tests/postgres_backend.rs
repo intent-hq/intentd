@@ -60,6 +60,8 @@ mod hooks;
 mod idempotency;
 #[path = "postgres_backend/leases.rs"]
 mod leases;
+#[path = "postgres_backend/lifecycle_leases.rs"]
+mod lifecycle_leases;
 #[path = "postgres_backend/mcp_oauth.rs"]
 mod mcp_oauth;
 #[path = "postgres_backend/nodes.rs"]

@@ -550,6 +550,11 @@ impl PgStore {
         } = content_col_and_payload_rows(content).await?;
         let tenant = self.tenant();
         let mut tx = self.begin_write().await?;
+        // A send into a workspace another process is deleting fails here.
+        if role == "user" {
+            self.refuse_if_agent_workspace_deleting(&mut tx, agent_id)
+                .await?;
+        }
         let row = sqlx::query(
             "SELECT COALESCE(NULLIF(s.resolved_model, ''), NULLIF(s.model, ''), 'unknown') AS model, \
              (SELECT COALESCE(MAX(m.seq), -1) + 1 FROM agent_message m \

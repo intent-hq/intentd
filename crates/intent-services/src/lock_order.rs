@@ -112,6 +112,65 @@ impl OrderedGate {
     }
 }
 
+/// A retirement gate: an [`OrderedGate`] of rank `RetirementGate` plus, on
+/// a store other processes share, the store lease of the same target (see
+/// `intent_store::lifecycle_leases`), taken after the local gate.
+#[derive(Clone, Default)]
+pub struct RetirementGate {
+    gate: OrderedGate,
+    lease: Option<(intent_store::Store, &'static str, String)>,
+}
+
+impl RetirementGate {
+    pub(crate) fn new(
+        gate: OrderedGate,
+        lease: Option<(intent_store::Store, &'static str, String)>,
+    ) -> Self {
+        Self { gate, lease }
+    }
+
+    /// Wait for the local gate, then for the store lease. Debug builds
+    /// panic first when the calling task holds a later-ranked lock.
+    ///
+    /// # Errors
+    ///
+    /// The lease could not be read (the database did not answer); nothing
+    /// is held.
+    #[track_caller]
+    pub fn lock(&self) -> impl Future<Output = intent_core::Result<RetirementGuard>> + Send + '_ {
+        let local = self.gate.lock();
+        async move {
+            let guard = local.await;
+            let lease = match &self.lease {
+                Some((store, scope, key)) => store.hold_lifecycle_lease(scope, key).await?,
+                None => intent_store::LifecycleLease::local(),
+            };
+            Ok(RetirementGuard {
+                _lease: lease,
+                _guard: guard,
+            })
+        }
+    }
+
+    /// Whether both handles name the same local gate.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.gate.ptr_eq(&other.gate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_count(&self) -> usize {
+        self.gate.handle_count()
+    }
+}
+
+/// A hold on a [`RetirementGate`]. Drop releases the lease (in the
+/// background), then the local gate.
+pub struct RetirementGuard {
+    _lease: intent_store::LifecycleLease,
+    _guard: OrderedGuard,
+}
+
 /// A hold on an [`OrderedGate`]; releases it on drop.
 pub struct OrderedGuard {
     _guard: OwnedMutexGuard<()>,

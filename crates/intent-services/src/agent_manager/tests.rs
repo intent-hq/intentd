@@ -4079,6 +4079,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
         tokio::spawn(async move { fence.acquire(&ws).await })
             .await
             .unwrap()
+            .unwrap()
     };
     assert!(mgr
         .services

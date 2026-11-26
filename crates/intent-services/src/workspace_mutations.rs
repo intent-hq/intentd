@@ -5,6 +5,17 @@
 //! and sends finish before `stop_many`, and later producers fail without waiting.
 //! Duplicate deletes serialize here. No registry mutex or database connection
 //! is held while waiting for an operation or runtime teardown.
+//!
+//! These permits are per process. On a store other processes share
+//! (Postgres), the deletion also holds the workspace's
+//! `intent_store::WORKSPACE_DELETION_SCOPE` lease after its exclusive permit
+//! (`Services::delete_workspace_with_claim`). Another process's agent
+//! create or user message in the workspace then fails in its own write
+//! transaction, and every such write it committed earlier is ordered before
+//! the lease, so it is in the deletion's session snapshot. Across processes
+//! admission is per write, not per service operation: a create admitted in
+//! another process whose first message comes after the lease gets its
+//! session swept and the message refused.
 
 use intent_core::{Error, Result, WorkspaceId};
 use std::cell::RefCell;
