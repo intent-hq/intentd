@@ -2202,6 +2202,25 @@ while IFS= read -r unexpected; do exit 95; done
         );
     }
 
+    /// The full sweep answers in `AUTH_PROBE_PROVIDERS` order whatever order
+    /// the parallel probes finish in (the index-slotted JoinSet). The WSS
+    /// e2e test checks the provider set against the registry; this pins the
+    /// order. Like the scoped test above, probes run for real on hosts that
+    /// have the CLIs, so only the shape and order are asserted.
+    #[tokio::test]
+    async fn full_sweep_answers_in_probe_list_order() {
+        let result = provider_auth_status(None, false, &HashMap::new())
+            .await
+            .expect("full sweep");
+        let ids: Vec<&str> = result["providers"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("provider id"))
+            .collect();
+        assert_eq!(ids, AUTH_PROBE_PROVIDERS);
+    }
+
     /// A fresh RAII temp dir; removed on drop (including on panic). Set
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
     /// The default account's sign-in is probed once and served from the
