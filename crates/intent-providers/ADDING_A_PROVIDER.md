@@ -55,7 +55,7 @@ needs. Fields that matter most:
 - **`supports_mcp_config` / `mcp_config_flag`** — provider takes an MCP config *file* via
   CLI flag (auggie: `--mcp-config`). See §3a.
 - **`supports_session_mcp_servers`** — provider consumes the typed `mcpServers` field on
-  ACP `session/new` / `session/load` (claude-code, codex, droid, grok). See §3c.
+  ACP `session/new` / `session/load` / `session/resume` (claude-code, codex, droid, grok). See §3c.
 - **`model_flag`** — CLI model selection (auggie/droid: `--model`). Providers that select
   models post-session via `session/set_model` (grok) set `supports_set_model: true` and no
   flag; providers whose adapter exposes the model as a `configOptions[id="model"]` select
@@ -459,8 +459,12 @@ and `provider_models`.
   group per DSH model provider) of opaque values such as
   `["deepseek-official","deepseek-v4-flash"]`; `thought_level` (`reasoning_effort`) is
   off/low/high/max. The probe keeps an empty session folder in the DSH home.
-- **Resume** — no `loadSession`; DSH offers `session/resume`, which intent-acp does not
-  send yet, so restarts use the recreate + resend fallback.
+- **Resume** — no `loadSession`, but `sessionCapabilities.resume`: after a restart the
+  agent reopens its stored session with `session/resume` (same id, cwd and MCP servers;
+  `intent_acp::session::session_reopen`). DSH sends no history replay and reopens with its
+  default config, so Intent re-applies the stored model and effort. A failed resume uses
+  the recreate + resend fallback. Any provider that advertises only `resume` gets the same
+  path; `loadSession` wins when both are offered.
 
 ## Antigravity
 

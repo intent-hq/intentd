@@ -11603,6 +11603,13 @@ fn load_auth_required_error_matches_mapped_shape() {
             "{id}"
         );
     }
+    // An agent reopened with `session/resume` (dsh) maps the same way.
+    let msg = format!(
+        "session/resume: {}",
+        crate::provider_auth::not_authenticated_message("dsh")
+    );
+    assert!(msg.starts_with(super::RESUME_AUTH_REQUIRED_PREFIX), "{msg}");
+    assert!(super::load_auth_required_error(&Error::InvalidParams(msg)));
     // Ordinary load failures (the Internal wrapper) and other InvalidParams
     // shapes never classify — start_session still falls through to recreate.
     for err in [

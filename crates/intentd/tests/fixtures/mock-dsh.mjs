@@ -5,13 +5,17 @@
 // ACP stdio server. Like the real launcher, a missing `--patch` file stops
 // startup, and the dump reflects the overlay: a row is disabled only when the
 // overlay names its id. The ACP server exits on stdin EOF (as dsh does).
+// Like dsh, `session/new` keeps a folder per session under `$DSH_HOME/sessions`,
+// and `session/resume` reopens one in a new process with the default config
+// and no history replay; `session/load` is not offered (-32601).
 //
 // Env:
 //   MOCK_DSH_LOG             JSONL log: argv/env per launch and every ACP frame
 //   MOCK_DSH_DUMP            the recorded `--dump-config` fixture
 //   MOCK_DSH_RENAMED_UPLOAD  "1": the session-log row ships under a new id
 //   DEEPSEEK_API_KEY         present: two DeepSeek models and working prompts
-import { appendFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const args = process.argv.slice(2);
@@ -87,6 +91,7 @@ const models = hasKey
   : [{ value: FLASH, name: 'deepseek-v4-flash' }];
 const EFFORTS = ['off', 'low', 'high', 'max'];
 const sessions = new Map();
+const sessionDir = (id) => join(process.env.DSH_HOME ?? '.dsh', 'sessions', id);
 const configOptions = (state) => [
   {
     id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: state.model,
@@ -132,7 +137,15 @@ function handle(msg) {
       const sessionId = randomUUID();
       const state = { model: FLASH, effort: 'high' };
       sessions.set(sessionId, state);
+      mkdirSync(sessionDir(sessionId), { recursive: true });
       return reply({ sessionId, configOptions: configOptions(state) });
+    }
+    case 'session/resume': {
+      const { sessionId } = msg.params;
+      if (!existsSync(sessionDir(sessionId))) return fail(-32602, `Invalid params: unknown session ${sessionId}`);
+      const state = sessions.get(sessionId) ?? { model: FLASH, effort: 'high' };
+      sessions.set(sessionId, state);
+      return reply({ configOptions: configOptions(state) });
     }
     case 'session/set_config_option': {
       const state = sessions.get(msg.params.sessionId);

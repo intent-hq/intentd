@@ -248,7 +248,11 @@ pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
 /// contract as [`PROMPT_AUTH_REQUIRED_PREFIX`].
 pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
 
-/// Whether a resume failure is the auth-required `session/load` mapping.
+/// [`LOAD_AUTH_REQUIRED_PREFIX`] for an agent reopened with `session/resume`.
+pub(crate) const RESUME_AUTH_REQUIRED_PREFIX: &str = "session/resume: provider \"";
+
+/// Whether a resume failure is the auth-required `session/load` or
+/// `session/resume` mapping.
 /// `AgentManager::start_session` propagates such a failure instead of
 /// falling through to recreate (PR #1650 review): the provider just said it
 /// is not logged in, and for claude-code the recreate's `session/new` can
@@ -258,7 +262,8 @@ pub(crate) fn load_auth_required_error(err: &Error) -> bool {
     if let Error::ExecutionAuthorization { source, .. } = err {
         return load_auth_required_error(source);
     }
-    matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
+    matches!(err, Error::InvalidParams(msg)
+        if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX) || msg.starts_with(RESUME_AUTH_REQUIRED_PREFIX))
 }
 
 /// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
@@ -3623,10 +3628,10 @@ impl Services {
         }
     }
 
-    /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
-    /// when one was stored and the agent advertised the `loadSession` capability.
-    /// Returns the resumed id plus the modes the provider advertised in
-    /// `session/load`, or `None` when resume is not possible (§6.5).
+    /// Resume the agent's persisted `acpSessionId` via `session/load`, or via
+    /// `session/resume` when the agent advertises only that, but only when an
+    /// id was stored. Returns the resumed id plus the modes the provider
+    /// advertised, or `None` when resume is not possible (§6.5).
     pub(crate) async fn resume_acp_session(
         &self,
         conn: &Connection,
@@ -3767,9 +3772,12 @@ impl Services {
                 "Private native history requires original admission".into(),
             ));
         }
-        if !session::supports_load_session(init) {
+        // Private review history needs the `session/load` replay to verify.
+        let Some(how) = session::session_reopen(init)
+            .filter(|how| review.is_none() || *how == session::SessionReopen::Load)
+        else {
             return Ok(None);
-        }
+        };
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection. Same loud
         // fall-through as [`open_acp_session`] (monorepo#3044).
@@ -3777,7 +3785,7 @@ impl Services {
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
-        .ok_or_else(|| no_default_provider_error("session/load"))?;
+        .ok_or_else(|| no_default_provider_error(how.method()))?;
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -3913,19 +3921,21 @@ impl Services {
             }
             opened
         } else if let Some(callbacks) = callbacks {
-            boxed_await(|| callbacks.load_session(&acp_session_id, cwd, mcp_servers, meta))
+            boxed_await(|| callbacks.reopen_session(how, &acp_session_id, cwd, mcp_servers, meta))
                 .await
         } else {
-            boxed_await(|| session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta))
-                .await
-                .map(
+            boxed_await(|| {
+                session::reopen_session(conn, how, &acp_session_id, cwd, mcp_servers, meta)
+            })
+            .await
+            .map(
                     |response| intent_acp::callback_registration::CallbackSession {
                         response,
                         query: None,
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
+        .map_err(|e| map_acp_session_error_for(how.method(), &e, &owner))?;
         if provider_id == "codex" {
             boxed_await(|| {
                 crate::codex_session_title::confirm(
