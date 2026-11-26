@@ -1934,7 +1934,15 @@ fn profile_spec_drives_the_profile_bases_consistently() {
     bases.sort_unstable();
     assert_eq!(
         bases,
-        ["auggie", "claude-code", "codex", "cursor", "droid", "grok"]
+        [
+            "auggie",
+            "claude-code",
+            "codex",
+            "cursor",
+            "droid",
+            "dsh",
+            "grok"
+        ]
     );
     for base in crate::PROFILE_BASE_PROVIDERS.iter() {
         let spec = crate::profile_spec(base).unwrap();
@@ -1952,7 +1960,10 @@ fn profile_spec_drives_the_profile_bases_consistently() {
     assert!(crate::profile_spec("codex@p1").is_none());
     let mut dirs: Vec<&str> = crate::profile_account_dir_keys().collect();
     dirs.sort_unstable();
-    assert_eq!(dirs, ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"]);
+    assert_eq!(
+        dirs,
+        ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME", "GROK_HOME"]
+    );
     let cursor = crate::profile_spec("cursor").unwrap();
     for (key, _) in cursor.credential_launch_env {
         assert!(cursor.reserved_keys.iter().any(|(k, _)| k == key), "{key}");

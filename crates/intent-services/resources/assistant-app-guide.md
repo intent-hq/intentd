@@ -627,9 +627,9 @@ credentials that would otherwise win. Pending frontend release (not in current b
 keys); Intent signs Codex in with it in a folder of its own on the machine that runs the
 agent (`~/.intent/codex-api-key/`), so the user's own Codex login is never changed. On an
 orchestrator, **API key** and **Token** check only the key's format before **Create**,
-because an orchestrator runs no test prompt. Grok, Cursor and Factory Droid (only while
-Droid is enabled) also offer **Add profile** with an **API key** (`xai-…`, a Cursor user
-API key, `fk-…`), and Auggie with an **Access token**: paste what `auggie token print`
+because an orchestrator runs no test prompt. Grok, Cursor, DeepSeek Harness and Factory
+Droid (only while Droid is enabled) also offer **Add profile** with an **API key**
+(`xai-…`, a Cursor user API key, a DeepSeek key `sk-…`, `fk-…`), and Auggie with an **Access token**: paste what `auggie token print`
 shows, and Intent keeps only the session after `SESSION=`. These providers have one kind,
 so the dialog opens on it; **Switch to Advanced** opens the raw editor. Grok and Cursor
 prefer a saved login over a key, so their API key profiles run in a folder of their own
@@ -1029,15 +1029,21 @@ the user's agy history. Choose the thinking level as the reasoning effort.
 
 ## Use DeepSeek Harness as an agent provider
 
-<!-- Sources: packages/intentd/crates/intent-providers/src/{config,dsh}.rs; packages/intentd/crates/intent-services/src/{dsh_cli.rs,provider_auth.rs,provider_models/mod.rs,agent_session.rs}; packages/intentd/crates/intent-acp/src/session.rs. -->
+<!-- Sources: packages/intentd/crates/intent-providers/src/{config,dsh}.rs; packages/intentd/crates/intent-services/src/{dsh_cli.rs,provider_auth.rs,provider_models/mod.rs,agent_session.rs}; packages/intentd/crates/intent-acp/src/session.rs; packages/cloudlands-fe/src/lib/provider-profile-kinds.ts. -->
 DeepSeek Harness (DSH) is DeepSeek's open-source coding agent. It is an opt-in provider:
 enable it in **Settings → Providers** (`/settings?tab=providers#providers`). DSH itself
 is a developer preview from DeepSeek, and new DSH versions can change how it behaves.
 It needs the `dsh` CLI on the daemon host (`npm i -g @deepseek-ai/dsh`, Node.js 24.9 or
-later) and a DeepSeek API key: set `DEEPSEEK_API_KEY` in the daemon's environment, or
-save the key in `dsh web` under **Settings → Models**. A DeepSeek account sign-in is
-not used. A custom path in **Providers** must point to the `dsh` executable. Older
-versions of the app may not list DSH.
+later) and a DeepSeek API key. Add the key as a profile: on the DeepSeek Harness row
+in **Providers**, choose **Add API key** and paste a key from the DeepSeek Platform (API
+keys), then pick that profile for agents. A key profile runs in a DSH folder of its own
+on the machine that runs the agent (`~/.intent/dsh-api-key/`), because a key saved in
+DSH's own folder would otherwise win; your own `~/.dsh` is not used or changed. DSH can
+also use `DEEPSEEK_API_KEY` from the daemon's environment or `~/.dsh/.env`, or a key
+saved in `dsh web` under **Settings → Models**. A DeepSeek account sign-in is not used,
+and onboarding does not offer DSH. A custom path in **Providers** must point to the
+`dsh` executable. Older versions of the app may not list DSH, or may offer only the
+**Advanced** profile editor: set `DEEPSEEK_API_KEY` there.
 
 Intent turns off DSH's session-log upload and telemetry for the agents it starts, and
 DSH's own subagent tools; model requests still go to the model service you chose.

@@ -180,7 +180,7 @@ fn finish(provider_id: &str, outcome: Result<Vec<Value>, ProbeError>) -> Provide
 pub(crate) async fn fetch_profile_models(
     base: &str,
     profile: std::sync::Arc<intent_acp::ProfileEnv>,
-    cursor_path: Option<String>,
+    override_path: Option<String>,
 ) -> ProviderModelsFetch {
     match base {
         "grok" => {
@@ -188,7 +188,14 @@ pub(crate) async fn fetch_profile_models(
         }
         "droid" => fetch_droid_models_for(Some(profile)).await,
         "cursor" => {
-            fetch_cursor_models_for(cursor_binary(cursor_path.as_deref()), Some(profile)).await
+            fetch_cursor_models_for(cursor_binary(override_path.as_deref()), Some(profile)).await
+        }
+        intent_providers::dsh::PROVIDER_ID => {
+            fetch_dsh_models_for(
+                dsh_binary(override_path.as_deref()),
+                Some(crate::agent_manager::local_launch_overlay(&profile)),
+            )
+            .await
         }
         "auggie" => match crate::agent_ops::fetch_auggie_models_for(None, Some(&profile)).await {
             Some(models) => ProviderModelsFetch::ok(models),
@@ -243,6 +250,15 @@ pub(crate) fn dsh_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
 /// `DEEPSEEK_API_KEY` and `DSH_HOME` gap-fill; the list depends on the key).
 /// Never prompts; DSH keeps an empty session folder per probe.
 pub(crate) async fn fetch_dsh_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    fetch_dsh_models_for(binary, None).await
+}
+
+/// [`fetch_dsh_models_at`] under a named profile's launch overlay (its key
+/// and own DSH home); `None` = Default. The guard judges the same overlay.
+pub(crate) async fn fetch_dsh_models_for(
+    binary: Option<PathBuf>,
+    profile: Option<intent_acp::ProfileEnv>,
+) -> ProviderModelsFetch {
     let provider_id = intent_providers::dsh::PROVIDER_ID;
     let Some(bin) = binary else {
         return ProviderModelsFetch::unavailable(provider_id, "dsh binary not found");
@@ -251,8 +267,9 @@ pub(crate) async fn fetch_dsh_models_at(binary: Option<PathBuf>) -> ProviderMode
         return ProviderModelsFetch::unavailable(provider_id, "dsh provider not registered");
     };
     let probe_bin = bin.clone();
+    let probe_profile = profile.clone();
     let status = match tokio::task::spawn_blocking(move || {
-        crate::dsh_cli::probe_dsh_cli_at(Some(probe_bin), None)
+        crate::dsh_cli::probe_dsh_cli_at(Some(probe_bin), probe_profile.as_ref())
     })
     .await
     {
@@ -270,7 +287,7 @@ pub(crate) async fn fetch_dsh_models_at(binary: Option<PathBuf>) -> ProviderMode
     let args =
         intent_providers::build_provider_args(config, &intent_providers::ArgInputs::default());
     let mut cmd = AcpProbeCommand::binary(bin, args);
-    let env = crate::dsh_cli::launch_env(None);
+    let env = crate::dsh_cli::launch_env(profile.as_ref());
     for key in env.removes() {
         cmd = cmd.env_remove(key);
     }

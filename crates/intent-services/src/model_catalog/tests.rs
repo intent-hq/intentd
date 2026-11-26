@@ -1709,6 +1709,34 @@ async fn a_changed_installed_cli_failure_is_not_served_the_old_cached_kind() {
     }
 }
 
+/// A named profile's catalog cache key follows the configured executable of
+/// its base (`providers.paths.<base>`), so pointing Cursor or DSH at another
+/// binary never serves the previous binary's rows as fresh.
+#[cfg(unix)]
+#[test]
+fn profile_cache_key_follows_the_configured_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    for command in ["cursor-agent", "dsh"] {
+        let [a, b] = ["a", "b"].map(|name| {
+            let path = dir.path().join(command).join(name).join(command);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        });
+        let base = if command == "dsh" { "dsh" } else { "cursor" };
+        let key_a = super::profile_base_version_key(base, a.to_str());
+        let key_b = super::profile_base_version_key(base, b.to_str());
+        assert_ne!(key_a, key_b, "{base}");
+        assert_eq!(
+            key_a,
+            super::profile_base_version_key(base, a.to_str()),
+            "{base}"
+        );
+    }
+}
+
 /// The Cursor catalog cache key follows the resolved `cursor-agent`, so a
 /// `providers.paths.cursor` change never serves another binary's rows.
 #[cfg(unix)]

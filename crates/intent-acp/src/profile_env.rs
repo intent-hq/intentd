@@ -546,6 +546,25 @@ mod tests {
     }
 
     #[test]
+    fn dsh_api_key_profile_runs_in_its_own_dsh_home() {
+        let home = tempfile::tempdir().unwrap();
+        let one = profile("dsh@p1", &[("DEEPSEEK_API_KEY", Some("sk-one"))])
+            .with_api_key_home(Some(home.path()));
+        let path = std::path::PathBuf::from(value(&one, "DSH_HOME").unwrap());
+        assert!(path.starts_with(home.path().join(".intent/dsh-api-key")));
+        assert!(path.is_dir());
+        let two = profile("dsh@p1", &[("DEEPSEEK_API_KEY", Some("sk-two"))])
+            .with_api_key_home(Some(home.path()));
+        assert_ne!(value(&two, "DSH_HOME"), value(&one, "DSH_HOME"));
+        let own = profile(
+            "dsh@p",
+            &[("DEEPSEEK_API_KEY", Some("sk")), ("DSH_HOME", Some("/d"))],
+        );
+        let after = own.clone().with_api_key_home(Some(home.path()));
+        assert_eq!(value(&after, "DSH_HOME"), Some("/d"));
+    }
+
+    #[test]
     fn providers_whose_key_wins_and_default_configs_are_left_as_saved() {
         let home = tempfile::tempdir().unwrap();
         for profile in [

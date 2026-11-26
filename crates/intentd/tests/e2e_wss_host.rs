@@ -1798,6 +1798,15 @@ async fn host_provider_discovery_over_wss() {
             }
             continue;
         }
+        // DeepSeek Harness reports its CLI identity the same way when `dsh`
+        // resolves on the host.
+        if p["id"] == "dsh" {
+            assert!(p.get("cliRequirement").is_none(), "{p}");
+            if p.get("cliCommand").is_some() {
+                assert_eq!(p["cliCommand"], "dsh", "{p}");
+            }
+            continue;
+        }
         // agy's minimum is the first release with `agy acp`; an old agy is
         // updated at launch, never gated.
         if p["id"] == "antigravity" {

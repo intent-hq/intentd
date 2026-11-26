@@ -247,6 +247,7 @@ async fn the_catalog_says_every_default_runs_on_a_machine() {
             "droid": "machine-sign-in",
             "grok": "machine-sign-in",
             "cursor": "machine-sign-in",
+            "dsh": "machine-sign-in",
         })
     );
     assert!(

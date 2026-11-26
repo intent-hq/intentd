@@ -14,6 +14,7 @@
 //   MOCK_DSH_DUMP            the recorded `--dump-config` fixture
 //   MOCK_DSH_RENAMED_UPLOAD  "1": the session-log row ships under a new id
 //   DEEPSEEK_API_KEY         present: two DeepSeek models and working prompts
+//   DSH_HOME                 logged per launch (a key profile runs in its own home)
 import { appendFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -27,6 +28,7 @@ log('launch', {
   args,
   telemetryDisabled: process.env.DSH_TELEMETRY_DISABLED ?? null,
   hasKey,
+  dshHome: process.env.DSH_HOME ?? null,
 });
 
 if (args[0] === '--version' || args[0] === '-V') {

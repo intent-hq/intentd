@@ -9851,25 +9851,18 @@ impl Services {
                 .resolve_installed_for(&reference, profile, force_refresh)
                 .await
         } else {
-            // Grok, Droid, Auggie, Cursor: the base's own probe under the
+            // Grok, Droid, Auggie, Cursor, DSH: the base's own probe under the
             // profile's overlay, cached under the reference plus the base
             // source's version and the profile's settings fingerprint, so a
             // catalog never crosses profiles, the Default or saved edits.
-            let base_version = crate::model_catalog::source_for(&base)
-                .map(|source| (source.version_key)())
-                .unwrap_or_default();
-            let cursor_path = self
+            let override_path = self
                 .effective_settings()
                 .providers
                 .paths
-                .get("cursor")
+                .get(base.as_str())
                 .cloned();
-            // Cursor's version key follows its configured binary path.
-            let base_version = if base == "cursor" {
-                crate::model_catalog::CursorModelSource::resolve(cursor_path.as_deref()).version_key
-            } else {
-                base_version
-            };
+            let base_version =
+                crate::model_catalog::profile_base_version_key(&base, override_path.as_deref());
             let version_key = format!(
                 "{base_version}#{}",
                 profile.as_ref().map(|p| p.cache_key()).unwrap_or_default()
@@ -9893,7 +9886,7 @@ impl Services {
                             crate::provider_models::fetch_profile_models(
                                 &base,
                                 profile,
-                                cursor_path,
+                                override_path,
                             )
                             .await,
                         )

@@ -340,26 +340,31 @@ pub(crate) fn apply_dsh_cli_fields(
     }
 }
 
-/// Whether a launch would find a DeepSeek API key: in the daemon's
+/// Whether a Default launch would find a DeepSeek API key: in the daemon's
 /// environment, the login-shell capture, or the DSH home
 /// (`.credentials.yaml` / `.env`). Presence only.
 #[must_use]
 pub fn api_key_known() -> bool {
-    let captured = intent_core::path_utils::login_shell_credential_env();
-    let lookup = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .or_else(|| captured.get(key).cloned())
-            .filter(|v| !v.trim().is_empty())
-    };
-    if lookup(dsh::API_KEY_ENV).is_some() {
+    api_key_known_in(&launch_env(None))
+}
+
+/// [`api_key_known`] for the environment a launch composes (a key profile's
+/// overlay sets the key and its own DSH home).
+#[must_use]
+pub(crate) fn api_key_known_in(env: &DshLaunchEnv) -> bool {
+    if env
+        .value(dsh::API_KEY_ENV)
+        .is_some_and(|v| !v.trim().is_empty())
+    {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = env.value("HOME").map(PathBuf::from) else {
         return false;
     };
-    let dsh_home_env = lookup(dsh::HOME_ENV);
-    dsh::home_has_api_key(&dsh::dsh_home_in(&home, dsh_home_env.as_deref()))
+    dsh::home_has_api_key(&dsh::dsh_home_in(
+        &home,
+        env.value(dsh::HOME_ENV).as_deref(),
+    ))
 }
 
 /// Appended to the not-authenticated message.
@@ -597,6 +602,36 @@ mod tests {
         assert!(fetch.models.is_none());
         let warning = fetch.warning.unwrap_or_default();
         assert!(warning.contains("session-log-deepseek"), "{warning}");
+    }
+
+    #[test]
+    fn api_key_comes_from_the_launch_profile_or_its_dsh_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().display().to_string();
+        let keyed = intent_acp::ProfileEnv::new(
+            "dsh@p",
+            "fp",
+            vec![
+                (dsh::API_KEY_ENV.to_string(), Some("sk-profile".to_string())),
+                (dsh::HOME_ENV.to_string(), Some(home.clone())),
+            ],
+        );
+        assert!(api_key_known_in(&launch_env(Some(&keyed))));
+        let unset = intent_acp::ProfileEnv::new(
+            "dsh@p",
+            "fp",
+            vec![
+                (dsh::API_KEY_ENV.to_string(), None),
+                (dsh::HOME_ENV.to_string(), Some(home)),
+            ],
+        );
+        assert!(!api_key_known_in(&launch_env(Some(&unset))));
+        std::fs::write(
+            dir.path().join(".credentials.yaml"),
+            "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-saved\n",
+        )
+        .unwrap();
+        assert!(api_key_known_in(&launch_env(Some(&unset))));
     }
 
     #[test]
