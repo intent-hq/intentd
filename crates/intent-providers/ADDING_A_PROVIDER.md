@@ -343,6 +343,38 @@ monorepo root).
 | `CLEAN_CEILING` in `crates/intent-services/src/context_budget.rs` | The provider's prompt and tool size ceiling (copy the measured row the failure prints) | `make test-select E='test(context_budget_report)'` |
 | `AUTH_PROBE_PROVIDERS` in `crates/intent-services/src/provider_auth.rs`, or `NOT_AUTH_PROBED` in `crates/intentd/tests/e2e_wss_host.rs` | Whether `host.providerAuthStatus` probes the provider. The e2e test takes its expected list from the registry, so a provider in neither list fails it | `make test-select E='binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_host::host_provider_auth_status_over_wss$/)'` |
 
+### Becoming a profile base
+
+A provider that supports API key profiles (its registry row sets `profile: Some(ProfileSpec { .. })`
+in `crates/intent-providers/src/config.rs`) joins more lists. Most of these tests pin the
+profile bases by hand on purpose, so they fail until you add the provider;
+`every_key_written_at_launch_is_reserved` fails if the new base's launch writes a key no
+reservation covers (intentd#3804 failed six of them over two local rounds). Update them all
+in one pass:
+
+| Test | What to add |
+|---|---|
+| `profile_spec_drives_the_profile_bases_consistently` (`crates/intent-providers/src/tests.rs`) | The base, and its account folder if it has one |
+| `supports_profiles_follows_the_profile_spec` (`crates/intent-services/src/provider_catalog.rs`) | The base |
+| `every_key_written_at_launch_is_reserved` (`crates/intent-services/src/provider_profiles_tests.rs`) | Nothing in the test: reserve, in the spec's `reserved_keys`, every key the launch writes |
+| `the_catalog_says_every_default_runs_on_a_machine` (`crates/intent-services/src/provider_profiles_remote_choice_tests.rs`) | The base's `defaultRemoteLaunch` entry |
+| `every_profile_kind_launches_the_same_locally_and_on_a_machine` (`crates/intentd/src/executor/runner/tests/profile_parity.rs`) | A `Provider` variant (in `Provider::ALL`, with its `base()`) and its `Kind::saved` cases |
+| cloudlands-fe `ProfileProvider` tables (`src/lib/provider-profile-kinds.ts`: `BASE_PROVIDER_IDS`, `FOLDER_VARIABLES`, `PROFILE_KIND_TABLE`, and their tests) | The kinds the settings screens offer; a separate cloudlands-fe PR |
+
+Run the intentd ones together with
+`make test-select E='test(/profile_spec_drives|supports_profiles_follows|every_key_written_at_launch|every_default_runs_on_a_machine|every_profile_kind_launches/)'`.
+
+Then add the base's row to the "Profile-capable bases" table in the monorepo
+`docs/protocol/methods/provider-profiles.md` (credentials, account folder, launch-only
+step), and a "`<base>` only:" row in its "Reserved keys" table for each `reserved_keys`
+entry and for any key `launch_wired_keys` (`crates/intent-services/src/provider_profiles.rs`)
+reserves for that base alone. The check reads `reserved_keys` from the golden; it knows the
+launch-wired ones only from its own list (`LAUNCH_WIRED` in
+`scripts/check-provider-profile-bases.mjs`), so update that list too. Land that docs PR first: `make check-provider-profile-bases` (a consumer check, so it
+also runs on this repo's PRs) compares both tables with the `profile` field of
+`tests/goldens/provider_registry.json` and fails while the base is missing. The account
+folder rules in that document link to the table, so they need no edit.
+
 ## 8. Smoke test (dogfooding)
 
 From the monorepo root, run the stack end-to-end with the new provider:
