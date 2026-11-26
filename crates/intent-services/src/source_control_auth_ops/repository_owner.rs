@@ -52,7 +52,7 @@ pub(crate) struct GitlabCredentialGate {
     /// `try_refresh`): the tenant's store. The mutex above serializes this
     /// process's writers; the lease serializes refreshes across processes.
     /// `None` (test fixtures) refreshes without a lease.
-    refresh_leases: Option<intent_store::Store>,
+    refresh_leases: Option<Arc<intent_store::Store>>,
 }
 
 /// A turn is held only while its holder try-locks the ranked optional metadata
@@ -82,7 +82,7 @@ impl Drop for NativeReviewTurn {
 pub(crate) struct GitlabCredentialGuard {
     mutex: Arc<tokio::sync::Mutex<()>>,
     lease: PersistenceLease,
-    refresh_leases: Option<intent_store::Store>,
+    refresh_leases: Option<Arc<intent_store::Store>>,
 }
 
 impl GitlabCredentialGuard {
@@ -92,7 +92,7 @@ impl GitlabCredentialGuard {
 
     /// The store a refresh under this guard takes its lease on.
     pub(crate) fn refresh_leases(&self) -> Option<&intent_store::Store> {
-        self.refresh_leases.as_ref()
+        self.refresh_leases.as_deref()
     }
 }
 
@@ -119,7 +119,7 @@ impl GitlabCredentialGate {
     /// Refreshes take their cross-process lease on `store`.
     #[must_use]
     pub(crate) fn with_refresh_leases(mut self, store: intent_store::Store) -> Self {
-        self.refresh_leases = Some(store);
+        self.refresh_leases = Some(Arc::new(store));
         self
     }
 
