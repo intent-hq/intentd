@@ -96,7 +96,9 @@
           ]
         },
         "credentialLaunchEnv": [],
-        "reservedKeys": []
+        "reservedKeys": [
+          "INITIAL_AGENT_MODE"
+        ]
       }
     },
     {

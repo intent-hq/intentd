@@ -730,7 +730,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
                 launch_env: &[("DEFAULT_AUTH_REQUEST", CODEX_API_KEY_AUTH_REQUEST)],
             }),
             credential_launch_env: &[],
-            reserved_keys: &[],
+            reserved_keys: &[(
+                CODEX_INITIAL_AGENT_MODE_ENV,
+                "Intent sets this at launch (session wiring and commit identity)",
+            )],
         }),
         home_dirs: &[".codex"],
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
