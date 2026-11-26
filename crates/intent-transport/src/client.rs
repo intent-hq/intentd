@@ -442,4 +442,6 @@ fn frame(
 }
 
 #[cfg(test)]
+mod hello_capabilities_fixture;
+#[cfg(test)]
 mod tests;
