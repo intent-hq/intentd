@@ -18865,6 +18865,85 @@ impl Services {
         ))
     }
 
+    /// Runs `enqueue` (an in-memory insert of `message_id` into
+    /// `agent_id`'s queue) for a parent wake sent under the delivery claim
+    /// `claim` (see `TurnOptions::delivery_claim`); without one it is just
+    /// `enqueue()`. With one, the queue row is the wake's durable write, so
+    /// it must not land once the claim is lost:
+    ///
+    /// - Shared store (Postgres): under the persist gate, which every
+    ///   claimed drain takes (`claim_queue_pop`), so no other drain in this
+    ///   process pops the entry before the write decides, the queue is
+    ///   written by a sync that guards the claim's lease. On any failure the
+    ///   new entry leaves memory again and the error is returned: the wake
+    ///   is not durable, the caller retries.
+    /// - `SQLite` (one process): the claim is checked, then the entry is
+    ///   queued and persisted by the usual write-through.
+    pub(crate) async fn enqueue_under_claim(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        claim: Option<&crate::agent_manager::DeliveryClaim>,
+        enqueue: impl FnOnce() -> Result<(QueuedMessage, usize)>,
+    ) -> Result<(QueuedMessage, usize)> {
+        let Some(claim) = claim else {
+            return enqueue();
+        };
+        if !self.store.agent_queues_shared() {
+            let held = {
+                let lease = claim.0.lease().await;
+                match lease.as_ref() {
+                    Some(lease) => self.store.lease_is_held(lease).await?,
+                    None => false,
+                }
+            };
+            if !held {
+                return Err(Error::LeaseLost(format!(
+                    "delivery claim {}/{} lost before the wake was queued",
+                    claim.0.scope(),
+                    claim.0.key()
+                )));
+            }
+            return enqueue();
+        }
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let existed = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|queue| queue.iter().any(|m| m.matches_submission(message_id)));
+        let enqueued = enqueue()?;
+        let rows = self.queue_rows(agent_id);
+        match self
+            .store
+            .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0)
+            .await
+        {
+            Ok(sync) => {
+                if let Some(merged) = sync.merged {
+                    self.adopt_stored_queue(agent_id, &rows, merged);
+                }
+                Ok(enqueued)
+            }
+            Err(e) => {
+                if !existed {
+                    let mut queues = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    if let Some(queue) = queues.get_mut(agent_id) {
+                        queue.retain(|m| m.id != enqueued.0.id);
+                        if queue.is_empty() {
+                            queues.remove(agent_id);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn submission_replay_locked(
         &self,
         agent_id: &AgentId,

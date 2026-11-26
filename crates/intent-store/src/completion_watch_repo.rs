@@ -64,6 +64,21 @@ fn claimed<'a>(
     Ok(lease)
 }
 
+/// The lease of the delivery claim `claim` for a write that guards it;
+/// `Error::LeaseLost` once the claim was released.
+pub(crate) fn held_claim<'a>(
+    held: &'a tokio::sync::MutexGuard<'_, Option<Lease>>,
+    claim: &LeaseKeeper,
+) -> Result<&'a Lease> {
+    held.as_ref().ok_or_else(|| {
+        Error::LeaseLost(format!(
+            "delivery claim {}/{} was released",
+            claim.scope(),
+            claim.key()
+        ))
+    })
+}
+
 impl Store {
     /// Claims the watch `watch_id` for this process's delivery of its
     /// terminal wake: the lease (`completion-watch`, `watch_id`) for `ttl`,
@@ -186,6 +201,21 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         dispatch!(self, backend => backend.upsert_completion_watch(w).await)
+    }
+
+    /// The id of a stored ungrouped watch of `parent_agent_id` on
+    /// `child_agent_id` (any of them; registration keeps one per pair), as
+    /// any process sharing the store registered it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_ungrouped_completion_watch(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<String>> {
+        dispatch!(self, backend => backend.find_ungrouped_completion_watch(parent_agent_id, child_agent_id).await)
     }
 
     /// Load every persisted `completion_watch` row (the registry is
@@ -435,6 +465,23 @@ impl crate::SqliteStore {
         .map_err(|e| Error::Internal(format!("list completion watches: {e}")))?;
 
         rows.iter().map(decode_watch_row).collect()
+    }
+
+    pub async fn find_ungrouped_completion_watch(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT id FROM completion_watch \
+             WHERE parent_agent_id = ? AND child_agent_id = ? AND group_id IS NULL \
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&parent_agent_id.0)
+        .bind(&child_agent_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("find completion watch: {e}")))
     }
 
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {

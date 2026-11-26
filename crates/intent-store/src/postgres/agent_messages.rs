@@ -32,6 +32,7 @@ use crate::agent_repo::{
     normalize_compound_model, preview_col_value, OwnedBatchMessage, PreparedContent,
     MESSAGE_PREVIEW_METADATA_MAX_BYTES, SESSION_COLUMNS,
 };
+use crate::lease_repo::Lease;
 use crate::message_payload::{
     self as payload, KIND_THUMBNAILS, KIND_TOOL_RESULT_OUTPUT, KIND_TOOL_RESULT_OUTPUT_REPLAY,
     KIND_TOOL_USE_INPUT, KIND_TOOL_USE_INPUT_REPLAY,
@@ -419,6 +420,7 @@ impl PgStore {
             created_at,
             false,
             role_origin(role),
+            None,
         )
         .await
     }
@@ -435,7 +437,36 @@ impl PgStore {
         origin: UsageMessageOrigin,
     ) -> Result<AgentMessage> {
         self.append_agent_message_inner(
-            agent_id, id, role, content, metadata, created_at, false, origin,
+            agent_id, id, role, content, metadata, created_at, false, origin, None,
+        )
+        .await
+    }
+
+    /// [`Self::append_agent_message_with_provenance`] in a transaction that
+    /// guards `lease` first: a lost lease fails with `LeaseLost` and writes
+    /// nothing.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn append_agent_message_guarded(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+        origin: UsageMessageOrigin,
+        lease: &Lease,
+    ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(
+            agent_id,
+            id,
+            role,
+            content,
+            metadata,
+            created_at,
+            false,
+            origin,
+            Some(lease),
         )
         .await
     }
@@ -498,6 +529,7 @@ impl PgStore {
             created_at,
             true,
             role_origin(role),
+            None,
         )
         .await
     }
@@ -531,6 +563,7 @@ impl PgStore {
         created_at: &str,
         prestaged: bool,
         origin: UsageMessageOrigin,
+        guard: Option<&Lease>,
     ) -> Result<AgentMessage> {
         let metadata_json = encode_metadata(metadata)?;
         let preview_update = match role {
@@ -554,6 +587,10 @@ impl PgStore {
         if role == "user" {
             self.refuse_if_agent_workspace_deleting(&mut tx, agent_id)
                 .await?;
+        }
+        if let Some(lease) = guard {
+            // Rolls back (drop) on `LeaseLost`: nothing is written.
+            self.guard_lease(&mut tx, lease).await?;
         }
         let row = sqlx::query(
             "SELECT COALESCE(NULLIF(s.resolved_model, ''), NULLIF(s.model, ''), 'unknown') AS model, \

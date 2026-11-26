@@ -730,6 +730,28 @@ pub struct TurnOptions {
     /// failure needs: replace only the oversized entries with a recovery
     /// marker and keep the small siblings intact (intent-hq/intent#4703).
     pub(crate) flushed_entries: Option<Vec<QueuedMessage>>,
+    /// The delivery claim (a completion watch's or delegation group's
+    /// lease) a parent wake is sent under: the write that makes the wake
+    /// durable (its transcript row, or its queue row) guards the claim's
+    /// lease, so a claim lost before it fails the send with
+    /// `Error::LeaseLost` and writes nothing. [`AgentManager::send_message`]
+    /// takes it out of the options, so no worker or requeue carries it.
+    pub(crate) delivery_claim: Option<DeliveryClaim>,
+}
+
+/// A delivery claim shared with the wake send it guards; see
+/// [`TurnOptions::delivery_claim`].
+#[derive(Clone)]
+pub(crate) struct DeliveryClaim(pub(crate) Arc<intent_store::LeaseKeeper>);
+
+impl std::fmt::Debug for DeliveryClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliveryClaim")
+            .field("scope", &self.0.scope())
+            .field("key", &self.0.key())
+            .field("token", &self.0.token())
+            .finish()
+    }
 }
 
 impl TurnOptions {
@@ -9534,6 +9556,9 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        // Only this send's durable write guards the claim: never a worker,
+        // a requeue or a drain of the entry later.
+        let delivery_claim = options.delivery_claim.take();
         self.services
             .refuse_in_node_mode("sending to a local agent")?;
         crate::agent_ops::validate_submission_id(message_id.as_deref())?;
@@ -9611,17 +9636,27 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_submission(
-                &agent_id,
-                Some(message_id.clone()),
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-                options.origin,
-            )?;
+            let (queued, position) = self
+                .services
+                .enqueue_under_claim(
+                    &agent_id,
+                    message_id.as_str(),
+                    delivery_claim.as_ref(),
+                    || {
+                        self.services.enqueue_submission(
+                            &agent_id,
+                            Some(message_id.clone()),
+                            content,
+                            options.image_blocks.clone(),
+                            options.file_blocks.clone(),
+                            options.message_metadata.clone(),
+                            options.queued_prepend(),
+                            options.interrupt_priority,
+                            options.origin,
+                        )
+                    },
+                )
+                .await?;
             let mut result = json!({
                 "success": true,
                 "queued": true,
@@ -9669,17 +9704,27 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_submission(
-                        &agent_id,
-                        Some(message_id.clone()),
-                        content,
-                        options.image_blocks.clone(),
-                        options.file_blocks.clone(),
-                        options.message_metadata.clone(),
-                        options.queued_prepend(),
-                        options.interrupt_priority,
-                        options.origin,
-                    )?;
+                    let (queued, position) = self
+                        .services
+                        .enqueue_under_claim(
+                            &agent_id,
+                            message_id.as_str(),
+                            delivery_claim.as_ref(),
+                            || {
+                                self.services.enqueue_submission(
+                                    &agent_id,
+                                    Some(message_id.clone()),
+                                    content,
+                                    options.image_blocks.clone(),
+                                    options.file_blocks.clone(),
+                                    options.message_metadata.clone(),
+                                    options.queued_prepend(),
+                                    options.interrupt_priority,
+                                    options.origin,
+                                )
+                            },
+                        )
+                        .await?;
                     let mut result = json!({
                         "success": true,
                         "queued": true,
@@ -9743,17 +9788,27 @@ impl AgentManager {
                 Ok(ws) if ws.archived
             )
         {
-            let (queued, position) = self.services.enqueue_submission(
-                &agent_id,
-                Some(message_id.clone()),
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-                options.origin,
-            )?;
+            let (queued, position) = self
+                .services
+                .enqueue_under_claim(
+                    &agent_id,
+                    message_id.as_str(),
+                    delivery_claim.as_ref(),
+                    || {
+                        self.services.enqueue_submission(
+                            &agent_id,
+                            Some(message_id.clone()),
+                            content,
+                            options.image_blocks.clone(),
+                            options.file_blocks.clone(),
+                            options.message_metadata.clone(),
+                            options.queued_prepend(),
+                            options.interrupt_priority,
+                            options.origin,
+                        )
+                    },
+                )
+                .await?;
             let mut result = json!({
                 "success": true,
                 "queued": true,
@@ -9780,17 +9835,27 @@ impl AgentManager {
             && !self.is_busy(&agent_id)
             && self.services.has_ready_failed_turn(&agent_id)
         {
-            let (queued, position) = self.services.enqueue_submission(
-                &agent_id,
-                Some(message_id.clone()),
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-                options.queued_prepend(),
-                options.interrupt_priority,
-                options.origin,
-            )?;
+            let (queued, position) = self
+                .services
+                .enqueue_under_claim(
+                    &agent_id,
+                    message_id.as_str(),
+                    delivery_claim.as_ref(),
+                    || {
+                        self.services.enqueue_submission(
+                            &agent_id,
+                            Some(message_id.clone()),
+                            content,
+                            options.image_blocks.clone(),
+                            options.file_blocks.clone(),
+                            options.message_metadata.clone(),
+                            options.queued_prepend(),
+                            options.interrupt_priority,
+                            options.origin,
+                        )
+                    },
+                )
+                .await?;
             let mut result = json!({
                 "success": true,
                 "queued": true,
@@ -9831,6 +9896,7 @@ impl AgentManager {
                     message_id,
                     options,
                     session_status,
+                    delivery_claim,
                 )
                 .await
             }),
@@ -9851,6 +9917,7 @@ impl AgentManager {
         message_id: String,
         mut options: TurnOptions,
         session_status: AgentStatus,
+        delivery_claim: Option<DeliveryClaim>,
     ) -> Result<Value> {
         let Some(claim) = self.try_begin_turn(&agent_id, &workspace_id).await else {
             // A resume may have claimed its durable interruption before closure
@@ -9874,29 +9941,47 @@ impl AgentManager {
             // that turn later fails it stays behind the STAB-52 gate for
             // `agent.retry`, exactly as before.
             let (queued, position) = if session_status == AgentStatus::Error {
-                self.services.enqueue_recovery_send(
-                    &agent_id,
-                    message_id.clone(),
-                    content,
-                    options.image_blocks.clone(),
-                    options.file_blocks.clone(),
-                    options.message_metadata.clone(),
-                    options.queued_prepend(),
-                    options.interrupt_priority,
-                    options.origin,
-                )?
+                self.services
+                    .enqueue_under_claim(
+                        &agent_id,
+                        message_id.as_str(),
+                        delivery_claim.as_ref(),
+                        || {
+                            self.services.enqueue_recovery_send(
+                                &agent_id,
+                                message_id.clone(),
+                                content,
+                                options.image_blocks.clone(),
+                                options.file_blocks.clone(),
+                                options.message_metadata.clone(),
+                                options.queued_prepend(),
+                                options.interrupt_priority,
+                                options.origin,
+                            )
+                        },
+                    )
+                    .await?
             } else {
-                self.services.enqueue_submission(
-                    &agent_id,
-                    Some(message_id.clone()),
-                    content,
-                    options.image_blocks.clone(),
-                    options.file_blocks.clone(),
-                    options.message_metadata.clone(),
-                    options.queued_prepend(),
-                    options.interrupt_priority,
-                    options.origin,
-                )?
+                self.services
+                    .enqueue_under_claim(
+                        &agent_id,
+                        message_id.as_str(),
+                        delivery_claim.as_ref(),
+                        || {
+                            self.services.enqueue_submission(
+                                &agent_id,
+                                Some(message_id.clone()),
+                                content,
+                                options.image_blocks.clone(),
+                                options.file_blocks.clone(),
+                                options.message_metadata.clone(),
+                                options.queued_prepend(),
+                                options.interrupt_priority,
+                                options.origin,
+                            )
+                        },
+                    )
+                    .await?
             };
             let mut result = json!({
                 "success": true,
@@ -9958,23 +10043,45 @@ impl AgentManager {
         // `messageId` and the `agent:message` event both name the actual
         // transcript row (PROTOCOL §5.5 — previously the store minted its own
         // UUIDv7 id and the result id named nothing).
-        let message = match self
-            .services
-            .store
-            .append_agent_message_with_provenance(
-                &agent_id,
-                &message_id,
-                "user",
-                &blocks,
-                options.message_metadata.as_ref(),
-                &now_iso(),
-                usage_message_origin(options.origin, options.message_metadata.as_ref()),
-            )
-            .await
-        {
+        let origin = usage_message_origin(options.origin, options.message_metadata.as_ref());
+        let appended = if let Some(delivery) = delivery_claim.as_ref() {
+            self.services
+                .store
+                .append_agent_message_guarded(
+                    &agent_id,
+                    &message_id,
+                    "user",
+                    &blocks,
+                    options.message_metadata.as_ref(),
+                    &now_iso(),
+                    origin,
+                    &delivery.0,
+                )
+                .await
+        } else {
+            self.services
+                .store
+                .append_agent_message_with_provenance(
+                    &agent_id,
+                    &message_id,
+                    "user",
+                    &blocks,
+                    options.message_metadata.as_ref(),
+                    &now_iso(),
+                    origin,
+                )
+                .await
+        };
+        let message = match appended {
             Ok(message) => {
                 self.services.invalidate_agent_list_cache(&workspace_id);
                 message
+            }
+            // A lost delivery claim wrote nothing and must not fall back to
+            // the queue: the claim's next holder delivers the wake.
+            Err(lost @ Error::LeaseLost(_)) => {
+                claim.release(true).await;
+                return Err(lost);
             }
             Err(append_err) => {
                 // Store write failed on a validated agent (e.g. duplicate
@@ -10000,17 +10107,27 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_submission(
-                    &agent_id,
-                    Some(message_id.clone()),
-                    content,
-                    options.image_blocks.clone(),
-                    options.file_blocks.clone(),
-                    options.message_metadata.clone(),
-                    options.queued_prepend(),
-                    options.interrupt_priority,
-                    options.origin,
-                )?;
+                let (queued, position) = self
+                    .services
+                    .enqueue_under_claim(
+                        &agent_id,
+                        message_id.as_str(),
+                        delivery_claim.as_ref(),
+                        || {
+                            self.services.enqueue_submission(
+                                &agent_id,
+                                Some(message_id.clone()),
+                                content,
+                                options.image_blocks.clone(),
+                                options.file_blocks.clone(),
+                                options.message_metadata.clone(),
+                                options.queued_prepend(),
+                                options.interrupt_priority,
+                                options.origin,
+                            )
+                        },
+                    )
+                    .await?;
                 let mut result = json!({
                     "success": true,
                     "queued": true,

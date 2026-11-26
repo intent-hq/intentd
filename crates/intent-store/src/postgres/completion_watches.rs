@@ -214,6 +214,27 @@ impl PgStore {
         tx.commit().await.map_err(db)
     }
 
+    pub async fn find_ungrouped_completion_watch(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<String>> {
+        let mut tx = self.begin().await?;
+        let id = sqlx::query_scalar(
+            "SELECT id FROM completion_watch WHERE tenant_id = $1 \
+             AND parent_agent_id = $2 AND child_agent_id = $3 AND group_id IS NULL \
+             ORDER BY created_at COLLATE \"C\", row_seq LIMIT 1",
+        )
+        .bind(self.tenant())
+        .bind(&parent_agent_id.0)
+        .bind(&child_agent_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("find completion watch: {e}")))?;
+        tx.commit().await.map_err(db)?;
+        Ok(id)
+    }
+
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
         let sql = format!(
             "SELECT {WATCH_COLUMNS} FROM completion_watch WHERE tenant_id = $1 \
