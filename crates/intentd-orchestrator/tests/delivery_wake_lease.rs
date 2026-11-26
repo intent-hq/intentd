@@ -144,7 +144,10 @@ async fn a_holder_whose_claim_lapsed_before_the_send_writes_no_wake() {
     b.heal_completion_watches_on_startup()
         .await
         .expect("B loads the stored watch");
-    assert_eq!(b.watch_ids_for_child_for_test(&child), [watch.clone()]);
+    assert_eq!(
+        b.watch_ids_for_child_for_test(&child),
+        std::slice::from_ref(&watch)
+    );
     store_a
         .set_agent_session_status(
             &WorkspaceId::chief(),
