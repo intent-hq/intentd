@@ -1287,6 +1287,7 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
 struct Revocable {
     local: intent_node_connections::LocalOwnership,
     owned_from: std::sync::atomic::AtomicU64,
+    claims_held: tokio::sync::watch::Sender<bool>,
 }
 
 impl Revocable {
@@ -1294,6 +1295,7 @@ impl Revocable {
         Arc::new(Self {
             local: intent_node_connections::LocalOwnership::new(store.clone()),
             owned_from: std::sync::atomic::AtomicU64::new(0),
+            claims_held: tokio::sync::watch::Sender::new(false),
         })
     }
 
@@ -1302,6 +1304,16 @@ impl Revocable {
         self.owned_from
             .store(generation.0, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// New claims wait until [`Self::release_claims`], so a test can read
+    /// state before the connector's reconnect claims the link back.
+    fn hold_claims(&self) {
+        self.claims_held.send_replace(true);
+    }
+
+    fn release_claims(&self) {
+        self.claims_held.send_replace(false);
+    }
 }
 
 impl intent_node_connections::LinkOwnership for Revocable {
@@ -1309,7 +1321,11 @@ impl intent_node_connections::LinkOwnership for Revocable {
         &'a self,
         owner: &'a intent_core::nodes::LeaseOwner,
     ) -> intent_core::BoxFuture<'a, intent_core::Result<intent_node_connections::LinkClaim>> {
-        self.local.claim(owner)
+        Box::pin(async move {
+            let mut held = self.claims_held.subscribe();
+            let _ = held.wait_for(|held| !*held).await;
+            self.local.claim(owner).await
+        })
     }
 
     fn fence<'a>(
@@ -1374,12 +1390,16 @@ async fn a_fenced_ack_is_not_written_and_closes_the_link() {
 
     // Another process claims the next generation: this link's next ack is
     // neither written nor sent, and head closes the link.
+    // Claims are held so the reconnect cannot persist under its new claim
+    // before the fenced state is read.
     let taken = NodeCounter(first.hello.binding.generation.0 + 1);
     ownership.taken_until(taken);
+    ownership.hold_claims();
     first.journal(note(2, &agent, "two")).await;
     assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
     closed_without_writes(&mut first, NodeCounter(2)).await;
     assert_eq!(backend.persisted_ack(&node).await, NodeCounter(1));
+    ownership.release_claims();
 
     // This process claims the link back with a newer generation, and only
     // then persists what it ingested: under the new claim, so the hello
