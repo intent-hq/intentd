@@ -1765,20 +1765,16 @@ const NO_RUN_CAP: &str = "864000";
 /// state instead of reading it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
-    let Some(CloudBackend {
-        head: _head,
-        head_dir,
-        ws_id,
-        keyed_ref,
-        mut rpc_ws,
-        fake,
-        ..
-    }) = CloudBackend::start("itd-e2bcap-", &[("INTENTD_E2B_MINUTE_MS", "100")]).await
+    // Fields are borrowed, so the backend drops whole, in its field order.
+    let Some(mut backend) =
+        CloudBackend::start("itd-e2bcap-", &[("INTENTD_E2B_MINUTE_MS", "100")]).await
     else {
         return;
     };
+    let (ws_id, keyed_ref) = (backend.ws_id.clone(), backend.keyed_ref.clone());
+    let (rpc_ws, fake) = (&mut backend.rpc_ws, &backend.fake);
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         5,
         "agent.create",
         json!({
@@ -1789,14 +1785,14 @@ async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
-    send_and_reply(&mut rpc_ws, agent, "hello cap", 10).await;
-    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+    send_and_reply(rpc_ws, agent, "hello cap", 10).await;
+    let machine = machine_until(rpc_ws, 20, "sbx1", |m| m.is_some())
         .await
         .unwrap();
     let machine_id = machine["id"].as_str().unwrap().to_owned();
 
     // At a turn boundary: paused and resumed at once, with no prompt.
-    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+    call_until(fake, rpc_ws, "sbx1", |calls| {
         calls
             .iter()
             .position(|c| is_call(c, "POST", "/sbx1/pause"))
@@ -1807,15 +1803,15 @@ async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
             })
     })
     .await;
-    machine_until(&mut rpc_ws, 100, "sbx1", |m| {
+    machine_until(rpc_ws, 100, "sbx1", |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "running")
     })
     .await;
-    send_and_reply(&mut rpc_ws, agent, "after the cap", 200).await;
+    send_and_reply(rpc_ws, agent, "after the cap", 200).await;
 
     // Never during a turn.
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         300,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "@block here" }),
@@ -1828,7 +1824,7 @@ async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
             // timing-guard: the blocked turn needs a moment to reach the sandbox (a pause before that is resumed by the turn)
             tokio::time::sleep(Duration::from_millis(500)).await;
             let refused = rpc(
-                &mut rpc_ws,
+                rpc_ws,
                 id,
                 "cloudMachines.pause",
                 json!({ "machineId": machine_id }),
@@ -1843,7 +1839,7 @@ async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
     .expect("pause refused during the turn");
     let before = fake.calls_for("sbx1").len();
     // timing-guard: longer than the run cap, so a planned pause would have run
-    idle(&mut rpc_ws, RUN_CAP + Duration::from_secs(2)).await;
+    idle(rpc_ws, RUN_CAP + Duration::from_secs(2)).await;
     assert!(
         !fake.calls_for("sbx1")[before..]
             .iter()
@@ -1851,7 +1847,7 @@ async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
         "no pause during a turn: {:?}",
         fake.calls_for("sbx1")
     );
-    assert_no_secret_logged(&head_dir, &fake);
+    assert_no_secret_logged(&backend.head_dir, &backend.fake);
 }
 
 /// The life of a sandbox against the fake E2B, with one settings minute
