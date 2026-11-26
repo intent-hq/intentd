@@ -452,9 +452,22 @@ async fn boot_daemon_with_task_env(
     title: &str,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, String, String, u16, String) {
+    boot_daemon_with_task_env_seeded(title, extra_env, async |_, _| {}).await
+}
+
+/// [`boot_daemon_with_task_env`], running `seed` on the data dir and the
+/// seeded workspace's id before the daemon starts: a test's own store writes
+/// land there, since a second writer racing the live daemon fails at random
+/// with "database is locked".
+async fn boot_daemon_with_task_env_seeded(
+    title: &str,
+    extra_env: &[(&str, &str)],
+    seed: impl AsyncFnOnce(&Path, &str),
+) -> (Daemon, String, String, u16, String) {
     let data_dir_guard: daemon_exit::FixtureDir = temp_data_dir().into();
     let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
+    seed(&data_dir, &ws_id).await;
     let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(extra_env);
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1412,17 +1425,8 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         },
     })
     .to_string();
-    let (daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task_env(
-        "Guest Wake Task",
-        &[
-            ("MOCK_AGENT_SCRIPT_PATH", &script),
-            ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ],
-    )
-    .await;
-    let cfg = client_config(&fp);
-
-    // A collaborator with its own credential, seeded into the daemon's store.
+    // A collaborator with its own credential, seeded into the store before
+    // the daemon starts.
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
@@ -1435,34 +1439,49 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
         created_at: now_iso(),
         updated_at: now_iso(),
     };
+    let (daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task_env_seeded(
+        "Guest Wake Task",
+        &[
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+        async |data_dir: &Path, ws_id: &str| {
+            let store = Store::open(&data_dir.join("intentd.db"))
+                .await
+                .expect("open store");
+            store
+                .upsert_principal(&guest)
+                .await
+                .expect("guest principal");
+            let token_hash = sha2::Sha256::digest(guest_token.as_bytes()).iter().fold(
+                String::new(),
+                |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                },
+            );
+            store
+                .insert_principal_credential(&guest.id, &token_hash)
+                .await
+                .expect("guest credential");
+            store
+                .add_workspace_member(
+                    &intent_core::WorkspaceId::from(ws_id),
+                    &guest.id,
+                    intent_core::WorkspaceRole::Collaborator,
+                )
+                .await
+                .expect("guest membership");
+            store.close().await;
+        },
+    )
+    .await;
+    let cfg = client_config(&fp);
     let primary = {
         let store = Store::open(&daemon.data_dir.path().join("intentd.db"))
             .await
             .expect("open daemon store");
-        store
-            .upsert_principal(&guest)
-            .await
-            .expect("guest principal");
-        let token_hash =
-            sha2::Sha256::digest(guest_token.as_bytes())
-                .iter()
-                .fold(String::new(), |mut s, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(s, "{b:02x}");
-                    s
-                });
-        store
-            .insert_principal_credential(&guest.id, &token_hash)
-            .await
-            .expect("guest credential");
-        store
-            .add_workspace_member(
-                &intent_core::WorkspaceId::from(ws_id.as_str()),
-                &guest.id,
-                intent_core::WorkspaceRole::Collaborator,
-            )
-            .await
-            .expect("guest membership");
         store.get_primary_principal().await.expect("primary")
     };
 

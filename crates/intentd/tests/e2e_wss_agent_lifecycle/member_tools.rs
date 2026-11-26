@@ -948,6 +948,7 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
         "readiness changes do not expose the probe output"
     );
     assert!(!changed.to_string().contains("private-probe-secret"));
+    // live-store-write: allow — the test revokes the member's durable host row behind its open socket, which only an out-of-band write reaches; each write retries busy upgrades or is one autocommit statement
     let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
     let events = store
         .query_events(&intent_store::EventQuery {

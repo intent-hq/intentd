@@ -762,7 +762,61 @@ struct Host {
 /// Boot one `intentd serve` against `mock`, its forge credential(s) being
 /// exactly `credentials` (`GITLAB_TOKEN` / `GITHUB_TOKEN` pairs).
 async fn boot(mock: &MockForge, credentials: &[(&str, &str)]) -> Host {
-    let dir = temp_data_dir();
+    boot_in(temp_data_dir(), mock, credentials).await
+}
+
+/// A host with the owner's workspace titled `title`, stopped so the test can
+/// seed invites with no daemon running (a second writer racing the live
+/// daemon fails at random with "database is locked"). The first boot settles
+/// the primary identity, which an open invite would freeze. Returns the data
+/// dir, its open store, the workspace id and the primary principal's id.
+async fn stopped_host_with_workspace(
+    mock: &MockForge,
+    title: &str,
+) -> (
+    tempfile::TempDir,
+    intent_store::Store,
+    String,
+    intent_core::PrincipalId,
+) {
+    let Host {
+        dir,
+        mut daemon,
+        port,
+        cfg,
+    } = boot(mock, OWNER_FORGE).await;
+    let mut owner = connect_ws(port, cfg, TOKEN).await;
+    let ws_id = create_workspace(&mut owner, 1, title).await;
+    drop(owner);
+    daemon.child.kill_tree().expect("stop the daemon");
+    let store = intent_store::Store::open(&dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    (dir, store, ws_id, primary.id)
+}
+
+/// Boot again on `dir` and wait for the restarted daemon's startup profile
+/// refresh to reach the forge, so it stays out of a test's forge-call count.
+async fn reboot(dir: tempfile::TempDir, mock: &MockForge) -> Host {
+    let before = mock.requests.load(Ordering::SeqCst);
+    let host = boot_in(dir, mock, OWNER_FORGE).await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mock.requests.load(Ordering::SeqCst) == before {
+                // timing-guard: wait for the restarted daemon's startup refresh request
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        },
+    )
+    .await
+    .expect("restarted daemon's startup profile refresh");
+    host
+}
+
+/// [`boot`] on an existing data dir.
+async fn boot_in(dir: tempfile::TempDir, mock: &MockForge, credentials: &[(&str, &str)]) -> Host {
     let data_dir = dir.path().to_path_buf();
     let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
     let tailcat = write_fake_tailcat(&data_dir).to_string_lossy().to_string();
@@ -981,17 +1035,9 @@ fn preview_invite_row(
 
 async fn assert_preview_pin_identity_over_wss(method: &str) {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, OWNER_FORGE).await;
-    // The owner connection settles at boot; count forge traffic from here.
-    let baseline = mock.requests.load(Ordering::SeqCst);
-    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
-    let ws_id = create_workspace(&mut owner, 1, "Preview requirements").await;
-    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
-        .await
-        .unwrap();
-    let primary = store.get_primary_principal().await.unwrap();
-    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
-    for (name, expected) in [
+    let (dir, store, ws_id, primary) =
+        stopped_host_with_workspace(&mock, "Preview requirements").await;
+    let cases = [
         ("gitlab", gitlab_identity(GUEST_GL_ID)),
         (
             "self-managed",
@@ -1000,17 +1046,25 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
         ("github", github_identity(GUEST_GL_ID)),
         ("legacy", github_identity(GUEST_GL_ID)),
         ("unpinned", Value::Null),
-    ] {
-        let mut invite = preview_invite_row(&ws_id, &primary.id, name);
+    ];
+    for (name, expected) in &cases {
+        let mut invite = preview_invite_row(&ws_id, &primary, name);
         invite.pin_identity = serde_json::from_value(expected.clone()).unwrap();
         store.insert_workspace_invite(&invite).await.unwrap();
-        if name == "legacy" {
+        if *name == "legacy" {
             sqlx::query("UPDATE workspace_invite SET pin_identity_provider = NULL, pin_instance_host = NULL, pin_external_user_id = NULL WHERE id = ?")
-                .bind(name).execute(store.write_pool()).await.unwrap();
+                .bind(*name).execute(store.write_pool()).await.unwrap();
             let legacy = store.get_workspace_invite(name).await.unwrap().unwrap();
             assert!(legacy.pin_identity.is_none());
             assert_eq!(legacy.pin_github_user_id, Some(7777));
         }
+    }
+    store.close().await;
+    let host = reboot(dir, &mock).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
+    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
+    for (name, expected) in cases {
         let v = admitted_rpc(
             &mut preview,
             10,
@@ -1076,24 +1130,18 @@ async fn challenge_exposes_pin_identity_including_legacy_and_unpinned_over_wss()
 async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_wss() {
     use intent_core::InviteErrorKind;
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, OWNER_FORGE).await;
-    // The owner connection settles at boot; count forge traffic from here.
-    let baseline = mock.requests.load(Ordering::SeqCst);
-    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
-    let ws_id = create_workspace(&mut owner, 1, "Private requirements").await;
-    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
-        .await
-        .unwrap();
-    let primary = store.get_primary_principal().await.unwrap();
-    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
-    for (state, kind) in [
+    let (dir, store, ws_id, primary) =
+        stopped_host_with_workspace(&mock, "Private requirements").await;
+    let cases = [
         ("missing", InviteErrorKind::NotFound),
         ("bad-secret", InviteErrorKind::NotFound),
         ("expired", InviteErrorKind::Expired),
         ("revoked", InviteErrorKind::Revoked),
         ("redeemed", InviteErrorKind::Redeemed),
-    ] {
-        let mut invite = preview_invite_row(&ws_id, &primary.id, state);
+    ];
+    for (state, _) in &cases {
+        let state = *state;
+        let mut invite = preview_invite_row(&ws_id, &primary, state);
         invite.pin_identity = Some(intent_core::PrincipalIdentity {
             provider: "gitlab".into(),
             host: "private.example".into(),
@@ -1108,6 +1156,13 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
         if state != "missing" {
             store.insert_workspace_invite(&invite).await.unwrap();
         }
+    }
+    store.close().await;
+    let host = reboot(dir, &mock).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
+    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
+    for (state, kind) in cases {
         for method in ["invite.inspect", "invite.challenge"] {
             let secret = if state == "bad-secret" {
                 "wrong"
@@ -1140,30 +1195,12 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
 #[tokio::test]
 async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, OWNER_FORGE).await;
-    // The owner connection settles at boot; count forge traffic from here.
-    let baseline = mock.requests.load(Ordering::SeqCst);
-    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
-    let ws_id = create_workspace(&mut owner, 1, "Pin enforcement").await;
-    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
-        .await
-        .unwrap();
-    let primary = store.get_primary_principal().await.unwrap();
-    let mut invite = preview_invite_row(&ws_id, &primary.id, "pinned");
+    let (dir, store, ws_id, primary) = stopped_host_with_workspace(&mock, "Pin enforcement").await;
+    let mut invite = preview_invite_row(&ws_id, &primary, "pinned");
     invite.pin_identity = serde_json::from_value(gitlab_identity(GUEST_GL_ID)).unwrap();
     store.insert_workspace_invite(&invite).await.unwrap();
-    let mut guest_ws = connect_invite(host.port, host.cfg.clone()).await;
-    let preview = admitted_rpc(
-        &mut guest_ws,
-        2,
-        "invite.inspect",
-        json!({"inviteId": "pinned", "secret": "pinned"}),
-    )
-    .await;
-    assert_eq!(
-        preview["result"]["pinIdentity"],
-        gitlab_identity(GUEST_GL_ID)
-    );
+    // One guest principal per pin case, each with its own credential.
+    let mut guests = Vec::new();
     for (name, identity) in [
         ("wrong-provider", github_identity(GUEST_GL_ID)),
         (
@@ -1189,6 +1226,28 @@ async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_w
             .insert_principal_credential(&principal.id, &preview_secret_hash(name))
             .await
             .unwrap();
+        guests.push((name, principal));
+    }
+    store.close().await;
+    let host = reboot(dir, &mock).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
+    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let mut guest_ws = connect_invite(host.port, host.cfg.clone()).await;
+    let preview = admitted_rpc(
+        &mut guest_ws,
+        2,
+        "invite.inspect",
+        json!({"inviteId": "pinned", "secret": "pinned"}),
+    )
+    .await;
+    assert_eq!(
+        preview["result"]["pinIdentity"],
+        gitlab_identity(GUEST_GL_ID)
+    );
+    for (name, principal) in guests {
         let result = admitted_rpc(
             &mut guest_ws,
             3,

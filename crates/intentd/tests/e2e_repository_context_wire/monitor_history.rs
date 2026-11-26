@@ -187,26 +187,35 @@ async fn check_cold_history(wss: bool) {
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(input.with_extension("json")).unwrap()).unwrap();
     let account = OriginalAccount::new().await;
-    let h = Harness::boot_with_inputs(None, true, Some((&input, &account.endpoint))).await;
-    let store = Store::open(&h.dir.path().join("intentd.db")).await.unwrap();
     let agent = intent_core::AgentId::from(manifest["agentId"].as_str().unwrap());
     let message_id = manifest["messageId"].as_str().unwrap();
+    let h = Harness::boot_seeded(
+        None,
+        true,
+        Some((&input, &account.endpoint)),
+        false,
+        false,
+        async |store, _| {
+            store
+                .append_agent_message_with_id(
+                    &agent,
+                    "ordinary-cold-control",
+                    "user",
+                    &json!([{"type":"text","text":"Ordinary cold receiver control"}]),
+                    None,
+                    &intent_core::now_iso(),
+                )
+                .await
+                .unwrap();
+        },
+    )
+    .await;
+    let store = Store::open(&h.dir.path().join("intentd.db")).await.unwrap();
     let original = store
         .get_monitor_message_provenance(&agent, message_id)
         .await
         .unwrap()
         .expect("original prepared write survives cold boot");
-    store
-        .append_agent_message_with_id(
-            &agent,
-            "ordinary-cold-control",
-            "user",
-            &json!([{"type":"text","text":"Ordinary cold receiver control"}]),
-            None,
-            &intent_core::now_iso(),
-        )
-        .await
-        .unwrap();
     let rows = store
         .list_qualified_pr_monitors_by_agent(&agent)
         .await

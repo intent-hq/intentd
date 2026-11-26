@@ -222,7 +222,12 @@ where
 /// Boot a daemon with the WSS listener enabled and return the live handle + a pinned WSS
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir_guard = temp_data_dir();
+    boot_in(temp_data_dir()).await
+}
+
+/// [`boot`] on `data_dir_guard`, which a test may seed first: a second
+/// writer racing the live daemon fails at random with "database is locked".
+async fn boot_in(data_dir_guard: tempfile::TempDir) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -878,12 +883,13 @@ where
 /// host.exec: happy-path round-trip + timeout + cwd-outside-workspace rejection.
 #[tokio::test]
 async fn host_exec_over_wss() {
-    let (daemon, port, cfg) = boot().await;
     // Real filesystem root the daemon can `cd` into; a sibling temp dir the
     // guard removes when the test ends.
     let root_guard = common::test_tempdir("itd-wss-exec-root-");
     let root = root_guard.path().to_path_buf();
-    let ws_id = seed_workspace_with_path(&daemon.data_dir, &root).await;
+    let data_dir_guard = temp_data_dir();
+    let ws_id = seed_workspace_with_path(data_dir_guard.path(), &root).await;
+    let (_daemon, port, cfg) = boot_in(data_dir_guard).await;
     let mut ws = connect_ws(port, cfg).await;
 
     // 1) Happy path — echo returns stdout + exitCode 0 without cwd validation.

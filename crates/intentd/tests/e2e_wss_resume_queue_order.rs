@@ -354,6 +354,9 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     ];
 
     eprintln!("Phase 1: boot daemon1, run agent mid-turn, queue 2 messages");
+    // Seed before daemon1 starts: a second writer racing a live daemon fails
+    // at random with "database is locked".
+    let (ws_id, _guest) = seed_workspace_with_guest(data_dir).await;
     let child1 = spawn_serve(data_dir, "both", &env, false);
     let daemon1 = Daemon {
         child: child1,
@@ -361,8 +364,6 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon1 did not start");
-
-    let (ws_id, _guest) = seed_workspace_with_guest(data_dir).await;
 
     let create_result = uds_rpc(
         &socket,

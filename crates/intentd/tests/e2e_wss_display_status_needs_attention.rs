@@ -1637,6 +1637,7 @@ async fn blocker_recovery_automatic_wakes(state_snapshot: bool) {
     )
     .await;
     let agent = create_agent(&mut rpc, &ws_id, "foreground-recovery").await;
+    // live-store-write: allow — the test stamps an older harness on an agent the live daemon created and drives its reaction; one autocommit statement
     let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
         .await
         .unwrap();
@@ -1838,6 +1839,7 @@ async fn explicit_blocker_recovery_preserves_question_and_other_agent_over_wss()
         .expect("pending question marker")
         .to_string();
     assert!(!pending.is_empty(), "{before}");
+    // live-store-write: allow — the test plants a blocker on an agent parked on a question, which no RPC or turn can raise; one autocommit statement
     let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
         .await
         .unwrap();
@@ -1952,6 +1954,7 @@ async fn explicit_blocker_recovery_attention_requests_disabled_over_wss() {
     )
     .await;
     let agent = create_agent(&mut rpc, &ws_id, "disabled-recovery").await;
+    // live-store-write: allow — the test disables attention requests on a live agent and plants the blocker it can no longer raise; one autocommit statement each
     let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
         .await
         .unwrap();

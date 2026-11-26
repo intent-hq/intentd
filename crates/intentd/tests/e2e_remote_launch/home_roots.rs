@@ -86,7 +86,7 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     // from a local path is a plain worktree, which leaves it empty on any
     // daemon); `file://` submodules need this on modern git.
     let file_submodules = ("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'");
-    let (_head, port, cfg) = serve_backend(&head_dir, &[file_submodules]).await;
+    let (head, port, cfg) = serve_backend(&head_dir, &[file_submodules]).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
@@ -138,7 +138,12 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
     .await;
 
     // The workspace's roots, as an agent's `ws.git.registerRoot` or the
-    // submodule sweep would record them on the orchestrator.
+    // submodule sweep would record them on the orchestrator, written while
+    // it is stopped: a second writer racing the live daemon fails at random
+    // with "database is locked".
+    drop(rpc_ws);
+    drop(head);
+    // live-store-write: allow — the orchestrator owning this store is stopped; only the machine daemon, on its own data dir, runs
     let store = intent_store::Store::open(&head_dir.join("intentd.db"))
         .await
         .unwrap();
@@ -158,18 +163,33 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
         .await
         .unwrap()
         .0;
-    drop(store);
+    store.close().await;
     let lib_id = lib_root.id.as_str().to_owned();
+    let (_head, port, cfg) = serve_backend(&head_dir, &[file_submodules]).await;
+    let mut rpc_ws = connect(port, cfg).await;
 
-    // A file written in the submodule lands in the home's, not the mirror's.
-    id += 1;
-    ok(
-        &mut rpc_ws,
-        id,
-        "file.write",
-        json!({ "workspaceId": ws_id, "path": "lib/added.txt", "content": "in lib\n" }),
-    )
-    .await;
+    // A file written in the submodule lands in the home's, not the mirror's,
+    // once the machine binds to the restarted orchestrator.
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        id += 1;
+        let response = rpc(
+            &mut rpc_ws,
+            id,
+            "file.write",
+            json!({ "workspaceId": ws_id, "path": "lib/added.txt", "content": "in lib\n" }),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the home never came back: {response}"
+        );
+        // timing-guard: retry while the machine binds to the restarted orchestrator
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     assert_eq!(
         std::fs::read_to_string(work.join("lib").join("added.txt")).unwrap(),
         "in lib\n"

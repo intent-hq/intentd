@@ -1643,6 +1643,23 @@ async fn start_backend_on(
     (guard, port, cfg, ws_id)
 }
 
+/// [`start_backend_with`], running `seed` with the seeded workspace's id
+/// before the backend starts: a test's own store writes land there, since a
+/// second writer racing the live daemon fails at random with "database is
+/// locked".
+async fn start_backend_seeded(
+    data_dir: &Path,
+    repo: &Path,
+    env: &[(&str, &str)],
+    seed: impl AsyncFnOnce(&str),
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
+    std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
+    let ws_id = seed_workspace_on(data_dir, repo, false).await;
+    seed(&ws_id).await;
+    let (guard, port, cfg) = serve_backend(data_dir, env).await;
+    (guard, port, cfg, ws_id)
+}
+
 /// Start the backend's `intentd serve` on `data_dir` (seeded or from an
 /// earlier run: a restart keeps its store and its fixed WSS port).
 async fn serve_backend(
@@ -2557,7 +2574,21 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
             .collect()
     };
 
-    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    // The workspace's git roots on the backend: the remote agent lists only
+    // its carried submodules, at their paths in its checkout, and not the
+    // repository outside it (intent-hq/intent#8692).
+    let head_dir = scratch.path().join("head");
+    let roots = [
+        repo.join("a"),
+        repo.join("a/b"),
+        repo.join("c"),
+        c_url.clone(),
+    ];
+    let (_head, port, cfg, ws_id) =
+        start_backend_seeded(&head_dir, &repo, &[], async |ws_id: &str| {
+            seed_git_roots(&head_dir, ws_id, &roots).await;
+        })
+        .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
@@ -2617,20 +2648,6 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
         "backend only\n"
     );
 
-    // The workspace's git roots on the backend: the remote agent lists only
-    // its carried submodules, at their paths in its checkout, and not the
-    // repository outside it (intent-hq/intent#8692).
-    seed_git_roots(
-        &scratch.path().join("head"),
-        &ws_id,
-        &[
-            repo.join("a"),
-            repo.join("a/b"),
-            repo.join("c"),
-            c_url.clone(),
-        ],
-    )
-    .await;
     let listed = wsapi_turn(
         &mut rpc_ws,
         &mut events,

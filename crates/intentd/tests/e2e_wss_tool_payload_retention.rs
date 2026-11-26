@@ -34,7 +34,7 @@ use crate::common;
 
 use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -286,40 +286,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-/// Bounded poll: wait until the mock's `MOCK_AGENT_PID_FILE` holds at least
-/// `n` pid lines (one appended per spawn) and return them all.
-async fn await_pid_lines(path: &Path, n: usize) -> Vec<u32> {
-    for _ in 0..400 {
-        if let Ok(contents) = tokio::fs::read_to_string(path).await {
-            let pids: Vec<u32> = contents
-                .lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect();
-            if pids.len() >= n {
-                return pids;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("pid file {} never reached {n} line(s)", path.display());
-}
-
-/// Bounded poll: wait until the daemon log contains `needle`.
-async fn await_daemon_log_contains(data_dir: &Path, needle: &str) {
-    let log_path = data_dir.join("daemon.log");
-    for _ in 0..400 {
-        if tokio::fs::read_to_string(&log_path)
-            .await
-            .unwrap_or_default()
-            .contains(needle)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("daemon log never contained {needle:?}");
-}
-
 /// Bounded poll: wait until `agent.getSession` reports `status == "idle"`.
 async fn await_session_idle<S>(
     ws: &mut WebSocketStream<S>,
@@ -511,22 +477,19 @@ async fn pruned_tool_payload_is_flagged_and_replays_identically_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let pid_file = data_dir.join("pids.txt");
-    let pid_file_s = pid_file.to_string_lossy().into_owned();
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_s = prompt_log.to_string_lossy().into_owned();
-    // The mock does NOT advertise `loadSession`, so the post-kill respawn
-    // takes the recreate + history-replay path.
+    // The mock does NOT advertise `loadSession`, so the respawn after the
+    // restart takes the recreate + history-replay path.
     let behavior = json!({ "response": "ack" }).to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("MOCK_AGENT_PID_FILE", &pid_file_s),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_s),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir_guard,
     };
@@ -571,6 +534,14 @@ async fn pruned_tool_payload_is_flagged_and_replays_identically_over_wss() {
     // Turn 1 opens the provider session (`session/new`) and settles idle.
     run_turn(&mut rpc, &mut sub, 11, &ws_id, &agent_id, "first turn").await;
     await_session_idle(&mut rpc, 100, &ws_id, &agent_id).await;
+
+    // Stop the daemon before writing its store: a second writer racing the
+    // live daemon fails at random with "database is locked". Stopping it also
+    // ends the idle mock child, so turn 2 below respawns a fresh child that
+    // must recreate the session.
+    drop(sub);
+    drop(rpc);
+    daemon.child.kill_tree().expect("stop the daemon");
 
     // Two identical heavy tool messages: one back-dated 3 days (the sweep's
     // target), one fresh (must survive the sweep untouched). Bodies well past
@@ -627,6 +598,30 @@ async fn pruned_tool_payload_is_flagged_and_replays_identically_over_wss() {
         vec!["tool_result_output", "tool_use_input"],
         "fresh message untouched by the sweep"
     );
+
+    daemon.child = spawn_serve(&data_dir, &env);
+    assert!(await_uds(&socket).await, "daemon did not restart");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "resubscribed: {sub_resp}"
+    );
+    let mut rpc = connect_ws(port, cfg).await;
 
     // (1) The slim conversation read is unchanged for the pruned message:
     // block-for-block identical to the unpruned sibling (ids aside).
@@ -695,21 +690,9 @@ async fn pruned_tool_payload_is_flagged_and_replays_identically_over_wss() {
     assert_eq!(full_use["input"]["cmd"].as_str(), Some(big_in.as_str()));
     assert!(full_use.get("inputPruned").is_none() && full_use.get("inputTruncated").is_none());
 
-    // (3) Recovery replay: SIGKILL the idle mock child so turn 2 respawns a
-    // fresh child that must recreate the session (no `loadSession`) and
-    // replay the history as `<supervisor>` XML.
-    let pids = await_pid_lines(&pid_file, 1).await;
-    let killed = Command::new("kill")
-        .args(["-9", &pids[0].to_string()])
-        .status()
-        .expect("run kill")
-        .success();
-    assert!(killed, "SIGKILL delivered to idle mock child {}", pids[0]);
-    await_daemon_log_contains(
-        &data_dir,
-        "idle agent child exited unexpectedly; handle reaped",
-    )
-    .await;
+    // (3) Recovery replay: the restart ended the idle mock child, so turn 2
+    // respawns a fresh child that must recreate the session (no
+    // `loadSession`) and replay the history as `<supervisor>` XML.
     run_turn(
         &mut rpc,
         &mut sub,

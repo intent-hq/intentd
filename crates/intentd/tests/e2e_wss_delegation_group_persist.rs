@@ -704,6 +704,22 @@ async fn baseline_plus_aggregated_wake() {
             .any(|id| id.0 == child2_id),
         "child2 still expected"
     );
+    // The SIGKILLed daemon1 recorded no interrupted_agent row for child2, so
+    // insert it now, while no daemon is running: a second writer racing a
+    // live daemon fails at random with "database is locked".
+    {
+        use intent_core::{now_iso, AgentId, WorkspaceId};
+        store
+            .insert_interrupted_agent(
+                &AgentId(child2_id.clone()),
+                &WorkspaceId(ws_id.clone()),
+                "active",
+                &now_iso(),
+            )
+            .await
+            .expect("insert interrupted child2");
+    }
+    store.close().await;
 
     // Increment 3: boot daemon2 using the SAME data_dir
     // Daemon2 gets child2 delay=0ms so child2 completes quickly and fires the aggregated wake.
@@ -757,26 +773,8 @@ async fn baseline_plus_aggregated_wake() {
     let mut rpc2 = connect_ws(port2, cfg2).await;
     eprintln!("Connected to daemon2.");
 
-    // Increment 4: call agent.resolveInterrupted to resume child2
-    // First, insert interrupted_agent row for child2 (the previous implementors manually did this)
-    eprintln!("Inserting interrupted_agent row for child2...");
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
-    {
-        use intent_core::{now_iso, AgentId, WorkspaceId};
-        store
-            .insert_interrupted_agent(
-                &AgentId(child2_id.clone()),
-                &WorkspaceId(ws_id.clone()),
-                "active",
-                &now_iso(),
-            )
-            .await
-            .expect("insert interrupted child2");
-    }
-    eprintln!("Interrupted_agent row inserted for child2.");
-
+    // Increment 4: call agent.resolveInterrupted to resume child2, whose
+    // interrupted_agent row was inserted while no daemon was running.
     eprintln!("Calling agent.resolveInterrupted to resume child2...");
     let resolve_resp = wss_rpc(
         &mut rpc2,

@@ -48,6 +48,7 @@ async fn permission_recovery(routed: bool) {
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     let person = seed_member(dir.path(), &ws).await;
+    // live-store-write: allow — the test flips a connected guest's role to and from Owner, which no RPC can do; set_workspace_member_role retries busy upgrades
     let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
     store.remove_host_member(&person).await.unwrap();
     let primary = store.get_primary_principal().await.unwrap();

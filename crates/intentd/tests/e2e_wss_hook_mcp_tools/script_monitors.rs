@@ -177,6 +177,7 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
         // timing-guard: poll the real owner's observable idle state before releasing the child.
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // live-store-write: allow — the test injects a failing trigger and stale settlements into the live daemon on purpose; each write is one statement first in its transaction
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();
@@ -398,6 +399,7 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
     let mut rpc = connect_ws(port, cfg).await;
     let created = wss_rpc(&mut rpc,"agent.create",json!({"workspaceId":ws_id,"name":"Worker receipt owner","model":"default","provider":"mock"})).await;
     let agent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // live-store-write: allow — the test injects failing triggers and a monitor row into the live daemon on purpose; each write is one statement first in its transaction
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();

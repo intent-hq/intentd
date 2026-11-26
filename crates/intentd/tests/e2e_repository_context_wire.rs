@@ -187,6 +187,20 @@ impl Harness {
         hold: bool,
         native: bool,
     ) -> Self {
+        Self::boot_seeded(ids, support, history, hold, native, async |_, _| {}).await
+    }
+    /// [`Self::boot_case`], running `seed` on the store and workspace before
+    /// the daemon starts: a test's own store writes land there, since a
+    /// second writer racing the live daemon fails at random with "database
+    /// is locked".
+    async fn boot_seeded(
+        ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
+        support: bool,
+        history: Option<(&Path, &str)>,
+        hold: bool,
+        native: bool,
+        seed: impl AsyncFnOnce(&Store, &WorkspaceId),
+    ) -> Self {
         let dir = common::test_tempdir_in("/tmp", "itd-repository-wire-");
         if let Some((database, _)) = history {
             std::fs::copy(database, dir.path().join("intentd.db")).unwrap();
@@ -244,7 +258,8 @@ impl Harness {
             .add_workspace_member(&ws.id, &guest.id, WorkspaceRole::Collaborator)
             .await
             .unwrap();
-        drop(store);
+        seed(&store, &ws.id).await;
+        store.close().await;
         std::fs::write(
             dir.path().join("config.toml"),
             "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
