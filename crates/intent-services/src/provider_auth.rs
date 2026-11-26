@@ -2203,7 +2203,7 @@ while IFS= read -r unexpected; do exit 95; done
     }
 
     /// The full sweep answers in `AUTH_PROBE_PROVIDERS` order whatever order
-    /// the parallel probes finish in (the index-slotted JoinSet). The WSS
+    /// the parallel probes finish in (the index-slotted `JoinSet`). The WSS
     /// e2e test checks the provider set against the registry; this pins the
     /// order. Like the scoped test above, probes run for real on hosts that
     /// have the CLIs, so only the shape and order are asserted.
