@@ -88,6 +88,14 @@ crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib   
 crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      model_preference::tests
 crates/intent-providers/data/adapter-cli-packages.json   intentd::suite_wss_agents e2e_wss_agent_workers
 
+# Provider registry: host_provider_auth_status_over_wss reads its expected
+# providers from ACP_PROVIDERS, and the sweep order lives in provider_auth.rs.
+# Without these entries a new provider's local test-changed run skipped it and
+# CI found the gap (intentd#3790). See ADDING_A_PROVIDER.md "Lists a new
+# provider must join".
+crates/intent-providers/src/config.rs                    intentd::suite_wss_g_r    e2e_wss_host
+crates/intent-services/src/provider_auth.rs              intentd::suite_wss_g_r    e2e_wss_host
+
 # Remote launch: the head connector and port, the node runtime and its git
 # checkouts, and the git-over-link pieces they compose, against a real
 # `intentd node` process.

@@ -15,6 +15,7 @@
 use crate::common;
 
 use intentd_test_support::GuardedChild;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -455,6 +456,12 @@ async fn host_app_detection_services_over_wss() {
     }
 }
 
+/// Registered providers `host.providerAuthStatus` does not report: cortex
+/// (no auth probe is implemented for its adapter), unsloth (rides opencode's
+/// binary and sign-in, `primary_binary_provider_id`) and mock (the scripted
+/// test agent, nothing to sign in to).
+const NOT_AUTH_PROBED: &[&str] = &["cortex", "unsloth", "mock"];
+
 /// host.providerAuthStatus over the real WSS wire: full sweep, scoped call,
 /// and the unknown-provider invalid-params error (PROTOCOL §9).
 #[tokio::test]
@@ -462,7 +469,7 @@ async fn host_provider_auth_status_over_wss() {
     let (_daemon, port, cfg) = boot().await;
     let mut ws = connect_ws(port, cfg).await;
 
-    // Full sweep: every probe-able provider appears exactly once, in order,
+    // Full sweep: every probe-able provider appears exactly once,
     // with `authenticated: true | false | null`. On a host without providers
     // every entry short-circuits to null without probing; with providers
     // installed the parallel probes are bounded by their own budgets, so give
@@ -476,33 +483,29 @@ async fn host_provider_auth_status_over_wss() {
     )
     .await;
     let providers = result["providers"].as_array().expect("providers array");
-    let expected_ids = [
-        "auggie",
-        "claude-code",
-        "codex",
-        "opencode",
-        "droid",
-        "grok",
-        "pi",
-        "antigravity",
-        "cursor",
-        "dsh",
-    ];
-    assert_eq!(
-        providers.len(),
-        expected_ids.len(),
-        "one entry per probe-able provider: {result}"
-    );
-    for (entry, expected_id) in providers.iter().zip(expected_ids) {
-        assert_eq!(
-            entry["id"], expected_id,
-            "response order is fixed: {result}"
-        );
+    // The expected set comes from the provider registry, so adding a provider
+    // there cannot leave this test stale (intentd#3790 missed a hand-written
+    // copy here). A registered provider the daemon does not probe joins
+    // NOT_AUTH_PROBED instead, with why.
+    let expected_ids: BTreeSet<&str> = intent_providers::all_provider_ids()
+        .into_iter()
+        .filter(|id| !NOT_AUTH_PROBED.contains(id))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for entry in providers {
+        let id = entry["id"].as_str().expect("provider id is a string");
+        assert!(seen.insert(id), "{id} appears more than once: {result}");
         assert!(
             entry["authenticated"].is_boolean() || entry["authenticated"].is_null(),
             "authenticated is true|false|null: {entry}"
         );
     }
+    assert_eq!(
+        seen, expected_ids,
+        "one entry per registered provider outside NOT_AUTH_PROBED. A new provider \
+         needs an auth probe in intent-services' AUTH_PROBE_PROVIDERS, or an entry in \
+         NOT_AUTH_PROBED here: {result}"
+    );
 
     // Scoped call: `providerId` narrows the sweep to one provider. This also
     // exercises the cache — the sweep above already probed (or skipped) grok,
