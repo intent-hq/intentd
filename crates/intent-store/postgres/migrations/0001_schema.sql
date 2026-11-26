@@ -568,7 +568,7 @@ CREATE TABLE IF NOT EXISTS completion_watch (
     -- completion wakes the parent once even when two processes see it. A
     -- process claims the row before it sends the terminal wake and skips
     -- when another holds it. The claim names the tenant's epoch
-    -- (tenant_writer.epoch, read under the writer lock) and the claiming
+    -- (the tenant lease token, read under the writer lock) and the claiming
     -- process (a token per process): it is stale only when a newer epoch
     -- exists (a takeover), never by elapsed time. Retiring the row drops the
     -- claim; a failed delivery releases it for its retry. NULL: unclaimed.
@@ -627,6 +627,14 @@ CREATE TABLE IF NOT EXISTS delete_grace (
 -- goes back. `expires_at` and `acquired_at` come from the database clock
 -- alone. A lease does not depend on the tenant epoch. SQLite (desktop) keeps
 -- leases in its single process.
+--
+-- The row (tenant_id, 'tenant', '') is the tenant lease: one orchestrator
+-- process owns the tenant while it holds it. Its `holder` is the claiming
+-- instance id and its `token` is the tenant's epoch. A claim takes the
+-- tenant writer lock, then acquires the row; every writer reads the row
+-- right after it took the writer lock and writes only while it names this
+-- process's claim (see tenant_writer). Renewal and release match the claim's
+-- lease_id and token, outside the writer lock.
 CREATE TABLE IF NOT EXISTS lease (
     tenant_id text NOT NULL,
     scope text NOT NULL,
@@ -996,7 +1004,7 @@ CREATE TABLE IF NOT EXISTS idempotency_key (
     created_at text NOT NULL,
     row_seq bigint NOT NULL,
     -- Postgres only (orchestrator mode): the reservation names the tenant's
-    -- epoch (tenant_writer.epoch, read under the writer lock) and the
+    -- epoch (the tenant lease token, read under the writer lock) and the
     -- reserving process (a token per process). It is stale only when a
     -- newer epoch exists (a takeover), never by elapsed time (the ~hourly
     -- reaper still drops any row older than its retention, pending or not).
@@ -1463,24 +1471,6 @@ CREATE TABLE IF NOT EXISTS task_agent_link (
     PRIMARY KEY (tenant_id, workspace_id, note_id, task_key)
 );
 
--- Postgres only (orchestrator mode): the fenced tenant lease. One
--- orchestrator process owns a tenant at a time. The owner's heartbeat
--- renews it with a plain UPDATE of this row, outside the writer lock, so a
--- busy tenant cannot starve it. A claim takes the writer lock, then this
--- row's lock, and succeeds only when there is no row or `expires_at` has
--- passed by the database clock; it sets the owner and bumps the epoch here
--- and on tenant_writer in one transaction. One row per tenant, keyed by
--- tenant_id alone (no identity columns), so it routes to the tenant's shard
--- on Neki.
-CREATE TABLE IF NOT EXISTS tenant_lease (
-    tenant_id text NOT NULL,
-    owner_instance text NOT NULL,
-    epoch bigint NOT NULL,
-    expires_at timestamptz NOT NULL,
-    renewed_at timestamptz NOT NULL,
-    PRIMARY KEY (tenant_id)
-);
-
 -- Tenant secrets (orchestrator mode). The desktop keeps its secrets in the
 -- file store (`intent_core::FileSecretStore`); an orchestrator stores each
 -- tenant's secrets here, so they follow the tenant to the process that
@@ -1541,19 +1531,17 @@ CREATE TABLE IF NOT EXISTS tenant_config (
 -- write (`INSERT ... ON CONFLICT DO NOTHING`, then the lock). Once Postgres
 -- stores ship, a lock change needs one release that takes both locks.
 --
--- The row also carries the lease fence (orchestrator mode, see
--- tenant_lease): the owner instance and the tenant's epoch. A writer
--- compares them with its process's claim after it takes the lock, so a
--- process that lost the tenant cannot write, even one that waited for the
--- lock behind the takeover (READ COMMITTED re-reads the locked row). NULL
--- owner and epoch 0: no process ever claimed the tenant.
+-- Once it holds the lock, a writer reads the tenant lease (the `lease` row
+-- with scope 'tenant') in its next statement and compares it with its
+-- process's claim, so a process that lost the tenant cannot write, even one
+-- that waited for the lock behind the takeover (READ COMMITTED: the next
+-- statement sees every claim committed before the lock was granted). No
+-- tenant lease row: no process ever claimed the tenant.
 --
 -- last_row_seq is the tenant's row_seq counter: the last value handed out
 -- across all its tables (see intent_next_row_seq).
 CREATE TABLE IF NOT EXISTS tenant_writer (
     tenant_id text NOT NULL,
-    owner_instance text,
-    epoch bigint NOT NULL DEFAULT 0,
     last_row_seq bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id)
 );

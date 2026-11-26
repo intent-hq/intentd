@@ -66,7 +66,7 @@ fn listen_config(dir: &Path) -> ListenConfig {
 fn short() -> LeaseTiming {
     LeaseTiming {
         ttl: Duration::from_secs(3),
-        interval: Duration::from_millis(100),
+        margin: Duration::from_millis(500),
     }
 }
 

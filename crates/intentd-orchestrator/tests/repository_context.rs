@@ -116,7 +116,7 @@ async fn stop(mut served: ServedTenant) {
         .expect("the tenant stops");
     assert!(report.overran.is_empty(), "{:?}", report.overran);
     assert!(
-        served.heartbeat().release().await.expect("release"),
+        served.lease().release().await.expect("release"),
         "the lease is released"
     );
 }

@@ -30,13 +30,13 @@
 //! A live lease of another instance refuses the start with
 //! `Error::NotOwner` naming that instance and its expiry, having written
 //! nothing; the daemon must exit rather than serve the tenant. Once open,
-//! `intent_store::postgres::LeaseHeartbeat` renews the lease
-//! (`LEASE_TTL`, `LEASE_RENEW_INTERVAL`) and fires the claim's
+//! `intent_store::postgres::TenantLeaseKeeper` renews the lease
+//! (`LEASE_TTL`) and fires the claim's
 //! `intent_core::tenant_fence::TenantFence` once it cannot renew by the
 //! expiry minus `LEASE_FENCE_MARGIN`; any `NotOwner` write fires it too, and
 //! a fired fence refuses every later write. Nothing in this binary
-//! starts the heartbeat or a `SelfFence` yet: per-tenant composition (a
-//! later step) will spawn `LeaseHeartbeat`, build the tenant's `SelfFence`
+//! starts the keeper or a `SelfFence` yet: per-tenant composition (a
+//! later step) will spawn `TenantLeaseKeeper`, build the tenant's `SelfFence`
 //! (`intent_services::self_fence::tenant_self_fence`, then its client
 //! connections, machine links and tasks) and spawn it, so the tenant's work
 //! stops on the fence.

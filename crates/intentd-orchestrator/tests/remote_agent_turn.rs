@@ -716,7 +716,7 @@ async fn stopping_the_tenant_mid_turn_records_the_turn_interrupted() {
     let report = running.served.stopped().await;
     assert!(report.overran.is_empty(), "{report:?}");
     assert!(
-        running.served.heartbeat().release().await.expect("release"),
+        running.served.lease().release().await.expect("release"),
         "the lease was still ours"
     );
 
@@ -806,11 +806,7 @@ async fn release(mut served: ServedTenant) {
         .await
         .expect("the tenant stops");
     assert!(
-        served
-            .heartbeat()
-            .release()
-            .await
-            .expect("release the lease"),
+        served.lease().release().await.expect("release the lease"),
         "the lease was still ours"
     );
 }
@@ -1380,11 +1376,7 @@ async fn a_tenant_http_mcp_server_reaches_its_machine_agents_and_stdio_is_refuse
     tokio::time::timeout(wait(), first.stopped())
         .await
         .expect("the first instance stops");
-    first
-        .heartbeat()
-        .release()
-        .await
-        .expect("release the lease");
+    first.lease().release().await.expect("release the lease");
 
     // The instance that takes the tenant over starts the saved server.
     let (served, listeners, mut client) =

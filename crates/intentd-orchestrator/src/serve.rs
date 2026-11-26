@@ -17,25 +17,26 @@ use intent_services::{
     StartupResumeCandidates,
 };
 use intent_store::postgres::{
-    LeaseHeartbeat, LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId,
-    LEASE_RENEW_INTERVAL, LEASE_TTL,
+    LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId, TenantLeaseKeeper,
+    LEASE_FENCE_MARGIN, LEASE_TTL,
 };
 use intent_store::{OrchestratorOnly, Store};
 use intent_transport::PrimaryReverseRegistry;
 
-/// How a tenant's lease is held: claimed for `ttl`, renewed every
-/// `interval`.
+/// How a tenant's lease is held: claimed and renewed for `ttl`, with the
+/// fence firing `margin` before the lease's local deadline when no renewal
+/// succeeded ([`TenantLeaseKeeper::spawn_with_margin`]).
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseTiming {
     pub ttl: Duration,
-    pub interval: Duration,
+    pub margin: Duration,
 }
 
 impl Default for LeaseTiming {
     fn default() -> Self {
         Self {
             ttl: LEASE_TTL,
-            interval: LEASE_RENEW_INTERVAL,
+            margin: LEASE_FENCE_MARGIN,
         }
     }
 }
@@ -53,8 +54,8 @@ pub struct ServedTenant {
     /// browser actions reach the desktops those listeners connect.
     reverse: Arc<PrimaryReverseRegistry>,
     fence: TenantFence,
-    /// Renews the lease; dropping it fires the fence.
-    heartbeat: LeaseHeartbeat,
+    /// Keeps (renews) the lease; dropping it fires the fence.
+    lease: TenantLeaseKeeper,
     /// The tenant's agent manager: `services` holds only a weak handle, so
     /// this one keeps every `agent.*` turn running while the tenant serves.
     agents: Arc<AgentManager>,
@@ -250,8 +251,9 @@ async fn try_serve_tenant_with(
         Ok(opened) => opened,
         Err(held) => return Ok(Serving::Held(held)),
     };
-    let heartbeat = LeaseHeartbeat::spawn(store.clone(), &lease, timing.ttl, timing.interval);
-    let fence = heartbeat.fence();
+    let epoch = lease.epoch;
+    let lease = TenantLeaseKeeper::spawn_with_margin(store.clone(), lease, timing.margin);
+    let fence = lease.fence();
     let dir = crate::tenant_dir(data_dir, tenant);
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::Internal(format!("tenant {tenant}: create {}: {e}", dir.display())))?;
@@ -286,7 +288,7 @@ async fn try_serve_tenant_with(
             }
             let _ = runner.stop().await;
             services.release_machine_runs();
-            if let Err(error) = heartbeat.release().await {
+            if let Err(error) = lease.release().await {
                 tracing::warn!(tenant, %error, "could not release the tenant lease");
             }
             return Err(Error::Internal(format!(
@@ -327,7 +329,7 @@ async fn try_serve_tenant_with(
     if let Some(candidates) = resume {
         runtime.resume_interrupted(&services, candidates);
     }
-    tracing::info!(tenant, instance, epoch = lease.epoch, "serving the tenant");
+    tracing::info!(tenant, instance, epoch, "serving the tenant");
     Ok(Serving::Served(Box::new(ServedTenant {
         tenant: tenant.to_owned(),
         dir,
@@ -337,7 +339,7 @@ async fn try_serve_tenant_with(
         runtime,
         reverse,
         fence,
-        heartbeat,
+        lease,
         agents: recovered.agents,
         settings_follower,
         report: Some(runner.spawn()),
@@ -702,10 +704,10 @@ impl ServedTenant {
         &self.fence
     }
 
-    /// The lease heartbeat.
+    /// The tenant lease's keeper.
     #[must_use]
-    pub fn heartbeat(&self) -> &LeaseHeartbeat {
-        &self.heartbeat
+    pub fn lease(&self) -> &TenantLeaseKeeper {
+        &self.lease
     }
 
     /// Drain the tenant's work as `intentd` drains its own on shutdown

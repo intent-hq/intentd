@@ -181,7 +181,7 @@ async fn run(url: String, keyring: Arc<SecretKeyring>) -> Result<ExitCode, Strin
     for tenant in &tenants {
         let opened = loop {
             // Boxed so the grace below takes ownership: a timed-out open
-            // (and the heartbeat it may already run) is dropped right
+            // (and the lease keeper it may already run) is dropped right
             // there, not kept renewing while stop_all waits for the others.
             let mut opening = Box::pin(try_serve_tenant(
                 pool.clone(),
@@ -441,7 +441,7 @@ async fn drain_all(served: &[ServedTenant]) {
 /// failure only leaves the lease to lapse after its TTL.
 async fn release(tenant: &ServedTenant) {
     let name = tenant.tenant();
-    match tokio::time::timeout(RELEASE_BUDGET, tenant.heartbeat().release()).await {
+    match tokio::time::timeout(RELEASE_BUDGET, tenant.lease().release()).await {
         Ok(Ok(true)) => tracing::info!(tenant = name, "released the tenant lease"),
         Ok(Ok(false)) => {
             tracing::warn!(

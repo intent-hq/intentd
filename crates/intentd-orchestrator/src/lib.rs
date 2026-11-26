@@ -12,8 +12,9 @@
 //!    this head are accepted (`intentd` installs them at its start);
 //! 1. `Store::open_postgres_owned`: the schema gate, then the tenant's lease
 //!    claim, then provisioning, before anything else writes;
-//! 2. `LeaseHeartbeat::spawn`: renews the lease and fires the claim's fence
-//!    once it cannot;
+//! 2. `TenantLeaseKeeper::spawn_with_margin`: keeps the tenant lease (a
+//!    store lease of scope `tenant`) and fires the claim's fence once it
+//!    cannot renew it;
 //! 3. the tenant's `Services`, with every on-disk path under
 //!    [`tenant_dir`], in orchestrator mode, its secrets (the GitLab
 //!    credential pair included) in its Postgres rows, encrypted with the
