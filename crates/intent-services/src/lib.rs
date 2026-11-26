@@ -11424,14 +11424,16 @@ impl Services {
         message_id: String,
         claim: &Arc<lease_keeper::LeaseKeeper>,
     ) -> Result<serde_json::Value> {
-        self.deliver_parent_wake_with_id(
+        // Boxed: the manager send is a large future, and the watch and
+        // group deliveries that await this one are deep already.
+        Box::pin(self.deliver_parent_wake_with_id(
             workspace_id,
             parent_agent_id,
             content,
             message_metadata,
             Some(message_id),
             Some(claim),
-        )
+        ))
         .await
     }
 
@@ -11489,8 +11491,10 @@ impl Services {
             park.release.notified().await;
         }
         if let Some(manager) = self.agent_manager() {
-            manager
-                .send_message(
+            // Boxed: the send is a large future, awaited deep inside the
+            // completion and group delivery passes.
+            Box::pin(
+                manager.send_message(
                     parent_agent_id,
                     workspace_id.clone(),
                     content,
@@ -11501,8 +11505,9 @@ impl Services {
                             .map(|claim| crate::agent_manager::DeliveryClaim(Arc::clone(claim))),
                         ..Default::default()
                     },
-                )
-                .await
+                ),
+            )
+            .await
         } else {
             // The runtime send path already owns admission. Its store-only
             // counterpart must fence the actual destination before persisting.
