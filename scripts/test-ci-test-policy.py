@@ -1030,6 +1030,7 @@ NAMED_TEST_STEPS = {
     ("windows", "Headless workspace setup (Windows runtime)"): 3,
     ("windows", "Codex diagnostic process ownership (Windows runtime)"): 3,
     ("store-postgres", "Postgres backend tests"): 3,
+    ("services-postgres", "Stack guards (postgres feature)"): 9,
 }
 
 # The macOS queue step as intentd#3205 first queued it: the PR deleted five of
