@@ -18885,7 +18885,20 @@ impl Services {
     ///   is not durable, the caller retries.
     /// - `SQLite` (one process): the claim is checked, then the entry is
     ///   queued and persisted by the usual write-through.
-    pub(crate) async fn enqueue_under_claim(
+    ///
+    /// Boxed: every `send_message` branch awaits it, and an inline future
+    /// there overflows the test stack of deep callers.
+    pub(crate) fn enqueue_under_claim<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        message_id: &'a str,
+        claim: Option<&'a crate::agent_manager::DeliveryClaim>,
+        enqueue: impl FnOnce() -> Result<(QueuedMessage, usize)> + Send + 'a,
+    ) -> intent_core::BoxFuture<'a, Result<(QueuedMessage, usize)>> {
+        Box::pin(self.enqueue_under_claim_inner(agent_id, message_id, claim, enqueue))
+    }
+
+    async fn enqueue_under_claim_inner(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -18899,7 +18912,7 @@ impl Services {
             let held = {
                 let lease = claim.0.lease().await;
                 match lease.as_ref() {
-                    Some(lease) => self.store.lease_is_held(lease).await?,
+                    Some(lease) => Box::pin(self.store.lease_is_held(lease)).await?,
                     None => false,
                 }
             };
@@ -18940,10 +18953,12 @@ impl Services {
             park.entered.notify_one();
             park.release.notified().await;
         }
-        match self
-            .store
-            .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0)
-            .await
+        // Boxed: this awaits inside every send_message branch.
+        match Box::pin(
+            self.store
+                .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0),
+        )
+        .await
         {
             Ok(sync) => {
                 if let Some(merged) = sync.merged {

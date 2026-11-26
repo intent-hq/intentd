@@ -10004,9 +10004,11 @@ impl AgentManager {
             // its guarded write committed: a turn that ended meanwhile
             // skipped it, so drain now (a no-op while a turn holds the slot).
             if delivery_claim.is_some() {
-                self.clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
+                Box::pin(
+                    self.clone()
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone()),
+                )
+                .await;
             }
             return Ok(result);
         };
@@ -10057,19 +10059,18 @@ impl AgentManager {
         // UUIDv7 id and the result id named nothing).
         let origin = usage_message_origin(options.origin, options.message_metadata.as_ref());
         let appended = if let Some(delivery) = delivery_claim.as_ref() {
-            self.services
-                .store
-                .append_agent_message_guarded(
-                    &agent_id,
-                    &message_id,
-                    "user",
-                    &blocks,
-                    options.message_metadata.as_ref(),
-                    &now_iso(),
-                    origin,
-                    &delivery.0,
-                )
-                .await
+            // Boxed: keeps the send future the size it was without a claim.
+            Box::pin(self.services.store.append_agent_message_guarded(
+                &agent_id,
+                &message_id,
+                "user",
+                &blocks,
+                options.message_metadata.as_ref(),
+                &now_iso(),
+                origin,
+                &delivery.0,
+            ))
+            .await
         } else {
             self.services
                 .store

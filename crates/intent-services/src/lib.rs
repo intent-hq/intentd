@@ -11491,7 +11491,7 @@ impl Services {
             // Another process may have queued this wake (a former holder of
             // the delivery claim): read the stored queue too (a no-op where
             // no other process writes it).
-            self.refresh_queue_from_store(&parent_agent_id).await;
+            Box::pin(self.refresh_queue_from_store(&parent_agent_id)).await;
             // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
                 .queue_snapshot(&parent_agent_id)
@@ -11586,18 +11586,17 @@ impl Services {
             };
             let message_id = message_id.unwrap_or_else(crate::agent_ops::new_message_id);
             if let Some(claim) = delivery_claim {
-                self.store
-                    .append_agent_message_guarded(
-                        &parent_agent_id,
-                        &message_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                        origin,
-                        claim,
-                    )
-                    .await?;
+                Box::pin(self.store.append_agent_message_guarded(
+                    &parent_agent_id,
+                    &message_id,
+                    "user",
+                    &blocks,
+                    message_metadata.as_ref(),
+                    &now_iso(),
+                    origin,
+                    claim,
+                ))
+                .await?;
             } else {
                 self.store
                     .append_agent_message_with_provenance(
