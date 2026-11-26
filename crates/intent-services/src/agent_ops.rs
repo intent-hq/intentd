@@ -19001,7 +19001,6 @@ impl Services {
             armed: !existed,
         };
         let rows = self.queue_rows(agent_id);
-        #[cfg(any(test, feature = "test-hooks"))]
         if let Some(park) = self.delivery_guards.enqueue_park.get() {
             park.entered.notify_one();
             park.release.notified().await;
