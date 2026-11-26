@@ -1748,11 +1748,116 @@ impl CloudBackend {
     }
 }
 
+/// The run cap (50 settings minutes) with a minute of 100 ms. A test with
+/// that minute that does not test the run cap sets it past its end
+/// ([`NO_RUN_CAP`]): a planned pause may come at any idle moment after it,
+/// which a busy runner reaches between any two steps.
+const RUN_CAP: Duration = Duration::from_secs(5);
+
+/// `INTENTD_E2B_RUN_CAP_MINUTES` that no test outlives (a day of 100 ms
+/// minutes).
+const NO_RUN_CAP: &str = "864000";
+
+/// A sandbox that ran for the run cap is paused and resumed at once at a
+/// turn boundary, with no prompt, and never during a turn. One settings
+/// minute is scaled to 100 ms, so the cap (50 minutes) is 5 s. The cap may
+/// come at any idle moment after that, so every check here waits for its
+/// state instead of reading it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
+    let Some(CloudBackend {
+        head_dir,
+        ws_id,
+        keyed_ref,
+        mut rpc_ws,
+        fake,
+        ..
+    }) = CloudBackend::start("itd-e2bcap-", &[("INTENTD_E2B_MINUTE_MS", "100")]).await
+    else {
+        return;
+    };
+    let created = ok(
+        &mut rpc_ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Capped", "model": "default", "provider": keyed_ref,
+            "placement": { "target": "e2b" },
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let agent = (ws_id.as_str(), agent_id.as_str());
+    send_and_reply(&mut rpc_ws, agent, "hello cap", 10).await;
+    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+        .await
+        .unwrap();
+    let machine_id = machine["id"].as_str().unwrap().to_owned();
+
+    // At a turn boundary: paused and resumed at once, with no prompt.
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+        calls
+            .iter()
+            .position(|c| is_call(c, "POST", "/sbx1/pause"))
+            .is_some_and(|at| {
+                calls[at..]
+                    .iter()
+                    .any(|c| is_call(c, "POST", "/sbx1/connect"))
+            })
+    })
+    .await;
+    machine_until(&mut rpc_ws, 100, "sbx1", |m| {
+        m.is_some_and(|m| m["cloud"]["state"] == "running")
+    })
+    .await;
+    send_and_reply(&mut rpc_ws, agent, "after the cap", 200).await;
+
+    // Never during a turn.
+    ok(
+        &mut rpc_ws,
+        300,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "@block here" }),
+    )
+    .await;
+    timeout(wait(), async {
+        let mut id = 310;
+        loop {
+            id += 1;
+            // timing-guard: the blocked turn needs a moment to reach the sandbox (a pause before that is resumed by the turn)
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let refused = rpc(
+                &mut rpc_ws,
+                id,
+                "cloudMachines.pause",
+                json!({ "machineId": machine_id }),
+            )
+            .await;
+            if refused["error"]["data"]["code"] == "machine-in-use" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("pause refused during the turn");
+    let before = fake.calls_for("sbx1").len();
+    // timing-guard: longer than the run cap, so a planned pause would have run
+    idle(&mut rpc_ws, RUN_CAP + Duration::from_secs(2)).await;
+    assert!(
+        !fake.calls_for("sbx1")[before..]
+            .iter()
+            .any(|c| is_call(c, "POST", "/sbx1/pause")),
+        "no pause during a turn: {:?}",
+        fake.calls_for("sbx1")
+    );
+    assert_no_secret_logged(&head_dir, &fake);
+}
+
 /// The life of a sandbox against the fake E2B, with one settings minute
-/// scaled to 100 ms and one day to 3 s. Proves every row of the lifecycle
-/// table: the timeout is renewed while the sandbox lives; it is paused and
-/// resumed before the run cap at a turn boundary, never during a turn;
-/// `cloudMachines.pause` pauses it (E2B's refusal leaves it running) and a
+/// scaled to 100 ms and one day to 3 s, and the run cap out of the way
+/// ([`a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap`] proves
+/// it). Proves the other rows of the lifecycle table: the timeout is
+/// renewed while the sandbox lives; `cloudMachines.pause` pauses it (E2B's refusal leaves it running) and a
 /// new prompt resumes it and redials; a refused resume fails the turn with
 /// `cloud-quota`; it pauses when idle; paused too long it is resumed, final
 /// stopped and deleted, and the agent's next message starts a new sandbox;
@@ -1791,6 +1896,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
             ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MINUTE_MS", "100"),
             ("INTENTD_E2B_DAY_MS", "3000"),
+            ("INTENTD_E2B_RUN_CAP_MINUTES", NO_RUN_CAP),
         ],
     )
     .await;
@@ -1856,25 +1962,6 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         calls.iter().any(|c| is_call(c, "POST", "/sbx1/timeout"))
     })
     .await;
-
-    // Before the run cap (50 minutes = 5 s), at a turn boundary: paused and
-    // resumed at once, with no prompt.
-    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
-        calls
-            .iter()
-            .position(|c| is_call(c, "POST", "/sbx1/pause"))
-            .is_some_and(|at| {
-                calls[at..]
-                    .iter()
-                    .any(|c| is_call(c, "POST", "/sbx1/connect"))
-            })
-    })
-    .await;
-    machine_until(&mut rpc_ws, 100, "sbx1", |m| {
-        m.is_some_and(|m| m["cloud"]["state"] == "running")
-    })
-    .await;
-    send_and_reply(&mut rpc_ws, agent, "after the cap", 200).await;
 
     // cloudMachines.pause: E2B's refusal leaves it running.
     fake.state().pause_refusal = Some((503, json!({ "code": 503, "message": "node busy" })));
@@ -2060,7 +2147,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         "a sandbox whose state is unknown is kept"
     );
 
-    // A turn in flight: no pause, neither asked for nor before the cap.
+    // A turn in flight: no pause asked for.
     ok(
         &mut rpc_ws,
         500,
@@ -2089,16 +2176,6 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     .await
     .expect("pause refused during the turn");
     assert_eq!(busy["error"]["data"]["runningAgents"], 1, "{busy}");
-    let before = fake.calls_for("sbx2").len();
-    // timing-guard: longer than the run cap (5 s), so a planned pause would have run
-    idle(&mut rpc_ws, Duration::from_secs(7)).await;
-    assert!(
-        !fake.calls_for("sbx2")[before..]
-            .iter()
-            .any(|c| is_call(c, "POST", "/sbx2/pause")),
-        "no pause during a turn: {:?}",
-        fake.calls_for("sbx2")
-    );
 
     // E2B removes the sandbox mid-turn: the turn fails with sandbox-lost,
     // and the agent is left without a sandbox.

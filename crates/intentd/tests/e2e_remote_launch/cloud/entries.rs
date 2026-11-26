@@ -543,6 +543,7 @@ async fn a_removed_entrys_key_stays_until_the_reaper_deletes_its_sandbox() {
             ("INTENTD_E2B_ENVD_URL", &fake.url),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
             ("INTENTD_E2B_MINUTE_MS", "100"),
+            ("INTENTD_E2B_RUN_CAP_MINUTES", NO_RUN_CAP),
         ],
     )
     .await;
