@@ -247,10 +247,10 @@ async fn renew_until_lost(
         let Ok(renewed) = tokio::time::timeout(left, store.renew(current, ttl)).await else {
             tracing::warn!(
                 scope = current.scope(),
-                "lease renewal did not answer before expiry; fencing"
+                "lease renewal did not answer before the fence deadline; fencing"
             );
             fence.send_replace(Some(
-                "lease renewal did not answer before the lease expired".to_owned(),
+                "lease renewal did not answer before the lease's fence deadline".to_owned(),
             ));
             return;
         };
@@ -258,7 +258,9 @@ async fn renew_until_lost(
             Ok(true) => retry = RETRY_MIN,
             Ok(false) => {
                 tracing::info!(scope = current.scope(), "lease lost");
-                fence.send_replace(Some("lease lost to another holder".to_owned()));
+                fence.send_replace(Some(
+                    "lease lost: another holder took it, or its holder stopped renewing".to_owned(),
+                ));
                 return;
             }
             Err(e) => {
@@ -267,7 +269,7 @@ async fn renew_until_lost(
                     tracing::warn!(
                         scope = current.scope(),
                         error = %e,
-                        "lease renewal failed past expiry; fencing"
+                        "lease renewal kept failing until the fence deadline; fencing"
                     );
                     fence.send_replace(Some(format!(
                         "lease renewal kept failing until the lease's deadline: {e}"

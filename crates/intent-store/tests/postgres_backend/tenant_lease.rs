@@ -406,9 +406,10 @@ async fn an_unclaimed_store_has_no_lease_to_renew() {
     );
 }
 
-/// A keeper's claim TTL: short enough that renewals (halfway to the fence
-/// deadline) come every few hundred milliseconds.
-const KEEPER_TTL: Duration = Duration::from_secs(1);
+/// A keeper's claim TTL: renewals come about every 1.25 s (halfway to the
+/// fence deadline, a sixth of the TTL before expiry), with as long again to
+/// retry before the fence fires.
+const KEEPER_TTL: Duration = Duration::from_secs(3);
 
 /// Wait until the tenant lease's expiry moves past `after` (epoch ms): a
 /// renewal landed.
@@ -460,7 +461,13 @@ async fn the_keeper_renews_and_reports_a_lost_lease() {
     let lost = tokio::time::timeout(test_timeout(Duration::from_secs(30)), keeper.lost())
         .await
         .expect("the keeper reports the loss");
-    assert!(matches!(lost, Error::NotOwner(_)), "{lost:?}");
+    match lost {
+        Error::NotOwner(message) => assert!(
+            message.contains("taken over"),
+            "lost to the takeover, not a lapse: {message}"
+        ),
+        other => panic!("expected NotOwner, got {other:?}"),
+    }
     assert!(keeper.fence().is_fenced());
 }
 
@@ -811,12 +818,51 @@ async fn dropping_the_keeper_after_a_cancelled_wait_stops_renewals() {
     wait_for_renewal(&db.admin, tenant, renewed).await;
 
     drop(keeper);
-    // timing-guard: let a renewal already on the wire when the task was aborted settle
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let before = lease_expiry_ms(&db.admin, tenant).await;
-    // timing-guard: past two renewal points of the 1 s claim with no keeper, to see that none renews
-    tokio::time::sleep(KEEPER_TTL * 2).await;
-    assert_eq!(lease_expiry_ms(&db.admin, tenant).await, before);
+    // With no keeper the lease lapses (a renewal already on the wire when
+    // the task was aborted can extend it once at most), and another
+    // process takes the tenant over.
+    wait_for_expiry(&db.admin, tenant).await;
+    let (_next, next) = open_owned(&db.app, tenant, "proc-b", LONG_TTL)
+        .await
+        .expect("the lapsed lease is claimed");
+    assert_eq!(next.epoch, 2);
+}
+
+/// The fence holds only at READ COMMITTED: under REPEATABLE READ a writer's
+/// snapshot predates its lock wait and would show the old tenant lease, so
+/// a writer at any other isolation level is refused before it writes.
+#[tokio::test]
+async fn a_writer_not_at_read_committed_is_refused() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "lease-isolation";
+    let (owner, _) = open_owned(&db.app, tenant, "proc-a", LONG_TTL)
+        .await
+        .unwrap();
+    owner.set_setting("userRules", "\"a\"").await.unwrap();
+    let before = tenant_rows(&db.admin, tenant).await;
+    // A database whose sessions default to REPEATABLE READ (test database
+    // only): new connections inherit it.
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&db.admin)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER DATABASE \"{name}\" SET default_transaction_isolation = 'repeatable read'"
+    )))
+    .execute(&db.admin)
+    .await
+    .expect("set the database default");
+    let repeatable = postgres::connect(&db.url, 2).await.unwrap();
+    match open_owned(&repeatable, tenant, "proc-b", LONG_TTL).await {
+        Err(Error::Internal(message)) => {
+            assert!(message.contains("READ COMMITTED"), "{message}");
+        }
+        Err(other) => panic!("expected the isolation refusal, got {other:?}"),
+        Ok(_) => panic!("a REPEATABLE READ writer claimed the tenant"),
+    }
+    assert_eq!(tenant_rows(&db.admin, tenant).await, before);
 }
 
 /// How many processes race for one tenant.

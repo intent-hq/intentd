@@ -452,10 +452,11 @@ async fn the_keeper_renews_before_its_fence_deadline() {
         return;
     };
     let tenant = "fence-short-deadline";
-    let ttl = Duration::from_secs(3);
+    // Renewal due after 1.5 s, with 1.5 s to retry before the fence.
+    let ttl = Duration::from_secs(4);
     let (store, lease) = open_owned(&db.app, tenant, "proc-a", ttl).await;
     let claimed = lease.expires_at;
-    let keeper = TenantLeaseKeeper::spawn_with_margin(store, lease, ttl / 2);
+    let keeper = TenantLeaseKeeper::spawn_with_margin(store, lease, ttl / 4);
     let fence = keeper.fence();
     // timing-guard: outlive two TTLs; with no renewal the fence would fire within one
     tokio::time::sleep(ttl * 2).await;

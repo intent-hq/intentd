@@ -1248,6 +1248,8 @@ pub struct WriterRow {
     /// The tenant's epoch: the tenant lease token, which every claim bumps;
     /// 0 when no process ever claimed the tenant.
     pub epoch: i64,
+    /// The writer transaction's isolation level (`read committed`).
+    pub isolation: String,
 }
 
 /// Seeds the tenant's `tenant_writer` row ($1). On a conflict with a
@@ -1260,7 +1262,13 @@ const WRITER_SEED_SQL: &str =
 /// first statement after the lock was granted, so its snapshot sees every
 /// claim committed before (see [`WRITER_LOCK_SQL`]). One row; the lease
 /// columns are NULL (epoch 0) when the tenant was never claimed.
+///
+/// It also reports the transaction's isolation level: the fence holds only
+/// at READ COMMITTED (a REPEATABLE READ snapshot is taken before the lock
+/// wait and would show the old lease), so [`PgStore::begin_write`] refuses
+/// any other level.
 const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true) AS reset, \
+     current_setting('transaction_isolation') AS isolation, \
      l.lease_id, l.holder AS owner_instance, COALESCE(l.token, 0) AS epoch \
      FROM (SELECT 1 AS one) AS once \
      LEFT JOIN lease AS l ON l.tenant_id = $2 AND l.scope = 'tenant' AND l.lease_key = ''";
@@ -1524,6 +1532,15 @@ impl PgStore {
                 Ok(_) if started.elapsed() > limits.wait_budget => {
                     let _ = tx.rollback().await;
                     return Err(writer_busy(self.tenant(), started.elapsed()));
+                }
+                Ok(writer) if writer.isolation != "read committed" => {
+                    let _ = tx.rollback().await;
+                    return Err(Error::Internal(format!(
+                        "tenant {}: a writer runs at {} isolation; the tenant fence needs READ \
+                         COMMITTED (check default_transaction_isolation); nothing was written",
+                        self.tenant(),
+                        writer.isolation
+                    )));
                 }
                 Ok(writer) => {
                     if fence == Fence::Check {

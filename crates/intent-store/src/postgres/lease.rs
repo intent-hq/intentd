@@ -843,22 +843,20 @@ impl Drop for TenantLeaseKeeper {
 }
 
 /// Fires `fence` once the keeper's fence (`lost`) fires; ends with why the
-/// tenant fence fired, whichever fired first.
+/// tenant fence fired (its first reason).
 async fn fire_on_loss(lost: LeaseFence, fence: TenantFence) -> Error {
     tokio::select! {
         () = lost.fired() => {
-            let e = Error::NotOwner(format!(
+            fence.fire_lost(format!(
                 "the tenant lease is lost: {}",
                 lost.reason().unwrap_or_default()
             ));
-            fence.fire_lost(e.to_string());
-            e
         }
-        () = fence.fenced() => Error::NotOwner(format!(
-            "the tenant fence fired: {}",
-            fence.reason().unwrap_or_default()
-        )),
+        () = fence.fenced() => {}
     }
+    // The first reason the fence fired with: a renewal that met a takeover
+    // fires it (naming the takeover) before the keeper reports the loss.
+    Error::NotOwner(fence.reason().unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -871,6 +869,7 @@ mod tests {
             lease_id: lease.map(str::to_owned),
             owner_instance: lease.map(|_| "a".to_owned()),
             epoch,
+            isolation: "read committed".to_owned(),
         }
     }
 
