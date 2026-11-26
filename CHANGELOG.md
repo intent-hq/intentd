@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.305] - 2026-11-26
+
+### 🚀 Features
+
+- *(services)* Make PR refresh, PR monitor polls and the GitLab refresh single-flight on leases ([#3809](https://github.com/intent-hq/intentd/pull/3809))
+
+### 📚 Documentation
+
+- *(providers)* List the pinned tests a new profile base must update ([#3813](https://github.com/intent-hq/intentd/pull/3813))
+
+### 🧪 Testing
+
+- *(providers)* Guard the hermetic provider home hide list ([#3812](https://github.com/intent-hq/intentd/pull/3812))
+
+
 ## [0.11.304] - 2026-11-26
 
 ### 🚀 Features
