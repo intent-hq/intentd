@@ -147,13 +147,42 @@ impl CallbackClient {
         mcp_servers: Vec<McpServer>,
         meta: Option<Meta>,
     ) -> AcpResult<CallbackSession<LoadSessionResponse>> {
+        self.reopen_session(
+            crate::session::SessionReopen::Load,
+            session_id,
+            cwd,
+            mcp_servers,
+            meta,
+        )
+        .await
+    }
+
+    /// Execute the original load or resume once; correlate with its original
+    /// requested ID.
+    ///
+    /// # Errors
+    /// Returns the unchanged ordinary ACP error.
+    pub async fn reopen_session(
+        &self,
+        how: crate::session::SessionReopen,
+        session_id: &str,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        meta: Option<Meta>,
+    ) -> AcpResult<CallbackSession<LoadSessionResponse>> {
         let attempt = self
             .monitoring
             .as_ref()
             .map(|generation| generation.attempt(Some(session_id), meta.as_ref()));
-        let response =
-            crate::session::load_session(&self.connection, session_id, cwd, mcp_servers, meta)
-                .await?;
+        let response = crate::session::reopen_session(
+            &self.connection,
+            how,
+            session_id,
+            cwd,
+            mcp_servers,
+            meta,
+        )
+        .await?;
         let mut query = self.capture(session_id.to_owned(), response.meta.as_ref());
         let monitoring = attempt.and_then(|attempt| {
             attempt.capture(&self.connection, session_id, response.meta.as_ref())

@@ -1029,7 +1029,7 @@ the user's agy history. Choose the thinking level as the reasoning effort.
 
 ## Use DeepSeek Harness as an agent provider
 
-<!-- Sources: packages/intentd/crates/intent-providers/src/{config,dsh}.rs; packages/intentd/crates/intent-services/src/{dsh_cli.rs,provider_auth.rs,provider_models/mod.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-providers/src/{config,dsh}.rs; packages/intentd/crates/intent-services/src/{dsh_cli.rs,provider_auth.rs,provider_models/mod.rs,agent_session.rs}; packages/intentd/crates/intent-acp/src/session.rs. -->
 DeepSeek Harness (DSH) is DeepSeek's open-source coding agent. It is an opt-in provider:
 enable it in **Settings → Providers** (`/settings?tab=providers#providers`). DSH itself
 is a developer preview from DeepSeek, and new DSH versions can change how it behaves.
@@ -1044,6 +1044,9 @@ DSH's own subagent tools; model requests still go to the model service you chose
 **Providers** shows DSH as unavailable when the `dsh` found is another tool, or when
 Intent cannot turn off the upload in that DSH version. Your own `dsh web` runs are not
 changed. Choose the reasoning effort (off, low, high, max) as for other providers.
+When Intent or its daemon restarts, a DSH agent reopens its own DSH session and keeps
+DSH's context; if DSH cannot reopen it, Intent starts a new session and sends the
+conversation again. Older versions may always start a new session.
 
 ## Run Intent in a browser from a cloud machine
 

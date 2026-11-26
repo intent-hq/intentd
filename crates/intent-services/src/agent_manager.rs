@@ -5387,7 +5387,8 @@ impl AgentManager {
         } {
             Ok(Some((opened, delivery))) => {
                 // `session/load` replays the prior conversation as a buffered
-                // `session/update` burst; discard it before the first turn so it
+                // `session/update` burst (`session/resume` sends none, so the
+                // drain just settles); discard it before the first turn so it
                 // is neither re-published as events nor re-accumulated into the
                 // transcript (parity with TS's "no active streaming handler ⇒
                 // drop"). Only the resume path needs this settle-window drain —
@@ -5468,9 +5469,9 @@ impl AgentManager {
             Err(e) if crate::agent_session::load_auth_required_error(&e) => {
                 return Err(e);
             }
-            // `session/load` was attempted but failed → fall through to recreate.
+            // `session/load` or `session/resume` failed → fall through to recreate.
             Err(e) => {
-                tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");
+                tracing::warn!(agent = %agent_id, error = %e, "session reopen failed; recreating");
             }
         }
 

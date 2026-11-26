@@ -223,9 +223,38 @@ struct Fixture {
     _dir: tempfile::TempDir,
     data_dir: std::path::PathBuf,
     log: std::path::PathBuf,
-    _daemon: Daemon,
+    daemon: Daemon,
+    env: Vec<(String, String)>,
+    without_key: bool,
     port: u16,
     cfg: Arc<ClientConfig>,
+}
+
+impl Fixture {
+    /// Kill the daemon and start it again on the same data dir and env.
+    async fn restart(&mut self) {
+        self.daemon.child.kill_tree().unwrap();
+        let env: Vec<(&str, &str)> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.daemon.child = spawn_serve_with(&self.data_dir, &env, self.without_key);
+        let (port, cfg) = await_daemon(&self.data_dir).await;
+        self.port = port;
+        self.cfg = cfg;
+    }
+}
+
+async fn await_daemon(data_dir: &Path) -> (u16, Arc<ClientConfig>) {
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    (
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
 }
 
 /// A daemon whose `providers.paths.dsh` is the mock, with a private HOME and
@@ -258,32 +287,35 @@ async fn start(prefix: &str, api_key: Option<&str>, extra: &[(&str, &str)]) -> O
     )
     .unwrap();
     let log = data_dir.join("dsh.jsonl");
-    let home_s = home.to_str().unwrap().to_string();
-    let dsh_home = home.join(".dsh");
-    let mut env: Vec<(&str, &str)> = vec![
-        ("MOCK_DSH_LOG", log.to_str().unwrap()),
-        ("MOCK_DSH_DUMP", &dump),
-        ("HOME", &home_s),
-        ("DSH_HOME", dsh_home.to_str().unwrap()),
+    let path = |p: &Path| p.to_str().unwrap().to_string();
+    let mut env: Vec<(String, String)> = vec![
+        ("MOCK_DSH_LOG".into(), path(&log)),
+        ("MOCK_DSH_DUMP".into(), dump),
+        ("HOME".into(), path(&home)),
+        ("DSH_HOME".into(), path(&home.join(".dsh"))),
     ];
-    env.extend_from_slice(extra);
+    env.extend(
+        extra
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+    );
     if let Some(key) = api_key {
-        env.push(("DEEPSEEK_API_KEY", key));
+        env.push(("DEEPSEEK_API_KEY".into(), key.to_string()));
     }
-    let mut child = spawn_serve_with(&data_dir, &env, api_key.is_none());
-    let socket = data_dir.join("intentd.sock");
-    if !await_uds(&socket).await {
+    let borrowed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut child = spawn_serve_with(&data_dir, &borrowed, api_key.is_none());
+    if !await_uds(&data_dir.join("intentd.sock")).await {
         let _ = child.kill_tree();
         panic!("daemon did not start");
     }
-    let status = common::await_wss_status(&socket).await;
-    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
-    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let (port, cfg) = await_daemon(&data_dir).await;
     Some(Fixture {
         _dir: dir,
         data_dir,
         log,
-        _daemon: Daemon { child },
+        daemon: Daemon { child },
+        env,
+        without_key: api_key.is_none(),
         port,
         cfg,
     })
@@ -310,6 +342,44 @@ fn spawn_serve_with(data_dir: &Path, env: &[(&str, &str)], without_key: bool) ->
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+/// Wait for the agent's turn to end; returns its `agent:tool:call` payloads.
+async fn await_turn(events: &mut Ws, agent_id: &str) -> Vec<Value> {
+    let mut tools: Vec<Value> = Vec::new();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let Some(Ok(Message::Text(text))) = events.next().await else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let event = &frame["params"]["event"];
+                if event["data"]["agentId"] != agent_id {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("agent:tool:call") => tools.push(event["data"].clone()),
+                    Some("agent:failed") => panic!("dsh turn failed: {event}"),
+                    Some("agent:idle") => break,
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await
+    .expect("DSH turn must finish");
+    tools
+}
+
+/// The ACP requests the daemon sent to DSH with this `method`.
+fn sent<'a>(frames: &'a [Value], method: &str) -> Vec<&'a Value> {
+    frames
+        .iter()
+        .filter(|f| f["dir"] == "in" && f["msg"]["method"] == method)
+        .map(|f| &f["msg"])
+        .collect()
 }
 
 fn mock_log(path: &Path) -> Vec<Value> {
@@ -408,30 +478,7 @@ async fn dsh_provider_discovery_models_and_turn_over_wss() {
         json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "check git status" }),
     )
     .await;
-    let mut tools: Vec<Value> = Vec::new();
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(60)),
-        async {
-            loop {
-                let Some(Ok(Message::Text(text))) = events.next().await else {
-                    continue;
-                };
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                let event = &frame["params"]["event"];
-                if event["data"]["agentId"] != agent_id.as_str() {
-                    continue;
-                }
-                match event["type"].as_str() {
-                    Some("agent:tool:call") => tools.push(event["data"].clone()),
-                    Some("agent:failed") => panic!("dsh turn failed: {event}"),
-                    Some("agent:idle") => break,
-                    _ => {}
-                }
-            }
-        },
-    )
-    .await
-    .expect("DSH turn must finish");
+    let tools = await_turn(&mut events, &agent_id).await;
     assert!(
         tools.iter().any(|t| t["toolCallId"] == "call_00_bash"),
         "{tools:?}"
@@ -479,13 +526,7 @@ async fn dsh_provider_discovery_models_and_turn_over_wss() {
         intent_providers::dsh::OVERLAY
     );
 
-    let sent = |method: &str| -> Vec<&Value> {
-        frames
-            .iter()
-            .filter(|f| f["dir"] == "in" && f["msg"]["method"] == method)
-            .map(|f| &f["msg"])
-            .collect()
-    };
+    let sent = |method: &str| sent(&frames, method);
     assert!(sent("authenticate").is_empty(), "DSH has no ACP sign-in");
     let new = sent("session/new");
     let agent_session = new.last().expect("agent session/new");
@@ -638,4 +679,192 @@ async fn dsh_signed_out_and_upload_guard_over_wss() {
             .all(|f| f["msg"]["method"] != "session/prompt"),
         "a guarded DSH never receives a prompt"
     );
+}
+
+/// One turn on a fresh DSH agent (model Pro, effort Max), then a daemon
+/// restart. Returns the workspace, agent and the agent's first DSH session id.
+async fn first_turn_then_restart(fx: &mut Fixture) -> (String, String, String) {
+    let pro = r#"["deepseek-official","deepseek-v4-pro"]"#;
+    let mut rpc = connect_ws(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "DSH resume", "noPrompt": true }),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].as_str().unwrap().to_string();
+    let mut events = connect_ws(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": workspace_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": workspace_id, "name": "DSH resume", "provider": "dsh",
+            "model": pro, "reasoningEffort": "max",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "check git status" }),
+    )
+    .await;
+    await_turn(&mut events, &agent_id).await;
+    let frames = mock_log(&fx.log);
+    let prompts = sent(&frames, "session/prompt");
+    assert_eq!(prompts.len(), 1);
+    let session_id = prompts[0]["params"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(rpc);
+    drop(events);
+    fx.restart().await;
+    (workspace_id, agent_id, session_id)
+}
+
+/// Send `content` after the restart and wait for the turn; returns every
+/// mock frame logged after the restart.
+async fn turn_after_restart(
+    fx: &Fixture,
+    workspace_id: &str,
+    agent_id: &str,
+    content: &str,
+) -> Vec<Value> {
+    let before = mock_log(&fx.log).len();
+    let mut rpc = connect_ws(fx.port, fx.cfg.clone()).await;
+    let mut events = connect_ws(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": workspace_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        1,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    await_turn(&mut events, agent_id).await;
+    mock_log(&fx.log).split_off(before)
+}
+
+const HISTORY_RESEND: &str = "The previous ACP session was lost";
+
+/// DSH offers `session/resume` but not `session/load`: after a daemon
+/// restart the agent reopens its own DSH session (same id, cwd and MCP
+/// servers), re-applies the model and effort, and resends no history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dsh_restart_resumes_the_same_session_over_wss() {
+    let Some(mut fx) = start("itd-wss-dsh-resume-", Some("sk-e2e-placeholder"), &[]).await else {
+        return;
+    };
+    let (workspace_id, agent_id, session_id) = first_turn_then_restart(&mut fx).await;
+    let first_frames = mock_log(&fx.log);
+    let opened = sent(&first_frames, "session/new")
+        .into_iter()
+        .rev()
+        .find(|m| {
+            first_frames.iter().any(|f| {
+                f["dir"] == "out"
+                    && f["msg"]["id"] == m["id"]
+                    && f["msg"]["result"]["sessionId"] == session_id.as_str()
+            })
+        })
+        .expect("the agent's session/new")
+        .clone();
+
+    let frames = turn_after_restart(&fx, &workspace_id, &agent_id, "and again").await;
+
+    assert!(
+        sent(&frames, "session/load").is_empty(),
+        "DSH has no loadSession"
+    );
+    assert!(
+        sent(&frames, "session/new").is_empty(),
+        "no new session: {frames:?}"
+    );
+    let resumes = sent(&frames, "session/resume");
+    assert_eq!(resumes.len(), 1, "{frames:?}");
+    let resume = &resumes[0]["params"];
+    assert_eq!(resume["sessionId"], session_id.as_str());
+    assert_eq!(resume["cwd"], opened["params"]["cwd"]);
+    let names = |servers: &Value| -> Vec<String> {
+        servers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        names(&resume["mcpServers"]),
+        names(&opened["params"]["mcpServers"])
+    );
+    assert!(!names(&resume["mcpServers"]).is_empty());
+
+    // DSH reopens with its default config, so the stored picks are re-applied.
+    let applied = |id: &str, value: &str| {
+        sent(&frames, "session/set_config_option").iter().any(|m| {
+            m["params"]["sessionId"] == session_id.as_str()
+                && m["params"]["configId"] == id
+                && m["params"]["value"] == value
+        })
+    };
+    assert!(
+        applied("model", r#"["deepseek-official","deepseek-v4-pro"]"#),
+        "{frames:?}"
+    );
+    assert!(applied("reasoning_effort", "max"), "{frames:?}");
+
+    let prompts = sent(&frames, "session/prompt");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["params"]["sessionId"], session_id.as_str());
+    let body = prompts[0]["params"]["prompt"].to_string();
+    assert!(!body.contains(HISTORY_RESEND), "no history resend: {body}");
+    assert!(
+        !body.contains("check git status"),
+        "no history resend: {body}"
+    );
+    assert!(!body.contains("<system>"), "no first-turn prepend: {body}");
+    assert!(body.contains("and again"), "{body}");
+}
+
+/// When DSH cannot resume (its session folder is gone), the agent falls
+/// back to a new session and resends the history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dsh_failed_resume_falls_back_to_new_session_over_wss() {
+    let Some(mut fx) = start("itd-wss-dsh-resume-fail-", Some("sk-e2e-placeholder"), &[]).await
+    else {
+        return;
+    };
+    let (workspace_id, agent_id, session_id) = first_turn_then_restart(&mut fx).await;
+    std::fs::remove_dir_all(fx.data_dir.join("home/.dsh/sessions")).unwrap();
+
+    let frames = turn_after_restart(&fx, &workspace_id, &agent_id, "and again").await;
+
+    let resumes = sent(&frames, "session/resume");
+    assert_eq!(resumes.len(), 1, "{frames:?}");
+    assert_eq!(resumes[0]["params"]["sessionId"], session_id.as_str());
+    assert_eq!(sent(&frames, "session/new").len(), 1, "{frames:?}");
+    let prompts = sent(&frames, "session/prompt");
+    assert_eq!(prompts.len(), 1);
+    assert_ne!(prompts[0]["params"]["sessionId"], session_id.as_str());
+    let body = prompts[0]["params"]["prompt"].to_string();
+    assert!(body.contains(HISTORY_RESEND), "history resent: {body}");
+    assert!(body.contains("check git status"), "{body}");
 }

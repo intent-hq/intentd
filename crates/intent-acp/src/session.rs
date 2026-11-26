@@ -21,9 +21,12 @@
 //! stored session ids become stale. For providers that do not persist session state
 //! across restarts, post-restart `session/load` will fail (typically `-32602`
 //! invalid params) because the provider has no record of the stale id. This is a
-//! limitation of process-local session state in such providers, not a bug. The
+//! limitation of process-local session state in such providers, not a bug.
+//! Providers that persist sessions reopen them with `session/load` or, when they
+//! advertise only `sessionCapabilities.resume`, with `session/resume` (no
+//! history replay); see [`session_reopen`]. The
 //! daemon implements a recreate+resend fallback (see `AgentManager::start_session`):
-//! when `session/load` fails (or the agent lacks `loadSession` capability), the
+//! when reopening fails (or the agent advertises neither capability), the
 //! daemon creates a fresh session via `session/new` (CAS-replacing the stale id)
 //! and prepends the prior conversation history as `<supervisor>` XML on the next
 //! prompt turn so the fresh session has context.
@@ -35,7 +38,8 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionNotification, ToolCall,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use serde_json::Value;
 
@@ -53,7 +57,7 @@ pub use agent_client_protocol::schema::v1::{
     SessionModeState, SessionUpdate, StopReason, Usage,
 };
 
-/// Timeout for session setup requests (`session/new`, `session/load`). Generous
+/// Timeout for session setup requests (`session/new`, `session/load`, `session/resume`). Generous
 /// relative to `initialize` because the agent may connect MCP servers here.
 /// Overridable via `INTENTD_SESSION_SETUP_TIMEOUT_MS` (primarily for tests/CI).
 fn session_setup_timeout() -> Duration {
@@ -192,6 +196,95 @@ pub async fn load_session(
         .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid session/load response: {e}")))
+}
+
+/// `session/resume` to reopen an existing `acpSessionId` without a history
+/// replay. Only valid when the agent advertised `sessionCapabilities.resume`.
+///
+/// # Errors
+///
+/// Returns [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error from the request.
+pub async fn resume_session(
+    conn: &Connection,
+    session_id: &str,
+    cwd: impl Into<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
+) -> AcpResult<ResumeSessionResponse> {
+    let mut request =
+        ResumeSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
+    request.meta = meta;
+    let params = serde_json::to_value(&request)?;
+    let result = conn
+        .request_timeout("session/resume", params, session_setup_timeout())
+        .await?;
+    serde_json::from_value(result)
+        .map_err(|e| AcpError::Protocol(format!("invalid session/resume response: {e}")))
+}
+
+/// How an agent can reopen a stored session after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionReopen {
+    /// `session/load`: the agent replays the history as `session/update`s.
+    Load,
+    /// `session/resume`: the agent restores the session without a replay.
+    Resume,
+}
+
+impl SessionReopen {
+    /// The ACP method this reopen sends.
+    #[must_use]
+    pub const fn method(self) -> &'static str {
+        match self {
+            Self::Load => "session/load",
+            Self::Resume => "session/resume",
+        }
+    }
+}
+
+/// The reopen the agent advertised: `loadSession` first, then
+/// `sessionCapabilities.resume`; `None` when it offers neither.
+#[must_use]
+pub fn session_reopen(init: &InitializeResponse) -> Option<SessionReopen> {
+    if supports_load_session(init) {
+        Some(SessionReopen::Load)
+    } else if init
+        .agent_capabilities
+        .session_capabilities
+        .resume
+        .is_some()
+    {
+        Some(SessionReopen::Resume)
+    } else {
+        None
+    }
+}
+
+/// Reopen `session_id` with `how`. A `session/resume` reply carries the same
+/// modes, config options and `_meta` as a `session/load` reply, so both
+/// return the load shape.
+///
+/// # Errors
+///
+/// Propagates the error of [`load_session`] or [`resume_session`].
+pub async fn reopen_session(
+    conn: &Connection,
+    how: SessionReopen,
+    session_id: &str,
+    cwd: impl Into<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
+) -> AcpResult<LoadSessionResponse> {
+    match how {
+        SessionReopen::Load => load_session(conn, session_id, cwd, mcp_servers, meta).await,
+        SessionReopen::Resume => {
+            let resumed = resume_session(conn, session_id, cwd, mcp_servers, meta).await?;
+            Ok(LoadSessionResponse::new()
+                .modes(resumed.modes)
+                .config_options(resumed.config_options)
+                .meta(resumed.meta))
+        }
+    }
 }
 
 /// Outcome of a completed `session/prompt` turn: why the agent stopped plus
@@ -1368,6 +1461,35 @@ mod prompt_guidance_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_reopen_prefers_load_then_resume() {
+        let init = |caps: Value| -> InitializeResponse {
+            serde_json::from_value(serde_json::json!({
+                "protocolVersion": 1,
+                "agentCapabilities": caps,
+            }))
+            .unwrap()
+        };
+        let resume = serde_json::json!({ "resume": {} });
+        assert_eq!(
+            session_reopen(&init(
+                serde_json::json!({ "loadSession": true, "sessionCapabilities": resume })
+            )),
+            Some(SessionReopen::Load)
+        );
+        assert_eq!(
+            session_reopen(&init(serde_json::json!({ "sessionCapabilities": resume }))),
+            Some(SessionReopen::Resume)
+        );
+        assert_eq!(
+            session_reopen(&init(
+                serde_json::json!({ "sessionCapabilities": { "resume": null } })
+            )),
+            None
+        );
+        assert_eq!(session_reopen(&init(serde_json::json!({}))), None);
+    }
 
     /// Restores an env var to its prior state on drop so tests stay hermetic.
     struct EnvGuard {
