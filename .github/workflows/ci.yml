@@ -2882,12 +2882,15 @@ jobs:
   # held inline grows every Store future and every debug poll frame above it,
   # which overflowed 30 intent-services tests in this build only. Runs the
   # stack and future-size guards and the deepest of those tests. Separate from
-  # store-postgres to keep that job inside its timeout. Gated like it.
+  # store-postgres to keep that job inside its timeout. Gated like it. Build
+  # and test are separate steps with their own timeouts, so a stall fails a
+  # named step with its log kept (a job timeout cancels the job and its log
+  # was not kept: 10 min on the first run, cancelled at 30 on the second).
   services-postgres:
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -2908,8 +2911,12 @@ jobs:
           tools: nextest
       - name: Fetch locked crates (retries crates.io network errors)
         run: python3 -I -B scripts/fetch-locked-crates.py
+      - name: Build intent-services tests (postgres feature)
+        timeout-minutes: 25
+        run: cargo nextest run -p intent-services --features intent-store/postgres --lib --no-run
       # Named (not -E) so test-ci-test-policy.py fails when one is renamed.
       - name: Stack guards (postgres feature)
+        timeout-minutes: 10
         run: >-
           cargo nextest run -p intent-services --features intent-store/postgres --lib
           future_size
