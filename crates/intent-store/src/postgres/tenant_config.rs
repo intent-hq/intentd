@@ -153,7 +153,7 @@ impl TenantConfigStore {
             ));
         }
         Ok(Self {
-            store: pg.clone(),
+            store: (**pg).clone(),
             runtime,
         })
     }

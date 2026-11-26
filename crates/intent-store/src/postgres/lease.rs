@@ -772,7 +772,7 @@ impl crate::Store {
         store.provision().await?;
         Ok(Ok((
             Self {
-                backend: crate::Backend::Postgres(store),
+                backend: crate::Backend::Postgres(Box::new(store)),
             },
             lease,
         )))

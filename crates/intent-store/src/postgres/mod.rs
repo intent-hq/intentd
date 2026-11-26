@@ -76,6 +76,8 @@ mod delete_grace;
 mod desktop;
 mod discussions;
 mod events;
+#[cfg(test)]
+mod future_size_tests;
 mod homes;
 mod hooks;
 mod idempotency;
@@ -1698,7 +1700,7 @@ impl crate::Store {
         // `clear_foreign_claims_once`. The leased open does not call it.
         open(store.clear_foreign_claims_once().await)?;
         Ok(Self {
-            backend: crate::Backend::Postgres(store),
+            backend: crate::Backend::Postgres(Box::new(store)),
         })
     }
 }
@@ -1783,6 +1785,27 @@ pub(crate) fn db(e: impl std::fmt::Display) -> Error {
 )]
 pub(crate) fn unported_panic(method: &'static str) -> ! {
     panic!("{method} is not yet supported on the Postgres store")
+}
+
+/// Build the Postgres future `make` returns in its own never-inlined frame
+/// and box it, so the `Store` future that awaits it holds a pointer. Held
+/// inline, Postgres futures grew every `Store` future, and the debug poll
+/// frames that await them, by up to hundreds of KiB across `intent-services`
+/// (test stack overflows only in builds with this feature). `dispatch!` uses
+/// it; a hand-written Postgres arm that awaits must too. Guarded by
+/// `future_size_tests`.
+#[inline(never)]
+pub(crate) fn boxed_call<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
+/// Run a synchronous `dispatch!` call. The closure keeps an awaited call
+/// that bypasses [`boxed_call`] from compiling.
+#[inline]
+pub(crate) fn sync_call<T>(call: impl FnOnce() -> T) -> T {
+    call()
 }
 
 /// The error a SQLite-only `Store` method returns on Postgres.

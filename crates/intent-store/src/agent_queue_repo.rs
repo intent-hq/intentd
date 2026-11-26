@@ -167,7 +167,8 @@ impl Store {
             }
             #[cfg(feature = "postgres")]
             crate::Backend::Postgres(backend) => {
-                backend.sync_agent_queue(agent_id, rows, claims).await
+                crate::postgres::boxed_call(|| backend.sync_agent_queue(agent_id, rows, claims))
+                    .await
             }
         }
     }
@@ -235,7 +236,9 @@ impl Store {
                 Ok(None)
             }
             #[cfg(feature = "postgres")]
-            crate::Backend::Postgres(backend) => backend.refresh_agent_queue(agent_id, local).await,
+            crate::Backend::Postgres(backend) => {
+                crate::postgres::boxed_call(|| backend.refresh_agent_queue(agent_id, local)).await
+            }
         }
     }
 

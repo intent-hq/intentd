@@ -15,12 +15,29 @@ pub use intent_core::{Error, Result};
 /// Run `$call` against the backend of `$self`, bound to `$s`. Every backend
 /// must provide the method under the same name and signature, so a method
 /// moves here from `pending_postgres!` once its Postgres version exists.
+///
+/// An awaited call must have the form `backend.method(args).await`: its
+/// Postgres future is built and awaited through [`postgres::boxed_call`].
+/// Postgres futures are many times larger than the `SQLite` ones; held
+/// inline they grew every `Store` future, and every debug poll frame that
+/// awaits one, by up to hundreds of KiB in any build with the feature, and
+/// overflowed test stacks. Any other `$call` runs inside a closure on
+/// Postgres, so awaiting there does not compile.
 macro_rules! dispatch {
+    ($self:ident, $s:ident => $b:ident . $method:ident ( $($arg:tt)* ) . await $(,)?) => {
+        match &$self.backend {
+            $crate::Backend::Sqlite($s) => $b.$method($($arg)*).await,
+            #[cfg(feature = "postgres")]
+            $crate::Backend::Postgres($s) => {
+                $crate::postgres::boxed_call(|| $b.$method($($arg)*)).await
+            }
+        }
+    };
     ($self:ident, $s:ident => $call:expr) => {
         match &$self.backend {
             $crate::Backend::Sqlite($s) => $call,
             #[cfg(feature = "postgres")]
-            $crate::Backend::Postgres($s) => $call,
+            $crate::Backend::Postgres($s) => $crate::postgres::sync_call(|| $call),
         }
     };
 }
@@ -509,8 +526,10 @@ pub struct Store {
 #[derive(Clone)]
 enum Backend {
     Sqlite(SqliteStore),
+    /// Boxed so the feature does not grow every `Store` (and every future
+    /// and `Services` clone holding one) to the larger `PgStore`.
     #[cfg(feature = "postgres")]
-    Postgres(postgres::PgStore),
+    Postgres(Box<postgres::PgStore>),
 }
 
 impl Store {
