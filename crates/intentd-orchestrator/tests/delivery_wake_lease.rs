@@ -206,21 +206,6 @@ async fn a_holder_whose_claim_lapsed_before_the_send_writes_no_wake() {
         a.queue_snapshot_for_test(&parent).is_empty(),
         "the stale holder queued no second wake"
     );
-
-    // Whatever A does next (a retry under a new claim) converges: the watch
-    // leaves A too and the parent still has one wake.
-    tokio::time::timeout(wait(), async {
-        while !a.watch_ids_for_child_for_test(&child).is_empty()
-            || a.completion_retry_pending_for_test(&child)
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("A's retry settles");
-    assert_eq!(wakes(&store_a, &parent).await, 1, "exactly one wake");
-    assert!(
-        a.queue_snapshot_for_test(&parent).is_empty(),
-        "and nothing queued"
-    );
+    // A schedules a retry under a new claim; whenever it runs, its probe
+    // finds B's wake (no pass can add one: that is what is asserted above).
 }

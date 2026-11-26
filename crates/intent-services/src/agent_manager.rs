@@ -9909,6 +9909,10 @@ impl AgentManager {
     /// finish together: a caller dropped between them (a request budget
     /// expiring, intent-hq/intent#9927) otherwise left the slot claimed with
     /// no worker, and every later delivery queued behind a turn that never ran.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the delivery claim rides beside the options so no worker keeps it"
+    )]
     async fn send_message_claimed(
         self: Arc<Self>,
         agent_id: AgentId,

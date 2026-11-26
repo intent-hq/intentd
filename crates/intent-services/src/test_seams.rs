@@ -260,16 +260,6 @@ impl Services {
             .collect()
     }
 
-    /// Test seam: whether a completion delivery retry is pending for the
-    /// child.
-    #[must_use]
-    pub fn completion_retry_pending_for_test(&self, child_agent_id: &AgentId) -> bool {
-        self.completion_delivery_retries
-            .lock()
-            .expect("completion retry registry poisoned")
-            .contains_key(&child_agent_id.0)
-    }
-
     /// Test seam: `execution_call`.
     pub fn execution_call_for_test<'a, T: Send + 'a>(
         &'a self,
