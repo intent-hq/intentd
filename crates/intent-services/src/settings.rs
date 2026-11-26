@@ -877,6 +877,10 @@ impl AsyncSecretStore {
         &self,
         write: impl FnOnce() -> Result<()> + Send + 'static,
     ) -> Result<()> {
+        // A write made under a lease (the GitLab refresh) keeps guarding it
+        // on the blocking writer (`intent_store::LeaseWriteGuards`).
+        let guards = intent_store::LeaseWriteGuards::current();
+        let write = move || guards.sync_scope(write);
         #[cfg(test)]
         let write = {
             let before = self.before_gitlab_persistence.lock().unwrap().take();

@@ -298,6 +298,7 @@ pub mod repo_config;
 pub mod retention;
 mod rtk;
 mod runtime_config;
+mod work_leases;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
@@ -1879,6 +1880,8 @@ impl Services {
         let pending_deletes = delete_grace::OwnedPendingDeletes::new(store.clone())
             .with_tasks(pending_delete_tasks.clone());
         let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
+        let gitlab_credential_gate =
+            source_control_auth_ops::new_gitlab_credential_gate(store.clone());
         let daemon_boot_id = uuid::Uuid::new_v4().to_string();
         let profile_activation = Arc::new(profile_activation::ProfileActivation::default());
         let repository_connection_directory = Arc::new(
@@ -2037,7 +2040,7 @@ impl Services {
             gitlab_secret_store,
             #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
             isolated_secrets_dir: None,
-            gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
+            gitlab_credential_gate,
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
@@ -6254,16 +6257,21 @@ impl Services {
             // local steps above have already done their work. A forge whose
             // quota is exhausted is treated the same for the remaining roots
             // — the local steps 1–3 above still ran (monorepo#2961).
-            let Some((sc, _permit)) = admitted else {
+            let Some((sc, permit)) = admitted else {
                 continue;
             };
             let root_id = root.id.clone();
             let root_repo = root.repo();
-            let refreshed = pr_discovery::automatically_refresh(
-                interval_secs,
-                self.refresh_git_root_pr(root, sc),
-            )
-            .await;
+            // `None`: another process is refreshing this root now.
+            let Some(refreshed) = permit
+                .run(pr_discovery::automatically_refresh(
+                    interval_secs,
+                    self.refresh_git_root_pr(root, sc),
+                ))
+                .await
+            else {
+                continue;
+            };
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
@@ -6566,13 +6574,17 @@ impl Services {
             .spawn_draining(pr_discovery::inherit_refresh(
                 intent_sourcecontrol::traffic::inherit_context(intent_core::with_caller(
                     caller,
-                    intent_core::caller::with_wire_credential(wire, async move {
-                        intent_sourcecontrol::traffic::with_caller(
-                            intent_sourcecontrol::traffic::Caller::GitRootRefresh,
-                            services.refresh_git_root_pr_accounted(root, &sc),
-                        )
-                        .await
-                    }),
+                    intent_core::caller::with_wire_credential(
+                        wire,
+                        // An automatic refresh's writes keep guarding its lease.
+                        intent_store::inherit_lease_write_guards(async move {
+                            intent_sourcecontrol::traffic::with_caller(
+                                intent_sourcecontrol::traffic::Caller::GitRootRefresh,
+                                services.refresh_git_root_pr_accounted(root, &sc),
+                            )
+                            .await
+                        }),
+                    ),
                 )),
             ))
             .ok_or_else(|| Error::Internal("PR refresh writers are shutting down".into()))?;
@@ -7110,13 +7122,17 @@ impl Services {
             .spawn_draining(pr_discovery::inherit_refresh(
                 intent_sourcecontrol::traffic::inherit_context(intent_core::with_caller(
                     caller,
-                    intent_core::caller::with_wire_credential(wire, async move {
-                        intent_sourcecontrol::traffic::with_caller(
-                            intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
-                            services.refresh_workspace_pr_with_sc_accounted(ws, &sc),
-                        )
-                        .await
-                    }),
+                    intent_core::caller::with_wire_credential(
+                        wire,
+                        // An automatic refresh's writes keep guarding its lease.
+                        intent_store::inherit_lease_write_guards(async move {
+                            intent_sourcecontrol::traffic::with_caller(
+                                intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                                services.refresh_workspace_pr_with_sc_accounted(ws, &sc),
+                            )
+                            .await
+                        }),
+                    ),
                 )),
             ))
             .ok_or_else(|| Error::Internal("PR refresh writers are shutting down".into()))?;
@@ -7653,12 +7669,18 @@ impl Services {
                     let permit = self.admit_automatic_pr_refresh(&ws_id, None, interval)?;
                     Some((sc, permit))
                 });
-            if let Some((sc, _permit)) = admitted {
-                let refreshed = pr_discovery::automatically_refresh(
-                    interval,
-                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
-                )
-                .await;
+            let refreshed = match admitted {
+                // `None` from `run`: another process is refreshing it now.
+                Some((sc, permit)) => permit
+                    .run(pr_discovery::automatically_refresh(
+                        interval,
+                        self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                    ))
+                    .await
+                    .map(|refreshed| (sc, refreshed)),
+                None => None,
+            };
+            if let Some((sc, refreshed)) = refreshed {
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
                         intent_sourcecontrol::traffic::with_caller(

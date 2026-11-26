@@ -93,6 +93,7 @@ use crate::{publish_event, system_actor, Services};
 
 // Compiled storage/read primitives; the admitted caller directory wires these later.
 mod observation_feed;
+mod poll_lease;
 #[expect(
     dead_code,
     reason = "qualified reads await admitted caller-directory wiring"
@@ -4314,95 +4315,106 @@ impl Services {
         let mut rate_limited = false;
         for monitor in monitors {
             let key = pr_key(&monitor);
-            let fetched = match shared.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    intent_sourcecontrol::traffic::record_reuse(
-                        intent_sourcecontrol::traffic::Operation::PrDetail,
-                        intent_sourcecontrol::traffic::Reuse::CacheHit,
+            // The gate closed mid-sweep — by this sweep's own fetch or by a
+            // sibling sweep sharing the gate: PRs not fetched yet stay
+            // untouched until the pause window elapses.
+            if !shared.contains_key(&key) && (rate_limited || self.sweeps_rate_limited()) {
+                if !rate_limited {
+                    tracing::debug!(
+                        "pr monitor sweep: forge rate limit pause opened mid-sweep; skipping remaining fetches"
                     );
-                    entry.get().clone()
+                    rate_limited = true;
                 }
-                // The gate closed mid-sweep — by this sweep's own fetch or by
-                // a sibling sweep sharing the gate: PRs not fetched yet stay
-                // untouched until the pause window elapses.
-                std::collections::hash_map::Entry::Vacant(_)
-                    if rate_limited || self.sweeps_rate_limited() =>
-                {
-                    if !rate_limited {
-                        tracing::debug!(
-                            "pr monitor sweep: forge rate limit pause opened mid-sweep; skipping remaining fetches"
+                continue;
+            }
+            // Single-flight across processes; see `poll_lease`.
+            let Some(lease) = self.take_monitor_poll_lease(&monitor).await else {
+                continue;
+            };
+            let poll = async {
+                let fetched = match shared.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        intent_sourcecontrol::traffic::record_reuse(
+                            intent_sourcecontrol::traffic::Operation::PrDetail,
+                            intent_sourcecontrol::traffic::Reuse::CacheHit,
                         );
+                        entry.get().clone()
+                    }
+                    // A sibling sweep closed the gate while the lease was taken.
+                    std::collections::hash_map::Entry::Vacant(_) if self.sweeps_rate_limited() => {
                         rate_limited = true;
+                        return;
                     }
-                    continue;
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let repo_ref = monitor.repo();
-                    // Clear an observation mark before the fetch: a read that
-                    // sees the PR move while this fetch is in flight marks it
-                    // again (the baseline is still the pre-fetch state), so
-                    // a merge racing the fetch is polled on the next tick.
-                    let observed = self.pr_monitor_feed.lock().unwrap().take(&key);
-                    // The timeout is defense in depth above the client-level
-                    // network timeouts: a fetch that pends indefinitely maps
-                    // to an error (recorded as `lastError` below) instead of
-                    // wedging the sweep for every other monitor.
-                    let fetched = match tokio::time::timeout(
-                        self.pr_monitor_fetch_timeout,
-                        read_pr_via(
-                            sc.as_ref(),
-                            &repo_ref,
-                            monitor.pr_number.cast_unsigned(),
-                            &self.pr_cache,
-                            PrReadPolicy::Poll,
-                            &monitored,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Err(Error::RateLimited(detail))) => {
-                            self.pause_sweeps_for_rate_limit(&sc, &detail).await;
-                            rate_limited = true;
-                            Err(self.rate_limit_pause_error())
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let repo_ref = monitor.repo();
+                        // Clear an observation mark before the fetch: a read that
+                        // sees the PR move while this fetch is in flight marks it
+                        // again (the baseline is still the pre-fetch state), so
+                        // a merge racing the fetch is polled on the next tick.
+                        let observed = self.pr_monitor_feed.lock().unwrap().take(&key);
+                        // The timeout is defense in depth above the client-level
+                        // network timeouts: a fetch that pends indefinitely maps
+                        // to an error (recorded as `lastError` below) instead of
+                        // wedging the sweep for every other monitor.
+                        let fetched = match tokio::time::timeout(
+                            self.pr_monitor_fetch_timeout,
+                            read_pr_via(
+                                sc.as_ref(),
+                                &repo_ref,
+                                monitor.pr_number.cast_unsigned(),
+                                &self.pr_cache,
+                                PrReadPolicy::Poll,
+                                &monitored,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Err(Error::RateLimited(detail))) => {
+                                self.pause_sweeps_for_rate_limit(&sc, &detail).await;
+                                rate_limited = true;
+                                Err(self.rate_limit_pause_error())
+                            }
+                            Ok(Ok(read)) => {
+                                self.pr_monitor_feed
+                                    .lock()
+                                    .unwrap()
+                                    .record_poll(key.clone(), &read.pr);
+                                self.project_monitor_queue(&repo_ref, &read).await;
+                                Ok(read.snapshot)
+                            }
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => Err(format!(
+                                "PR fetch timed out after {:?}",
+                                self.pr_monitor_fetch_timeout
+                            )),
+                        };
+                        if observed && fetched.is_err() {
+                            self.pr_monitor_feed.lock().unwrap().restore(key);
                         }
-                        Ok(Ok(read)) => {
-                            self.pr_monitor_feed
-                                .lock()
-                                .unwrap()
-                                .record_poll(key.clone(), &read.pr);
-                            self.project_monitor_queue(&repo_ref, &read).await;
-                            Ok(read.snapshot)
-                        }
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err(format!(
-                            "PR fetch timed out after {:?}",
-                            self.pr_monitor_fetch_timeout
-                        )),
-                    };
-                    if observed && fetched.is_err() {
-                        self.pr_monitor_feed.lock().unwrap().restore(key);
+                        entry.insert(fetched).clone()
                     }
-                    entry.insert(fetched).clone()
+                };
+                match fetched {
+                    Ok(snapshot) => {
+                        if let Err(e) = self.poll_one_pr_monitor(&monitor, &snapshot).await {
+                            tracing::warn!(
+                                monitor = %monitor.monitor_id.0,
+                                error = %e,
+                                "pr monitor poll failed; will retry next tick"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // A forge error records `lastError` without touching the
+                        // baseline — the next tick retries against the same
+                        // baseline, so a transient outage never fabricates or
+                        // loses a change (backoff is the poll interval itself).
+                        self.record_pr_monitor_error(&monitor, &error).await;
+                    }
                 }
             };
-            match fetched {
-                Ok(snapshot) => {
-                    if let Err(e) = self.poll_one_pr_monitor(&monitor, &snapshot).await {
-                        tracing::warn!(
-                            monitor = %monitor.monitor_id.0,
-                            error = %e,
-                            "pr monitor poll failed; will retry next tick"
-                        );
-                    }
-                }
-                Err(error) => {
-                    // A forge error records `lastError` without touching the
-                    // baseline — the next tick retries against the same
-                    // baseline, so a transient outage never fabricates or
-                    // loses a change (backoff is the poll interval itself).
-                    self.record_pr_monitor_error(&monitor, &error).await;
-                }
-            }
+            lease.guard_writes(poll).await;
+            lease.release(&self.store).await;
             tokio::time::sleep(crate::SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
@@ -13530,6 +13542,57 @@ mod tests {
             polled(b.monitor_id.clone()).await.as_deref(),
             Some(fresh.as_str())
         );
+    }
+
+    /// Across processes a monitor is polled under its poll lease: while
+    /// another process holds it, a sweep leaves the monitor alone; once it
+    /// is free the monitor is polled and the lease released.
+    #[tokio::test]
+    async fn a_monitor_another_process_polls_is_skipped() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        forge.take_fetched_numbers();
+        let ttl = Duration::from_secs(600);
+        let held = svc
+            .store()
+            .acquire_lease("pr-monitor-poll", &monitor.monitor_id.0, ttl)
+            .await
+            .unwrap()
+            .expect("the other process takes the poll lease");
+        svc.poll_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a monitor another process polls is not polled"
+        );
+        svc.store().release_lease(held).await.unwrap();
+        svc.poll_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        assert!(
+            svc.store()
+                .acquire_lease("pr-monitor-poll", &monitor.monitor_id.0, ttl)
+                .await
+                .unwrap()
+                .is_some(),
+            "the poll released its lease"
+        );
+    }
+
+    /// A sweep picks monitors from a row it read earlier. If the row moved
+    /// before the poll lease was taken (another process polled it), the
+    /// stale image is not polled again, and the lease is left free.
+    #[tokio::test]
+    async fn a_monitor_whose_row_moved_since_the_sweep_read_it_is_not_polled() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let stale = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+        forge.take_fetched_numbers();
+        assert!(svc.take_monitor_poll_lease(&stale).await.is_none());
+        let current = svc.store().get_pr_monitor(&stale.monitor_id).await.unwrap();
+        let lease = svc
+            .take_monitor_poll_lease(&current)
+            .await
+            .expect("the current row is polled, and the lease was left free");
+        lease.release(svc.store()).await;
     }
 
     /// The nudge and the legacy sweep share one lane: a nudge skips while a

@@ -122,22 +122,33 @@ impl Services {
             {
                 continue;
             }
-            let polled = authority
-                .run_poll(Box::pin(
-                    original.poll_qualified_monitor(&row, &authority, now, None),
-                ))
-                .await;
-            // Prompt capture is a daemon-manager entry. Leave the original
-            // polling caller scope before preparing a destination; the retained
-            // authority and cache delivery still gate every resulting effect.
-            let polled = match polled {
-                Ok(Some((observed, delivery))) => original
-                    .queue_qualified_monitor_wake(&observed, &authority, delivery, now, false)
-                    .await
-                    .map(|_| ()),
-                Ok(None) => Ok(()),
-                Err(error) => Err(error),
+            // Single-flight across processes; see `poll_lease`.
+            let Some(lease) = self.take_monitor_poll_lease(monitor).await else {
+                continue;
             };
+            let polled = lease
+                .guard_writes(async {
+                    let polled = authority
+                        .run_poll(Box::pin(
+                            original.poll_qualified_monitor(&row, &authority, now, None),
+                        ))
+                        .await;
+                    // Prompt capture is a daemon-manager entry. Leave the original
+                    // polling caller scope before preparing a destination; the retained
+                    // authority and cache delivery still gate every resulting effect.
+                    match polled {
+                        Ok(Some((observed, delivery))) => original
+                            .queue_qualified_monitor_wake(
+                                &observed, &authority, delivery, now, false,
+                            )
+                            .await
+                            .map(|_| ()),
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                })
+                .await;
+            lease.release(&self.store).await;
             if let Err(error) = polled {
                 // An original authority failure cannot mutate its saved binding
                 // or substitute current-account permission. Later list/delivery
@@ -239,23 +250,36 @@ impl Services {
             }
         };
         let original = authority.original_services()?;
-        let now = time::OffsetDateTime::now_utc();
-        // Even plain Flush derives sendable content from a freshly admitted read.
-        // Stored private text never becomes a replacement prompt.
-        let polled = authority
-            .run_poll(Box::pin(original.poll_qualified_monitor(
-                &expected,
-                &authority,
-                now,
-                Some(control),
-            )))
-            .await?;
-        let Some((observed, delivery)) = polled else {
-            return Ok(false);
-        };
-        original
-            .queue_qualified_monitor_wake(&observed, &authority, delivery, now, true)
+        // Single-flight across processes (`poll_lease`): while another
+        // process polls this monitor the flush is unavailable; retry it.
+        let lease = self
+            .acquire_monitor_poll_lease(expected.monitor())
             .await
+            .map_err(|_| AdmissionError::Unavailable)?
+            .ok_or(AdmissionError::Unavailable)?;
+        let now = time::OffsetDateTime::now_utc();
+        let flushed = lease
+            .guard_writes(async {
+                // Even plain Flush derives sendable content from a freshly admitted read.
+                // Stored private text never becomes a replacement prompt.
+                let polled = authority
+                    .run_poll(Box::pin(original.poll_qualified_monitor(
+                        &expected,
+                        &authority,
+                        now,
+                        Some(control),
+                    )))
+                    .await?;
+                let Some((observed, delivery)) = polled else {
+                    return Ok(false);
+                };
+                original
+                    .queue_qualified_monitor_wake(&observed, &authority, delivery, now, true)
+                    .await
+            })
+            .await;
+        lease.release(&self.store).await;
+        flushed
     }
 
     async fn poll_qualified_monitor(

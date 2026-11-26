@@ -360,6 +360,21 @@ pub async fn refresh_grant(
     refresh_grant_inner(host, client_id, store, None, None).await
 }
 
+/// Exchange exactly `refresh_token` (the caller's read of the stored one),
+/// never reloading the store: a caller that compares the stored token
+/// before persisting knows which token it consumed.
+///
+/// # Errors
+/// Returns the same exchange errors as [`refresh_access_token`].
+pub async fn refresh_grant_with_operand(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    refresh_token: SecretString,
+) -> Result<GitlabGrant> {
+    refresh_grant_inner(host, client_id, store, None, Some(refresh_token)).await
+}
+
 /// Exchange the exact operand attested by the original repository owner.
 /// No credential reload or persistence occurs in this exchange.
 ///

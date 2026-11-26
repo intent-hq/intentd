@@ -18,11 +18,10 @@ use std::sync::Arc;
 
 use intent_core::events::SOURCE_CONTROL_AUTH_CHANGED;
 use intent_core::{now_iso, Error, FileSecretStore, IdentityProofErrorKind, Result, WorkspaceId};
-use intent_sourcecontrol::gitlab_auth::{
-    refresh_grant, stored_credential, validate_pat, GitlabWriteObserver,
-};
+use intent_sourcecontrol::gitlab_auth::{stored_credential, validate_pat, GitlabWriteObserver};
 use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
 use intent_sourcecontrol::identity_proof::provider::{CreatedProof, ProofProvider};
+use intent_sourcecontrol::ExposeSecret as _;
 use intent_sourcecontrol::{
     GitlabDeviceFlow, GitlabExchange, GitlabHost, GitlabUser, StoredCredential, UserIdentity,
 };
@@ -41,6 +40,8 @@ use crate::repository_credentials::RepositoryMutationKind;
 pub(crate) use repository_owner::GitlabCredentialGate;
 use repository_owner::{GitlabCredentialGuard, RepositoryWrite};
 
+#[cfg(test)]
+mod refresh_lease_tests;
 #[cfg(test)]
 mod repository_owner_tests;
 #[cfg(test)]
@@ -244,8 +245,8 @@ pub(crate) fn new_gitlab_state() -> GitlabAuthStateHandle {
 /// never across the ordinary `GET /api/v4/user` status probe. Account verification
 /// of a newly issued grant/refresh stays inside the same owner hold. Lock order: this gate
 /// first, the [`GitlabAuthStateHandle`] slot lock only ever nested inside it.
-pub(crate) fn new_gitlab_credential_gate() -> GitlabCredentialGate {
-    GitlabCredentialGate::new()
+pub(crate) fn new_gitlab_credential_gate(store: intent_store::Store) -> GitlabCredentialGate {
+    GitlabCredentialGate::new().with_refresh_leases(store)
 }
 
 /// Build a `sourceControl:auth-changed { provider, host, status }` event —
@@ -1060,6 +1061,24 @@ enum RefreshFailure {
     Transient,
 }
 
+/// How long a refresh waits for another process's refresh of the same host
+/// (the `"gitlab-credential-refresh"` lease) before it gives up as a
+/// transient failure. A crashed holder's lease lapses within
+/// [`crate::work_leases::WORK_LEASE_TTL`].
+const REFRESH_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The pause between tries for a held refresh lease.
+const REFRESH_LEASE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Refresh the stored GitLab pair of `host`, under the credential gate
+/// (`guard`) in this process and, across the tenant's processes, under the
+/// host's refresh lease (`"gitlab-credential-refresh"`). GitLab rotates the
+/// refresh token on every exchange, so two processes exchanging the same
+/// one would leave one of them with `invalid_grant`. The lease is taken
+/// before the refresh token is read and kept through the exchange and the
+/// persist; a held lease is waited for, then the token that refresh stored
+/// is the one exchanged. The persist's store writes guard the lease, and
+/// the stored refresh token must still be the one read before the exchange
+/// (see `refresh_under_lease`).
 async fn try_refresh(
     host: &GitlabHost,
     client_id: Option<&str>,
@@ -1068,13 +1087,122 @@ async fn try_refresh(
     guard: &GitlabCredentialGuard,
     write: Option<Arc<RepositoryWrite>>,
 ) -> std::result::Result<(), RefreshFailure> {
-    let refresh_operand = if let Some(write) = &write {
-        Some(
-            write
-                .refresh_operand(&store, guard.lease())
-                .await
-                .map_err(RefreshFailure::Local)?,
+    let Some(leases) = guard.refresh_leases() else {
+        return refresh_under_lease(host, client_id, store, secrets, guard, write).await;
+    };
+    let lease = take_refresh_lease(leases, host).await?;
+    let result = lease
+        .guard_writes(refresh_under_lease(
+            host, client_id, store, secrets, guard, write,
+        ))
+        .await;
+    lease.release(leases).await;
+    result
+}
+
+/// The host's refresh lease, waiting up to [`REFRESH_LEASE_WAIT`] while
+/// another process holds it.
+async fn take_refresh_lease(
+    leases: &intent_store::Store,
+    host: &GitlabHost,
+) -> std::result::Result<intent_store::LeaseKeeper, RefreshFailure> {
+    let deadline = Instant::now() + REFRESH_LEASE_WAIT;
+    loop {
+        match intent_store::LeaseKeeper::acquire(
+            leases,
+            crate::work_leases::GITLAB_REFRESH_SCOPE,
+            host.host(),
+            crate::work_leases::WORK_LEASE_TTL,
         )
+        .await
+        {
+            Ok(Some(lease)) => return Ok(lease),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(REFRESH_LEASE_RETRY).await;
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    host = host.host(),
+                    "gitlab token refresh: another process kept refreshing; try again later"
+                );
+                return Err(RefreshFailure::Transient);
+            }
+            Err(error) => {
+                tracing::warn!(host = host.host(), %error, "gitlab token refresh: no refresh lease");
+                return Err(RefreshFailure::Transient);
+            }
+        }
+    }
+}
+
+/// The stored refresh token; `Err(())` when the store cannot be read.
+async fn stored_refresh_token(store: &FileSecretStore) -> std::result::Result<Option<String>, ()> {
+    let store = store.clone();
+    match tokio::task::spawn_blocking(move || {
+        store.load(intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT)
+    })
+    .await
+    {
+        Ok(Ok(token)) => Ok(token),
+        _ => Err(()),
+    }
+}
+
+/// Whether the stored refresh token is still `before` (an unreadable store
+/// counts as changed).
+async fn refresh_token_unchanged(store: &FileSecretStore, before: Option<&str>) -> bool {
+    matches!(stored_refresh_token(store).await, Ok(now) if now.as_deref() == before)
+}
+
+async fn refresh_under_lease(
+    host: &GitlabHost,
+    client_id: Option<&str>,
+    store: FileSecretStore,
+    secrets: &crate::settings::AsyncSecretStore,
+    guard: &GitlabCredentialGuard,
+    write: Option<Arc<RepositoryWrite>>,
+) -> std::result::Result<(), RefreshFailure> {
+    // The pair's version: the refresh token stored now, under the lease.
+    let store_before = store.clone();
+    let before = stored_refresh_token(&store).await;
+    #[cfg(test)]
+    let before = if refresh_lease_tests::FAIL_VERSION_READ
+        .try_with(|()| ())
+        .is_ok()
+    {
+        Err(())
+    } else {
+        before
+    };
+    // Without the version nothing can tell a later persist apart from a
+    // peer's: never exchange (and so consume) the token then.
+    let Ok(before) = before else {
+        tracing::warn!(
+            host = host.host(),
+            "gitlab token refresh: the stored refresh token could not be read; not refreshing"
+        );
+        return Err(RefreshFailure::Transient);
+    };
+    #[cfg(test)]
+    if let Ok(hook) = refresh_lease_tests::AFTER_VERSION_READ.try_with(Arc::clone) {
+        hook();
+    }
+    // The token exchanged is exactly the version: the owner's attested
+    // operand must equal it, and the legacy path exchanges it as read. A
+    // pair a peer stored after the version read is never consumed here.
+    let refresh_operand = if let Some(write) = &write {
+        let operand = write
+            .refresh_operand(&store, guard.lease())
+            .await
+            .map_err(RefreshFailure::Local)?;
+        if before.as_deref() != Some(operand.expose_secret()) {
+            tracing::warn!(
+                host = host.host(),
+                "gitlab token refresh: the stored pair changed before the exchange; keeping it"
+            );
+            return Err(RefreshFailure::Transient);
+        }
+        Some(operand)
     } else {
         None
     };
@@ -1098,8 +1226,19 @@ async fn try_refresh(
             ))?,
         )
         .await
+    } else if let Some(token) = &before {
+        intent_sourcecontrol::gitlab_auth::refresh_grant_with_operand(
+            host,
+            client_id,
+            store,
+            intent_sourcecontrol::SecretString::from(token.clone()),
+        )
+        .await
     } else {
-        refresh_grant(host, client_id, store).await
+        Err(intent_sourcecontrol::Error::Auth(format!(
+            "no gitlab refresh token stored for {}",
+            host.host()
+        )))
     };
     if result.is_err() {
         if let Some(write) = &write {
@@ -1107,6 +1246,20 @@ async fn try_refresh(
             // the already-begun original owner before any legacy fallback.
             write.begin().map_err(RefreshFailure::Local)?;
         }
+    }
+    // The version check: the stored refresh token must still be the one read
+    // before the exchange. Under the refresh lease only a writer that is not
+    // refreshing (a connect or disconnect in another process) or a lost lease
+    // moves it; the stored pair then stands and this grant is dropped unwritten.
+    if result.is_ok() && !refresh_token_unchanged(&store_before, before.as_deref()).await {
+        if let Some(write) = &write {
+            write.begin().map_err(RefreshFailure::Local)?;
+        }
+        tracing::warn!(
+            host = host.host(),
+            "gitlab token refresh: the stored pair changed during the exchange; keeping it"
+        );
+        return Err(RefreshFailure::Transient);
     }
     match result {
         Ok(grant) => {
@@ -1125,6 +1278,14 @@ async fn try_refresh(
             error @ (intent_sourcecontrol::Error::AdmissionRetired
             | intent_sourcecontrol::Error::AdmissionUnavailable(_)),
         ) => Err(RefreshFailure::Local(error)),
+        // A refused refresh token that is no longer the stored one was
+        // rotated by another refresh: the stored pair is the live one.
+        Err(e @ intent_sourcecontrol::Error::Auth(_))
+            if !refresh_token_unchanged(&store_before, before.as_deref()).await =>
+        {
+            tracing::warn!(error = %e, host = host.host(), "gitlab token refresh refused a rotated token; keeping the stored pair");
+            Err(RefreshFailure::Transient)
+        }
         Err(
             e @ (intent_sourcecontrol::Error::Auth(_) | intent_sourcecontrol::Error::Config(_)),
         ) => {

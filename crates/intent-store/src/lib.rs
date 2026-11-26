@@ -167,8 +167,10 @@ mod workspace_home_repo;
 pub use workspace_home_repo::{backup_warning_in, BACKUP_WARNING_AFTER};
 mod lease_keeper;
 mod lease_repo;
+mod lease_write_guard;
 pub use lease_keeper::{LeaseFence, LeaseKeeper};
 mod lifecycle_leases;
+pub use lease_write_guard::{inherit_lease_write_guards, LeaseWriteGuards};
 #[cfg(any(test, feature = "test-support"))]
 pub use lifecycle_leases::contended_lease_attempts_for_tests;
 pub use lifecycle_leases::{
@@ -516,6 +518,16 @@ impl Store {
 }
 
 impl Store {
+    /// The tenant whose writes guard a lease kept on this store
+    /// (`lease_write_guard`); `None` on `SQLite`.
+    pub(crate) fn lease_guard_tenant(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Sqlite(_) => None,
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(store) => Some(store.tenant().to_owned()),
+        }
+    }
+
     /// The fence of this process's current claim on the store's tenant:
     /// `None` on `SQLite` (no lease) and on a Postgres store whose process
     /// never claimed the tenant. See [`TenantFence`].
