@@ -1178,17 +1178,34 @@ async fn check(
                 spawn_kill(svc, feature, client, row);
             }
         }
-        // A transition a backend restart cut: finish it.
-        CloudSandboxState::Pausing if settled => {
-            spawn_pause(svc, client, &row.id, PauseFor::Restart);
-        }
-        CloudSandboxState::Resuming if settled => {
-            feature.cloud.park(&row.id);
-            set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
+        // A transition a backend restart cut: finish it. `row` was read
+        // before this check, so a pause or resume may have ended since:
+        // act only on the state read again under the transition lock.
+        CloudSandboxState::Pausing | CloudSandboxState::Resuming if settled => {
+            let Some(transition) = feature.cloud.try_transition(&row.id) else {
+                return;
+            };
+            match current_state(svc, &row.id).await {
+                Some(CloudSandboxState::Pausing) => {
+                    drop(transition);
+                    spawn_pause(svc, client, &row.id, PauseFor::Restart);
+                }
+                Some(CloudSandboxState::Resuming) => {
+                    feature.cloud.park(&row.id);
+                    set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
+                }
+                _ => {}
+            }
         }
         CloudSandboxState::Stopping if settled => spawn_kill(svc, feature, client, row),
         CloudSandboxState::Pausing | CloudSandboxState::Resuming | CloudSandboxState::Stopping => {}
     }
+}
+
+/// Machine `machine_id`'s sandbox state as stored now.
+async fn current_state(svc: &Services, machine_id: &str) -> Option<CloudSandboxState> {
+    let row = svc.store().get_exposed_machine(machine_id).await.ok()??;
+    row.cloud.map(|cloud| cloud.state)
 }
 
 /// Keep the sandbox's timeout ahead.

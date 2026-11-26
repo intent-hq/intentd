@@ -1766,6 +1766,7 @@ const NO_RUN_CAP: &str = "864000";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
     let Some(CloudBackend {
+        head: _head,
         head_dir,
         ws_id,
         keyed_ref,
