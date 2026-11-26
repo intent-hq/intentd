@@ -1161,8 +1161,7 @@ async fn check(
             }
             let idle = activity.last_busy.elapsed() >= clock.minutes(saved.idle_pause_minutes);
             let capped = activity.capped
-                || (client.caps_run()
-                    && since(cloud.running_since.as_deref()) >= clock.run_cap());
+                || (client.caps_run() && since(cloud.running_since.as_deref()) >= clock.run_cap());
             if idle || capped {
                 spawn_pause(
                     svc,
