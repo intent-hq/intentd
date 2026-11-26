@@ -26,7 +26,7 @@ struct TokenServer {
     release: Arc<Notify>,
 }
 
-async fn token_server(exchanges: Vec<(&'static str, Value)>) -> TokenServer {
+async fn token_server(script: Vec<(&'static str, Value)>) -> TokenServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let host = GitlabHost::parse("gitlab.lease.test")
@@ -43,7 +43,7 @@ async fn token_server(exchanges: Vec<(&'static str, Value)>) -> TokenServer {
         release: Arc::clone(&release),
     };
     tokio::spawn(async move {
-        let mut exchanges = exchanges.into_iter();
+        let mut script = script.into_iter();
         let mut first = true;
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -78,7 +78,7 @@ async fn token_server(exchanges: Vec<(&'static str, Value)>) -> TokenServer {
                     entered.notify_one();
                     release.notified().await;
                 }
-                exchanges.next().expect("an unscripted token exchange")
+                script.next().expect("an unscripted token exchange")
             } else if request.starts_with("GET /api/v4/user ") {
                 ("200 OK", json!({"id": 42, "username": "lease-user"}))
             } else {
