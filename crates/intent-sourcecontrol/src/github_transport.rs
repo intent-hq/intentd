@@ -173,6 +173,76 @@ impl<B> tower::retry::Policy<http::Request<OctoBody>, http::Response<B>, Attempt
     }
 }
 
+/// The socket pool every GitHub client shares: TLS over the proxy-aware
+/// connector, with connect/read/write timeouts.
+fn proxied_pool(
+    connect_timeout: std::time::Duration,
+    read_write_timeout: std::time::Duration,
+    proxies: Matcher,
+) -> Result<Pool> {
+    let mut direct = HttpConnector::new();
+    direct.enforce_http(false);
+    let tls = || {
+        hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|_| Error::Config("cannot load TLS roots".into()))
+            .map(|builder| builder.https_or_http().enable_http1())
+    };
+    let connector = tls()?.wrap_connector(ProxyConnector {
+        direct: direct.clone(),
+        to_proxy: tls()?.wrap_connector(direct),
+        proxies: Arc::new(proxies),
+    });
+    let mut connector = hyper_timeout::TimeoutConnector::new(connector);
+    connector.set_connect_timeout(Some(connect_timeout));
+    connector.set_read_timeout(Some(read_write_timeout));
+    connector.set_write_timeout(Some(read_write_timeout));
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+/// The unauthenticated device-flow login client for `base` (github.com in
+/// production): the shared proxy-aware pool, `Accept: application/json` as
+/// octocrab's `authenticate_as_device` requires, and octocrab's default
+/// retries.
+pub(crate) fn login_client(base: &str) -> Result<octocrab::Octocrab> {
+    login_client_with(
+        base,
+        CONNECT_TIMEOUT,
+        READ_WRITE_TIMEOUT,
+        Matcher::from_env(),
+    )
+}
+
+fn login_client_with(
+    base: &str,
+    connect_timeout: std::time::Duration,
+    read_write_timeout: std::time::Duration,
+    proxies: Matcher,
+) -> Result<octocrab::Octocrab> {
+    let base: Uri = base
+        .parse()
+        .map_err(|e| Error::Config(format!("invalid github login base uri: {e}")))?;
+    let pool = proxied_pool(connect_timeout, read_write_timeout, proxies)?;
+    let retry = tower::retry::Retry::new(RetryConfig::Simple(3), pool);
+    let headers = ExtraHeadersLayer::new(Arc::new(vec![
+        (
+            http::header::USER_AGENT,
+            HeaderValue::from_static("octocrab"),
+        ),
+        (
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        ),
+    ]))
+    .layer(retry);
+    let service = BaseUriLayer::new(base).layer(headers);
+    octocrab::OctocrabBuilder::new_empty()
+        .with_service(service.map_err(|e| -> BoxError { Box::new(e) }))
+        .with_auth(octocrab::AuthState::None)
+        .build()
+        .map_err(|e| Error::Config(format!("github login client: {e}")))
+}
+
 pub(crate) struct Transport {
     pool: Pool,
     base: Uri,
@@ -205,25 +275,8 @@ impl Transport {
             .map(|t| HeaderValue::from_str(&format!("Bearer {t}")))
             .transpose()
             .map_err(|_| Error::Config("invalid github credential header".into()))?;
-        let mut direct = HttpConnector::new();
-        direct.enforce_http(false);
-        let tls = || {
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .map_err(|_| Error::Config("cannot load TLS roots".into()))
-                .map(|builder| builder.https_or_http().enable_http1())
-        };
-        let connector = tls()?.wrap_connector(ProxyConnector {
-            direct: direct.clone(),
-            to_proxy: tls()?.wrap_connector(direct),
-            proxies: Arc::new(proxies),
-        });
-        let mut connector = hyper_timeout::TimeoutConnector::new(connector);
-        connector.set_connect_timeout(Some(connect_timeout));
-        connector.set_read_timeout(Some(read_write_timeout));
-        connector.set_write_timeout(Some(read_write_timeout));
         Ok(Self {
-            pool: Client::builder(TokioExecutor::new()).build(connector),
+            pool: proxied_pool(connect_timeout, read_write_timeout, proxies)?,
             base,
             auth,
         })
@@ -983,5 +1036,90 @@ mod tests {
         );
         let failed = tokio::time::timeout(budget, call).await.unwrap().unwrap();
         assert!(failed, "the proxy closed the connection");
+    }
+
+    /// The device-flow login client honors the proxy env like the API
+    /// client: github.com is tunnelled through the proxy, while a `NO_PROXY`
+    /// login host connects directly and still gets `Accept: application/json`.
+    #[tokio::test]
+    async fn the_login_client_tunnels_through_the_proxy() {
+        let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_uri = format!("http://{}", proxy.local_addr().unwrap());
+        let fixture = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let fixture_base = format!("http://{}", fixture.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = fixture.accept().await.unwrap();
+            let head = request(&mut stream).await.unwrap_or_default();
+            let body = r#"{"device_code":"dc","user_code":"UC-1","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#;
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = seen_tx.send(head);
+        });
+        let matcher = || {
+            Matcher::builder()
+                .all(proxy_uri.clone())
+                .no("127.0.0.1")
+                .build()
+        };
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(10));
+        let client_id = secrecy::SecretString::from("public-client-id".to_string());
+
+        let direct = login_client_with(
+            &fixture_base,
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            matcher(),
+        )
+        .unwrap();
+        let codes =
+            tokio::time::timeout(budget, direct.authenticate_as_device(&client_id, ["repo"]))
+                .await
+                .expect("the fixture answers in time")
+                .expect("a NO_PROXY login host connects directly");
+        assert_eq!(codes.user_code, "UC-1");
+        let head = seen_rx.await.unwrap().to_ascii_lowercase();
+        assert!(head.contains("accept: application/json"), "{head}");
+
+        let proxied = login_client_with(
+            "https://github.com",
+            CONNECT_TIMEOUT,
+            READ_WRITE_TIMEOUT,
+            matcher(),
+        )
+        .unwrap();
+        let call = tokio::spawn(async move {
+            proxied
+                .authenticate_as_device(&client_id, ["repo"])
+                .await
+                .is_err()
+        });
+        let head = tokio::time::timeout(budget, async {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let head = request(&mut stream).await.unwrap_or_default();
+            let _ = stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            head
+        })
+        .await
+        .expect("the proxy saw the login request");
+        assert!(
+            head.starts_with("CONNECT github.com:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        let failed = tokio::time::timeout(budget, call).await.unwrap().unwrap();
+        assert!(failed, "the proxy refused the tunnel");
     }
 }

@@ -3,14 +3,13 @@
 //! A test that forgets its fake forge server fails at once on this proxy
 //! instead of reaching the real GitHub or GitLab, whatever host the code
 //! picked (intentd#3743 and intentd#3758 each closed one host). reqwest
-//! clients, the GitHub REST/GraphQL transport and `git` children honor these
-//! vars; loopback fixtures pass through
+//! clients, the GitHub REST/GraphQL transport and device-flow login client,
+//! and `git` children honor these vars; loopback fixtures pass through
 //! `NO_PROXY` only on `127.0.0.1`, `localhost` (and `*.localhost`) and `::1`.
 //!
 //! Not covered: clients built with `.no_proxy()` and libgit2 transports
 //! without auto proxy (native checkout and push in `intent-git`), which refuse
-//! proxies by design; the GitHub device-flow login client (octocrab's default
-//! transport, aimed by `INTENTD_GITHUB_LOGIN_BASE_URI`); children spawned with
+//! proxies by design; children spawned with
 //! `env_clear()` that skip [`apply_test_egress`]; and `git` under an
 //! `http.proxy` config setting, which wins over these vars.
 //!
