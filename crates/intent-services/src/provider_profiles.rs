@@ -544,8 +544,8 @@ fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-/// Whether `key` names an account folder of any profile base
-/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, ignoring ASCII case). Reads return these values unmasked:
+/// Whether `key` names an account folder of any profile base (its
+/// `ProfileSpec::account_dir_keys`, ignoring ASCII case). Reads return these values unmasked:
 /// a folder path is not a credential. Launch-log redaction still covers
 /// them through `ProfileEnv::secret_values`.
 fn is_folder_path_key(key: &str) -> bool {
