@@ -3310,6 +3310,20 @@ impl PgStore {
         rows: &[AgentQueueRow],
         claims: &[String],
     ) -> Result<AgentQueueSync> {
+        self.sync_agent_queue_guarded(agent_id, rows, claims, None)
+            .await
+    }
+
+    /// [`Self::sync_agent_queue`], guarding `guard` (when given) in the
+    /// write transaction first: a lost lease fails with `LeaseLost` and
+    /// writes nothing.
+    pub async fn sync_agent_queue_guarded(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+        claims: &[String],
+        guard: Option<&crate::lease_repo::Lease>,
+    ) -> Result<AgentQueueSync> {
         if let Some(row) = rows.iter().find(|r| r.agent_id != *agent_id) {
             return Err(Error::Internal(format!(
                 "sync agent queue row {} belongs to agent {}, not {}",
@@ -3322,6 +3336,11 @@ impl PgStore {
         // The tenant writer lock orders this read-merge-write against every
         // other process's queue write.
         let mut tx = self.begin_write().await?;
+        if let Some(lease) = guard {
+            // Rolls back (drop) on `LeaseLost`: nothing is written and the
+            // seen version stays as it was.
+            self.guard_lease(&mut tx, lease).await?;
+        }
         let seen = self.queue_versions.seen(agent_id);
         let stored_version = self.stored_queue_version(&mut tx, agent_id).await?;
         let mut sync = AgentQueueSync::default();

@@ -929,6 +929,125 @@ async fn a_holder_that_lost_its_claim_writes_nothing() {
     );
 }
 
+fn wake_row(id: &str, agent: &str) -> intent_store::AgentQueueRow {
+    intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: aid(agent),
+        position: 0,
+        payload: serde_json::json!({ "content": format!("wake {id}") }),
+        created_at: T5.into(),
+        turn_id: id.into(),
+    }
+}
+
+async fn wake_counts(store: &Store, parent: &str) -> (usize, usize) {
+    let transcript = store
+        .get_agent_session_with_transcript(&aid(parent))
+        .await
+        .unwrap()
+        .messages
+        .len();
+    let queued = store
+        .load_all_agent_queues()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|row| row.agent_id == aid(parent))
+        .count();
+    (transcript, queued)
+}
+
+/// A parent wake sent under a delivery claim (its transcript row, or its
+/// queue row for a busy parent) guards the claim's lease in its own
+/// transaction: once the claim lapsed and another process took it over,
+/// the stale holder's wake fails with `LeaseLost` and writes nothing, and
+/// the new holder's lands. On `SQLite` (one process) a held claim writes.
+#[tokio::test]
+async fn a_wake_sent_under_a_lost_claim_writes_nothing() {
+    let wake = serde_json::json!([{ "type": "text", "text": "child finished" }]);
+    let Some(db) = crate::harness::test_db(false).await else {
+        let (store, _dir) = crate::harness::sqlite_store().await;
+        sessions(&store, &["p1"], "sqlite").await;
+        let claim = watch_claim(&store, "w1").await;
+        store
+            .append_agent_message_guarded(
+                &aid("p1"),
+                "completion-wake:w1",
+                "user",
+                &wake,
+                None,
+                T5,
+                intent_store::UsageMessageOrigin::Excluded,
+                &claim,
+            )
+            .await
+            .unwrap();
+        store
+            .sync_agent_queue_guarded(&aid("p1"), &[wake_row("q1", "p1")], &[], &claim)
+            .await
+            .unwrap();
+        assert_eq!(wake_counts(&store, "p1").await, (1, 1));
+        return;
+    };
+    let tenant = "stale-wakes";
+    let stale = open_as_process(&db, tenant, "process-stale").await;
+    let fresh = open_as_process(&db, tenant, "process-fresh").await;
+    sessions(&stale, &["p1"], tenant).await;
+    let stale_claim = watch_claim(&stale, "w1").await;
+    expire_claim(&db, tenant, "w1").await;
+    let fresh_claim = watch_claim(&fresh, "w1").await;
+
+    assert!(matches!(
+        stale
+            .append_agent_message_guarded(
+                &aid("p1"),
+                "completion-wake:w1",
+                "user",
+                &wake,
+                None,
+                T5,
+                intent_store::UsageMessageOrigin::Excluded,
+                &stale_claim,
+            )
+            .await,
+        Err(intent_store::Error::LeaseLost(_))
+    ));
+    assert!(matches!(
+        stale
+            .sync_agent_queue_guarded(&aid("p1"), &[wake_row("q1", "p1")], &[], &stale_claim)
+            .await,
+        Err(intent_store::Error::LeaseLost(_))
+    ));
+    assert_eq!(
+        wake_counts(&fresh, "p1").await,
+        (0, 0),
+        "the stale holder wrote no wake"
+    );
+
+    fresh
+        .append_agent_message_guarded(
+            &aid("p1"),
+            "completion-wake:w1",
+            "user",
+            &wake,
+            None,
+            T5,
+            intent_store::UsageMessageOrigin::Excluded,
+            &fresh_claim,
+        )
+        .await
+        .unwrap();
+    fresh
+        .sync_agent_queue_guarded(&aid("p1"), &[wake_row("q1", "p1")], &[], &fresh_claim)
+        .await
+        .unwrap();
+    assert_eq!(
+        wake_counts(&stale, "p1").await,
+        (1, 1),
+        "the holder's wake lands"
+    );
+}
+
 /// A tenant lease takeover leaves a live delivery claim alone: the new
 /// tenant owner cannot claim the watch or group the old process is
 /// delivering, and the old holder's keeper does not fence. The old

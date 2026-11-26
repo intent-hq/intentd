@@ -226,6 +226,104 @@ impl Services {
         self.with_completion_claim_park(park)
     }
 
+    /// Test seam: `with_completion_send_park`.
+    #[must_use]
+    pub fn with_completion_send_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_completion_send_park(park)
+    }
+
+    /// Test seam: `with_guarded_enqueue_park`.
+    #[must_use]
+    pub fn with_guarded_enqueue_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_guarded_enqueue_park(park)
+    }
+
+    /// Test seam: park a poisoned-queue migration right before it takes the
+    /// queue persist gate.
+    #[must_use]
+    pub fn with_migration_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.migration_park.set(park);
+        self
+    }
+
+    /// Test seam: `migrate_queue_and_gc_poisoned_session`.
+    pub async fn migrate_queue_and_gc_poisoned_session_for_test(
+        &self,
+        poisoned_id: &AgentId,
+        target_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize> {
+        self.migrate_queue_and_gc_poisoned_session(poisoned_id, target_id, workspace_id)
+            .await
+    }
+
+    /// Test seam: `persist_shutdown_queues`.
+    pub async fn persist_shutdown_queues_for_test(&self) {
+        self.persist_shutdown_queues().await;
+    }
+
+    /// Test seam: `agent_send_queued_message_now_op`.
+    pub async fn agent_send_queued_message_now_op_for_test(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        self.agent_send_queued_message_now_op(agent_id, message_id)
+            .await
+    }
+
+    /// Test seam: `with_watch_registration_park`.
+    #[must_use]
+    pub fn with_watch_registration_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_watch_registration_park(park)
+    }
+
+    /// Test seam: `register_completion_watch_strict_durable` (an ask-only
+    /// watch, parent and child in `workspace_id`).
+    pub async fn register_completion_watch_strict_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        self.register_completion_watch_strict_durable(
+            workspace_id,
+            workspace_id,
+            parent_agent_id,
+            "parent".into(),
+            child_agent_id,
+        )
+        .await
+    }
+
+    /// Test seam: `register_completion_watch_durable`.
+    pub async fn register_completion_watch_durable_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        child_agent_id: AgentId,
+        group_id: Option<String>,
+    ) -> Result<String> {
+        self.register_completion_watch_durable(
+            workspace_id,
+            workspace_id,
+            parent_agent_id,
+            "parent".into(),
+            child_agent_id,
+            group_id,
+        )
+        .await
+    }
+
+    /// Test seam: the ids of `find_watches_for_child`.
+    #[must_use]
+    pub fn watch_ids_for_child_for_test(&self, child_agent_id: &AgentId) -> Vec<String> {
+        self.find_watches_for_child(child_agent_id)
+            .into_iter()
+            .map(|watch| watch.id)
+            .collect()
+    }
+
     /// Test seam: `execution_call`.
     pub fn execution_call_for_test<'a, T: Send + 'a>(
         &'a self,

@@ -6630,6 +6630,32 @@ impl Store {
         dispatch!(self, backend => backend.append_agent_message_with_provenance(agent_id, id, role, content, metadata, created_at, origin).await)
     }
 
+    /// [`Store::append_agent_message_with_provenance`] for the holder of
+    /// `claim` (a delivery claim): the write guards the claim's lease in its
+    /// own transaction, so once the lease is lost (lapsed, taken over, or
+    /// released) it fails with `Error::LeaseLost` and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` when the claim is no longer held; otherwise as
+    /// [`Store::append_agent_message_with_provenance`].
+    #[expect(clippy::too_many_arguments)]
+    pub async fn append_agent_message_guarded(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+        origin: UsageMessageOrigin,
+        claim: &crate::LeaseKeeper,
+    ) -> Result<AgentMessage> {
+        let held = claim.lease().await;
+        let lease = crate::completion_watch_repo::held_claim(&held, claim)?;
+        dispatch!(self, backend => backend.append_agent_message_guarded(agent_id, id, role, content, metadata, created_at, origin, lease).await)
+    }
+
     /// Stage one completed content block's heavy payload into
     /// `agent_message_payload` BEFORE the owning `agent_message` envelope row
     /// exists (0109, intent-hq/intent#3884 part 2) — the envelope lands once,
@@ -7390,6 +7416,29 @@ impl crate::SqliteStore {
         created_at: &str,
         origin: UsageMessageOrigin,
     ) -> Result<AgentMessage> {
+        self.append_agent_message_inner(
+            agent_id, id, role, content, metadata, created_at, false, origin,
+        )
+        .await
+    }
+
+    /// [`Self::append_agent_message_with_provenance`] for the holder of
+    /// `lease`: `LeaseLost` (nothing written) unless it is still held. One
+    /// process writes a `SQLite` file, so the check is the guard (see
+    /// `SqliteStore::guard_lease`).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn append_agent_message_guarded(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        role: &str,
+        content: &serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+        created_at: &str,
+        origin: UsageMessageOrigin,
+        lease: &crate::Lease,
+    ) -> Result<AgentMessage> {
+        self.guard_lease(lease)?;
         self.append_agent_message_inner(
             agent_id, id, role, content, metadata, created_at, false, origin,
         )

@@ -172,6 +172,41 @@ impl Store {
         }
     }
 
+    /// [`Store::sync_agent_queue`] for the holder of `claim` (a delivery
+    /// claim): the write guards the claim's lease in its own transaction,
+    /// so once the lease is lost it fails with `Error::LeaseLost` and writes
+    /// nothing. `SQLite` checks the lease, then replaces the queue (one
+    /// process: see `SqliteStore::guard_lease`).
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` when the claim is no longer held; otherwise as
+    /// [`Store::sync_agent_queue`].
+    pub async fn sync_agent_queue_guarded(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+        claims: &[String],
+        claim: &crate::LeaseKeeper,
+    ) -> Result<AgentQueueSync> {
+        let held = claim.lease().await;
+        let lease = crate::completion_watch_repo::held_claim(&held, claim)?;
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                let _ = claims;
+                backend.guard_lease(lease)?;
+                backend.replace_agent_queue(agent_id, rows).await?;
+                Ok(AgentQueueSync::default())
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                backend
+                    .sync_agent_queue_guarded(agent_id, rows, claims, Some(lease))
+                    .await
+            }
+        }
+    }
+
     /// Read-only refresh of this process's view of one agent's queue: when
     /// another process wrote the queue since this process last read or wrote
     /// it, returns `local` (this process's queue now) with the stored change

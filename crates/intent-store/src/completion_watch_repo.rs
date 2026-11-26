@@ -64,6 +64,21 @@ fn claimed<'a>(
     Ok(lease)
 }
 
+/// The lease of the delivery claim `claim` for a write that guards it;
+/// `Error::LeaseLost` once the claim was released.
+pub(crate) fn held_claim<'a>(
+    held: &'a tokio::sync::MutexGuard<'_, Option<Lease>>,
+    claim: &LeaseKeeper,
+) -> Result<&'a Lease> {
+    held.as_ref().ok_or_else(|| {
+        Error::LeaseLost(format!(
+            "delivery claim {}/{} was released",
+            claim.scope(),
+            claim.key()
+        ))
+    })
+}
+
 impl Store {
     /// Claims the watch `watch_id` for this process's delivery of its
     /// terminal wake: the lease (`completion-watch`, `watch_id`) for `ttl`,
@@ -186,6 +201,50 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         dispatch!(self, backend => backend.upsert_completion_watch(w).await)
+    }
+
+    /// [`Store::upsert_completion_watch`] for the holder of `lease`: the
+    /// write guards it in its own transaction, so once the lease is lost
+    /// (lapsed, taken over) it fails with `Error::LeaseLost` and writes
+    /// nothing. Strict ask registration inserts a pair's watch under the
+    /// pair's registration lease this way.
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` when `lease` is no longer held; otherwise as
+    /// [`Store::upsert_completion_watch`].
+    pub async fn upsert_completion_watch_guarded(
+        &self,
+        w: &PersistedCompletionWatch,
+        lease: &Lease,
+    ) -> Result<()> {
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                backend.guard_lease(lease)?;
+                backend.upsert_completion_watch(w).await
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                backend
+                    .upsert_completion_watch_guarded(w, Some(lease))
+                    .await
+            }
+        }
+    }
+
+    /// A stored ungrouped watch of `parent_agent_id` on `child_agent_id`
+    /// (the oldest; registration keeps one per pair), as any process
+    /// sharing the store registered it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_ungrouped_completion_watch(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<PersistedCompletionWatch>> {
+        dispatch!(self, backend => backend.find_ungrouped_completion_watch(parent_agent_id, child_agent_id).await)
     }
 
     /// Load every persisted `completion_watch` row (the registry is
@@ -435,6 +494,27 @@ impl crate::SqliteStore {
         .map_err(|e| Error::Internal(format!("list completion watches: {e}")))?;
 
         rows.iter().map(decode_watch_row).collect()
+    }
+
+    pub async fn find_ungrouped_completion_watch(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> Result<Option<PersistedCompletionWatch>> {
+        let row = sqlx::query(
+            "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
+                    parent_agent_name, child_agent_id, group_id,
+                    report_delivered, wake_on_attention, completion_only, created_at
+             FROM completion_watch
+             WHERE parent_agent_id = ? AND child_agent_id = ? AND group_id IS NULL
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&parent_agent_id.0)
+        .bind(&child_agent_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("find completion watch: {e}")))?;
+        row.as_ref().map(decode_watch_row).transpose()
     }
 
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {

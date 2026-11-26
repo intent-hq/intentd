@@ -655,6 +655,45 @@ fn decode_user_message_index_token(token: &str) -> Result<i64> {
 // helper the delivery paths render fresh at flush time.
 pub(crate) mod ready_delta;
 
+/// A new queue entry of a guarded enqueue (`Services::enqueue_under_claim`)
+/// whose guarded write has not committed: while armed, dropping it removes
+/// the entry from memory, and a recovery-send marker naming it.
+struct PendingGuardedEntry<'a> {
+    services: &'a Services,
+    agent_id: &'a AgentId,
+    entry_id: String,
+    armed: bool,
+}
+
+impl Drop for PendingGuardedEntry<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut queues = self
+                .services
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            if let Some(queue) = queues.get_mut(self.agent_id) {
+                queue.retain(|m| m.id != self.entry_id);
+                if queue.is_empty() {
+                    queues.remove(self.agent_id);
+                }
+            }
+        }
+        let mut parked = self
+            .services
+            .parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned");
+        if parked.get(self.agent_id) == Some(&self.entry_id) {
+            parked.remove(self.agent_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1967,6 +2006,11 @@ pub struct QueuedMessage {
     /// True on a draining overlay until its transcript row is durable.
     #[serde(skip)]
     pub provisional: bool,
+    /// A parent wake queued under a delivery claim whose guarded queue
+    /// write has not committed yet: no drain may take it until the write
+    /// decides (see `Services::enqueue_under_claim`). Never persisted.
+    #[serde(skip)]
+    pub(crate) write_pending: bool,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -2411,6 +2455,7 @@ impl QueuedMessage {
     )]
     pub fn ready_to_send(&self) -> bool {
         !self.editing
+            && !self.write_pending
             && !self.is_held()
             && !intent_core::human_author::is_unbound_historical_human(
                 self.message_metadata.as_ref(),
@@ -18865,6 +18910,125 @@ impl Services {
         ))
     }
 
+    /// Runs `enqueue` (an in-memory insert of `message_id` into
+    /// `agent_id`'s queue) for a parent wake sent under the delivery claim
+    /// `claim` (see `TurnOptions::delivery_claim`); without one it is just
+    /// `enqueue()`. With one, the queue row is the wake's durable write, so
+    /// it must not land once the claim is lost:
+    ///
+    /// - Shared store (Postgres): under the persist gate, which every
+    ///   claimed drain takes (`claim_queue_pop`), so no other drain in this
+    ///   process pops the entry before the write decides, the queue is
+    ///   written by a sync that guards the claim's lease. On any failure the
+    ///   new entry leaves memory again and the error is returned: the wake
+    ///   is not durable, the caller retries.
+    /// - `SQLite` (one process): the claim is checked, then the entry is
+    ///   queued and persisted by the usual write-through.
+    ///
+    /// Boxed: every `send_message` branch awaits it, and an inline future
+    /// there overflows the test stack of deep callers.
+    pub(crate) fn enqueue_under_claim<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        message_id: &'a str,
+        claim: Option<&'a crate::agent_manager::DeliveryClaim>,
+        enqueue: impl FnOnce() -> Result<(QueuedMessage, usize)> + Send + 'a,
+    ) -> intent_core::BoxFuture<'a, Result<(QueuedMessage, usize)>> {
+        Box::pin(self.enqueue_under_claim_inner(agent_id, message_id, claim, enqueue))
+    }
+
+    async fn enqueue_under_claim_inner(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        claim: Option<&crate::agent_manager::DeliveryClaim>,
+        enqueue: impl FnOnce() -> Result<(QueuedMessage, usize)>,
+    ) -> Result<(QueuedMessage, usize)> {
+        let Some(claim) = claim else {
+            return enqueue();
+        };
+        if !self.store.agent_queues_shared() {
+            let held = {
+                let lease = claim.0.lease().await;
+                match lease.as_ref() {
+                    Some(lease) => Box::pin(self.store.lease_is_held(lease)).await?,
+                    None => false,
+                }
+            };
+            if !held {
+                return Err(Error::LeaseLost(format!(
+                    "delivery claim {}/{} lost before the wake was queued",
+                    claim.0.scope(),
+                    claim.0.key()
+                )));
+            }
+            return enqueue();
+        }
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let existed = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|queue| queue.iter().any(|m| m.matches_submission(message_id)));
+        // A new entry is inserted with `write_pending` set (read under the
+        // queue lock that inserts it), so no drain takes it before the
+        // guarded write decides: not one that takes the persist gate held
+        // here, and not one that does not (`agent.sendQueuedMessageNow`,
+        // the worker's drains), which skip or refuse a pending entry.
+        self.delivery_guards
+            .guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .insert(message_id.to_owned());
+        let enqueued = enqueue();
+        self.delivery_guards
+            .guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .remove(message_id);
+        let enqueued = enqueued?;
+        // Until the guarded write commits, the new entry is provisional:
+        // dropping this guard (the write failed, or this future was
+        // cancelled, e.g. by shutdown cancelling the delivery task) removes
+        // it from memory before the persist gate is released, so no later
+        // unguarded write (a write-through, the shutdown queue save) can
+        // store it. Declared after the gate, so it drops first.
+        let mut pending = PendingGuardedEntry {
+            services: self,
+            agent_id,
+            entry_id: enqueued.0.id.clone(),
+            armed: !existed,
+        };
+        let rows = self.queue_rows(agent_id);
+        if let Some(park) = self.delivery_guards.enqueue_park.get() {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        // Boxed: this awaits inside every send_message branch.
+        let sync = Box::pin(
+            self.store
+                .sync_agent_queue_guarded(agent_id, &rows, &[], &claim.0),
+        )
+        .await?;
+        pending.armed = false;
+        if let Some(merged) = sync.merged {
+            self.adopt_stored_queue(agent_id, &rows, merged);
+        }
+        if let Some(entry) = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get_mut(agent_id)
+            .and_then(|queue| queue.iter_mut().find(|m| m.id == enqueued.0.id))
+        {
+            entry.write_pending = false;
+        }
+        let (mut queued, position) = enqueued;
+        queued.write_pending = false;
+        Ok((queued, position))
+    }
+
     fn submission_replay_locked(
         &self,
         agent_id: &AgentId,
@@ -18984,6 +19148,12 @@ impl Services {
         // The receipt is scoped to human wire front doors, including
         // sendToTask (whose legacy runtime delivery uses Automatic origin).
         intent_core::browser_message::accept_browser_message(agent_id, &id);
+        let write_pending = self
+            .delivery_guards
+            .guarded_enqueues
+            .lock()
+            .expect("guarded enqueue registry poisoned")
+            .contains(&id);
         let queued = QueuedMessage {
             monitor_turn,
             delivery_groups: None,
@@ -19014,6 +19184,7 @@ impl Services {
             editing_message_id: None,
             latest_human_submission_at: None,
             provisional: false,
+            write_pending,
             submission_order: self
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -19160,6 +19331,7 @@ impl Services {
                     editing_message_id: None,
                     latest_human_submission_at: None,
                     provisional: false,
+                    write_pending: false,
                     submission_order: 0,
                 };
                 queue.push(queued.clone());
@@ -20414,6 +20586,12 @@ impl Services {
                     ));
                     return None;
                 }
+                if queue[idx].write_pending {
+                    refused = Some(Error::StoreBusy(
+                        "the queued message is still being written; retry".into(),
+                    ));
+                    return None;
+                }
                 if let Some(gate) = gate {
                     if let Err(e) = gate.check(&queue[idx]) {
                         refused = Some(e);
@@ -21396,14 +21574,19 @@ impl Services {
             Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        // Drain in-memory, keeping the original entries for rollback should
-        // the durable move fail below. The append onto the target happens
-        // OUTSIDE the persist gate: a concurrent enqueue to the target in the
-        // window before the move commits can write-through a snapshot that
-        // already carries the migrated ids while the poisoned rows still
-        // exist — a global-PK conflict that fails that best-effort
-        // write-through with a benign WARN (the move right below commits the
-        // correct snapshot).
+        // The whole migration (in-memory drain, durable move, rollback) runs
+        // under the persist gate. A guarded enqueue holds that gate from its
+        // in-memory insert until its guarded write settles, so this never
+        // moves an entry whose write is still pending: it waits until the
+        // entry is committed (and drainable) or gone (rejected or
+        // cancelled). Test seam: park right before taking the gate.
+        if let Some(park) = self.delivery_guards.migration_park.get() {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        let gate = self.agent_queue_persist_gate.lock().await;
+        // Keep the original entries for rollback should the durable move
+        // fail below.
         let drained: Vec<QueuedMessage> = {
             let mut guard = self
                 .agent_queues
@@ -21431,13 +21614,11 @@ impl Services {
             // crash window with the messages on NEITHER queue.) The snapshot
             // is taken inside the persist gate, same ordering contract as
             // `persist_queue_snapshot`.
-            let moved = {
-                let _gate = self.agent_queue_persist_gate.lock().await;
-                let rows = self.queue_rows(target_id);
-                self.store
-                    .move_agent_queue(poisoned_id, target_id, &rows)
-                    .await
-            };
+            let rows = self.queue_rows(target_id);
+            let moved = self
+                .store
+                .move_agent_queue(poisoned_id, target_id, &rows)
+                .await;
             if let Err(e) = moved {
                 // Roll back the in-memory drain and skip GC: the messages
                 // remain durable on the poisoned queue (rows untouched) and
@@ -21460,6 +21641,11 @@ impl Services {
                     .splice(0..0, drained);
                 return Err(e);
             }
+        }
+        // Released before the publish and the poisoned agent's delete,
+        // which persist queues themselves.
+        drop(gate);
+        if migrated > 0 {
             // Re-arm release timers for migrated held entries against the
             // TARGET agent (mirrors the boot-rehydration re-arm): the timer
             // armed at enqueue time captured the poisoned agent id, so left

@@ -464,6 +464,27 @@ pub struct CompletionClassifyPark {
     pub release: tokio::sync::Notify,
 }
 
+/// Shared state of lease-guarded delivery (`Services::delivery_guards`).
+#[derive(Default)]
+pub(crate) struct DeliveryGuards {
+    /// Message ids being queued under a delivery claim right now
+    /// (`Services::enqueue_under_claim`): the queue insert reads it to mark
+    /// the new entry `write_pending` in the same critical section.
+    pub(crate) guarded_enqueues: Mutex<HashSet<String>>,
+    /// Test seam: parks a parent wake send after its stable-id probe and
+    /// right before the wake is written. Unset in production.
+    pub(crate) send_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a guarded enqueue between its in-memory insert and
+    /// its guarded write. Unset in production.
+    pub(crate) enqueue_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a strict watch registration between its lookups and
+    /// its guarded insert. Unset in production.
+    pub(crate) registration_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks a poisoned-queue migration right before it takes
+    /// the persist gate. Unset in production.
+    pub(crate) migration_park: OnceLock<Arc<CompletionClassifyPark>>,
+}
+
 /// Provenance retained when a synthetic completion has to defer again.
 #[derive(Clone, Copy)]
 enum InterimIdleProvenance {
@@ -487,14 +508,13 @@ struct CompletionRetryAttempt {
 }
 
 /// Live state of the completion delivery passes over one child
-/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Evicted
-/// when the last pass exits and no watch claim remains.
+/// (intent-hq/intent#4367): what overlapping passes share. Which pass
+/// delivers a watch is decided by the watch's delivery claim (a stored
+/// lease), not here. Evicted when the last pass exits.
 #[derive(Default)]
 struct ChildCompletionPasses {
     /// Passes currently inside `deliver_completion_to_watches_inner`.
     passes: usize,
-    /// Ungrouped watch ids whose terminal wake is in flight on some pass.
-    claimed_watches: HashSet<String>,
     /// The child's flipped-completion triggers, consumed from the store by
     /// exactly one pass and shared by every pass overlapping it. The store
     /// take is destructive, so without this a split snapshot (pass 1 claims
@@ -516,23 +536,6 @@ struct CompletionPassGuard<'a> {
 impl Drop for CompletionPassGuard<'_> {
     fn drop(&mut self) {
         self.services.exit_completion_pass(&self.child);
-    }
-}
-
-/// Ownership of one ungrouped watch's in-flight terminal delivery
-/// (intent-hq/intent#4367); see [`Services::claim_watch_delivery`]. Dropping
-/// the guard releases the claim on every exit of the delivering pass —
-/// delivered, retried, or unwound.
-struct WatchDeliveryClaim<'a> {
-    services: &'a Services,
-    child: AgentId,
-    watch_id: String,
-}
-
-impl Drop for WatchDeliveryClaim<'_> {
-    fn drop(&mut self) {
-        self.services
-            .release_watch_delivery(&self.child, &self.watch_id);
     }
 }
 
@@ -683,6 +686,9 @@ pub struct Services {
     /// processes are ordered by the store (writer lock + queue version), not
     /// by this lock.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The lease-guarded delivery's shared state: one field, so `Services`
+    /// (cloned into large futures such as `workspace.create`) stays small.
+    delivery_guards: Arc<DeliveryGuards>,
     /// Serializes every `agent:queue:updated` publish
     /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
     /// *inside* this async lock, immediately before the bus write, so a
@@ -802,9 +808,6 @@ pub struct Services {
     /// a later sweep/settlement delete and resurrect the row
     /// (intent-hq/intent#4460). Lazily spawned on first use.
     group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistLane>>,
-    /// Serializes strict completion-only ask registration so a watch is
-    /// durably persisted before it becomes visible to completion delivery.
-    completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
     /// Cancellation and drain ownership for automatic agent delivery tasks.
     delivery_tasks: Arc<delivery_tasks::DeliveryTasks>,
     /// Finite derived-state writers drained after request and agent producers.
@@ -904,22 +907,14 @@ pub struct Services {
     /// any re-mark that does not re-qualify. In-memory only, like the
     /// parent set.
     advisory_pending_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
-    /// Ungrouped completion watches whose terminal wake is being delivered
-    /// RIGHT NOW by some delivery pass (intent-hq/intent#4367). Two passes
-    /// can settle the same child concurrently — the completion-delivery
-    /// loop handling the live `agent:idle`, and the worker-exit
-    /// `redeliver_completion_after_queue_mutation` synthesizing the same
-    /// completion off a stale interim-skip marker — and each reads the
-    /// watch as still armed before either retires it. The stable wake id
-    /// does not close that window (a direct-send wake is not in the queue
-    /// and not yet persisted while its turn starts), so the parent received
-    /// two terminal wakes. The claim is taken before the "watch still
-    /// armed" check and released when the pass is done with the watch
-    /// (delivered + retired, or handed to the retry task); a pass that
-    /// finds the watch claimed skips it. The same entry shares the child's
-    /// consumed flipped-completion triggers between overlapping passes, so
-    /// a split snapshot never loses them (see [`ChildCompletionPasses`]).
-    /// In-memory only, like the other live delivery state.
+    /// The completion delivery passes in flight per child
+    /// (intent-hq/intent#4367) and what overlapping passes share: the
+    /// child's consumed flipped-completion triggers, so a split snapshot
+    /// never loses them (see [`ChildCompletionPasses`]). Not a gate: which
+    /// pass delivers an ungrouped watch is decided by the watch's delivery
+    /// claim, a stored lease that orders the passes of this process and of
+    /// every other process alike. In-memory only, like the other live
+    /// delivery state.
     completion_deliveries_in_flight: Arc<Mutex<HashMap<AgentId, ChildCompletionPasses>>>,
     /// Process-local mirror of the persisted `advisory_wake_delivery`
     /// once-per-period markers: `(parent, child)` pairs whose monitoring-idle
@@ -1902,6 +1897,7 @@ impl Services {
             draining_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            delivery_guards: Arc::default(),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
             desktop: Arc::new(desktop::Runtime::default()),
@@ -1926,7 +1922,6 @@ impl Services {
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
             group_persist_lane: Arc::new(OnceLock::new()),
-            completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             delivery_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             store_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             settings_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
@@ -3338,6 +3333,30 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_claim_park = Some(park);
+        self
+    }
+
+    /// Test seam: park a parent wake send between its idempotency probe and
+    /// the wake write, so a test can let the delivery claim lapse there.
+    /// Test seam: park a guarded enqueue between its in-memory insert and
+    /// its guarded queue write.
+    /// Test seam: park a strict watch registration between its lookups and
+    /// its guarded insert.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_watch_registration_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.registration_park.set(park);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_guarded_enqueue_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.enqueue_park.set(park);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_completion_send_park(self, park: Arc<CompletionClassifyPark>) -> Self {
+        let _ = self.delivery_guards.send_park.set(park);
         self
     }
 
@@ -8894,55 +8913,22 @@ impl Services {
             .expect("completion delivery claim registry poisoned");
         if let Some(entry) = registry.get_mut(child_id) {
             entry.passes = entry.passes.saturating_sub(1);
-            if entry.passes == 0 && entry.claimed_watches.is_empty() {
+            if entry.passes == 0 {
                 registry.remove(child_id);
             }
         }
-    }
-
-    /// Claim the ungrouped watch `watch_id` of `child_id` for terminal
-    /// delivery (intent-hq/intent#4367). `None` when another delivery pass
-    /// already holds it — the caller skips the watch: the owning pass
-    /// either delivers + retires it or hands it to the stable-id retry
-    /// task, so a skipped concurrent pass never strands the watch. The
-    /// returned guard releases the claim on drop.
-    fn claim_watch_delivery(
-        &self,
-        child_id: &AgentId,
-        watch_id: &str,
-    ) -> Option<WatchDeliveryClaim<'_>> {
-        self.completion_deliveries_in_flight
-            .lock()
-            .expect("completion delivery claim registry poisoned")
-            .entry(child_id.clone())
-            .or_default()
-            .claimed_watches
-            .insert(watch_id.to_string())
-            .then(|| WatchDeliveryClaim {
-                services: self,
-                child: child_id.clone(),
-                watch_id: watch_id.to_string(),
-            })
     }
 
     /// Releases a delivery claim (a watch's or group's lease) whose delivery
     /// ended without settling it, so the retry, here or in another process,
     /// can claim it at once. Best effort: a failed release lapses by the
     /// claim's TTL.
-    async fn release_delivery_claim(&self, claim: lease_keeper::LeaseKeeper) {
-        Box::pin(claim.release(&self.store)).await;
-    }
-
-    fn release_watch_delivery(&self, child_id: &AgentId, watch_id: &str) {
-        let mut registry = self
-            .completion_deliveries_in_flight
-            .lock()
-            .expect("completion delivery claim registry poisoned");
-        if let Some(entry) = registry.get_mut(child_id) {
-            entry.claimed_watches.remove(watch_id);
-            if entry.passes == 0 && entry.claimed_watches.is_empty() {
-                registry.remove(child_id);
-            }
+    async fn release_delivery_claim(&self, claim: Arc<lease_keeper::LeaseKeeper>) {
+        match Arc::try_unwrap(claim) {
+            Ok(claim) => Box::pin(claim.release(&self.store)).await,
+            // Still shared (a send or settlement that did not hand it back):
+            // it lapses by its TTL.
+            Err(shared) => drop(shared),
         }
     }
 
@@ -10615,56 +10601,36 @@ impl Services {
                     continue;
                 }
             }
-            // intent-hq/intent#4367: the live `agent:idle` pass and the
-            // worker-exit synthesized redelivery can settle the same child
-            // concurrently; without a claim both read the watch as armed
-            // below (retirement only lands after the durable send) and the
-            // parent gets two terminal wakes. Claim BEFORE the armed check
-            // so the loser skips; the guard releases on every exit of this
-            // iteration (delivered, retried, or unwound).
-            let Some(_claim) = self.claim_watch_delivery(child_id, &watch.id) else {
-                tracing::debug!(
-                    child = %child_id.0,
-                    parent = %watch.parent_agent_id.0,
-                    watch = %watch.id,
-                    "terminal delivery already in flight on a concurrent pass, skipping"
-                );
-                continue;
-            };
-            if !self
-                .find_watches_for_child(child_id)
-                .iter()
-                .any(|current| current.id == watch.id)
-            {
-                tracing::debug!(
-                    child = %child_id.0,
-                    parent = %watch.parent_agent_id.0,
-                    "watch already removed, skipping terminal delivery"
-                );
-                continue;
-            }
-            // The in-process claim above orders passes of THIS process; the
-            // delivery claim (a lease on the watch) orders processes: another
-            // daemon that rehydrated the same watch, or one still delivering
-            // after a tenant takeover. It is kept (renewed) until the watch
-            // retires, which fences on it, or a failed delivery below
-            // releases it for the retry. A holder that crashed leaves it to
-            // lapse after its TTL.
+            // The delivery claim (a lease on the watch) orders every pass
+            // over this watch, in this process and across processes: the
+            // live `agent:idle` pass and the worker-exit synthesized
+            // redelivery settling the same child concurrently
+            // (intent-hq/intent#4367), another daemon that rehydrated the
+            // same watch, or one still delivering after a tenant takeover.
+            // A lease is not re-entrant, so a second pass of this process
+            // loses it as another process would. It is taken BEFORE the
+            // armed check (retirement only lands after the durable send, so
+            // two passes would both read the watch as armed), kept
+            // (renewed) until the watch retires, which fences on it, or a
+            // failed delivery below releases it for the retry. A holder that
+            // crashed leaves it to lapse after its TTL.
             let claim = match self
                 .store
                 .claim_completion_watch(&watch.id, DELIVERY_CLAIM_TTL)
                 .await
             {
-                Ok(Some(claim)) => claim,
+                // Shared with the wake send, whose durable write guards it.
+                Ok(Some(claim)) => Arc::new(claim),
                 Ok(None) => {
-                    // Another holder delivers, or crashed: retry until it
-                    // retired the watch (the retry then finds the delivery
-                    // marker or the stable wake id) or its claim lapsed.
+                    // Another pass or holder delivers, or crashed: retry
+                    // until it retired the watch (the retry then finds it
+                    // gone, the delivery marker or the stable wake id) or
+                    // its claim lapsed.
                     tracing::info!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         watch = %watch.id,
-                        "terminal delivery claimed by another holder; retry scheduled"
+                        "terminal delivery claimed by another pass or holder; retry scheduled"
                     );
                     ungrouped_delivery_failed = true;
                     self.schedule_completion_delivery_retry(
@@ -10690,6 +10656,19 @@ impl Services {
                     continue;
                 }
             };
+            if !self
+                .find_watches_for_child(child_id)
+                .iter()
+                .any(|current| current.id == watch.id)
+            {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "watch already removed, skipping terminal delivery"
+                );
+                self.release_delivery_claim(claim).await;
+                continue;
+            }
             // Test seam: park in the claim→send window so a test can run a
             // concurrent delivery pass for the same child while this one
             // holds the claim.
@@ -10802,12 +10781,13 @@ impl Services {
                 &stamped_triggers,
             );
             if let Err(e) = self
-                .deliver_parent_wake_durable(
+                .deliver_parent_wake_claimed(
                     &parent_ws,
                     watch.parent_agent_id.clone(),
                     wake,
                     Some(metadata),
                     format!("completion-wake:{}", watch.id),
+                    &claim,
                 )
                 .await
             {
@@ -10831,6 +10811,9 @@ impl Services {
                     self.release_delivery_claim(claim).await;
                     continue;
                 }
+                // A lost claim (`LeaseLost`) wrote nothing either: the
+                // retry claims anew, and its probe finds the wake if the
+                // claim's next holder delivered it.
                 tracing::warn!(
                     error = %e,
                     parent = %watch.parent_agent_id.0,
@@ -11185,7 +11168,9 @@ impl Services {
             .claim_delegation_group(group_id, DELIVERY_CLAIM_TTL)
             .await
         {
-            Ok(Some(claim)) => claim,
+            // Shared with the wake send and the settlement lane, which both
+            // guard it.
+            Ok(Some(claim)) => Arc::new(claim),
             Ok(None) => {
                 // Another holder delivers, or crashed: retry until it
                 // settled the group (the retry's send then finds the stable
@@ -11310,12 +11295,13 @@ impl Services {
             merge_held_report_metadata(&mut metadata, entry.message_metadata.as_ref());
         }
         if let Err(e) = self
-            .deliver_parent_wake_durable(
+            .deliver_parent_wake_claimed(
                 workspace_id,
                 group.parent_agent_id.clone(),
                 wake,
                 Some(metadata),
                 format!("completion-group-wake:{group_id}"),
+                &claim,
             )
             .await
         {
@@ -11366,7 +11352,6 @@ impl Services {
         }
         // The settlement runs on the group persistence lane, which shares
         // the claim until it acked.
-        let claim = Arc::new(claim);
         let settled = self
             .settle_delegation_group_persisted(group_id, &failed_children, Arc::clone(&claim))
             .await;
@@ -11379,12 +11364,7 @@ impl Services {
             );
             // Also a lost claim (`LeaseLost`): another holder may be
             // delivering; the retry converges on the stable wake id.
-            match Arc::try_unwrap(claim) {
-                Ok(claim) => self.release_delivery_claim(claim).await,
-                // Still shared (the lane did not hand it back): it lapses
-                // by its TTL.
-                Err(shared) => drop(shared),
-            }
+            self.release_delivery_claim(claim).await;
             self.release_group_delivery(group_id);
             self.schedule_completion_group_delivery_retry(group_id.to_string());
             return;
@@ -11435,6 +11415,7 @@ impl Services {
             content,
             message_metadata,
             None,
+            None,
         )
         .await
     }
@@ -11456,7 +11437,38 @@ impl Services {
             content,
             message_metadata,
             Some(message_id),
+            None,
         )
+        .await
+    }
+
+    /// [`Services::deliver_parent_wake_durable`] for the holder of the
+    /// delivery claim `claim` (a watch's or group's lease): the write that
+    /// makes the wake durable (its transcript row, or its queue row when the
+    /// parent is busy) guards the claim's lease in its own transaction. A
+    /// claim lost before that write (lapsed, taken over) fails the send with
+    /// `Error::LeaseLost` and writes nothing, so a holder that lost its claim
+    /// between its held check and the send cannot wake the parent a second
+    /// time; the claim's next holder delivers.
+    pub(crate) async fn deliver_parent_wake_claimed(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        content: String,
+        message_metadata: Option<serde_json::Value>,
+        message_id: String,
+        claim: &Arc<lease_keeper::LeaseKeeper>,
+    ) -> Result<serde_json::Value> {
+        // Boxed: the manager send is a large future, and the watch and
+        // group deliveries that await this one are deep already.
+        Box::pin(self.deliver_parent_wake_with_id(
+            workspace_id,
+            parent_agent_id,
+            content,
+            message_metadata,
+            Some(message_id),
+            Some(claim),
+        ))
         .await
     }
 
@@ -11467,6 +11479,7 @@ impl Services {
         content: String,
         message_metadata: Option<serde_json::Value>,
         message_id: Option<String>,
+        delivery_claim: Option<&Arc<lease_keeper::LeaseKeeper>>,
     ) -> Result<serde_json::Value> {
         if self.delivery_tasks.is_closed() {
             // A transient refusal keeps completion watches armed for restart;
@@ -11474,6 +11487,10 @@ impl Services {
             return Err(Error::Internal("daemon is shutting down".into()));
         }
         if let Some(id) = message_id.as_deref() {
+            // Another process may have queued this wake (a former holder of
+            // the delivery claim): read the stored queue too (a no-op where
+            // no other process writes it).
+            Box::pin(self.refresh_queue_from_store(&parent_agent_id)).await;
             // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
                 .queue_snapshot(&parent_agent_id)
@@ -11502,19 +11519,30 @@ impl Services {
                 }));
             }
         }
+        // Test seam: park after the idempotency probe, right before the
+        // wake is written, so a test can let the delivery claim lapse there.
+        if let Some(park) = self.delivery_guards.send_park.get() {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         if let Some(manager) = self.agent_manager() {
-            manager
-                .send_message(
+            // Boxed: the send is a large future, awaited deep inside the
+            // completion and group delivery passes.
+            Box::pin(
+                manager.send_message(
                     parent_agent_id,
                     workspace_id.clone(),
                     content,
                     message_id,
                     crate::agent_manager::TurnOptions {
                         message_metadata,
+                        delivery_claim: delivery_claim
+                            .map(|claim| crate::agent_manager::DeliveryClaim(Arc::clone(claim))),
                         ..Default::default()
                     },
-                )
-                .await
+                ),
+            )
+            .await
         } else {
             // The runtime send path already owns admission. Its store-only
             // counterpart must fence the actual destination before persisting.
@@ -11556,8 +11584,8 @@ impl Services {
                 intent_store::UsageMessageOrigin::Excluded
             };
             let message_id = message_id.unwrap_or_else(crate::agent_ops::new_message_id);
-            self.store
-                .append_agent_message_with_provenance(
+            if let Some(claim) = delivery_claim {
+                Box::pin(self.store.append_agent_message_guarded(
                     &parent_agent_id,
                     &message_id,
                     "user",
@@ -11565,8 +11593,22 @@ impl Services {
                     message_metadata.as_ref(),
                     &now_iso(),
                     origin,
-                )
+                    claim,
+                ))
                 .await?;
+            } else {
+                self.store
+                    .append_agent_message_with_provenance(
+                        &parent_agent_id,
+                        &message_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &now_iso(),
+                        origin,
+                    )
+                    .await?;
+            }
             self.invalidate_agent_list_cache(workspace_id);
             Ok(serde_json::json!({ "success": true, "queued": false }))
         }
