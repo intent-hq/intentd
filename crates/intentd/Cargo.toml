@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.11.305"
+version = "0.11.306"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
