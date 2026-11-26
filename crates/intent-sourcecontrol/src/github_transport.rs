@@ -1105,7 +1105,8 @@ mod tests {
                 .await
                 .is_err()
         });
-        let head = tokio::time::timeout(budget, async {
+        // Moving the listener in closes it after one tunnel, so retries are refused.
+        let head = tokio::time::timeout(budget, async move {
             let (mut stream, _) = proxy.accept().await.unwrap();
             let head = request(&mut stream).await.unwrap_or_default();
             let _ = stream
