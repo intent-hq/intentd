@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.303] - 2026-11-26
+
+### 🚀 Features
+
+- *(providers)* DeepSeek API key profiles for DeepSeek Harness ([#3804](https://github.com/intent-hq/intentd/pull/3804))
+
+### 🐛 Bug Fixes
+
+- Route the GitHub device-code sign-in through the proxy ([#3806](https://github.com/intent-hq/intentd/pull/3806))
+
+
 ## [0.11.302] - 2026-11-26
 
 ### 🚀 Features
