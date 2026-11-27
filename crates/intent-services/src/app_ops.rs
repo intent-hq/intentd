@@ -1125,31 +1125,49 @@ impl Services {
         let mut providers = Vec::new();
         for (provider_ref, display) in &refs {
             let is_profile = intent_providers::split_profile_ref(provider_ref).is_some();
-            let ready = if local {
-                crate::agent_ops::ensure_provider_available_checked(
-                    "app.complete",
-                    provider_ref,
-                    &settings.providers,
-                    !is_profile,
-                )
-            } else {
+            // A profile, and a Default with saved overrides, runs with its
+            // own overlay: the bare installation's sign-in verdict does not
+            // apply to it (as for agent creation).
+            let check_bare_verdict = !is_profile && !self.default_has_overrides(provider_ref);
+            let is_auggie = intent_providers::base_provider_id(provider_ref) == "auggie";
+            let method = "app.complete";
+            let ready = if !local {
                 crate::agent_ops::ensure_provider_enabled(
-                    "app.complete",
+                    method,
                     provider_ref,
                     settings.providers.enabled.as_ref(),
+                )
+            } else if is_auggie {
+                // The auggie print route resolves its CLI itself
+                // (`context.auggiePath` exclusively when set, else
+                // discovery), so its readiness is that resolution.
+                crate::agent_ops::ensure_provider_enabled(
+                    method,
+                    provider_ref,
+                    settings.providers.enabled.as_ref(),
+                )
+                .and_then(|()| {
+                    if check_bare_verdict {
+                        crate::agent_ops::ensure_provider_authenticated(
+                            method,
+                            provider_ref,
+                            crate::provider_auth::cached_auth_verdict(provider_ref),
+                        )
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| self.one_shot_auggie_bin().map(|_| ()))
+            } else {
+                crate::agent_ops::ensure_provider_available_checked(
+                    method,
+                    provider_ref,
+                    &settings.providers,
+                    check_bare_verdict,
                 )
             }
             .and_then(|()| {
                 self.ensure_provider_ref_selectable_in(provider_ref, &settings.providers)
-            })
-            .and_then(|()| {
-                // The auggie print route resolves its own CLI
-                // (`context.auggiePath`, else discovery): the same check.
-                if local && intent_providers::base_provider_id(provider_ref) == "auggie" {
-                    self.one_shot_auggie_bin().map(|_| ())
-                } else {
-                    Ok(())
-                }
             });
             let models: Vec<Value> = catalog
                 .cached_catalog_rows(provider_ref)

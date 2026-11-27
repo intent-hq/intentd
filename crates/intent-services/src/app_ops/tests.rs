@@ -1439,3 +1439,47 @@ async fn complete_times_out_on_a_provider_that_never_answers() {
     assert_eq!(app_error.rpc_code, -32603);
     assert_eq!(app_error.data_code(), "timeout");
 }
+
+/// Auggie readiness follows the print route's own CLI resolution: a valid
+/// `context.auggiePath` is runnable even when `providers.paths` names a
+/// missing binary.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn auggie_readiness_uses_the_print_route_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, app) = models_fx().await;
+    let cli = f.dir.path().join("custom-auggie");
+    std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    f.svc
+        .settings_registry()
+        .unwrap()
+        .apply(&[("context.auggiePath".into(), json!(cli.to_string_lossy()))])
+        .unwrap();
+    let listed = f.call_as(app, "app.models.list", json!({})).await.unwrap();
+    assert_eq!(row(&listed, "auggie")["available"], true, "{listed}");
+}
+
+/// A Default with saved overrides runs with its own credentials, so a
+/// signed-out bare installation does not make it unavailable; without
+/// overrides the bare verdict applies.
+#[intent_test_macros::daemon_test]
+async fn a_default_with_saved_overrides_ignores_the_bare_verdict() {
+    let (f, app) = models_fx().await;
+    crate::provider_auth::seed_auth_verdict_for_tests("codex", Some(false));
+    let listed = f
+        .call_as(app.clone(), "app.models.list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(row(&listed, "codex")["available"], false, "{listed}");
+    f.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "codex",
+            "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": "sk-test" }],
+        }))
+        .await
+        .unwrap();
+    let listed = f.call_as(app, "app.models.list", json!({})).await.unwrap();
+    crate::provider_auth::seed_auth_verdict_for_tests("codex", None);
+    assert_eq!(row(&listed, "codex")["available"], true, "{listed}");
+}
