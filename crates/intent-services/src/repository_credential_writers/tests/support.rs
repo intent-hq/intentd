@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use intent_core::{ExecutionScope, RepositoryProvider, RepositoryTarget};
 use intent_sourcecontrol::{GitlabDescriptor, GitlabInstance, SecretString};
-use tokio::sync::{Notify, Semaphore};
+pub use intentd_test_support::PausePoint;
 
 use crate::repository_credential_writers::*;
 use crate::repository_credentials::authority::{
@@ -15,29 +15,12 @@ use crate::repository_credentials::*;
 pub const INSTANCE: &str = "https://git.example:8443/forge";
 pub const PROJECT: &str = "team/nested/project";
 
-pub struct Pause {
-    pub entered: Notify,
-    pub release: Semaphore,
-}
-impl Pause {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: Semaphore::new(0),
-        })
-    }
-    pub async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-    }
-}
-
 #[derive(Default)]
 pub struct Secrets {
     pub value: Mutex<String>,
     pub writes: AtomicUsize,
     pub reads: Mutex<Vec<RepositorySecretRequest>>,
-    pub pause: Mutex<Option<Arc<Pause>>>,
+    pub pause: Mutex<Option<Arc<PausePoint>>>,
 }
 impl Secrets {
     pub fn persist(&self, value: &str) {
@@ -55,7 +38,7 @@ impl RepositorySecretReader for Secrets {
             let token = SecretString::from(self.value.lock().unwrap().clone());
             let pause = self.pause.lock().unwrap().take();
             if let Some(pause) = pause {
-                pause.wait().await;
+                pause.pause().await;
             }
             Ok(RepositorySecretSnapshot {
                 request: expected.clone(),

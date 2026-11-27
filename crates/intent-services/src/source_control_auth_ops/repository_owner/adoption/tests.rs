@@ -846,7 +846,7 @@ async fn late_pat_result_cannot_publish_after_a_settings_owner_begins() {
     }
     let current = f.directory.binding().unwrap_err();
     assert_eq!(current, RepositoryCredentialError::Unverified);
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(connect.await.unwrap().is_err());
     assert_eq!(f.directory.binding().unwrap_err(), current);
     assert_eq!(
@@ -918,7 +918,7 @@ async fn retired_account_proof_cannot_adopt_or_rewrite_the_stored_token() {
     let proof = tokio::spawn(async move { services.reconcile_gitlab_repository_binding().await });
     server.entered().await;
     f.directory.retire().unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(proof.await.unwrap().is_err());
     assert_eq!(
         f.directory.binding().unwrap_err(),
@@ -930,11 +930,11 @@ async fn retired_account_proof_cannot_adopt_or_rewrite_the_stored_token() {
     );
 }
 
-struct WritePause(Arc<(Mutex<bool>, std::sync::Condvar)>);
+/// Holds every settings write at the gate's write probe until dropped.
+struct WritePause(Arc<intentd_test_support::PausePoint>);
 impl Drop for WritePause {
     fn drop(&mut self) {
-        *self.0 .0.lock().unwrap() = true;
-        self.0 .1.notify_all();
+        self.0.open();
     }
 }
 
@@ -946,19 +946,13 @@ async fn abandoned_settings_write_retains_original_gate_and_leaves_unknown_settl
         .reconcile_gitlab_repository_binding()
         .await
         .unwrap();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let pause = WritePause(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
-    let hit = entered.clone();
+    let pause = WritePause(intentd_test_support::PausePoint::new(
+        "settings write probe",
+    ));
     let held = pause.0.clone();
     f.services
         .gitlab_credential_gate
-        .set_write_probe(Arc::new(move || {
-            hit.notify_one();
-            let mut released = held.0.lock().unwrap();
-            while !*released {
-                released = held.1.wait(released).unwrap();
-            }
-        }));
+        .set_write_probe(Arc::new(move || held.pause_blocking()));
     let svc = f.services.clone();
     let task = tokio::spawn(async move {
         let guard = svc.gitlab_credential_gate.lock().await;
@@ -972,12 +966,7 @@ async fn abandoned_settings_write_retains_original_gate_and_leaves_unknown_settl
             .update_secrets(&changes)
             .await
     });
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-        entered.notified(),
-    )
-    .await
-    .unwrap();
+    pause.0.wait_reached().await;
     assert_eq!(
         f.directory.binding().unwrap_err(),
         RepositoryCredentialError::Mutating
@@ -1082,7 +1071,7 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
         .directory
         .record_backoff(ticket.dispatch_stamp(), Instant::now())
         .unwrap());
-    server.control.release.notify_one();
+    server.control.hold.release();
     refresh.await.unwrap();
     assert_eq!(f.directory.binding().unwrap(), binding);
     assert!(!f
@@ -1408,14 +1397,14 @@ async fn prepared_connect_refuses_stale_settings_before_any_secret_write() {
         Some("pat-second".into()),
     );
     tokio::pin!(call);
-    tokio::select! { result = &mut call => panic!("expected held original preflight: {result:?}"), () = server.control.entered.notified() => {} }
+    tokio::select! { result = &mut call => panic!("expected held original preflight: {result:?}"), () = server.control.hold.wait_reached() => {} }
     f.services
         .settings_update(
             json!([{"path":"sourceControl.gitlab.oauthClientId","value":"new-client"}]),
         )
         .await
         .unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(call.await.is_err());
     assert_eq!(
         std::fs::read(f.services.gitlab_secret_store.path()).unwrap(),
@@ -1601,7 +1590,7 @@ async fn checkout_late_pat_cannot_publish_after_same_host_prefix_settings_change
     tokio::pin!(connect);
     tokio::select! { result = &mut connect => panic!("expected pending validation: {result:?}"), () = server.entered() => {} }
     f.services.settings_update(json!([{"path":"sourceControl.gitlab.instanceBaseUrl","value":"https://gitlab.test:8443/Other"}])).await.unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(connect.await.is_err());
     assert_eq!(
         std::fs::read(f.services.gitlab_secret_store.path()).unwrap(),
@@ -1635,7 +1624,7 @@ async fn checkout_device_start_and_cancel_keep_full_instance_identity() {
         f.services.gitlab_cancel_auth(&first).await.unwrap()["cancelled"],
         true
     );
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(start.await.is_err());
     assert!(f.services.gitlab_auth.lock().await.flow.is_none());
     assert_eq!(

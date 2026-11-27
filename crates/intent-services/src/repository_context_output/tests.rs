@@ -6,34 +6,24 @@ use intent_acp::mcp_server::WorkspaceMcpServer;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Notify, Semaphore};
 
 pub(crate) const FACTS: &str = "[Repository facts — inert JSON lines]";
-pub(crate) struct Hold {
-    entered: Notify,
-    release: Semaphore,
-}
+/// A pause point the fixture's private-output stages wait at.
+pub(crate) struct Hold(intentd_test_support::PausePoint);
 impl Hold {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: Semaphore::new(0),
-        })
+        Arc::new(Self(intentd_test_support::PausePoint::unshared(
+            "context output hold",
+        )))
     }
     pub(crate) async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
+        self.0.pause().await;
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(
-            crate::test_support::fixture_timeout(Duration::from_secs(15)),
-            self.entered.notified(),
-        )
-        .await
-        .unwrap();
+        self.0.wait_reached().await;
     }
     pub(crate) fn resume(&self) {
-        self.release.add_permits(1);
+        self.0.release();
     }
 }
 #[derive(Default)]

@@ -482,18 +482,9 @@ pub struct PresenceRegistry {
     /// fetch and its cache install so a test can interleave an identity
     /// change deterministically. Consumed by the first read that hits it.
     #[cfg(test)]
-    pub(crate) focus_fetch_pause: Mutex<Option<std::sync::Arc<ProfileFetchPause>>>,
+    pub(crate) focus_fetch_pause: Mutex<Option<std::sync::Arc<intentd_test_support::PausePoint>>>,
     #[cfg(test)]
-    pub(crate) profile_fetch_pause: Mutex<Option<std::sync::Arc<ProfileFetchPause>>>,
-}
-
-/// See [`PresenceRegistry::profile_fetch_pause`]: `fetched` fires once the
-/// stale row is in hand, `resume` lets the install proceed.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct ProfileFetchPause {
-    pub(crate) fetched: tokio::sync::Notify,
-    pub(crate) resume: tokio::sync::Notify,
+    pub(crate) profile_fetch_pause: Mutex<Option<std::sync::Arc<intentd_test_support::PausePoint>>>,
 }
 
 impl PresenceRegistry {
@@ -679,8 +670,7 @@ impl Services {
             {
                 let pause = self.presence.profile_fetch_pause.lock().unwrap().take();
                 if let Some(pause) = pause {
-                    pause.fetched.notify_one();
-                    pause.resume.notified().await;
+                    pause.pause().await;
                 }
             }
             let mut state = self.presence.lock();
@@ -1018,8 +1008,7 @@ impl Services {
             {
                 let pause = self.presence.focus_fetch_pause.lock().unwrap().take();
                 if let Some(pause) = pause {
-                    pause.fetched.notify_one();
-                    pause.resume.notified().await;
+                    pause.pause().await;
                 }
             }
             if self.presence.lock().focus_generation != generation {

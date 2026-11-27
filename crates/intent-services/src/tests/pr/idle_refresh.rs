@@ -125,12 +125,12 @@ async fn idle_refresh_bursts_are_coalesced() {
         let ws = ws.clone();
         tokio::spawn(async move { svc.refresh_prs_on_agent_idle(&ws).await })
     };
-    park.entered.notified().await;
+    park.pause.wait_reached().await;
     // Several agents in the workspace finish while the refresh is running.
     for _ in 0..4 {
         svc.refresh_prs_on_agent_idle(&ws).await;
     }
-    park.release.notify_one();
+    park.pause.release();
     first.await.unwrap();
     for _ in 0..4 {
         svc.refresh_prs_on_agent_idle(&ws).await;
@@ -309,7 +309,7 @@ async fn shutdown_drains_an_in_flight_idle_refresh() {
     publish_idle(&bus, &ws_id, "agent-a").await;
     tokio::time::timeout(
         intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
-        park.entered.notified(),
+        park.pause.wait_reached(),
     )
     .await
     .expect("the workspace refresh reached the forge");
@@ -330,7 +330,7 @@ async fn shutdown_drains_an_in_flight_idle_refresh() {
         .is_err(),
         "shutdown waits for the parked refresh"
     );
-    park.release.notify_one();
+    park.pause.release();
     tokio::time::timeout(
         intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
         shutdown,

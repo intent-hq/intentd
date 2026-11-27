@@ -15,13 +15,12 @@ use intent_core::{
     ExecutionScope, RepositoryProvider, RepositoryResourceKind, RepositoryTarget, ReviewTarget,
 };
 use intent_sourcecontrol::{error::ProviderFailureKind, Error as ScError, ProviderAvailability};
-use intentd_test_support::test_timeout;
+use intentd_test_support::{test_timeout, PausePoint};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Notify;
 use tokio::time::timeout;
 
 const BUDGET: Duration = Duration::from_secs(5);
@@ -55,14 +54,23 @@ impl RepositoryAuthorityFence for InjectedFence {
     }
 }
 
-#[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
     next_pages: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
-    entered: Notify,
-    release: Notify,
+    hold: PausePoint,
     calls: Mutex<Vec<String>>,
+}
+impl Default for Replies {
+    fn default() -> Self {
+        Self {
+            statuses: Mutex::default(),
+            next_pages: Mutex::default(),
+            pause: Mutex::default(),
+            hold: PausePoint::unshared("held provider reply"),
+            calls: Mutex::default(),
+        }
+    }
 }
 struct ReadServer {
     fixture: Server,
@@ -71,7 +79,7 @@ struct ReadServer {
 }
 impl Drop for ReadServer {
     fn drop(&mut self) {
-        self.replies.release.notify_waiters();
+        self.replies.hold.release();
         self.task.abort();
     }
 }
@@ -158,8 +166,7 @@ impl ReadServer {
                         }
                     };
                     if pause {
-                        control.entered.notify_one();
-                        control.release.notified().await;
+                        control.hold.pause().await;
                     }
                     let body=if path.starts_with(&format!("{PROJECT}/merge_requests?")) || path.starts_with(&format!("{PROJECT}/issues?")) { json!([]) }
                     else if path==PROJECT {
@@ -210,12 +217,12 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     async fn entered(&self) {
-        timeout(test_timeout(BUDGET), self.replies.entered.notified())
+        timeout(test_timeout(BUDGET), self.replies.hold.wait_reached())
             .await
             .unwrap();
     }
     fn resume(&self) {
-        self.replies.release.notify_one();
+        self.replies.hold.release();
     }
     fn count(&self) -> usize {
         self.replies.calls.lock().unwrap().len()
@@ -526,7 +533,7 @@ async fn rejection_during_owned_refresh_is_not_an_obsolete_token_claim() {
     let (result, _, a) = call.await.unwrap().into_parts();
     denial(&result, ProviderFailureKind::CredentialRejected, 401);
     assert_eq!(applied(&e, &a, &t).unwrap(), D::NotApplied);
-    s.fixture.control.release.notify_one();
+    s.fixture.control.hold.release();
     refresh.await;
     e.check().unwrap();
 }
@@ -1249,7 +1256,7 @@ async fn batch_admitted_output_survives_later_actual_pat_replacement() {
         Ok(())
     })
     .unwrap();
-    s.fixture.control.release.notify_one();
+    s.fixture.control.hold.release();
     replace.await.unwrap().unwrap();
     assert!(transferred.is_some());
     batch_refuses(&[&e], Error::Retired);
@@ -1400,15 +1407,12 @@ fn settled_error(result: Result<RepositorySettledConnection>, expected: Error) {
 }
 
 struct SettledWritePause {
-    entered: Arc<Notify>,
-    released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    pause: Arc<PausePoint>,
 }
 impl SettledWritePause {
     fn install(service: &crate::Services, call: usize) -> Self {
-        let entered = Arc::new(Notify::new());
-        let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let signal = entered.clone();
-        let held = released.clone();
+        let pause = PausePoint::new(format!("settled GitLab write {call}"));
+        let held = pause.clone();
         let calls = AtomicUsize::new(0);
         service
             .gitlab_credential_gate
@@ -1416,23 +1420,15 @@ impl SettledWritePause {
                 if calls.fetch_add(1, Ordering::SeqCst) + 1 != call {
                     return;
                 }
-                signal.notify_one();
-                let (lock, ready) = &*held;
-                let mut released = lock.lock().unwrap();
-                while !*released {
-                    released = ready.wait(released).unwrap();
-                }
+                held.pause_blocking();
             }));
-        Self { entered, released }
+        Self { pause }
     }
     async fn entered(&self) {
-        timeout(test_timeout(BUDGET), self.entered.notified())
-            .await
-            .unwrap();
+        self.pause.wait_reached().await;
     }
     fn resume(&self) {
-        *self.released.0.lock().unwrap() = true;
-        self.released.1.notify_all();
+        self.pause.open();
     }
 }
 impl Drop for SettledWritePause {
@@ -1591,7 +1587,7 @@ async fn settled_pat_reservation_stays_ready_then_actual_effect_retires_old_fact
     });
     s.entered().await;
     assert_eq!(original.reobserve().unwrap().selected(), &selected);
-    s.control.release.notify_one();
+    s.control.hold.release();
     pause.entered().await;
     settled_error(original.reobserve(), Error::Retired);
     settled_error(
@@ -1639,7 +1635,7 @@ async fn settled_refresh_accepts_new_actual_proof_without_mutating_old_observati
         f.auth.service.gitlab_repository_settled_connection(),
         Error::Mutating,
     );
-    s.fixture.control.release.notify_one();
+    s.fixture.control.hold.release();
     timeout(test_timeout(BUDGET), refresh)
         .await
         .unwrap()
@@ -2314,7 +2310,7 @@ async fn facts_reservation_then_actual_pat_replace_preserves_old_observation() {
     assert_eq!(reserved.lifecycle(), Lifecycle::Ready);
     assert_eq!(reserved.mutation(), None);
     assert_eq!(reserved.settled().unwrap().selected(), &selected);
-    s.control.release.notify_one();
+    s.control.hold.release();
     pause.entered().await;
     let begun = connection_facts(&f.service);
     assert_eq!(begun.lifecycle(), Lifecycle::Mutating);
@@ -2358,7 +2354,7 @@ async fn facts_oauth_refresh_reports_actual_mutation_and_new_settled_revision() 
     assert_eq!(pending.mutation(), Some(MutationKind::Refresh));
     assert_eq!(pending.lifecycle(), Lifecycle::Mutating);
     unready(&pending, Error::Mutating);
-    s.fixture.control.release.notify_one();
+    s.fixture.control.hold.release();
     timeout(test_timeout(BUDGET), refresh)
         .await
         .unwrap()
@@ -3240,7 +3236,7 @@ async fn optional_output_real_preflight_and_replacement_select_original_or_omit(
     assert!(preflight.preflight_pending());
     // This ownership transfer is admitted before the original writer's effect.
     assert!(optional_choice(&[&good], Some(&preflight)).unwrap());
-    s.fixture.control.release.notify_one();
+    s.fixture.control.hold.release();
     writer.await.unwrap().unwrap();
     assert_eq!(
         optional_choice(&[&good], Some(&preflight)),

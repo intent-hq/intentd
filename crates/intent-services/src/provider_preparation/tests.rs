@@ -553,10 +553,10 @@ async fn foreground_cleanup_cancellation_keeps_preparation_fenced_until_reaped()
         crate::agent_manager::tests::held_preparation_foreground(dir.path()).await;
     wait_for(|| dir.path().join("foreground-started").exists()).await;
     let manager = Arc::new(manager);
-    let (entered, release) = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
+    let commit = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
     let owner = manager.clone();
     let stop = tokio::spawn(async move { owner.stop(&id).await });
-    crate::periodic_shutdown_tests::entered(entered).await;
+    crate::periodic_shutdown_tests::entered(&commit).await;
     stop.abort();
     let _ = stop.await;
     let root = dir.path().to_owned();
@@ -565,7 +565,7 @@ async fn foreground_cleanup_cancellation_keeps_preparation_fenced_until_reaped()
     queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
     wait_for(|| queue.state.lock().unwrap().pending.is_empty()).await;
     let overlapped = dir.path().join("pi/started").exists();
-    release.send(()).unwrap();
+    commit.release();
     manager.shutdown().await;
     assert_eq!(
         COORDINATION["pi"]
@@ -603,20 +603,20 @@ async fn failed_foreground_initialize_retains_guard_until_cleanup_finishes() {
     let (manager, id, services) =
         crate::agent_manager::tests::held_preparation_foreground(dir.path()).await;
     wait_for(|| dir.path().join("foreground-started").exists()).await;
-    let (entered, release) = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
+    let commit = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
     // The foreground fixture exits unsuccessfully as soon as it reads initialize.
     assert!(manager
         .start_session(&id, dir.path().to_owned(), find_provider("pi").unwrap())
         .await
         .is_err());
-    crate::periodic_shutdown_tests::entered(entered).await;
+    crate::periodic_shutdown_tests::entered(&commit).await;
     let root = dir.path().to_owned();
     let selector: Arc<Selector> = Arc::new(move |id, _| Some(fake_job(&root, id, None, false)));
     let queue = Preparation::default();
     queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
     wait_for(|| queue.state.lock().unwrap().pending.is_empty()).await;
     let overlapped = dir.path().join("pi/started").exists();
-    release.send(()).unwrap();
+    commit.release();
     manager.shutdown().await;
     assert_eq!(
         COORDINATION["pi"]

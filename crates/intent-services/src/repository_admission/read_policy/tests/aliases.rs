@@ -48,17 +48,17 @@ async fn public_and_raw_aliases_share_original_qualified_values_cache_and_reques
         let f = ActualRead::new(&http).await;
         no_spill(&f);
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::HostPromise, true, gate.clone()));
         let endpoint = controlled(&f, control.clone());
         let code = format!(
             "const first=await ws.{first}.snapshot(4); return JSON.stringify({{same:ws.pr===ws.mr, values:[first, await ws.pr.snapshot(4), await host({{method:'mr.snapshot',args:{{prNumber:4}}}}), await host({{method:'pr.snapshot',args:{{prNumber:4}}}})]}});"
         );
         let task = tokio::spawn(async move { run(&endpoint, &code).await });
-        gate.reached().await;
+        gate.wait_reached().await;
         let requests_after_first = http.count();
         assert!(requests_after_first > 0);
-        gate.release.add_permits(1);
+        gate.release();
         let value = json_result(&task.await.unwrap());
         assert_eq!(value["same"], true);
         let values = value["values"].as_array().unwrap();
@@ -248,17 +248,17 @@ async fn both_aliases_keep_host_and_direct_transfer_retirement_order() {
             let http = ReadServer::new().await;
             let f = ActualRead::new(&http).await;
             let control = Arc::new(Control::default());
-            let gate = Hold::new();
+            let gate = PausePoint::new("policy admission");
             *control.hold.lock().unwrap() = Some((boundary, after, gate.clone()));
             let endpoint = controlled(&f, control.clone());
             let code = format!(
                 "try {{ await ws.{namespace}.snapshot(4); }} catch(e) {{}} return 'after-read';"
             );
             let task = tokio::spawn(async move { run(&endpoint, &code).await });
-            gate.reached().await;
+            gate.wait_reached().await;
             let count = http.count();
             f.owner.interrupt_requests();
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             if boundary == Boundary::DirectResponse && after {
                 assert!(
@@ -293,12 +293,12 @@ async fn aliases_cannot_discard_credential_or_source_obligations_at_direct_outpu
             let http = ReadServer::new().await;
             let f = ActualRead::new(&http).await;
             let control = Arc::new(Control::default());
-            let gate = Hold::new();
+            let gate = PausePoint::new("policy admission");
             *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
             let endpoint = controlled(&f, control.clone());
             let code = format!("await ws.workspace.setStatusMessage('completed ordinary effect'); await ws.{namespace}.snapshot(4); {suffix}");
             let task = tokio::spawn(async move { run(&endpoint, &code).await });
-            gate.reached().await;
+            gate.wait_reached().await;
             let count = http.count();
             if change == "source" {
                 f.git.git(
@@ -320,7 +320,7 @@ async fn aliases_cannot_discard_credential_or_source_obligations_at_direct_outpu
                 .await
                 .unwrap();
             }
-            gate.release.add_permits(1);
+            gate.release();
             delivery_refused(&task.await.unwrap());
             assert_eq!(http.count(), count);
             let workspace = f
@@ -351,7 +351,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             let http = ReadServer::new().await;
             let f = ActualRead::new(&http).await;
             let control = Arc::new(Control::default());
-            let gate = Hold::new();
+            let gate = PausePoint::new("policy admission");
             *control.hold.lock().unwrap() = Some((Boundary::TcpResponse, after, gate.clone()));
             let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(controlled(
                 &f,
@@ -366,10 +366,10 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
                 .write_all(format!("{request}\n").as_bytes())
                 .await
                 .unwrap();
-            gate.reached().await;
+            gate.wait_reached().await;
             let count = http.count();
             f.owner.interrupt_requests();
-            gate.release.add_permits(1);
+            gate.release();
             let mut line = String::new();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -466,7 +466,7 @@ async fn partial_quota_is_identical_for_both_aliases_without_legacy_pause_or_fal
         no_spill(&f);
         http.status(&format!("{MR}/approvals"), 429);
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::HostPromise, true, gate.clone()));
         let endpoint = controlled(&f, control.clone());
         let code = format!(
@@ -478,12 +478,12 @@ async fn partial_quota_is_identical_for_both_aliases_without_legacy_pause_or_fal
             return JSON.stringify({{first,errors}});"
         );
         let task = tokio::spawn(async move { run(&endpoint, &code).await });
-        gate.reached().await;
+        gate.wait_reached().await;
         let requests_after_first = http.count();
         // The MR, project policy and approvals request run; the quota observation
         // prevents the later discussions request from reaching HTTP.
         assert_eq!(requests_after_first, 3);
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         let value = json_result(&reply);
         let first = &value["first"];

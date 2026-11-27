@@ -325,8 +325,7 @@ async fn a_settings_update_that_lost_the_race_is_a_conflict_and_a_retry_lands() 
 #[derive(Clone)]
 struct StalledDocument {
     doc: MemoryDocument,
-    entered: Arc<std::sync::Barrier>,
-    release: Arc<std::sync::Barrier>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 
 impl SettingsDocumentStore for StalledDocument {
@@ -335,8 +334,7 @@ impl SettingsDocumentStore for StalledDocument {
     }
 
     fn compare_and_set(&self, expected: u64, text: &str) -> Result<SettingsWrite> {
-        self.entered.wait();
-        self.release.wait();
+        self.pause.pause_blocking();
         self.doc.compare_and_set(expected, text)
     }
 
@@ -353,8 +351,7 @@ async fn readers_and_the_follower_never_wait_on_an_in_flight_store_write() {
     let dir = crate::test_support::test_tempdir("settings-stalled-write");
     let stalled = StalledDocument {
         doc: MemoryDocument::default(),
-        entered: Arc::new(std::sync::Barrier::new(2)),
-        release: Arc::new(std::sync::Barrier::new(2)),
+        pause: intentd_test_support::PausePoint::new("settings compare-and-set"),
     };
     let registry = Arc::new(SettingsRegistry::load_from_store(Arc::new(stalled.clone())).unwrap());
     let store = Store::open(&dir.path().join("state.db")).await.unwrap();
@@ -366,7 +363,7 @@ async fn readers_and_the_follower_never_wait_on_an_in_flight_store_write() {
         let registry = registry.clone();
         std::thread::spawn(move || registry.apply(&set("git.autoCommit", json!(false))))
     };
-    stalled.entered.wait();
+    stalled.pause.wait_reached().await;
     // The write is inside its compare-and-set now.
     assert!(registry.write_in_flight());
     assert_eq!(registry.store_revision(), 0);
@@ -387,7 +384,7 @@ async fn readers_and_the_follower_never_wait_on_an_in_flight_store_write() {
         FollowOutcome::Current
     ));
 
-    stalled.release.wait();
+    stalled.pause.release();
     writer.join().unwrap().unwrap();
     assert!(!registry.write_in_flight());
     assert_eq!(registry.store_revision(), 1);

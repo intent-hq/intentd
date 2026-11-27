@@ -1609,12 +1609,10 @@ mod tests {
             raw.store(ACCOUNT, &serde_json::to_string(&saved).unwrap())
                 .unwrap();
             drop(entry);
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = intentd_test_support::PausePoint::new("held secret write");
             let backend = Arc::new(HeldRevoke {
                 store: raw.clone(),
-                entered: entered.clone(),
-                release: std::sync::Mutex::new(if disconnect { Some(held) } else { None }),
+                pause: std::sync::Mutex::new(disconnect.then(|| pause.clone())),
                 outcome: match outcome {
                     2 => 1,
                     3 => 2,
@@ -1633,13 +1631,10 @@ mod tests {
                 Duration::from_secs(60),
             );
             // Refresh uses the actual grant closure; disconnect uses the backend delete.
-            // Separate channels avoid moving the disconnect receiver into the refresh hook.
-            let (refresh_release, refresh_held) = std::sync::mpsc::channel();
             if !disconnect {
-                let signal = entered.clone();
+                let signal = pause.clone();
                 *secrets.before_gitlab_persistence.lock().unwrap() = Some(Box::new(move || {
-                    signal.notify_one();
-                    let _ = refresh_held.recv();
+                    signal.pause_blocking();
                     match outcome {
                         2 => Err(Error::Internal("controlled refresh write error".into())),
                         3 => panic!("controlled refresh backend panic"),
@@ -1674,7 +1669,7 @@ mod tests {
             });
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -1724,11 +1719,7 @@ mod tests {
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
-            if disconnect {
-                release.send(()).unwrap();
-            } else {
-                refresh_release.send(()).unwrap();
-            }
+            pause.release();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,
@@ -1809,8 +1800,7 @@ mod tests {
     struct HeldCredentialTail {
         store: FileSecretStore,
         key: &'static str,
-        entered: Arc<tokio::sync::Notify>,
-        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        pause: std::sync::Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
         outcome: u8,
     }
 
@@ -1823,10 +1813,9 @@ mod tests {
         }
         fn store(&self, key: &str, value: &str) -> Result<()> {
             if key == self.key {
-                let held = self.release.lock().unwrap().take();
+                let held = self.pause.lock().unwrap().take();
                 if let Some(held) = held {
-                    self.entered.notify_one();
-                    let _ = held.recv();
+                    held.pause_blocking();
                     match self.outcome {
                         2 => return Err(Error::Internal("controlled receipt write error".into())),
                         3 => panic!("controlled receipt backend panic"),
@@ -1873,8 +1862,7 @@ mod tests {
                 raw.store("identity.proof.77", &saved.generation).unwrap();
             }
             drop(entry);
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = intentd_test_support::PausePoint::new("held secret write");
             let secrets = crate::settings::AsyncSecretStore::with_timings(
                 Arc::new(HeldCredentialTail {
                     store: raw.clone(),
@@ -1883,8 +1871,7 @@ mod tests {
                     } else {
                         "identity.proof.77"
                     },
-                    entered: entered.clone(),
-                    release: std::sync::Mutex::new(Some(held)),
+                    pause: std::sync::Mutex::new(Some(pause.clone())),
                     outcome,
                 }),
                 Duration::from_secs(5),
@@ -2010,7 +1997,7 @@ mod tests {
             });
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -2064,7 +2051,7 @@ mod tests {
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
-            release.send(()).unwrap();
+            pause.release();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,
@@ -2142,14 +2129,12 @@ mod tests {
     }
 
     struct HeldGrantResult {
-        entered: Arc<tokio::sync::Notify>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        pause: Arc<intentd_test_support::PausePoint>,
     }
 
     impl Drop for HeldGrantResult {
         fn drop(&mut self) {
-            self.entered.notify_one();
-            let _ = self.release.lock().unwrap().recv();
+            self.pause.pause_blocking();
         }
     }
 
@@ -2280,11 +2265,9 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn collaboration_device_retains_late_grant_result_and_account() {
         let (tmp, service, bus, target, entry, server) = device_grant_fixture(false).await;
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (release, held) = std::sync::mpsc::channel();
+        let pause = intentd_test_support::PausePoint::new("held secret write");
         *entry.commit_test_lease.lock().unwrap() = Some(Arc::new(HeldGrantResult {
-            entered: entered.clone(),
-            release: std::sync::Mutex::new(held),
+            pause: pause.clone(),
         }));
         service
             .identity_connect(
@@ -2297,7 +2280,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
+            pause.wait_reached(),
         )
         .await
         .unwrap();
@@ -2312,7 +2295,7 @@ mod tests {
         // timing-guard: cross the legacy ten-second engine wait while its
         // completed physical write is held before returning the actual result.
         tokio::time::sleep(Duration::from_secs(11)).await;
-        release.send(()).unwrap();
+        pause.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             service.shutdown_store_writers(),
@@ -2369,8 +2352,7 @@ mod tests {
             drop(entry);
             let backend = Arc::new(HeldPat {
                 store: raw.clone(),
-                entered: Arc::new(tokio::sync::Notify::new()),
-                release: std::sync::Mutex::new(None),
+                pause: std::sync::Mutex::new(None),
                 arm_worker_failure: std::sync::Mutex::new(None),
                 outcome: 0,
             });
@@ -2381,13 +2363,11 @@ mod tests {
                 Duration::from_secs(60),
                 Duration::from_secs(60),
             );
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let signal = entered.clone();
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = intentd_test_support::PausePoint::new("held grant write");
+            let signal = pause.clone();
             let partial_store = raw.clone();
             let before: Box<dyn FnOnce() -> Result<()> + Send> = Box::new(move || {
-                signal.notify_one();
-                let _ = held.recv();
+                signal.pause_blocking();
                 match outcome {
                     1 => Err(Error::Internal("controlled grant prewrite error".into())),
                     2 => panic!("controlled grant backend panic"),
@@ -2438,7 +2418,7 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -2512,7 +2492,7 @@ mod tests {
             );
             assert!(service.settings_tasks.is_closed());
             assert!(!drain.is_finished());
-            release.send(()).unwrap();
+            pause.release();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,
@@ -3115,8 +3095,7 @@ mod tests {
 
     struct HeldPat {
         store: FileSecretStore,
-        entered: Arc<tokio::sync::Notify>,
-        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        pause: std::sync::Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
         arm_worker_failure: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
         outcome: u8,
     }
@@ -3127,10 +3106,9 @@ mod tests {
         }
         fn store(&self, key: &str, value: &str) -> Result<()> {
             if key == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
-                let held = self.release.lock().unwrap().take();
+                let held = self.pause.lock().unwrap().take();
                 if let Some(held) = held {
-                    self.entered.notify_one();
-                    let _ = held.recv();
+                    held.pause_blocking();
                     self.store.store(key, value)?;
                     match self.outcome {
                         1 => return Err(Error::Internal("controlled partial PAT write".into())),
@@ -3187,12 +3165,10 @@ mod tests {
                 raw.store(key, value).unwrap();
             }
             drop(entry);
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = intentd_test_support::PausePoint::new("held secret write");
             let backend = Arc::new(HeldPat {
                 store: raw.clone(),
-                entered: entered.clone(),
-                release: std::sync::Mutex::new(Some(held)),
+                pause: std::sync::Mutex::new(Some(pause.clone())),
                 arm_worker_failure: std::sync::Mutex::new(None),
                 outcome,
             });
@@ -3242,7 +3218,7 @@ mod tests {
             });
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -3298,7 +3274,7 @@ mod tests {
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
-            release.send(()).unwrap();
+            pause.release();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,
@@ -3345,8 +3321,7 @@ mod tests {
 
     struct HeldRevoke {
         store: FileSecretStore,
-        entered: Arc<tokio::sync::Notify>,
-        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        pause: std::sync::Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
         outcome: u8,
     }
 
@@ -3358,10 +3333,9 @@ mod tests {
             self.store.store(key, value)
         }
         fn delete(&self, key: &str) -> Result<()> {
-            let held = self.release.lock().unwrap().take();
+            let held = self.pause.lock().unwrap().take();
             if let Some(held) = held {
-                self.entered.notify_one();
-                let _ = held.recv();
+                held.pause_blocking();
                 match self.outcome {
                     1 => return Err(Error::InvalidParams("controlled revoke failure".into())),
                     2 => panic!("controlled revoke backend panic"),
@@ -3392,13 +3366,11 @@ mod tests {
                 raw.store(key, "old-private-value").unwrap();
             }
             drop(entry);
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = intentd_test_support::PausePoint::new("held secret write");
             let secrets = crate::settings::AsyncSecretStore::with_timings(
                 Arc::new(HeldRevoke {
                     store: raw.clone(),
-                    entered: entered.clone(),
-                    release: std::sync::Mutex::new(Some(held)),
+                    pause: std::sync::Mutex::new(Some(pause.clone())),
                     outcome,
                 }),
                 Duration::from_secs(5),
@@ -3436,7 +3408,7 @@ mod tests {
                 );
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -3493,7 +3465,7 @@ mod tests {
                 ))
                 .await
             );
-            release.send(()).unwrap();
+            pause.release();
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,

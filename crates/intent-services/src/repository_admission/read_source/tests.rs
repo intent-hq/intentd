@@ -1619,15 +1619,25 @@ async fn current_provider_denial_and_quota_never_become_successful_private_data(
         }
     }
 }
-#[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
     quota_headers: Mutex<HashMap<String, String>>,
     bodies: Mutex<HashMap<String, Value>>,
     pause: Mutex<Option<String>>,
-    entered: Notify,
-    release: Notify,
+    hold: intentd_test_support::PausePoint,
     calls: Mutex<Vec<String>>,
+}
+impl Default for Replies {
+    fn default() -> Self {
+        Self {
+            statuses: Mutex::default(),
+            quota_headers: Mutex::default(),
+            bodies: Mutex::default(),
+            pause: Mutex::default(),
+            hold: intentd_test_support::PausePoint::unshared("held provider reply"),
+            calls: Mutex::default(),
+        }
+    }
 }
 pub(crate) struct ReadServer {
     pub(crate) fixture: Server,
@@ -1636,7 +1646,7 @@ pub(crate) struct ReadServer {
 }
 impl Drop for ReadServer {
     fn drop(&mut self) {
-        self.replies.release.notify_waiters();
+        self.replies.hold.release();
         self.task.abort();
     }
 }
@@ -1744,8 +1754,7 @@ impl ReadServer {
                         }
                     };
                     if pause {
-                        control.entered.notify_one();
-                        control.release.notified().await;
+                        control.hold.pause().await;
                     }
                     let custom = control.bodies.lock().unwrap().get(&path).cloned();
                     let body=if let Some(custom) = custom { custom } else if path==PROJECT {
@@ -1801,12 +1810,12 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     pub(crate) async fn entered(&self) {
-        timeout(budget(), self.replies.entered.notified())
+        timeout(budget(), self.replies.hold.wait_reached())
             .await
             .unwrap();
     }
     pub(crate) fn resume(&self) {
-        self.replies.release.notify_one();
+        self.replies.hold.release();
     }
     pub(crate) fn count(&self) -> usize {
         self.replies.calls.lock().unwrap().len()

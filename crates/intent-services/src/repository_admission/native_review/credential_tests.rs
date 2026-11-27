@@ -5,7 +5,6 @@ use intent_core::FileSecretStore;
 use intent_sourcecontrol::{GitlabDescriptor, GitlabHost, GitlabInstance};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Default)]
 pub(super) struct Control {
     pub requests: Mutex<Vec<(String, String)>>,
     pub project: Mutex<Option<(u16, Value)>>,
@@ -14,12 +13,27 @@ pub(super) struct Control {
     pub posts: AtomicUsize,
     pub lost_post: AtomicBool,
     pub pause_post: AtomicBool,
-    pub post_entered: Notify,
-    pub post_release: Notify,
+    pub post_hold: intentd_test_support::PausePoint,
     pub malformed_post: AtomicBool,
     pub pause: Mutex<Option<String>>,
-    pub entered: Notify,
-    pub release: Notify,
+    pub hold: intentd_test_support::PausePoint,
+}
+impl Default for Control {
+    fn default() -> Self {
+        Self {
+            requests: Mutex::default(),
+            project: Mutex::default(),
+            reviews: Mutex::default(),
+            sha: Mutex::default(),
+            posts: AtomicUsize::default(),
+            lost_post: AtomicBool::default(),
+            pause_post: AtomicBool::default(),
+            post_hold: intentd_test_support::PausePoint::unshared("held review POST"),
+            malformed_post: AtomicBool::default(),
+            pause: Mutex::default(),
+            hold: intentd_test_support::PausePoint::unshared("held provider GET"),
+        }
+    }
 }
 pub(super) struct Server {
     pub host: GitlabHost,
@@ -75,7 +89,7 @@ impl Server {
                             c.requests.lock().unwrap().push((method.clone(),path.clone()));
                             assert!(header.contains("stored-pat"),"owned original token required");
                             let pause=c.pause.lock().unwrap().as_ref().is_some_and(|p|path.contains(p));
-                            if pause { c.pause.lock().unwrap().take(); c.entered.notify_one(); c.release.notified().await; }
+                            if pause { c.pause.lock().unwrap().take(); c.hold.pause().await; }
                             let route=path.split('?').next().unwrap();
                             let sha=c.sha.lock().unwrap().clone();
                             let (status,body)=if route=="/api/v4/user" {
@@ -91,7 +105,7 @@ impl Server {
                                 c.posts.fetch_add(1,Ordering::SeqCst);
                                 let review=review(&sha);
                                 c.reviews.lock().unwrap().push(review.clone());
-                                if c.pause_post.swap(false,Ordering::SeqCst) {c.post_entered.notify_one(); c.post_release.notified().await;}
+                                if c.pause_post.swap(false,Ordering::SeqCst) {c.post_hold.pause().await;}
                                 if c.lost_post.load(Ordering::SeqCst){return;}
                                 if c.malformed_post.load(Ordering::SeqCst){(201,json!({"unconfirmed":true}))}else{(201,review)}
                             } else if route.ends_with("/merge_requests") {

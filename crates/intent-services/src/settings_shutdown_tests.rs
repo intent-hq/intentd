@@ -1,5 +1,6 @@
 use super::*;
 use intent_core::{Caller, HostRole, PrincipalId, ServerControl, WorkspaceApi};
+use intentd_test_support::PausePoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 tokio::task_local! {
@@ -1684,8 +1685,7 @@ async fn wait_github_write_timeout(secrets: &AsyncSecretStore) {
 
 struct HeldGithubProvenance {
     raw: intent_core::FileSecretStore,
-    entered: tokio::sync::Notify,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pause: Arc<PausePoint>,
 }
 
 impl SecretStore for HeldGithubProvenance {
@@ -1694,8 +1694,7 @@ impl SecretStore for HeldGithubProvenance {
     }
     fn store(&self, account: &str, value: &str) -> Result<()> {
         if account == crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT {
-            self.entered.notify_one();
-            let _ = self.release.lock().unwrap().recv();
+            self.pause.pause_blocking();
         }
         self.raw.store(account, value)
     }
@@ -1710,11 +1709,10 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
     use std::task::Poll;
     let (dir, services, bus) = harness().await;
     let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
-    let (release_marker, marker_held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldGithubProvenance {
         raw: raw.clone(),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(marker_held),
+        pause: pause.clone(),
     });
     let services = services.with_secret_store(backend.clone());
     let (engine_entered, release_engine) = hold_github_write(&services.secrets, 0);
@@ -1751,7 +1749,7 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
     release_engine.send(()).unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -1780,7 +1778,7 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
             .unwrap(),
         None
     );
-    release_marker.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         drain,
@@ -2266,8 +2264,7 @@ async fn provisional_secret_is_not_executable_before_admission() {
 
 struct HeldBackend {
     inner: InMemorySecretStore,
-    entered: tokio::sync::Notify,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pause: Arc<PausePoint>,
 }
 
 struct HeldDirectBackend {
@@ -2276,8 +2273,7 @@ struct HeldDirectBackend {
     delete: bool,
     outcome: usize,
     calls: AtomicUsize,
-    entered: tokio::sync::Notify,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pause: Arc<PausePoint>,
 }
 
 impl HeldDirectBackend {
@@ -2286,8 +2282,7 @@ impl HeldDirectBackend {
             && delete == self.delete
             && self.calls.fetch_add(1, Ordering::SeqCst) == 0
         {
-            self.entered.notify_one();
-            let _ = self.release.lock().unwrap().recv();
+            self.pause.pause_blocking();
             match self.outcome {
                 1 => {
                     return Err(Error::InvalidParams(
@@ -2322,7 +2317,7 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
     use std::task::Poll;
     for github in [true, false] {
         let (dir, services, bus) = harness().await;
-        let (release, held) = std::sync::mpsc::channel();
+        let pause = PausePoint::new("held secret backend");
         let backend = Arc::new(HeldDirectBackend {
             inner: InMemorySecretStore::default(),
             account: if github {
@@ -2333,8 +2328,7 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
             delete: github,
             outcome: 0,
             calls: AtomicUsize::new(0),
-            entered: tokio::sync::Notify::new(),
-            release: Mutex::new(held),
+            pause: pause.clone(),
         });
         let marker = crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT;
         if github {
@@ -2364,7 +2358,7 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            backend.entered.notified(),
+            pause.wait_reached(),
         )
         .await
         .unwrap();
@@ -2393,7 +2387,7 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
         tokio::pin!(drain);
         assert!(poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-        release.send(()).unwrap();
+        pause.release();
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             drain,
@@ -2625,7 +2619,7 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
     for github in [true, false] {
         for outcome in 0..3 {
             let (dir, services, bus) = harness().await;
-            let (release, held) = std::sync::mpsc::channel();
+            let pause = PausePoint::new("held secret backend");
             let backend = Arc::new(HeldDirectBackend {
                 inner: InMemorySecretStore::default(),
                 account: if github {
@@ -2636,8 +2630,7 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
                 delete: github,
                 outcome,
                 calls: AtomicUsize::new(0),
-                entered: tokio::sync::Notify::new(),
-                release: Mutex::new(held),
+                pause: pause.clone(),
             });
             let marker = crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT;
             if github {
@@ -2659,7 +2652,7 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
             });
             timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
-                backend.entered.notified(),
+                pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -2694,7 +2687,7 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
                 () = &mut drain => panic!("timeout let shutdown pass a live mutation"),
                 () = std::future::ready(()) => {}
             }
-            release.send(()).unwrap();
+            pause.release();
             timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 drain,
@@ -2783,15 +2776,14 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
     use std::future::{poll_fn, Future};
     use std::task::Poll;
     let (_dir, services, bus) = harness().await;
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldDirectBackend {
         inner: InMemorySecretStore::default(),
         account: crate::github_auth_ops::SECRET_ACCOUNT,
         delete: true,
         outcome: 0,
         calls: AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(held),
+        pause: pause.clone(),
     });
     backend.inner.store(backend.account, "old").unwrap();
     let mut services = services.with_secret_store(backend.clone());
@@ -2801,7 +2793,7 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
     let response = intent_core::spawn_daemon(async move { writer.github_revoke().await });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -2840,7 +2832,7 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
         () = &mut drain => panic!("shutdown passed retained revoke"),
         () = std::future::ready(()) => {}
     }
-    release.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         &mut newer,
@@ -2870,15 +2862,14 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
 #[intent_test_macros::daemon_test]
 async fn direct_github_revoke_finishes_after_caller_cancel() {
     let (dir, services, bus) = harness().await;
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldDirectBackend {
         inner: InMemorySecretStore::default(),
         account: crate::github_auth_ops::SECRET_ACCOUNT,
         delete: true,
         outcome: 0,
         calls: AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(held),
+        pause: pause.clone(),
     });
     backend.inner.store(backend.account, "test-token").unwrap();
     let marker = crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT;
@@ -2889,7 +2880,7 @@ async fn direct_github_revoke_finishes_after_caller_cancel() {
     let response = intent_core::spawn_daemon(async move { writer.github_revoke().await });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -2902,7 +2893,7 @@ async fn direct_github_revoke_finishes_after_caller_cancel() {
         () = &mut drain => panic!("shutdown lost direct revoke's physical write"),
         () = std::future::ready(()) => {}
     }
-    release.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         drain,
@@ -2936,15 +2927,14 @@ async fn direct_github_revoke_finishes_after_caller_cancel() {
 #[intent_test_macros::daemon_test]
 async fn direct_mcp_toggle_finishes_after_caller_cancel() {
     let (_dir, services, bus) = harness().await;
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldDirectBackend {
         inner: InMemorySecretStore::default(),
         account: "mcp.servers",
         delete: false,
         outcome: 0,
         calls: AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(held),
+        pause: pause.clone(),
     });
     backend
         .inner
@@ -2961,7 +2951,7 @@ async fn direct_mcp_toggle_finishes_after_caller_cancel() {
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -2974,7 +2964,7 @@ async fn direct_mcp_toggle_finishes_after_caller_cancel() {
         () = &mut drain => panic!("shutdown lost direct MCP physical write"),
         () = std::future::ready(()) => {}
     }
-    release.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         drain,
@@ -3002,8 +2992,7 @@ impl SecretStore for HeldBackend {
         self.inner.load(account)
     }
     fn store(&self, account: &str, value: &str) -> Result<()> {
-        self.entered.notify_one();
-        let _ = self.release.lock().unwrap().recv();
+        self.pause.pause_blocking();
         self.inner.store(account, value)
     }
     fn delete(&self, account: &str) -> Result<()> {
@@ -3014,11 +3003,10 @@ impl SecretStore for HeldBackend {
 #[intent_test_macros::daemon_test]
 async fn settings_worker_panic_retains_live_write_and_account_guards() {
     let (dir, services, bus) = harness().await;
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldBackend {
         inner: InMemorySecretStore::default(),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(held),
+        pause: pause.clone(),
     });
     let services = services.with_secret_store(backend.clone());
     let (fail, failure) = tokio::sync::oneshot::channel();
@@ -3039,7 +3027,7 @@ async fn settings_worker_panic_retains_live_write_and_account_guards() {
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -3072,7 +3060,7 @@ async fn settings_worker_panic_retains_live_write_and_account_guards() {
         backend.inner.load("sourceControl.gitlab.token").unwrap(),
         None
     );
-    release.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         &mut drain,
@@ -3123,11 +3111,10 @@ async fn settings_worker_panic_retains_live_write_and_account_guards() {
 #[intent_test_macros::daemon_test]
 async fn settings_owner_recovers_captured_result_after_completion_observer_panics() {
     let (dir, services, bus) = harness().await;
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("held secret backend");
     let backend = Arc::new(HeldBackend {
         inner: InMemorySecretStore::default(),
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(held),
+        pause: pause.clone(),
     });
     let mut services = services.with_secret_store(backend.clone());
     let secrets = Arc::get_mut(&mut services.secrets).unwrap();
@@ -3149,7 +3136,7 @@ async fn settings_owner_recovers_captured_result_after_completion_observer_panic
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        backend.entered.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -3175,7 +3162,7 @@ async fn settings_owner_recovers_captured_result_after_completion_observer_panic
         () = &mut drain => panic!("unknown response lost actual write ownership"),
         () = std::future::ready(()) => {}
     }
-    release.send(()).unwrap();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         drain,
@@ -3228,8 +3215,7 @@ async fn settings_owner_recovers_captured_result_after_completion_observer_panic
 }
 
 struct HeldHook {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    pause: PausePoint,
     hold: AtomicBool,
     starts: AtomicUsize,
     running: AtomicBool,
@@ -3239,8 +3225,7 @@ struct HeldHook {
 impl HeldHook {
     fn new(hold: bool) -> Self {
         Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            pause: PausePoint::unshared("wsApi runtime hook"),
             hold: AtomicBool::new(hold),
             starts: AtomicUsize::new(0),
             running: AtomicBool::new(true),
@@ -3258,8 +3243,7 @@ impl ServerControl for HeldHook {
                     .map(|credential| credential.principal_id().clone()),
             ));
             if self.hold.swap(false, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
             }
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.running.store(true, Ordering::SeqCst);
@@ -3308,7 +3292,7 @@ async fn cancelled_hook_owner_finishes_before_final_listener_stop() {
     }));
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        control.entered.notified(),
+        control.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -3324,7 +3308,7 @@ async fn cancelled_hook_owner_finishes_before_final_listener_stop() {
         () = &mut second => panic!("concurrent drain passed the held runtime hook"),
         () = std::future::ready(()) => {}
     }
-    control.release.notify_one();
+    control.pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {

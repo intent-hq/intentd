@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use intent_core::FileSecretStore;
 use intent_sourcecontrol::gitlab_token::{REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT};
 use intent_sourcecontrol::GitlabHost;
+use intentd_test_support::PausePoint;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
 
 use super::{try_refresh, RefreshFailure};
 
@@ -26,13 +26,12 @@ tokio::task_local! {
 use crate::Services;
 
 /// A GitLab token endpoint that records each refresh token it is shown,
-/// answers the scripted exchanges in order, and parks the first exchange
-/// until `release` (after notifying `entered`).
+/// answers the scripted exchanges in order, and holds the first exchange
+/// at `pause`.
 struct TokenServer {
     host: GitlabHost,
     exchanged: Arc<Mutex<Vec<String>>>,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
+    pause: Arc<PausePoint>,
 }
 
 async fn token_server(script: Vec<(&'static str, Value)>) -> TokenServer {
@@ -43,13 +42,11 @@ async fn token_server(script: Vec<(&'static str, Value)>) -> TokenServer {
         .with_api_origin(&origin)
         .unwrap();
     let exchanged = Arc::new(Mutex::new(Vec::new()));
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
+    let pause = PausePoint::new("first token exchange");
     let server = TokenServer {
         host,
         exchanged: Arc::clone(&exchanged),
-        entered: Arc::clone(&entered),
-        release: Arc::clone(&release),
+        pause: Arc::clone(&pause),
     };
     tokio::spawn(async move {
         let mut script = script.into_iter();
@@ -84,8 +81,7 @@ async fn token_server(script: Vec<(&'static str, Value)>) -> TokenServer {
                     .to_owned();
                 exchanged.lock().unwrap().push(presented);
                 if std::mem::take(&mut first) {
-                    entered.notify_one();
-                    release.notified().await;
+                    pause.pause().await;
                 }
                 script.next().expect("an unscripted token exchange")
             } else if request.starts_with("GET /api/v4/user ") {
@@ -177,13 +173,13 @@ async fn two_processes_never_exchange_one_refresh_token_twice() {
             })
         })
         .collect();
-    server.entered.notified().await;
+    server.pause.wait_reached().await;
     assert_eq!(
         *server.exchanged.lock().unwrap(),
         ["refresh-0"],
         "while one exchange is in flight the other process waits for the lease"
     );
-    server.release.notify_one();
+    server.pause.release();
     for refreshed in refreshes {
         assert!(refreshed.await.unwrap(), "both refreshes succeed");
     }
@@ -212,12 +208,12 @@ async fn a_refresh_keeps_a_pair_that_changed_during_its_exchange() {
     let svc = services[0].clone();
     let host = server.host.clone();
     let refreshing = tokio::spawn(async move { refresh(&svc, &host).await });
-    server.entered.notified().await;
+    server.pause.wait_reached().await;
     let file = &services[0].gitlab_secret_store;
     file.store(SECRET_ACCOUNT, "access-external").unwrap();
     file.store(REFRESH_SECRET_ACCOUNT, "refresh-external")
         .unwrap();
-    server.release.notify_one();
+    server.pause.release();
     assert!(matches!(
         refreshing.await.unwrap(),
         Err(RefreshFailure::Transient)
@@ -242,12 +238,12 @@ async fn a_refused_token_that_another_refresh_rotated_is_not_a_disconnect() {
     let svc = services[0].clone();
     let host = server.host.clone();
     let refreshing = tokio::spawn(async move { refresh(&svc, &host).await });
-    server.entered.notified().await;
+    server.pause.wait_reached().await;
     services[0]
         .gitlab_secret_store
         .store(REFRESH_SECRET_ACCOUNT, "refresh-rotated")
         .unwrap();
-    server.release.notify_one();
+    server.pause.release();
     assert!(matches!(
         refreshing.await.unwrap(),
         Err(RefreshFailure::Transient)
@@ -266,8 +262,8 @@ async fn a_refused_stored_token_is_still_unrecoverable() {
     let svc = services[0].clone();
     let host = server.host.clone();
     let refreshing = tokio::spawn(async move { refresh(&svc, &host).await });
-    server.entered.notified().await;
-    server.release.notify_one();
+    server.pause.wait_reached().await;
+    server.pause.release();
     assert!(matches!(
         refreshing.await.unwrap(),
         Err(RefreshFailure::Unrecoverable)
@@ -318,8 +314,8 @@ async fn a_reconnect_before_the_exchange_is_never_consumed() {
                 .await
         }
     });
-    server.entered.notified().await;
-    server.release.notify_one();
+    server.pause.wait_reached().await;
+    server.pause.release();
     assert!(matches!(
         refreshing.await.unwrap(),
         Err(RefreshFailure::Transient)

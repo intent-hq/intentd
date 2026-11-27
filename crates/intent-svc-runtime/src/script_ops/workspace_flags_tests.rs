@@ -203,7 +203,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
         let ws = h.ws.clone();
         intent_core::spawn_daemon(async move { services.script_stop(ws, a).await })
     };
-    tokio::time::timeout(LIVENESS, park.entered.notified())
+    tokio::time::timeout(LIVENESS, park.wait_reached())
         .await
         .expect("a's settling recompute parked");
     assert!(!h.services.workspace_scripts_running_for_test(&h.ws), "a settled");
@@ -236,7 +236,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    park.release.notify_one();
+    park.release();
     tokio::time::timeout(LIVENESS, stop_a)
         .await
         .expect("stop a settled")

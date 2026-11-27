@@ -695,41 +695,15 @@ async fn native_wire_final_transfer_joins_writer_and_keeps_completed_effect() {
     assert!(s.read(&f, &c).await.is_err());
 }
 
-#[derive(Default)]
-struct BlockingHold {
-    entered: Notify,
-    released: Mutex<bool>,
-    wake: std::sync::Condvar,
-}
-impl BlockingHold {
-    fn hold(&self) {
-        self.entered.notify_one();
-        let (guard, expired) = self
-            .wake
-            .wait_timeout_while(
-                self.released.lock().unwrap(),
-                intentd_test_support::test_timeout(Duration::from_secs(15)),
-                |released| !*released,
-            )
-            .unwrap();
-        assert!(!expired.timed_out());
-        assert!(*guard);
-    }
-    fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.wake.notify_all();
-    }
-}
-
 #[intent_test_macros::daemon_test]
 async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exit() {
     let f = Fixture::new().await;
     let s = Arc::new(f.socket().await);
     let c = s.capture(&f).await.unwrap();
     let connection = s.concrete().await;
-    let hold = Arc::new(BlockingHold::default());
+    let hold = intentd_test_support::PausePoint::new("git probe");
     let probe = hold.clone();
-    *connection.git_probe.lock().unwrap() = Some(Arc::new(move || probe.hold()));
+    *connection.git_probe.lock().unwrap() = Some(Arc::new(move || probe.pause_blocking()));
     let scope = s.entered(async { s.owner.capture() }).await;
     let original = scope.clone();
     let owner = s.clone();
@@ -748,7 +722,7 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
     });
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        hold.entered.notified(),
+        hold.wait_reached(),
     )
     .await
     .unwrap();
@@ -762,7 +736,7 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
         .try_with_lock(&f.git.path, || async {})
         .await
         .is_none());
-    hold.release();
+    hold.open();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
@@ -1527,13 +1501,13 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
     };
     let s = Arc::new(f.socket().await);
     let connection = s.concrete().await;
-    let hold = Arc::new(BlockingHold::default());
+    let hold = intentd_test_support::PausePoint::new("git probe");
     let held = hold.clone();
     let registry = auth.registry.clone();
     let writer = tokio::task::spawn_blocking(move || {
-        registry.context_hold_snapshot_for_test(|| held.hold());
+        registry.context_hold_snapshot_for_test(|| held.pause_blocking());
     });
-    hold.entered.notified().await;
+    hold.wait_reached().await;
     let scope = s
         .entered(async { s.owner.capture_context(&f.query()) })
         .await;
@@ -1564,7 +1538,7 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
     assert_eq!(connection.permits.available_permits(), LEASE_LIMIT);
     assert!(connection.state.lock().unwrap().leases.is_empty());
     assert_eq!(connection.active_jobs.load(Ordering::Acquire), 1);
-    hold.release();
+    hold.open();
     writer.await.unwrap();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(3)),
@@ -1589,10 +1563,10 @@ async fn native_wire_final_future_moved_after_worker_start_cannot_restore_foreig
         let c = s.capture(&f).await.unwrap();
         s.entered(async{let scope=s.owner.capture_context(&f.query());scope.scope(Box::pin(async{
             f.services.repository_context(bound(f.query(),&c.lifetime_id)).await.unwrap();
-            let hold=Arc::new(BlockingHold::default());let hook=hold.clone();*connection.git_probe.lock().unwrap()=Some(Arc::new(move||hook.hold()));
+            let hold=intentd_test_support::PausePoint::new("git probe");let hook=hold.clone();*connection.git_probe.lock().unwrap()=Some(Arc::new(move||hook.pause_blocking()));
             let mut effects=0;let mut action=||{effects+=1;Ok(())};let mut future=scope.deliver(RepositoryReadReplyKind::Result,&mut action);
-            tokio::select! { result=&mut future=>panic!("delivery completed before held worker: {result:?}"), ()=hold.entered.notified()=>{} }
-            hold.release();
+            tokio::select! { result=&mut future=>panic!("delivery completed before held worker: {result:?}"), ()=hold.wait_reached()=>{} }
+            hold.open();
             let result=if credential_change { with_wire_credential(Some(WireCredential::Principal{principal_id:s.caller.principal_id().unwrap().clone(),token_hash:"foreign-poll".into()}),&mut future).await } else { with_caller(Caller::Daemon,&mut future).await };
             assert!(result.is_err());drop(future);assert_eq!(effects,0);*connection.git_probe.lock().unwrap()=None;
         })).await;scope.retire();}).await;
@@ -1864,19 +1838,19 @@ async fn native_wire_final_provider_refresh_busy_and_poison_refuse_original_cont
                         .join()
                         .is_err());
                     } else {
-                        let hold = Arc::new(BlockingHold::default());
+                        let hold = intentd_test_support::PausePoint::new("git probe");
                         let blocked = hold.clone();
                         let task = tokio::task::spawn_blocking(move || {
                             RepositoryConnectionFacts::with_native_context_current(
                                 Some(&facts),
                                 |current| {
                                     assert!(current);
-                                    blocked.hold();
+                                    blocked.pause_blocking();
                                     Ok(())
                                 },
                             )
                         });
-                        hold.entered.notified().await;
+                        hold.wait_reached().await;
                         held = Some((hold, task));
                     }
                     let calls = server.control.requests.lock().unwrap().len();
@@ -1891,7 +1865,7 @@ async fn native_wire_final_provider_refresh_busy_and_poison_refuse_original_cont
                     assert_eq!(effects, 0);
                     assert_eq!(server.control.requests.lock().unwrap().len(), calls);
                     if let Some((hold, task)) = held {
-                        hold.release();
+                        hold.open();
                         task.await.unwrap().unwrap();
                     }
                 }))
@@ -2532,19 +2506,19 @@ async fn native_wire_member_qualification_unknown_and_busy() {
                     Some(fixture.server.descriptor.instance().as_str()),
                 );
                 let facts = f.services.gitlab_repository_connection_facts().unwrap();
-                let hold = Arc::new(BlockingHold::default());
+                let hold = intentd_test_support::PausePoint::new("git probe");
                 let blocked = hold.clone();
                 let task = tokio::task::spawn_blocking(move || {
                     RepositoryConnectionFacts::with_native_context_current(
                         Some(&facts),
                         |current| {
                             assert!(current);
-                            blocked.hold();
+                            blocked.pause_blocking();
                             Ok(())
                         },
                     )
                 });
-                hold.entered.notified().await;
+                hold.wait_reached().await;
                 let calls = fixture.server.control.requests.lock().unwrap().len();
                 let mut transfers = 0;
                 let result = scope
@@ -2553,7 +2527,7 @@ async fn native_wire_member_qualification_unknown_and_busy() {
                         Ok(())
                     })
                     .await;
-                hold.release();
+                hold.open();
                 task.await.unwrap().unwrap();
                 assert!(result.is_err());
                 assert_eq!(transfers, 0);

@@ -195,7 +195,7 @@ async fn automatic_concurrent_windows_and_reconnect_share_running_attempt() {
             intent_core::with_caller(owner_caller(&svc).await, svc.pr_refresh_automatic(ws)).await
         })
     };
-    park.entered.notified().await;
+    park.pause.wait_reached().await;
     // Even after the interval passes, a slow running attempt owns admission.
     svc.age_automatic_pr_refresh(&ws, 900);
     assert_eq!(
@@ -215,7 +215,7 @@ async fn automatic_concurrent_windows_and_reconnect_share_running_attempt() {
         "skipped"
     );
     assert_eq!(forge.seen_get_pr.lock().unwrap().len(), 1);
-    park.release.notify_one();
+    park.pause.release();
     svc.shutdown_store_writers().await;
 }
 

@@ -169,13 +169,11 @@ pub(crate) fn accept_identity() -> IdentityGuard {
 }
 
 struct ParkLease {
-    entered: Arc<tokio::sync::Notify>,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 impl Drop for ParkLease {
     fn drop(&mut self) {
-        self.entered.notify_one();
-        let _ = self.release.lock().unwrap().recv();
+        self.pause.pause_blocking();
     }
 }
 
@@ -187,26 +185,23 @@ async fn github_poll_retains_engine_result_after_write_wait_budget() {
         .unwrap();
     let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
     let services = crate::Services::new_isolated(store).with_secret_store(Arc::new(raw.clone()));
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    let pause = intentd_test_support::PausePoint::new("identity lease drop");
+    let leased = std::sync::atomic::AtomicBool::new(false);
     let identity: IdentityGuard = Arc::new({
-        let entered = entered.clone();
+        let pause = pause.clone();
         move |_| {
+            assert!(
+                !leased.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "one identity lease"
+            );
             let lease = ParkLease {
-                entered: entered.clone(),
-                release: std::sync::Mutex::new(release.lock().unwrap().take().unwrap()),
+                pause: pause.clone(),
             };
             Box::pin(async move { Ok(Box::new(lease) as IdentityLease) })
         }
     });
     let mut flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        entered.notified(),
-    )
-    .await
-    .unwrap();
+    pause.wait_reached().await;
     // The engine's existing public wait cap is ten seconds. Its real blocking
     // closure has written the token but remains held in lease destruction,
     // before the actual Result can be returned to a completion owner.
@@ -215,7 +210,7 @@ async fn github_poll_retains_engine_result_after_write_wait_budget() {
         &mut flow,
     )
     .await;
-    release_tx.send(()).unwrap();
+    pause.release();
     if early.is_err() {
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -262,26 +257,23 @@ async fn revoke_or_cancel_before_publication(cancel: bool) {
         .with_secret_store(Arc::new(raw.clone()))
         .with_event_bus(bus)
         .with_github_login_base_uri("http://127.0.0.1:1");
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    let pause = intentd_test_support::PausePoint::new("identity lease drop");
+    let leased = std::sync::atomic::AtomicBool::new(false);
     let identity: IdentityGuard = Arc::new({
-        let entered = entered.clone();
+        let pause = pause.clone();
         move |_| {
+            assert!(
+                !leased.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "one identity lease"
+            );
             let lease = ParkLease {
-                entered: entered.clone(),
-                release: std::sync::Mutex::new(release.lock().unwrap().take().unwrap()),
+                pause: pause.clone(),
             };
             Box::pin(async move { Ok(Box::new(lease) as IdentityLease) })
         }
     });
     let flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        entered.notified(),
-    )
-    .await
-    .unwrap();
+    pause.wait_reached().await;
     assert_eq!(
         raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
         Some("new-device-token")
@@ -301,7 +293,7 @@ async fn revoke_or_cancel_before_publication(cancel: bool) {
             "revocation must wait for the actual persistence lease"
         );
     }
-    release_tx.send(()).unwrap();
+    pause.release();
     if !cancel {
         revoke.await.unwrap();
     }
@@ -366,26 +358,23 @@ async fn finalizer_ownership_timeout(replace_flow: bool) {
         crate::settings::AsyncSecretStore::new(Arc::new(raw.clone()))
             .with_settle_timeout(Duration::from_millis(100)),
     );
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    let pause = intentd_test_support::PausePoint::new("identity lease drop");
+    let leased = std::sync::atomic::AtomicBool::new(false);
     let identity: IdentityGuard = Arc::new({
-        let entered = entered.clone();
+        let pause = pause.clone();
         move |_| {
+            assert!(
+                !leased.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "one identity lease"
+            );
             let lease = ParkLease {
-                entered: entered.clone(),
-                release: std::sync::Mutex::new(release.lock().unwrap().take().unwrap()),
+                pause: pause.clone(),
             };
             Box::pin(async move { Ok(Box::new(lease) as IdentityLease) })
         }
     });
     let flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        entered.notified(),
-    )
-    .await
-    .unwrap();
+    pause.wait_reached().await;
     // Queue ahead of the finalizer while the persistence lease is still held.
     let mut mutation = Box::pin(services.secrets.github_mutation());
     assert!(
@@ -394,7 +383,7 @@ async fn finalizer_ownership_timeout(replace_flow: bool) {
         })
         .await
     );
-    release_tx.send(()).unwrap();
+    pause.release();
     let mut owner = mutation.await.unwrap();
     *owner += 1;
     raw.store(SECRET_ACCOUNT, "newer-token").unwrap();

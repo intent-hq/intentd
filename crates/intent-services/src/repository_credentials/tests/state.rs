@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::sync::{Notify, Semaphore};
+pub(super) use intentd_test_support::PausePoint;
 
 use super::authority::{CredentialFuture, RepositoryAuthorityFence, RepositoryCredentialTransport};
 use super::*;
@@ -276,25 +276,9 @@ fn child_policy_completion_cannot_override_direct_writes_in_either_order() {
 pub(super) const INSTANCE: &str = "https://git.example:8443/forge";
 pub(super) const PROJECT: &str = "team/sub/project";
 
-pub(super) struct Pause {
-    pub(super) entered: Notify,
-    pub(super) release: Semaphore,
-}
-impl Pause {
-    pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: Semaphore::new(0),
-        })
-    }
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-    }
-}
 pub(super) struct TestSecrets {
     pub(super) value: Mutex<String>,
-    pub(super) pause: Mutex<Option<Arc<Pause>>>,
+    pub(super) pause: Mutex<Option<Arc<PausePoint>>>,
     pub(super) calls: AtomicUsize,
     wrong_revision: AtomicBool,
     missing: AtomicBool,
@@ -312,7 +296,7 @@ impl RepositorySecretReader for TestSecrets {
             let token = SecretString::from(self.value.lock().unwrap().clone());
             let pause = self.pause.lock().unwrap().take();
             if let Some(pause) = pause {
-                pause.wait().await;
+                pause.pause().await;
             }
             let mut request = expected.clone();
             if self.wrong_revision.load(Ordering::SeqCst) {
@@ -324,7 +308,7 @@ impl RepositorySecretReader for TestSecrets {
 }
 pub(super) struct TestAuthority {
     pub(super) revision: Arc<Mutex<u64>>,
-    pause: Mutex<Option<Arc<Pause>>>,
+    pause: Mutex<Option<Arc<PausePoint>>>,
     pub(super) requests: Mutex<Vec<RepositoryAuthorityRequest>>,
     denied: AtomicBool,
 }
@@ -357,7 +341,7 @@ impl RepositoryAuthority for TestAuthority {
             }
             let pause = self.pause.lock().unwrap().take();
             if let Some(pause) = pause {
-                pause.wait().await;
+                pause.pause().await;
             }
             Ok(Box::new(Fence {
                 revision: self.revision.clone(),
@@ -576,13 +560,13 @@ async fn refresh_blocks_old_token_then_preserves_binding_with_new_secret_revisio
 async fn refresh_during_secret_load_rejects_old_snapshot_without_retiring_account() {
     let test = Arc::new(Test::new());
     let admission = test.admit(RepositoryCredentialUse::NativeRead);
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let task_test = test.clone();
     let read = tokio::spawn(async move { task_test.acquire(&admission).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     test.refresh("changed");
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         read.await.unwrap().unwrap_err(),
         RepositoryCredentialError::SecretMismatch
@@ -597,13 +581,13 @@ async fn refresh_during_secret_load_rejects_old_snapshot_without_retiring_accoun
 async fn replacement_during_secret_load_prevents_release_to_old_account() {
     let test = Arc::new(Test::new());
     let admission = test.admit(RepositoryCredentialUse::NativeRead);
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let task_test = test.clone();
     let read = tokio::spawn(async move { task_test.acquire(&admission).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     test.replace(test.verified.clone());
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         read.await.unwrap().unwrap_err(),
         RepositoryCredentialError::Retired
@@ -828,13 +812,13 @@ async fn child_opt_out_during_secret_load_preserves_native_push_admission() {
     test.directory.set_child_policy(&binding, true).unwrap();
     let child = test.admit(RepositoryCredentialUse::ChildGit);
     let native = test.admit(RepositoryCredentialUse::NativePush);
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let task_test = test.clone();
     let read = tokio::spawn(async move { task_test.acquire(&child).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     test.directory.set_child_policy(&binding, false).unwrap();
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         read.await.unwrap().unwrap_err(),
         RepositoryCredentialError::Retired
@@ -848,11 +832,11 @@ async fn unsettled_refresh_during_secret_load_blocks_release_until_compensation_
     let test = Arc::new(Test::new());
     let old = test.admit(RepositoryCredentialUse::NativeRead);
     let pending = test.admit(RepositoryCredentialUse::NativeRead);
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let task_test = test.clone();
     let read = tokio::spawn(async move { task_test.acquire(&pending).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     let writer = test
         .directory
         .reserve_mutation(RepositoryMutationKind::Refresh)
@@ -861,7 +845,7 @@ async fn unsettled_refresh_during_secret_load_blocks_release_until_compensation_
     test.directory
         .finish_mutation(&writer, SettledCredentialState::Indeterminate)
         .unwrap();
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         read.await.unwrap().unwrap_err(),
         RepositoryCredentialError::Indeterminate
@@ -920,7 +904,7 @@ async fn original_authority_rechecked_after_load_and_at_final_dispatch() {
     for after_revalidation in [false, true] {
         let test = Arc::new(Test::new());
         let admission = test.admit(RepositoryCredentialUse::NativeRead);
-        let pause = Pause::new();
+        let pause = PausePoint::new("repository secret read");
         if after_revalidation {
             *test.authority.pause.lock().unwrap() = Some(pause.clone());
         } else {
@@ -928,9 +912,9 @@ async fn original_authority_rechecked_after_load_and_at_final_dispatch() {
         }
         let task_test = test.clone();
         let read = tokio::spawn(async move { task_test.acquire(&admission).await });
-        pause.entered.notified().await;
+        pause.wait_reached().await;
         *test.authority.revision.lock().unwrap() += 1;
-        pause.release.add_permits(1);
+        pause.release();
         assert_eq!(
             read.await.unwrap().unwrap_err(),
             RepositoryCredentialError::Retired
@@ -942,7 +926,7 @@ async fn original_authority_rechecked_after_load_and_at_final_dispatch() {
 async fn acquisition_budget_bounds_both_secret_and_authority_work() {
     for slow_authority in [false, true] {
         let test = Test::new();
-        let pause = Pause::new();
+        let pause = PausePoint::new("repository secret read");
         if slow_authority {
             *test.authority.pause.lock().unwrap() = Some(pause);
         } else {

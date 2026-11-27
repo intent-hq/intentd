@@ -443,7 +443,7 @@ async fn reader_device_completion_uses_original_grant_and_cancellation_keeps_pri
         if cancel {
             f.service.gitlab_auth.lock().await.flow = None;
         }
-        server.control.release.notify_one();
+        server.control.hold.release();
         let guard = f.service.gitlab_credential_gate.lock().await;
         drop(guard);
         let current = f.request();
@@ -475,7 +475,7 @@ async fn reader_adoption_rejects_sibling_change_during_account_verification() {
             .gitlab_secret_store
             .store(key, "changed-during-proof")
             .unwrap();
-        server.control.release.notify_one();
+        server.control.hold.release();
         assert!(task.await.unwrap().is_err());
         assert_eq!(
             f.service
@@ -498,16 +498,15 @@ async fn reader_adoption_rejects_sibling_change_during_account_verification() {
     }
 }
 
+/// Holds the first blocking secret read; once resumed (or dropped) every
+/// later read passes.
 pub(crate) struct PausedRead {
-    entered: Arc<tokio::sync::Notify>,
-    release: Option<std::sync::mpsc::Sender<()>>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 impl PausedRead {
     pub(crate) fn install(f: &Fixture) -> Self {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let signal = entered.clone();
-        let (release, receive) = std::sync::mpsc::channel();
-        let receive = Mutex::new(receive);
+        let pause = intentd_test_support::PausePoint::new("blocking secret read");
+        let held = pause.clone();
         let once = std::sync::atomic::AtomicBool::new(true);
         *f.service
             .gitlab_credential_gate
@@ -519,34 +518,21 @@ impl PausedRead {
             .lock()
             .unwrap() = Some(Arc::new(move || {
             if once.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                signal.notify_one();
-                receive.lock().unwrap().recv().unwrap();
+                held.pause_blocking();
             }
         }));
-        Self {
-            entered,
-            release: Some(release),
-        }
+        Self { pause }
     }
     pub(crate) async fn entered(&self) {
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            self.entered.notified(),
-        )
-        .await
-        .unwrap();
+        self.pause.wait_reached().await;
     }
     pub(crate) fn resume(&mut self) {
-        if let Some(release) = self.release.take() {
-            release.send(()).unwrap();
-        }
+        self.pause.open();
     }
 }
 impl Drop for PausedRead {
     fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
+        self.pause.open();
     }
 }
 
@@ -624,8 +610,7 @@ async fn reader_rechecks_retirement_and_changed_file_after_blocking_read() {
 
 struct PausedAuthority {
     gate: GitlabCredentialGate,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
+    pause: intentd_test_support::PausePoint,
     deny: std::sync::atomic::AtomicBool,
 }
 impl RepositoryAuthority for PausedAuthority {
@@ -638,8 +623,7 @@ impl RepositoryAuthority for PausedAuthority {
                 self.gate.mutex.try_lock().is_ok(),
                 "reader must release the credential gate before the authority fence"
             );
-            self.entered.notify_one();
-            self.release.notified().await;
+            self.pause.pause().await;
             if self.deny.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(Error::AuthorityDenied);
             }
@@ -655,8 +639,7 @@ async fn reader_post_load_authority_denial_or_real_replacement_prevents_http() {
         let f = Fixture::new(&server).await;
         let authority = Arc::new(PausedAuthority {
             gate: f.service.gitlab_credential_gate.clone(),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            pause: intentd_test_support::PausePoint::unshared("authority revalidation"),
             deny: std::sync::atomic::AtomicBool::new(false),
         });
         let callback = BoundGitlabRequestCredentials::new(
@@ -668,12 +651,7 @@ async fn reader_post_load_authority_denial_or_real_replacement_prevents_http() {
         .unwrap();
         let provider = callback.into_provider().unwrap();
         let read = tokio::spawn(async move { provider.get_repo("group", "project").await });
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            authority.entered.notified(),
-        )
-        .await
-        .unwrap();
+        authority.pause.wait_reached().await;
         if replace {
             f.service
                 .gitlab_connect_pat(server.host.clone(), "pat-second".into())
@@ -685,7 +663,7 @@ async fn reader_post_load_authority_denial_or_real_replacement_prevents_http() {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let before = server.control.requests.lock().unwrap().len();
-        authority.release.notify_one();
+        authority.pause.release();
         assert!(read.await.unwrap().is_err());
         assert_eq!(
             server.control.requests.lock().unwrap().len(),
@@ -1049,7 +1027,7 @@ async fn original_auth_probe_receipt_rejects_late_200_and_401_for_same_token_suc
         let successor = f.request();
         assert_ne!(old_selected.binding.scope, successor.binding.scope);
         let bytes = std::fs::read(f.service.gitlab_secret_store.path()).unwrap();
-        server.control.release.notify_one();
+        server.control.hold.release();
         let result = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             old,

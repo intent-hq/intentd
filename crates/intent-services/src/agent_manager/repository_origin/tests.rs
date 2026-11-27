@@ -243,10 +243,31 @@ fn scripted_session(
     })
 }
 
+/// A scripted peer that holds the first `method` request: the test sees the
+/// request at [`PausedSession::arrived`] and chooses its reply with
+/// [`PausedSession::release`]. A held request that is never released fails
+/// after the pause point's hold timeout.
 struct PausedSession {
     peer: ScriptedSession,
-    arrived: tokio::sync::oneshot::Receiver<Value>,
-    release: tokio::sync::oneshot::Sender<SessionReply>,
+    pause: Arc<intentd_test_support::PausePoint>,
+    request: Arc<std::sync::Mutex<Option<Value>>>,
+    reply: Arc<std::sync::Mutex<Option<SessionReply>>>,
+}
+
+impl PausedSession {
+    async fn arrived(&self) -> Value {
+        self.pause.wait_reached().await;
+        self.request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the held request is recorded before its pause")
+    }
+
+    fn release(&self, reply: SessionReply) {
+        *self.reply.lock().unwrap() = Some(reply);
+        self.pause.release();
+    }
 }
 
 fn paused_session(
@@ -255,39 +276,33 @@ fn paused_session(
     load: bool,
     method: &'static str,
 ) -> PausedSession {
-    let (entered, arrived) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let mut pause = Some((entered, released));
-    let peer = scripted_replies(reader, writer, move |request| {
-        let gate = (request["method"] == method)
-            .then(|| pause.take())
-            .flatten();
-        Box::pin(async move {
-            if let Some((entered, released)) = gate {
-                entered.send(request).unwrap();
-                released
-                    .await
-                    .unwrap_or_else(|_| Err(json!({"code":-32603,"message":"cancelled fixture"})))
-            } else {
-                Ok(session_reply(&request, load, "candidate"))
-            }
-        })
-    });
+    let pause = intentd_test_support::PausePoint::new(format!("ACP {method}"));
+    let request_slot = Arc::new(std::sync::Mutex::new(None));
+    let reply_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut armed = true;
+    let (held, request_in, reply_out) = (pause.clone(), request_slot.clone(), reply_slot.clone());
+    let peer =
+        scripted_replies(reader, writer, move |request| {
+            let gate = (request["method"] == method && std::mem::take(&mut armed))
+                .then(|| (held.clone(), request_in.clone(), reply_out.clone()));
+            Box::pin(async move {
+                if let Some((held, request_in, reply_out)) = gate {
+                    *request_in.lock().unwrap() = Some(request);
+                    held.pause().await;
+                    reply_out.lock().unwrap().take().unwrap_or_else(|| {
+                        Err(json!({"code":-32603,"message":"cancelled fixture"}))
+                    })
+                } else {
+                    Ok(session_reply(&request, load, "candidate"))
+                }
+            })
+        });
     PausedSession {
         peer,
-        arrived,
-        release,
+        pause,
+        request: request_slot,
+        reply: reply_slot,
     }
-}
-
-async fn arrived(receiver: tokio::sync::oneshot::Receiver<Value>) -> Value {
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
-        receiver,
-    )
-    .await
-    .expect("actual ACP request arrived")
-    .unwrap()
 }
 
 pub(super) fn callback(origin: &RepositoryOrigin) -> Option<RepositoryCallbackContext> {
@@ -970,14 +985,11 @@ async fn actual_load_preserves_response_without_rewriting_or_adopting_a_later_bi
         f.count_writes().await;
         let (origin, reader, writer) = f.mount().await;
         let pending = origin.pending_callback().unwrap();
-        let PausedSession {
-            peer,
-            arrived: entered,
-            release,
-        } = paused_session(reader, writer, true, "session/load");
+        let paused = paused_session(reader, writer, true, "session/load");
+        let peer = &paused.peer;
         let opening = f.start("claude-code");
         let control = async {
-            let request = arrived(entered).await;
+            let request = paused.arrived().await;
             assert_eq!(request["params"]["sessionId"], "original-load");
             if replaced {
                 f.manager
@@ -992,7 +1004,7 @@ async fn actual_load_preserves_response_without_rewriting_or_adopting_a_later_bi
                     .await
                     .unwrap();
             }
-            release.send(Ok(json!({}))).unwrap();
+            paused.release(Ok(json!({})));
         };
         let (response, ()) = tokio::join!(opening, control);
         assert_eq!(response.unwrap(), "original-load");
@@ -1038,14 +1050,11 @@ async fn actual_recreate_runs_one_legacy_transaction_without_borrowing_a_winner(
         f.usage(100).await;
         f.count_writes().await;
         let (origin, reader, writer) = f.mount().await;
-        let PausedSession {
-            peer,
-            arrived: entered,
-            release,
-        } = paused_session(reader, writer, false, "session/new");
+        let paused = paused_session(reader, writer, false, "session/new");
+        let peer = &paused.peer;
         let opening = f.start("claude-code");
         let control = async {
-            arrived(entered).await;
+            paused.arrived().await;
             if scenario == "cleared" {
                 // A real same-ID row recreation is the current-NULL race;
                 // the ordinary full-row updater correctly forbids clearing ID.
@@ -1086,7 +1095,9 @@ async fn actual_recreate_runs_one_legacy_transaction_without_borrowing_a_winner(
                     .unwrap();
             }
             let before = f.writes().await;
-            release.send(Ok(json!({"sessionId":if scenario == "same-id" {"old-session"} else {"candidate"}}))).unwrap();
+            paused.release(Ok(
+                json!({"sessionId":if scenario == "same-id" {"old-session"} else {"candidate"}}),
+            ));
             before
         };
         let (response, before) = tokio::join!(opening, control);
@@ -1140,27 +1151,20 @@ async fn actual_failed_or_cancelled_create_never_persists_or_upgrades_pending_ca
         f.count_writes().await;
         let (origin, reader, writer) = f.mount().await;
         let pending = origin.pending_callback().unwrap();
-        let PausedSession {
-            peer,
-            arrived: entered,
-            release,
-        } = paused_session(reader, writer, false, "session/new");
+        let paused = paused_session(reader, writer, false, "session/new");
+        let peer = &paused.peer;
         let mut opening = Box::pin(f.start("claude-code"));
         tokio::select! {
-            _ = arrived(entered) => {},
+            _ = paused.arrived() => {},
             result = &mut opening => panic!("session completed before controlled reply: {result:?}"),
         }
         if cancel {
             drop(opening);
-            release
-                .send(Ok(json!({"sessionId":"late-cancelled"})))
-                .unwrap();
+            paused.release(Ok(json!({"sessionId":"late-cancelled"})));
         } else {
-            release
-                .send(Err(
-                    json!({"code":-32603,"message":"original create failure"}),
-                ))
-                .unwrap();
+            paused.release(Err(
+                json!({"code":-32603,"message":"original create failure"}),
+            ));
             let error = opening.await.unwrap_err().to_string();
             assert!(error.contains("original create failure"));
         }
@@ -1186,17 +1190,12 @@ async fn actual_retired_create_keeps_its_successful_result_without_an_owner() {
     f.count_writes().await;
     let (origin, reader, writer) = f.mount().await;
     let pending = origin.pending_callback().unwrap();
-    let PausedSession {
-        peer,
-        arrived: entered,
-        release,
-    } = paused_session(reader, writer, false, "session/new");
+    let paused = paused_session(reader, writer, false, "session/new");
+    let peer = &paused.peer;
     let control = async {
-        arrived(entered).await;
+        paused.arrived().await;
         origin.retire();
-        release
-            .send(Ok(json!({"sessionId":"committed-after-retirement"})))
-            .unwrap();
+        paused.release(Ok(json!({"sessionId":"committed-after-retirement"})));
     };
     let (response, ()) = tokio::join!(f.start("claude-code"), control);
     assert_eq!(response.unwrap(), "committed-after-retirement");

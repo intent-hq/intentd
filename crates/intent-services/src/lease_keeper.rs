@@ -146,10 +146,10 @@ mod tests {
             .insert_workspace(&crate::tests::workspace(&second))
             .await
             .unwrap();
-        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "token");
+        let commit = crate::periodic_shutdown_tests::hold(&svc, "token");
         let task = svc.spawn_token_usage_scan_loop_with_ttl(Duration::from_millis(1), TTL);
         // The sweep is in progress: one workspace's tally committed, held.
-        crate::periodic_shutdown_tests::entered(entered).await;
+        crate::periodic_shutdown_tests::entered(&commit).await;
         assert!(
             store
                 .acquire_lease(TOKEN_USAGE_SCAN_SCOPE, "", TTL)
@@ -159,7 +159,7 @@ mod tests {
             "the sweeping loop holds the lease"
         );
         svc.begin_settings_shutdown();
-        release.send(()).unwrap();
+        commit.release();
         tokio::time::timeout(timeout(), task)
             .await
             .expect("the loop ends on its own once settings shutdown began")

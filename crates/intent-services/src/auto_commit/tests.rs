@@ -1196,7 +1196,7 @@ async fn auto_commit_attribution_survives_receiver_abort() {
         .await
         .unwrap();
     attribute_dirty_change(&svc, &ws, "agent-tail").await;
-    let (rx, release) = hold(&svc, "git");
+    let commit = hold(&svc, "git");
     let task = svc.spawn_auto_commit_loop();
     tokio::time::timeout(
         intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
@@ -1222,7 +1222,7 @@ async fn auto_commit_attribution_survives_receiver_abort() {
     })
     .await
     .unwrap();
-    entered(rx).await;
+    entered(&commit).await;
     assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
     assert_eq!(
         svc.store().list_tracked_changes(&ws).await.unwrap()[0].stage,
@@ -1230,7 +1230,7 @@ async fn auto_commit_attribution_survives_receiver_abort() {
     );
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    drain_held(&svc, release).await;
+    drain_held(&svc, &commit).await;
     bus.shutdown().await.unwrap();
     svc.store().close().await;
     let reopened = Store::open(&db.path).await.unwrap();

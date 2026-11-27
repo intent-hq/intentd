@@ -3331,39 +3331,6 @@ enum SlotClaimLoss<E> {
     Refused(E),
 }
 
-/// Test seam for the lost-claim hand-back in
-/// [`AgentManager::send_queued_message_now`] (intent-hq/intent#4962): once
-/// armed, the hand-back sets `reached` after its queue-updated publish and
-/// parks until [`HandbackGate::resume`], so a test can act between the
-/// hand-back and the re-probe without depending on task scheduling.
-#[cfg(test)]
-#[derive(Default)]
-struct HandbackGate {
-    reached: std::sync::atomic::AtomicBool,
-    resume: tokio::sync::Notify,
-}
-
-/// Pause a claimed turn before startup side effects for retirement race tests.
-#[cfg(test)]
-#[derive(Default)]
-struct TurnStartPause {
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl HandbackGate {
-    /// Whether the hand-back has landed (entry requeued, publish done).
-    fn reached(&self) -> bool {
-        self.reached.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Let the parked hand-back continue into its re-probe.
-    fn resume(&self) {
-        self.resume.notify_one();
-    }
-}
-
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -3588,10 +3555,12 @@ pub struct AgentManager {
     /// startup heal to record as a crashed turn. Shutdown finishes them.
     pending_idle_writes: Mutex<HashMap<AgentId, (WorkspaceId, u64)>>,
     next_idle_write: AtomicU64,
-    /// Armed by [`AgentManager::arm_send_now_handback_gate`]; see
-    /// [`HandbackGate`].
+    /// Test seam for the lost-claim hand-back in
+    /// [`AgentManager::send_queued_message_now`] (intent-hq/intent#4962):
+    /// armed by [`AgentManager::arm_send_now_handback_gate`], the hand-back
+    /// pauses here after its queue-updated publish and before its re-probe.
     #[cfg(test)]
-    send_now_handback_gate: Mutex<Option<Arc<HandbackGate>>>,
+    send_now_handback_gate: Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
     /// Named pause points and store faults for interleaving tests.
     #[cfg(test)]
     turn_schedule: turn_schedule::TurnSchedule,
@@ -4000,23 +3969,21 @@ impl AgentManager {
     }
 
     /// Arm the lost-claim hand-back seam of
-    /// [`AgentManager::send_queued_message_now`]; see [`HandbackGate`].
+    /// [`AgentManager::send_queued_message_now`].
     #[cfg(test)]
-    fn arm_send_now_handback_gate(&self) -> Arc<HandbackGate> {
-        let gate = Arc::new(HandbackGate::default());
+    fn arm_send_now_handback_gate(&self) -> Arc<intentd_test_support::PausePoint> {
+        let gate = intentd_test_support::PausePoint::new("send-now hand-back");
         *self.send_now_handback_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
-    /// Park at the hand-back seam while a [`HandbackGate`] is armed; a no-op
+    /// Pause at the hand-back seam while its gate is armed; a no-op
     /// otherwise.
     #[cfg(test)]
     async fn park_at_send_now_handback(&self) {
         let gate = self.send_now_handback_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
-            gate.reached
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            gate.resume.notified().await;
+            gate.pause().await;
         }
     }
 
@@ -15115,43 +15082,39 @@ async fn shared_grace_window(deadline: tokio::time::Instant) {
 #[cfg(all(test, unix))]
 pub(crate) mod term_grace_gate {
     use std::future::Future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use tokio::sync::watch;
+    use intentd_test_support::PausePoint;
 
     tokio::task_local! { static GATE: TermGraceGate; }
 
     /// The gate; clones share it and its window count.
     #[derive(Clone)]
     pub(crate) struct TermGraceGate {
-        open: watch::Sender<bool>,
-        windows: Arc<AtomicUsize>,
+        pause: Arc<PausePoint>,
     }
 
     impl TermGraceGate {
         pub(crate) fn new() -> Self {
             Self {
-                open: watch::Sender::new(false),
-                windows: Arc::new(AtomicUsize::new(0)),
+                pause: PausePoint::new("kill sweep grace window"),
             }
         }
 
         /// End every grace window held by this gate.
         pub(crate) fn open(&self) {
-            self.open.send_replace(true);
+            self.pause.open();
         }
 
         /// How many grace windows sweeps under this gate have started. Once
         /// the gate is open every later window ends at once, so a sweep that
         /// waits one window per child would still finish: count them.
-        pub(crate) fn windows(&self) -> usize {
-            self.windows.load(Ordering::SeqCst)
+        pub(crate) fn windows(&self) -> u64 {
+            self.pause.arrivals()
         }
 
         pub(super) async fn opened(&self) {
-            self.windows.fetch_add(1, Ordering::SeqCst);
-            let _ = self.open.subscribe().wait_for(|open| *open).await;
+            self.pause.pause().await;
         }
     }
 
@@ -20698,7 +20661,7 @@ mod npx_launch_dir_lifetime_tests {
         }
         mgr.registry
             .register(agent_id.clone(), mgr.make_kill(agent_id.clone()));
-        let (rx, release) = hold(&svc, "physical-cleanup");
+        let commit = hold(&svc, "physical-cleanup");
         let task = if unexpected {
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(leader.cast_signed()),
@@ -20719,7 +20682,7 @@ mod npx_launch_dir_lifetime_tests {
                     .await;
             })
         };
-        entered(rx).await;
+        entered(&commit).await;
         assert!(!mgr.contains(&agent_id));
         assert!(pid_alive(tree.grandchild));
         assert!(tree.launch_path.is_dir());
@@ -20739,7 +20702,7 @@ mod npx_launch_dir_lifetime_tests {
             }
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
-        release.send(()).unwrap();
+        commit.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
@@ -27359,19 +27322,6 @@ mod agent_retry_tests {
         assert!(mgr.services.parked_recovery_send(&agent_id).is_none());
     }
 
-    /// Poll a future once with the current task's waker; `None` while it is
-    /// pending. Lets a test drive `sendQueuedMessageNow` up to an armed
-    /// [`HandbackGate`] and act while it is parked there.
-    async fn poll_step<T, F: std::future::Future<Output = T>>(
-        fut: &mut std::pin::Pin<Box<F>>,
-    ) -> Option<T> {
-        std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(value) => std::task::Poll::Ready(Some(value)),
-            std::task::Poll::Pending => std::task::Poll::Ready(None),
-        })
-        .await
-    }
-
     /// The slot holder's terminal exit can run its redrive while the "send
     /// now" entry is popped provisionally (it finds nothing to claim and
     /// keeps the marker) and release the slot before the lost-claim
@@ -27404,13 +27354,8 @@ mod agent_retry_tests {
         let gate = mgr.arm_send_now_handback_gate();
         let mut send_now =
             Box::pin(mgr.send_queued_message_now(agent_id.clone(), ws.clone(), id.clone()));
-        while !gate.reached() {
-            assert!(
-                poll_step(&mut send_now).await.is_none(),
-                "send now must lose the claim and reach the hand-back seam"
-            );
-            tokio::task::yield_now().await;
-        }
+        // send now must lose the claim and reach the hand-back seam.
+        gate.reached(&mut send_now).await;
         assert!(
             mgr.services.is_message_queued(&agent_id, &id),
             "the hand-back requeued the entry"
@@ -27428,7 +27373,7 @@ mod agent_retry_tests {
             .await;
         mgr.release_held_slot_for_test(&agent_id);
 
-        gate.resume();
+        gate.release();
         let now = send_now.await.expect("send now");
         assert_eq!(now["queued"], true, "the lost claim is reported honestly");
         assert!(

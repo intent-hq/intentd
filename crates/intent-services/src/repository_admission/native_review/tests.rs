@@ -600,7 +600,7 @@ async fn native_review_member_boundary_admitted_reuse_survives_retirement_and_re
                     tokio::pin!(call);
                     tokio::select! {
                         () = &mut call => panic!("response preceded admitted matching GET barrier"),
-                        () = fixture.server.control.entered.notified() => {},
+                        () = fixture.server.control.hold.wait_reached() => {},
                     }
                     {
                         let requests = fixture.server.control.requests.lock().unwrap();
@@ -632,7 +632,7 @@ async fn native_review_member_boundary_admitted_reuse_survives_retirement_and_re
                         .try_with_lock(&fixture.git.path, || async {})
                         .await
                         .is_none());
-                    fixture.server.control.release.notify_one();
+                    fixture.server.control.hold.release();
                     call.await;
                 }
                 frame.retire();
@@ -1265,13 +1265,13 @@ async fn native_review_actual_post_completion_after_cancel_retains_receipt_and_c
         let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
         let call = frame.scope(Box::pin(async { let _ = f.services.native_review_execute(q.clone()).await; }));
         tokio::pin!(call);
-        tokio::select! {()=&mut call=>panic!("response preceded fixture effect barrier"),()=f.server.control.post_entered.notified()=>{}}
+        tokio::select! {()=&mut call=>panic!("response preceded fixture effect barrier"),()=f.server.control.post_hold.wait_reached()=>{}}
         assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
         frame.retire();
         assert_eq!(c.review.workers.available_permits(), WORKERS-1);
         assert!(op.progress.lock().unwrap().settled.is_none());
         assert!(f.services.worktree_locks.try_with_lock(&f.git.path, || async {}).await.is_none());
-        f.server.control.post_release.notify_one();
+        f.server.control.post_hold.release();
         call.await;
     }).await;
     wait_until(|| op.progress.lock().unwrap().settled.is_some()).await;
@@ -1725,7 +1725,7 @@ async fn native_review_concurrent_registered_roots_coordinate_complete_branch_pa
     };
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        f.server.control.post_entered.notified(),
+        f.server.control.post_hold.wait_reached(),
     )
     .await
     .unwrap();
@@ -1745,7 +1745,7 @@ async fn native_review_concurrent_registered_roots_coordinate_complete_branch_pa
     })
     .await;
     assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
-    f.server.control.post_release.notify_one();
+    f.server.control.post_hold.release();
     let first = first_task.await.unwrap().unwrap();
     let second = second_task.await.unwrap().unwrap();
     assert_eq!(
@@ -1920,11 +1920,11 @@ async fn native_review_cancelled_acquisition_keeps_worker_until_original_http_fi
         let q=f.query(Stage::CreatePr);let frame=s.owner.capture_review(&Frame::Prepare(q.clone())).unwrap();
         let work=frame.scope(Box::pin(async {assert!(f.services.native_review_prepare(q).await.is_err());}));
         tokio::pin!(work);
-        tokio::select! {()=&mut work=>panic!("acquisition completed before fixture response"),()=f.server.control.entered.notified()=>{}}
+        tokio::select! {()=&mut work=>panic!("acquisition completed before fixture response"),()=f.server.control.hold.wait_reached()=>{}}
         frame.retire();work.await;
         assert_eq!(c.review.workers.available_permits(),WORKERS-1);
         assert!(c.review.feed.lock().unwrap().records.is_empty());
-        f.server.control.release.notify_one();
+        f.server.control.hold.release();
     }).await;
     wait_until(|| c.review.workers.available_permits() == WORKERS).await;
     assert_eq!(c.review.records.available_permits(), RECORDS);
@@ -2983,7 +2983,7 @@ async fn native_review_companion_child_acquisition_cancel_retains_original_http_
                 let call = frame.scope(Box::pin(async { assert!(f.services.native_review_prepare(child.clone()).await.is_err()); }));
                 tokio::pin!(call);
                 if entered {
-                    tokio::select! { ()=&mut call => panic!("HTTP did not stay held"), ()=f.server.control.entered.notified()=>{} }
+                    tokio::select! { ()=&mut call => panic!("HTTP did not stay held"), ()=f.server.control.hold.wait_reached()=>{} }
                 } else {
                     tokio::select! { ()=&mut call=>panic!("lock wait did not stay owned"), ()=wait_until(|| c.review.workers.available_permits()==WORKERS-1)=>{} }
                 }
@@ -2993,7 +2993,7 @@ async fn native_review_companion_child_acquisition_cancel_retains_original_http_
                 call.await;
                 if entered {
                     assert_eq!(c.review.workers.available_permits(), WORKERS-1);
-                    f.server.control.release.notify_one();
+                    f.server.control.hold.release();
                 } else { release.send(()).unwrap(); }
                 wait_until(|| c.review.workers.available_permits()==WORKERS).await;
                 frame.retire();
@@ -3127,14 +3127,14 @@ async fn native_review_companion_child_admitted_reuse_and_uncertain_post_survive
                     result=Some(response);
                 }));
                 tokio::pin!(call);
-                if reused {tokio::select! {()=&mut call=>panic!("expected admitted held GET"),()=f.server.control.entered.notified()=>{}}}
-                else {tokio::select! {()=&mut call=>panic!("expected admitted held POST"),()=f.server.control.post_entered.notified()=>{}}}
+                if reused {tokio::select! {()=&mut call=>panic!("expected admitted held GET"),()=f.server.control.hold.wait_reached()=>{}}}
+                else {tokio::select! {()=&mut call=>panic!("expected admitted held POST"),()=f.server.control.post_hold.wait_reached()=>{}}}
                 assert!(op.progress.lock().unwrap().settled.is_none());
                 s.request(&f.services,Frame::Release(bound(&parent))).await.unwrap();
                 assert!(op.write_current().is_err());
                 assert_eq!(c.review.workers.available_permits(),WORKERS-1);
                 assert!(f.services.worktree_locks.try_with_lock(&f.git.path,||async{}).await.is_none());
-                if reused { f.server.control.release.notify_one(); } else { f.server.control.post_release.notify_one(); }
+                if reused { f.server.control.hold.release(); } else { f.server.control.post_hold.release(); }
                 call.await; frame.retire();
             }).await;
             wait_until(|| c.review.workers.available_permits()==WORKERS).await;
@@ -3459,7 +3459,7 @@ async fn native_review_companion_pending_capture_expires_at_parent_deadline_and_
             let frame=s.owner.capture_review(&Frame::Prepare(q.clone())).unwrap();
             let call=frame.scope(Box::pin(async { assert!(f.services.native_review_prepare(q.clone()).await.is_err()); }));
             tokio::pin!(call);
-            tokio::select! { ()=&mut call=>panic!("expected original held read"), ()=f.server.control.entered.notified()=>{} }
+            tokio::select! { ()=&mut call=>panic!("expected original held read"), ()=f.server.control.hold.wait_reached()=>{} }
             eprintln!("expiry control: original provider read held");
             // Cross the absolute timer's millisecond wake granularity;
             // synchronous capture/publication still rejects at the exact bound.
@@ -3469,7 +3469,7 @@ async fn native_review_companion_pending_capture_expires_at_parent_deadline_and_
             eprintln!("expiry control: caller refused");
             assert_eq!(c.review.workers.available_permits(),WORKERS-1);
             assert_eq!(c.review.records.available_permits(),RECORDS-2);
-            f.server.control.release.notify_one();
+            f.server.control.hold.release();
             wait_until(|| c.review.workers.available_permits()==WORKERS).await;
             assert_eq!(c.review.records.available_permits(),RECORDS-1);
             eprintln!("expiry control: actual worker joined");
@@ -4097,11 +4097,11 @@ async fn companion_diagnostic_group2_once_cancel_expiry_capacity() {
                     if scenario==2{waiting.await.unwrap();}else{*f.server.control.pause.lock().unwrap()=Some("/projects/".into());}
                     let call=diagnostic_request(&f,&s,Frame::Prepare(child.clone()),&observer);tokio::pin!(call);
                     if scenario==2 {tokio::select!{result=&mut call=>panic!("unexpected early result:{result:?}"),()=wait_until(||c.review.workers.available_permits()==WORKERS-1)=>{}}}
-                    else {tokio::select!{result=&mut call=>panic!("unexpected early result:{result:?}"),()=f.server.control.entered.notified()=>{}}}
+                    else {tokio::select!{result=&mut call=>panic!("unexpected early result:{result:?}"),()=f.server.control.hold.wait_reached()=>{}}}
                     let released_parent=diagnostic_request(&f,&s,Frame::Release(bound(&parent)),&observer).await;
                     let reply=call.await;
                     diagnostic_checkpoint(&observer,"cancel-before-owned-join",json!({"body":diagnostic_reply(&reply),"parentRelease":diagnostic_reply(&released_parent),"workers":c.review.workers.available_permits()}));
-                    if scenario==2{release.send(()).unwrap();}else{f.server.control.release.notify_one();}
+                    if scenario==2{release.send(()).unwrap();}else{f.server.control.hold.release();}
                     if let Some(holder)=holder{holder.await.unwrap();}
                     wait_until(||c.review.workers.available_permits()==WORKERS).await;
                     assert!(released_parent.is_ok());assert!(reply.is_err());
@@ -4255,7 +4255,7 @@ impl Group4ProviderRelease {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "watchdog",
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
             };
-            held_provider.release.notify_one();
+            held_provider.hold.release();
             signal.store(true, Ordering::Release);
             (reason, started.elapsed())
         });
@@ -4487,7 +4487,7 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
                 frame.scope(Box::pin(async {
                     let call=original.fixture.services.native_review_prepare(original.child.clone());tokio::pin!(call);
                     let mut early=None;
-                    let held=tokio::select!{result=&mut call=>{early=Some(result);false},()=provider.control.entered.notified()=>true};
+                    let held=tokio::select!{result=&mut call=>{early=Some(result);false},()=provider.control.hold.wait_reached()=>true};
                     diagnostic_checkpoint(&observer,"g4-original-project-hold",json!({"entered":held,"capture":original.capture,"earlyBody":early.as_ref().map(diagnostic_reply),"workers":original.connection.review.workers.available_permits()}));
                     let before=Instant::now();
                     if held{tokio::time::advance(acquire_wait()).await;}

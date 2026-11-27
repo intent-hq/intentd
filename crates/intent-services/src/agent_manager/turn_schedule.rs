@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use super::TurnStartPause;
+use intentd_test_support::PausePoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TurnStep {
@@ -48,13 +48,13 @@ pub(crate) enum TurnFault {
 
 #[derive(Default)]
 pub(crate) struct TurnSchedule {
-    pauses: Mutex<HashMap<TurnStep, Arc<TurnStartPause>>>,
+    pauses: Mutex<HashMap<TurnStep, Arc<PausePoint>>>,
     faults: Mutex<HashSet<TurnFault>>,
 }
 
 impl TurnSchedule {
     /// Park the next action that reaches `step` on `pause`.
-    pub(crate) fn arm(&self, step: TurnStep, pause: Arc<TurnStartPause>) {
+    pub(crate) fn arm(&self, step: TurnStep, pause: Arc<PausePoint>) {
         self.pauses.lock().unwrap().insert(step, pause);
     }
 
@@ -64,8 +64,8 @@ impl TurnSchedule {
     }
 
     /// [`Self::arm`] with a fresh pause.
-    pub(crate) fn pause(&self, step: TurnStep) -> Arc<TurnStartPause> {
-        let pause = Arc::new(TurnStartPause::default());
+    pub(crate) fn pause(&self, step: TurnStep) -> Arc<PausePoint> {
+        let pause = PausePoint::new(format!("{step:?}"));
         self.arm(step, pause.clone());
         pause
     }
@@ -74,8 +74,7 @@ impl TurnSchedule {
     pub(crate) async fn reach(&self, step: TurnStep) {
         let pause = self.pauses.lock().unwrap().remove(&step);
         if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
+            pause.pause().await;
         }
     }
 

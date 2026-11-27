@@ -2431,7 +2431,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .get_mut(&id)
         .unwrap()
         .align_with_mock_for_test();
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::WorkerFinish,
         pause.clone(),
@@ -2447,7 +2447,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     .unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -2510,7 +2510,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         user_message_blocks("older instruction", None, None)
     );
     let replacement = mgr.slots.worker_abort_handle_for_test(&id).unwrap();
-    pause.resume.notify_one();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
@@ -11091,7 +11091,7 @@ async fn cancel_caller_after_slot_claim(door: CancelledFrontDoor) -> CancelledCl
             .0
             .id
     });
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::TurnStarting,
         pause.clone(),
@@ -11135,14 +11135,14 @@ async fn cancel_caller_after_slot_claim(door: CancelledFrontDoor) -> CancelledCl
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("delivery claimed the slot");
     assert!(mgr.is_busy(&id));
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
-    pause.resume.notify_one();
+    pause.release();
     CancelledClaim {
         _tmp: tmp,
         _env: env,
@@ -11234,7 +11234,7 @@ async fn send_queued_messages_now_cancelled_after_slot_claim_during_append_failu
         .execute(mgr.services.store.write_pool())
         .await
         .unwrap();
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::UserPersist,
         pause.clone(),
@@ -11248,16 +11248,16 @@ async fn send_queued_messages_now_cancelled_after_slot_claim_during_append_failu
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("the batch claimed the slot and reached its first append");
     assert!(mgr.is_busy(&id));
     if before_error {
         caller.abort();
-        pause.resume.notify_one();
+        pause.release();
     } else {
-        pause.resume.notify_one();
+        pause.release();
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
@@ -11405,7 +11405,7 @@ async fn shutdown_checkpoint_joins_detached_send_of_cancelled_caller() {
     let ws = WorkspaceId::from("ws-cancelled-shutdown");
     let id = AgentId::from("cancelled-shutdown");
     seed_agent(&mgr, &ws, &id).await;
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::TurnStarting,
         pause.clone(),
@@ -11425,7 +11425,7 @@ async fn shutdown_checkpoint_joins_detached_send_of_cancelled_caller() {
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("delivery claimed the slot");
@@ -11445,7 +11445,7 @@ async fn shutdown_checkpoint_joins_detached_send_of_cancelled_caller() {
         early.is_err(),
         "checkpoint must wait for the detached claim-to-spawn task"
     );
-    pause.resume.notify_one();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         checkpoint,
@@ -11480,7 +11480,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     let id = AgentId::from("retire-start");
     seed_agent(&mgr, &ws, &id).await;
     seed_top_level_peer(&mgr, &id).await;
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::TurnStarting,
         pause.clone(),
@@ -11491,7 +11491,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(2)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("turn claimed before side effects");
@@ -11525,7 +11525,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
         &mut retiring,
     )
     .await;
-    pause.resume.notify_one();
+    pause.release();
     let admission = starting.await.unwrap().unwrap();
     match early_retirement {
         Ok(result) => result.unwrap().unwrap(),
@@ -14336,12 +14336,12 @@ async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_tear
     let agent = AgentId::from("live-agent");
     seed_agent(&mgr, &ws, &agent).await;
     track(&mgr, &agent);
-    let (reached, resume) = services.workspace_delete_test_gate.arm(ws.clone());
+    let reached = services.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = services.delete_workspace(ws.clone());
     timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before runtime probe: {result:?}"),
-            () = reached.notified() => {}
+            () = reached.wait_reached() => {}
         }
     })
     .await
@@ -14375,7 +14375,7 @@ async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_tear
     assert!(!mgr.contains(&agent));
     assert!(!mgr.slots.has_workers());
     assert_eq!(mgr.registry().size(), 0);
-    resume.notify_one();
+    reached.release();
     deleting.await.unwrap();
 }
 
@@ -16016,7 +16016,7 @@ async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
         .await
         .unwrap();
     assert_eq!(queued["queued"], true, "held slot queues the follow-up");
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::UserPersist,
         pause.clone(),
@@ -16024,7 +16024,7 @@ async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
     release.send(()).unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("worker drains the follow-up into a new turn");
@@ -25264,7 +25264,7 @@ mod harness_wake_tests {
             .unwrap()[0]
             .editing = true;
         mgr.services.persist_queue_snapshot(&id).await;
-        let pause = Arc::new(super::super::TurnStartPause::default());
+        let pause = intentd_test_support::PausePoint::new("turn step");
         mgr.turn_schedule.arm(
             crate::agent_manager::turn_schedule::TurnStep::FailedWakeDisposal,
             pause.clone(),
@@ -25274,7 +25274,7 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            pause.reached.notified(),
+            pause.wait_reached(),
         )
         .await
         .expect("failed wake reaches provider disposal");
@@ -25324,7 +25324,7 @@ mod harness_wake_tests {
             .unwrap()[0]
             .editing = false;
         mgr.services.persist_queue_snapshot(&id).await;
-        pause.resume.notify_one();
+        pause.release();
         let events = collect_until(&mut sub, |seen| {
             seen.iter().any(|e| e.event_type == "agent:idle")
         })
@@ -29746,7 +29746,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
         AgentId::from("startup-first"),
         AgentId::from("startup-later"),
     ];
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist,
         pause.clone(),
@@ -29788,7 +29788,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
     };
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -29808,7 +29808,7 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
             terminal_failures += 1;
         }
     }
-    pause.resume.notify_one();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         shutdown,
@@ -29846,7 +29846,7 @@ async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
     let idle_ws = WorkspaceId::from("ws-shutdown-idle");
     seed_agent(&mgr, &idle_ws, &idle).await;
     assert!(mgr.try_begin(&busy, &ws).await);
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist,
         pause.clone(),
@@ -29857,12 +29857,12 @@ async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
     };
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
     let admitted = mgr.try_begin(&idle, &idle_ws).await;
-    pause.resume.notify_one();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         shutdown,
@@ -29886,7 +29886,7 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
     let id = AgentId::from("shutdown-preclaimed");
     seed_agent(&mgr, &ws, &id).await;
     let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::ShutdownPersist,
         pause.clone(),
@@ -29897,7 +29897,7 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
     };
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -29916,7 +29916,7 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
         worker.abort();
         let _ = worker.await;
     }
-    pause.resume.notify_one();
+    pause.release();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         shutdown,
@@ -29989,7 +29989,7 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
     let ws = WorkspaceId::from("ws-shutdown-start-write");
     let id = AgentId::from("shutdown-start-write");
     seed_agent(&mgr, &ws, &id).await;
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::TurnStarting,
         pause.clone(),
@@ -30000,7 +30000,7 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
     };
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -30009,7 +30009,7 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
     };
-    pause.resume.notify_one();
+    pause.release();
     let admission = start.await.unwrap().unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -30297,7 +30297,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     // Force the failure after an already-durable head, exercising the real
     // batch handback order as well as the shared terminal-failure handler.
     entries[0].persisted = true;
-    let pause = Arc::new(super::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::UserPersist,
         pause.clone(),
@@ -30317,13 +30317,13 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .unwrap();
     sqlx::query("CREATE TRIGGER fail_shutdown_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
     mgr.begin_shutdown();
-    pause.resume.notify_one();
+    pause.release();
     assert!(timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         preparation
@@ -30430,7 +30430,7 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
             .unwrap();
         enqueue("b2", "b", "barrier");
         sqlx::query("CREATE TRIGGER fail_pending_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
-        let pause = Arc::new(super::TurnStartPause::default());
+        let pause = intentd_test_support::PausePoint::new("turn step");
         mgr.turn_schedule.arm(
             crate::agent_manager::turn_schedule::TurnStep::UserPersist,
             pause.clone(),
@@ -30471,7 +30471,7 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            pause.reached.notified(),
+            pause.wait_reached(),
         )
         .await
         .unwrap();
@@ -30480,7 +30480,7 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
             "a3",
             "an admitted but unwritten B remains a human barrier"
         );
-        pause.resume.notify_one();
+        pause.release();
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             worker,
@@ -30528,11 +30528,11 @@ async fn reap_shutdown_retains_removed_child_cleanup() {
     let (pid, watcher) = track_with_child(&mgr, &id);
     let mut cleanup = Cleanup(Some(pid));
     mgr.registry.set_last_active(&id, 1);
-    let (rx, release) = hold(&mgr.services, "reap");
+    let commit = hold(&mgr.services, "reap");
     let owner = mgr.clone();
     let task =
         tokio::spawn(async move { owner.reap_idle_older_than(Duration::from_secs(1)).await });
-    entered(rx).await;
+    entered(&commit).await;
     assert!(!mgr.contains(&id));
     assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok());
     task.abort();
@@ -30547,7 +30547,7 @@ async fn reap_shutdown_retains_removed_child_cleanup() {
             result = &mut shutdown => { result.unwrap(); panic!("manager shutdown detached removed child cleanup"); }
         }
     }).await.unwrap();
-    release.send(()).unwrap();
+    commit.release();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         shutdown,
@@ -30611,17 +30611,17 @@ async fn admission_release_revoked_queue_tail_drains() {
     );
     svc.persist_queue_snapshot(&id).await;
     assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
-    let (rx, resume) = hold(&svc, "revoked-queue");
+    let commit = hold(&svc, "revoked-queue");
     {
         let (claim, release) = mgr.admission_claim_fns();
         assert!(claim(&id));
         svc.begin_settings_shutdown();
         release(&id);
     }
-    entered(rx).await;
+    entered(&commit).await;
     assert!(svc.queue_snapshot(&id).is_empty());
     assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
-    drain_held(&svc, resume).await;
+    drain_held(&svc, &commit).await;
     mgr.shutdown().await;
     bus.shutdown().await.unwrap();
     svc.store.close().await;
