@@ -60,10 +60,23 @@ const PAUSE_WORDS: &[&str] = &[
     "Stall",
 ];
 /// Field names for the "the operation got here" half of a pause point.
-const ENTERED_FIELDS: &[&str] = &["entered", "reached", "arrived", "parked", "paused"];
+const ENTERED_FIELDS: &[&str] = &[
+    "entered", "reached", "arrived", "parked", "paused", "started",
+];
 /// Field names for the "let it continue" half.
 const RELEASE_FIELDS: &[&str] = &[
-    "release", "released", "resume", "proceed", "unblock", "unpark",
+    "release", "released", "resume", "proceed", "unblock", "unpark", "go",
+];
+/// Channel-end and signal suffixes stripped from a field name before it is
+/// matched (`entered_tx`, `release_rx`, `started_signal`).
+const FIELD_SUFFIXES: &[&str] = &[
+    "_tx",
+    "_rx",
+    "_sender",
+    "_receiver",
+    "_signal",
+    "_notify",
+    "_ch",
 ];
 
 #[derive(Debug)]
@@ -73,21 +86,67 @@ struct Hit {
     malformed: bool,
 }
 
+/// CamelCase words of `name`, each in `Title` case. An acronym run is one
+/// word and ends before the capital that starts the next word, so
+/// `GATEState` reads as `Gate`, `State` and `HTTPGate` as `Http`, `Gate`.
 fn camel_words(name: &str) -> Vec<String> {
-    let mut words = Vec::new();
+    let chars: Vec<char> = name.chars().collect();
+    let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
-    for c in name.chars() {
-        if (c.is_ascii_uppercase() || c == '_') && !current.is_empty() {
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let starts_word = c.is_ascii_uppercase()
+            && !current.is_empty()
+            && (prev.is_some_and(|p| !p.is_ascii_uppercase())
+                || next.is_some_and(|n| n.is_ascii_lowercase()));
+        if starts_word {
             words.push(std::mem::take(&mut current));
         }
-        if c != '_' {
-            current.push(c);
-        }
+        current.push(c);
     }
     if !current.is_empty() {
         words.push(current);
     }
     words
+        .into_iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+            })
+        })
+        .collect()
+}
+
+/// `field` without one [`FIELD_SUFFIXES`] suffix.
+fn field_stem(field: &str) -> &str {
+    FIELD_SUFFIXES
+        .iter()
+        .find_map(|suffix| field.strip_suffix(suffix))
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(field)
+}
+
+/// Index of the token that ends the `struct` item whose keyword is at `at`:
+/// the `;` of a unit or tuple struct, or the `}` closing its body.
+fn struct_end(tokens: &[Token], at: usize) -> usize {
+    let depth = tokens[at].depth;
+    let mut i = at + 1;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t.depth == depth && (t.is(";") || t.is("}")) {
+            return i;
+        }
+        i += 1;
+    }
+    tokens.len() - 1
 }
 
 /// Named fields of the `{ … }` body opening at token `open`.
@@ -109,6 +168,14 @@ fn field_names(tokens: &[Token], open: usize) -> Vec<String> {
 
 fn why(tokens: &[Token], at: usize) -> Option<String> {
     let name = &tokens[at + 1].text;
+    // A fake that holds the shared helper is the migration, not a hand-rolled
+    // pause point (`struct WritePause { pause: Arc<PausePoint> }`).
+    if tokens[at + 1..=struct_end(tokens, at)]
+        .iter()
+        .any(|t| t.is("PausePoint"))
+    {
+        return None;
+    }
     if camel_words(name)
         .iter()
         .any(|w| PAUSE_WORDS.contains(&w.as_str()))
@@ -121,7 +188,7 @@ fn why(tokens: &[Token], at: usize) -> Option<String> {
         .map(|p| at + 2 + p)
         .filter(|p| tokens[*p].is("{"))?;
     let fields = field_names(tokens, open);
-    let has = |set: &[&str]| fields.iter().any(|f| set.contains(&f.as_str()));
+    let has = |set: &[&str]| fields.iter().any(|f| set.contains(&field_stem(f)));
     (has(ENTERED_FIELDS) && has(RELEASE_FIELDS)).then(|| name.clone())
 }
 
@@ -230,7 +297,9 @@ fn test_pause_points_use_the_bounded_helper() {
         .unwrap_or_else(|e| panic!("{e}"));
     let found: BTreeMap<String, Vec<Hit>> = test_code_files(&root)
         .into_iter()
-        .filter(|file| file.src.contains("struct"))
+        // Blanking only removes text, so a file without `struct` has no hit;
+        // a baselined one is kept so its entry reads "none left", not "gone".
+        .filter(|file| file.src.contains("struct") || baseline.contains_key(&file.rel))
         .map(|file| {
             let hits = scan_source(&file.src, file.whole);
             (file.rel, hits)
@@ -310,6 +379,43 @@ struct Inner { entered: u8 }
 struct Outer { inner: Inner, release: u8 }
 ";
     assert!(names(src, true).is_empty(), "{:?}", names(src, true));
+}
+
+#[test]
+fn suffixed_channel_fields_and_started_go_pairs_are_flagged() {
+    let src = "\
+struct HeldClaim { started: Arc<Notify>, release: Arc<Notify> }
+struct Handshake { entered_tx: oneshot::Sender<()>, release_rx: mpsc::Receiver<()> }
+struct Starter { started_signal: Notify, go: Semaphore }
+struct Timing { started: Instant, elapsed: Duration }
+";
+    assert_eq!(
+        names(src, true),
+        vec![
+            (1, "HeldClaim".into()),
+            (2, "Handshake".into()),
+            (3, "Starter".into())
+        ]
+    );
+}
+
+#[test]
+fn a_fake_holding_the_shared_helper_passes() {
+    let src = "\
+struct WritePause { pause: Arc<PausePoint>, op: &'static str }
+struct StoreGate(Arc<intentd_test_support::PausePoint>);
+struct Gate { entered: Notify, release: Semaphore }
+";
+    assert_eq!(names(src, true), vec![(3, "Gate".into())]);
+}
+
+#[test]
+fn acronym_runs_split_into_words() {
+    assert_eq!(camel_words("GATEState"), ["Gate", "State"]);
+    assert_eq!(camel_words("HTTPGate"), ["Http", "Gate"]);
+    assert_eq!(camel_words("write_pause"), ["Write", "Pause"]);
+    assert_eq!(camel_words("GatedSecrets"), ["Gated", "Secrets"]);
+    assert_eq!(camel_words("Gateway"), ["Gateway"]);
 }
 
 #[test]

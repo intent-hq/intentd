@@ -5,7 +5,7 @@
 //! struct: an "entered" signal the operation sends and a "release" it then
 //! waits on. Every copy waited on both with no time limit. On 2026-11-27 a
 //! new orchestrator test (`lifecycle_gates`, run as plain `cargo test`, so
-//! nextest's 180 s slow-timeout never applied) awaited `park.entered` for an
+//! nextest's slow-timeout never applied) awaited `park.entered` for an
 //! operation that had already failed before reaching it, and hung for about
 //! six hours.
 //!
@@ -36,15 +36,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Notify};
 
 /// Base budget for the test to see the operation reach the pause point,
-/// stretched by [`test_timeout`](crate::test_timeout). Under nextest's
-/// 90 s slow-timeout so the helper's message, not a kill, explains a hang.
-pub const DEFAULT_REACH_TIMEOUT: Duration = Duration::from_secs(60);
+/// stretched by [`test_timeout`](crate::test_timeout). The `make` test
+/// targets and coverage CI stretch it 3x (60 s), still under nextest's
+/// kill (90 s slow-timeout, terminated after 2 periods: 180 s), so the
+/// helper's message, not a kill, explains a hang.
+pub const DEFAULT_REACH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Base budget an operation stays held before it gives up (panics),
 /// stretched by [`test_timeout`](crate::test_timeout). Legitimate holds
 /// last seconds; this only frees an operation whose test forgot to release
-/// it or died.
-pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(120);
+/// it or died. 3x stretched (120 s) it still fires before nextest's 180 s
+/// kill.
+pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Debug, Default)]
 struct State {
@@ -150,6 +153,9 @@ impl PausePoint {
     /// release fails the operation instead of parking it forever.
     pub async fn pause(&self) {
         self.arrive();
+        if self.take_permit() {
+            return;
+        }
         let deadline = WallDeadline::after(self.hold_timeout);
         let mut deadline = pin!(deadline);
         loop {
@@ -195,20 +201,27 @@ impl PausePoint {
 
     /// Test side: wait until the operation reaches the pause point, while
     /// polling `op` (a `JoinHandle`, or any pinned future driving the
-    /// operation). Observes one arrival. If `op` arrived and then finished
-    /// (a release was already waiting), this returns with `op` completed:
-    /// do not poll a completed `JoinHandle` again.
+    /// operation). Observes one arrival.
+    ///
+    /// Returns `None` while `op` is still running (held at the pause point,
+    /// the usual case), or `Some(output)` when `op` arrived and then already
+    /// finished (a release was waiting): the output is handed back so the
+    /// test can assert it, and `op` must not be polled again (a completed
+    /// `JoinHandle` panics when polled).
     ///
     /// # Panics
     ///
     /// - When `op` finishes first: the message carries its output, so an
     ///   operation that failed early reports its error at once.
     /// - When neither happens within the reach timeout.
-    pub async fn reached<F>(&self, op: &mut F)
+    pub async fn reached<F>(&self, op: &mut F) -> Option<F::Output>
     where
         F: Future + Unpin,
         F::Output: Debug,
     {
+        if self.observe() {
+            return None;
+        }
         let deadline = WallDeadline::after(self.reach_timeout);
         let mut deadline = pin!(deadline);
         loop {
@@ -216,7 +229,7 @@ impl PausePoint {
             let mut notified = pin!(notified);
             notified.as_mut().enable();
             if self.observe() {
-                return;
+                return None;
             }
             tokio::select! {
                 biased;
@@ -225,7 +238,7 @@ impl PausePoint {
                     if self.observe() {
                         // Arrived and then finished (a release was already
                         // waiting): the pause point was reached.
-                        return;
+                        return Some(out);
                     }
                     panic!(
                         "pause point `{}`: the operation finished before reaching it: {out:?}",
@@ -234,7 +247,7 @@ impl PausePoint {
                 }
                 () = &mut deadline => {
                     if self.observe() {
-                        return;
+                        return None;
                     }
                     panic!("{}", self.reach_expired());
                 }
@@ -249,7 +262,7 @@ impl PausePoint {
     ///
     /// When no arrival comes within the reach timeout.
     pub async fn wait_reached(&self) {
-        self.reached(&mut std::future::pending::<()>()).await;
+        let _ = self.reached(&mut std::future::pending::<()>()).await;
     }
 
     /// Test side, blocking: [`PausePoint::wait_reached`] for a test that is
@@ -483,20 +496,23 @@ mod tests {
         assert_eq!(op.await.unwrap(), 7);
     }
 
-    /// A paused tokio clock auto-advances while the runtime waits on a
-    /// blocking thread; the wall-clock deadline must not fire then.
+    /// A paused tokio clock auto-advances as soon as the runtime is idle,
+    /// so a tokio timer would expire the reach budget at once. The operation
+    /// arrives from a plain OS thread (not `spawn_blocking`, which would
+    /// inhibit auto-advance) after real time passes: only a wall-clock
+    /// deadline waits for it.
     #[tokio::test(start_paused = true)]
     async fn a_paused_clock_does_not_expire_the_wait() {
         let pause = Arc::new(PausePoint::unshared("paused clock").with_reach_timeout(SHORT));
         let held = pause.clone();
-        let mut op = tokio::task::spawn_blocking(move || {
-            // timing-guard: the arrival must come after the runtime idles
-            std::thread::sleep(Duration::from_millis(50));
+        let op = std::thread::spawn(move || {
+            // timing-guard: the arrival must come after the idle runtime auto-advanced
+            std::thread::sleep(Duration::from_millis(100));
             held.pause_blocking();
         });
-        pause.reached(&mut op).await;
+        pause.wait_reached().await;
         pause.release();
-        op.await.unwrap();
+        op.join().unwrap();
     }
 
     #[tokio::test]
@@ -515,12 +531,39 @@ mod tests {
         assert_eq!(pause.arrivals(), 2);
     }
 
+    /// An unspawned operation only runs while `reached` polls it, so with a
+    /// release already waiting it arrives and finishes inside `reached`,
+    /// which hands its output back instead of dropping it.
+    #[tokio::test]
+    async fn reached_returns_the_output_of_an_operation_that_finished_after_arriving() {
+        let pause = PausePoint::new("inline");
+        pause.release();
+        let held = pause.clone();
+        let mut op = Box::pin(async move {
+            held.pause().await;
+            Err::<(), _>("failed after the pause point")
+        });
+        assert_eq!(
+            pause.reached(&mut op).await,
+            Some(Err("failed after the pause point"))
+        );
+    }
+
     #[tokio::test]
     async fn an_operation_that_passes_a_pre_released_point_counts_as_reached() {
         let pause = PausePoint::new("pre-released");
         pause.release();
         let held = pause.clone();
-        let mut op = tokio::spawn(async move { held.pause().await });
-        pause.reached(&mut op).await;
+        let mut op = tokio::spawn(async move {
+            held.pause().await;
+            "passed"
+        });
+        // Either the output came back with the arrival, or `op` was never
+        // polled to completion and can still be awaited.
+        let out = match pause.reached(&mut op).await {
+            Some(out) => out,
+            None => op.await,
+        };
+        assert_eq!(out.unwrap(), "passed");
     }
 }
