@@ -13,7 +13,8 @@
 # - <source glob>: a Bash pattern matched against the repo-relative path of a
 #   changed file; `*` also matches `/`.
 # - <crate>::<test binary>: the nextest binary id, e.g. intentd::suite_wss_g_r
-#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs),
+#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs
+#   or crates/<crate>/tests/<binary>/main.rs),
 #   or <crate>::lib for the crate's library unit tests (root file
 #   crates/<crate>/src/lib.rs; the crate must not also have a tests/lib.rs).
 # - <module path>: the test-name prefix inside that binary, e.g.
@@ -24,7 +25,9 @@
 #
 # `scripts/changed-tests.sh --check-map` (CI's release-scripts job, and every
 # selection run) fails when a glob matches no file or a binary or module no
-# longer exists. Editing this file runs every module it names.
+# longer exists, and when a test that reads another crate's source has no
+# entry (see "Source readers" below). Editing this file runs every module it
+# names.
 
 # Script bindings (ws.script.*): the MCP binding drives script creation,
 # start/run and monitors end to end.
@@ -172,3 +175,25 @@ crates/intentd-test-support/src/egress.rs            intentd::suite_e2e  e2e_tes
 # device-flow suite drives it end to end against a mock login host.
 crates/intent-sourcecontrol/src/device_flow.rs       intentd::suite_wss_repo  e2e_wss_github_device_flow
 crates/intent-sourcecontrol/src/github_transport.rs  intentd::suite_wss_repo  e2e_wss_github_device_flow
+
+# Source readers: tests that read another crate's source text (scan it or run
+# it). A change to that source selects only its own crate, so each reader is
+# mapped from the files it reads. changed-tests.sh keeps this section
+# complete: it fails the map when a test outside the source lints (which run
+# on every crates/ change) names a path in another crate's src/ or resolves
+# the crates/ directory, and no entry here targets that test. intentd#3835
+# changed only intent-services/src and was ejected from the merge queue by the
+# event-taxonomy golden (CI run 45971066229). Readers of intent-core/src need
+# no entry: every crate depending on intent-core runs on an intent-core change.
+crates/intent-services/src/*.rs                       intent-transport::lib          events::tests::emit_path_taxonomy
+crates/*/src/*.rs                                     intent-core::secret_store_roots
+crates/intentd/src/main.rs                            intentd-orchestrator::startup_parity
+crates/intent-app/src/lib.rs                          intentd-orchestrator::startup_parity
+crates/intent-app/src/tenant.rs                       intentd-orchestrator::startup_parity
+crates/intent-app/src/agents.rs                       intentd-orchestrator::startup_parity
+crates/intent-app/src/shutdown.rs                     intentd-orchestrator::startup_parity
+crates/intent-services/src/self_fence.rs              intentd-orchestrator::startup_parity
+crates/intent-services/src/pi_mcp_extension.ts        intentd::suite_e2e             pi_mcp_extension_node
+crates/intent-transport/src/router.rs                 intent-app::payload_budget
+crates/intent-transport/src/events/fixtures/*         intentd::suite_wss_a_f         e2e_wss_egress_conflation
+crates/intent-services/src/codex_diagnostics/catalog_fixture.cjs intentd::suite_e2e e2e_doctor_codex

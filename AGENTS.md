@@ -302,7 +302,9 @@ runs every source lint binary (`*_lint`, the CI "Source lints" step) but not the
 crate (intentd#3742); building intentd's lint binaries compiles most of the workspace. It also runs the end-to-end and library
 unit-test modules `.config/e2e-test-map.txt` maps changed source to — add an entry when an
 end-to-end test or another crate's unit test exercises a crate's source (`<crate>::lib
-<module>` names unit tests); `scripts/changed-tests.sh --check-map` validates it.
+<module>` names unit tests); `scripts/changed-tests.sh --check-map` validates it, and fails
+when a test reads another crate's `src/` (a golden or parity guard naming its path, or resolving
+`crates/`) with no entry targeting it — map each file it reads under "Source readers" (intentd#3835).
 
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and

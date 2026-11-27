@@ -107,11 +107,14 @@
 #
 # The map is validated on every run, and --check-map validates it alone (and
 # requires it to exist): each source glob must match a tracked or untracked
-# file, each test binary root crates/<c>/tests/<s>.rs (crates/<c>/src/lib.rs
+# file, each test binary root crates/<c>/tests/<s>.rs or
+# crates/<c>/tests/<s>/main.rs (crates/<c>/src/lib.rs
 # for <c>::lib, which must not also have a tests/lib.rs, nor a manifest
 # [lib] path elsewhere or test = false) must exist, and each
 # segment of a module path must be declared by its parent with its file
-# present. An invalid map exits 2 naming every bad line.
+# present. Every test that reads another crate's source (see
+# check_source_readers) must also be the target of an entry, so a change to
+# that source selects it. An invalid map exits 2 naming every bad line.
 #
 # Exit codes: 0 = nothing to test, every invocation passed, or --check-map
 # found the map valid; 2 = usage error, an invalid end-to-end map
@@ -468,12 +471,22 @@ resolve_module() {
   done
 }
 
-# True when tests/$2.rs of crate $1 is a test target: cargo builds every
-# tests/*.rs as one unless the manifest sets autotests = false, in which case
-# only its [[test]] names count (intentd's suite modules are not targets).
+# Sets test_root to the root file of test target $2 of crate $1:
+# tests/$2.rs, else tests/$2/main.rs (cargo discovers both shapes), else the
+# tests/$2.rs it would be.
+test_root() {
+  test_root="crates/$1/tests/$2.rs"
+  [[ -f "$test_root" || ! -f "crates/$1/tests/$2/main.rs" ]] || test_root="crates/$1/tests/$2/main.rs"
+}
+
+# True when tests/$2.rs (or tests/$2/main.rs) of crate $1 is a test target:
+# cargo builds every one as one unless the manifest sets autotests = false, in
+# which case only its [[test]] names count (intentd's suite modules are not
+# targets).
 is_test_target() {
   local manifest="crates/$1/Cargo.toml" line section="" autotests="" names=$'\n'
-  [[ -f "crates/$1/tests/$2.rs" ]] || return 1
+  test_root "$1" "$2"
+  [[ -f "$test_root" ]] || return 1
   [[ -f "$manifest" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line=${line#"${line%%[![:space:]]*}"}
@@ -570,7 +583,8 @@ load_e2e_map() {
       fi
       continue
     fi
-    root="crates/$crate/tests/$binary.rs"
+    test_root "$crate" "$binary"
+    root=$test_root
     if [[ ! -f "$root" ]]; then
       map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
     elif ! is_test_target "$crate" "$binary"; then
@@ -583,7 +597,142 @@ load_e2e_map() {
   done <"$e2e_map"
 }
 
+# Sets reader_crate, reader_binary ("*" = any binary of the crate) and
+# reader_module to the test target and module path that Rust file $1 (under
+# crates/) builds into: src/<p>.rs is module <p> of <crate>::lib (lib.rs and
+# mod.rs name their directory), tests/<t>.rs is target <t> or, when <t> is not
+# a target, module <t> of a suite, and tests/<d>/<p>.rs is module <p> of a
+# tests/<d>/main.rs target, else module <d>::<p> of a suite. #[path] remaps
+# are not followed.
+reader_target() {
+  local rest=${1#crates/} dir sub
+  reader_crate=${rest%%/*}
+  rest=${rest#*/}
+  reader_binary="*"
+  case "$rest" in
+    src/*)
+      reader_binary=lib
+      rest=${rest#src/}
+      ;;
+    tests/*/*)
+      rest=${rest#tests/}
+      dir=${rest%%/*}
+      sub=${rest#*/}
+      if [[ -f "crates/$reader_crate/tests/$dir/main.rs" ]] && is_test_target "$reader_crate" "$dir"; then
+        reader_binary=$dir
+        rest=$sub
+      fi
+      ;;
+    tests/*)
+      rest=${rest#tests/}
+      if is_test_target "$reader_crate" "${rest%.rs}"; then
+        reader_binary=${rest%.rs}
+        rest=""
+      fi
+      ;;
+  esac
+  rest=${rest%.rs}
+  case "$rest" in
+    lib | main | mod) rest="" ;;
+    */mod) rest=${rest%/mod} ;;
+  esac
+  reader_module=""
+  while [[ -n "$rest" ]]; do
+    reader_module+="${reader_module:+::}${rest%%/*}"
+    if [[ "$rest" == */* ]]; then rest=${rest#*/}; else rest=""; fi
+  done
+}
+
+# Source readers: a test that reads another crate's source text (a golden
+# scanning its literals, a parity guard, a script it runs) breaks on a change
+# to that source, which selects only the source's own crate. Each one must be
+# the target of a map entry (the map's "Source readers" section names the
+# files it reads), so a new reader cannot go unselected (intentd#3835: an
+# intent-services/src change passed test-changed and failed intent-transport's
+# event-taxonomy golden in the merge queue). A Rust file under crates/ is a
+# reader when it
+#  - has a string literal naming a path in another crate's src/ ("<crate>/src",
+#    "../<crate>/src/x.rs", "crates/<crate>/src/..."), or
+#  - resolves the crates/ directory: env!("CARGO_MANIFEST_DIR"), package_dir()
+#    or workspace_root() followed within two lines by .parent() or
+#    .join("crates").
+# This is a textual check, not a proof. Source lints (crates/*/tests/*_lint.rs)
+# are exempt: every crates/ change already runs them. A file that matches but
+# reads no other crate's source opts out with a line carrying
+# "changed-tests: not a source reader: <reason>". It is covered by an entry
+# naming its module, an enclosing one or a module inside it, or naming its
+# target whole (for a suite module: a suite binary that declares it). Appends one map_errors line per uncovered reader.
+check_source_readers() {
+  local manifest crate alternation="" hits line file lit lit_crate readers=$'\n' anchors entry_glob e_crate e_binary e_module covered
+  local marker='changed-tests: not a source reader:'
+  for manifest in crates/*/Cargo.toml; do
+    [[ -f "$manifest" ]] || continue
+    crate=${manifest#crates/}
+    crate=${crate%/Cargo.toml}
+    alternation+="${alternation:+|}$crate"
+  done
+  [[ -n "$alternation" ]] || return 0
+  local specs=('crates/*.rs' ':!crates/*/tests/*_lint.rs')
+  # git grep exits 1 when nothing matches.
+  hits=$(git -c core.quotePath=false grep --untracked -I -o -E "\"(\.\./)*(crates/)?($alternation)/src(/[^\"]*)?\"" -- "${specs[@]}" </dev/null) ||
+    [[ $? -eq 1 ]] || die 2 "git grep for source readers failed"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    file=${line%%:*}
+    lit=${line#*:}
+    lit=${lit#\"}
+    while [[ "$lit" == ../* ]]; do lit=${lit#../}; done
+    lit=${lit#crates/}
+    lit_crate=${lit%%/*}
+    crate=${file#crates/}
+    crate=${crate%%/*}
+    [[ "$lit_crate" == "$crate" || "$readers" == *$'\n'"$file"$'\n'* ]] || readers+="$file"$'\n'
+  done <<<"$hits"
+  anchors='CARGO_MANIFEST_DIR|package_dir\(\)|workspace_root\(\)'
+  hits=$(git -c core.quotePath=false grep --untracked -I -l -E "$anchors" -- "${specs[@]}" </dev/null) ||
+    [[ $? -eq 1 ]] || die 2 "git grep for source readers failed"
+  while IFS= read -r file; do
+    [[ -n "$file" && "$readers" != *$'\n'"$file"$'\n'* ]] || continue
+    if grep -A2 -E "$anchors" "$file" | grep -qE '\.parent\(\)|\.join\("crates"\)'; then
+      readers+="$file"$'\n'
+    fi
+  done <<<"$hits"
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    if grep -qF "$marker" "$file"; then
+      grep -qE "$marker[[:blank:]]*[^[:blank:]]" "$file" ||
+        map_errors+="$file: '$marker' needs a reason after the colon"$'\n'
+      continue
+    fi
+    reader_target "$file"
+    covered=""
+    while IFS=$'\t' read -r entry_glob e_crate e_binary e_module; do
+      [[ -n "$entry_glob" && "$e_crate" == "$reader_crate" ]] || continue
+      [[ "$reader_binary" == "*" || "$e_binary" == "$reader_binary" ]] || continue
+      if [[ -z "$e_module" ]]; then
+        # A whole binary covers a suite module only when it declares it.
+        if [[ "$reader_binary" != "*" ]]; then
+          covered=1
+        elif [[ "$e_binary" != lib ]]; then
+          test_root "$e_crate" "$e_binary"
+          ! resolve_module "$test_root" "$reader_module" || covered=1
+        fi
+      elif [[ "$e_module" == "$reader_module" ||
+        (-n "$reader_module" && ("$e_module" == "$reader_module::"* || "$reader_module" == "$e_module::"*)) ]]; then
+        covered=1
+      fi
+      [[ -z "$covered" ]] || break
+    done <<<"$e2e_entries"
+    if [[ -z "$covered" ]]; then
+      local where="$reader_crate::$reader_binary"
+      [[ "$reader_binary" != "*" ]] || where="any $reader_crate test binary"
+      map_errors+="$file reads another crate's source but no $e2e_map entry targets it ($where${reader_module:+, module $reader_module}): map each file it reads under 'Source readers', or mark it '$marker <reason>'"$'\n'
+    fi
+  done <<<"$readers"
+}
+
 load_e2e_map
+check_source_readers
 [[ -z "$check_map" || -f "$e2e_map" ]] || die 2 "$e2e_map does not exist"
 if [[ -n "$map_errors" ]]; then
   while IFS= read -r line; do
