@@ -50,6 +50,11 @@ use intent_services::feature_api::{
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
+/// Upper bound on waiting for the reader to reach EOF after the child is
+/// reaped. A background grandchild holding the PTY open keeps the reader alive,
+/// so the bound keeps `terminal:exit` from waiting on it (same as scripts).
+const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
+
 /// Delay after output before re-reading the foreground program. A program
 /// start or exit almost always prints (the echoed Enter, a new prompt), so
 /// output drives the check; the delay lets the new program take the
@@ -687,9 +692,9 @@ pub(crate) fn spawn_output_stream(
                 }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
-                        // Reaped: drain any output the reader flushed just before
-                        // EOF, then stop tailing.
-                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id());
+                        // Reaped, but the reader can still hold the child's last
+                        // output: stream it before `terminal:exit`.
+                        stream_until_output_eof(&mut live, &pty, pty_id, bus.as_ref(), &workspace_id, &terminal_id).await;
                         break;
                     }
                 }
@@ -698,6 +703,34 @@ pub(crate) fn spawn_output_stream(
         let exit = pty.try_exit(pty_id).ok().flatten();
         emit_exit(bus.as_ref(), &workspace_id, &terminal_id, exit).await;
     });
+}
+
+/// Emit live output until the reader reaches EOF (bounded by
+/// [`OUTPUT_EOF_WAIT`]), then flush what is left on the channel. The child can
+/// be reaped before the reader has published its final chunks; stopping at the
+/// reap dropped them from the live stream.
+async fn stream_until_output_eof(
+    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
+    pty: &PtyHost,
+    pty_id: PtyId,
+    bus: Option<&EventBus>,
+    workspace_id: &WorkspaceId,
+    terminal_id: &str,
+) {
+    let eof = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id));
+    tokio::pin!(eof);
+    loop {
+        tokio::select! {
+            biased;
+            recv = live.recv() => match recv {
+                Ok(chunk) => emit_data(bus, workspace_id, terminal_id, pty.daemon_boot_id(), &chunk),
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return,
+            },
+            _ = &mut eof => break,
+        }
+    }
+    drain_pending(live, bus, workspace_id, terminal_id, pty.daemon_boot_id());
 }
 
 /// Flush any output buffered on the live channel without blocking (used once the
