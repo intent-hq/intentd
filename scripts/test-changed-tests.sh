@@ -2168,51 +2168,75 @@ write crates/gamma/tests/smoke.rs $'// changed-tests: not a source reader:\ncons
 expect_reader_error "crates/gamma/tests/smoke.rs: 'changed-tests: not a source reader:' needs a reason after the colon"
 
 # The real tree: the fixtures above pin the mechanism, these cases pin the real
-# map's data. The copy holds every crates/ Rust file and manifest, .config/
-# and each file a map glob names (not the whole tree: crates/ is ~100 MB).
-# intentd#3835 changed only intent-services/src, passed test-changed and was
-# ejected from the merge queue by intent-transport's event-taxonomy golden,
-# which scans intent-services/src (CI run 45971066229).
-real_root=$(cd "$here/.." && pwd -P)
-real_repo="$temp_dir/real"
-mkdir -p "$real_repo/scripts"
-real_specs=('crates/*.rs' 'crates/*/Cargo.toml' '.config/*')
-while read -r glob _; do
-  [[ -n "$glob" && "$glob" != \#* ]] && real_specs+=("$glob")
-done <"$real_root/.config/e2e-test-map.txt"
-git -C "$real_root" -c core.quotePath=false ls-files -z --cached --others --exclude-standard -- "${real_specs[@]}" >"$temp_dir/real-files" ||
-  fail "cannot list the real tree's files"
-while IFS= read -r -d '' file; do
-  [[ -f "$real_root/$file" ]] && printf '%s\0' "$file"
-done <"$temp_dir/real-files" | (cd "$real_root" && tar --null -T - -cf -) | (cd "$real_repo" && tar -xf -)
-for helper in $helpers; do
-  cp "$here/$helper" "$real_repo/scripts/"
-done
-git -C "$real_repo" init -q
-git -C "$real_repo" add -A
-git -C "$real_repo" commit -q -m base
-fixture_script=$script
-script="$real_repo/scripts/changed-tests.sh"
+# map's data (intentd#3835 changed only intent-services/src, passed
+# test-changed and was ejected from the merge queue by intent-transport's
+# event-taxonomy golden, which scans intent-services/src; CI run 45971066229).
+# The copy is a --shared clone of this checkout's HEAD (no blob is rewritten)
+# checked out sparsely: every crates/ Rust file and manifest, .config/,
+# scripts/ and each path a map glob names, with this checkout's uncommitted
+# edits there (a map entry being written) and its scripts/ helpers laid over
+# it. These cases run once, not again in the Bash 3 pass below: the fixtures
+# already cover the script under Bash 3, and the copy is the suite's slowest
+# step.
+real_tree_cases() {
+  local glob file
+  real_root=$(cd "$here/.." && pwd -P)
+  real_repo="$temp_dir/real"
+  real_specs=('crates/*.rs' 'crates/*/Cargo.toml' '.config/*')
+  real_sparse=('/crates/**/*.rs' '/crates/*/Cargo.toml' '/.config/' '/scripts/')
+  while read -r glob _; do
+    if [[ -n "$glob" && "$glob" != \#* ]]; then
+      real_specs+=("$glob")
+      real_sparse+=("/$glob")
+    fi
+  done <"$real_root/.config/e2e-test-map.txt"
+  git clone -q --shared --no-checkout "$real_root" "$real_repo" || fail "cannot clone the real tree"
+  git -C "$real_repo" sparse-checkout set --no-cone "${real_sparse[@]}" >/dev/null 2>&1 ||
+    fail "cannot set the real tree's sparse checkout"
+  git -C "$real_repo" -c advice.detachedHead=false checkout -q "$(git -C "$real_root" rev-parse HEAD)" ||
+    fail "cannot check out the real tree"
+  # Uncommitted edits: modified and untracked files are copied, deleted ones
+  # removed.
+  git -C "$real_root" -c core.quotePath=false ls-files -z --modified --others --exclude-standard -- "${real_specs[@]}" >"$temp_dir/real-files" ||
+    fail "cannot list the real tree's edits"
+  while IFS= read -r -d '' file; do
+    if [[ -f "$real_root/$file" ]]; then
+      mkdir -p "$real_repo/$(dirname "$file")"
+      cp "$real_root/$file" "$real_repo/$file"
+    else
+      rm -f "$real_repo/$file"
+    fi
+  done <"$temp_dir/real-files"
+  mkdir -p "$real_repo/scripts"
+  for helper in $helpers; do
+    cp "$here/$helper" "$real_repo/scripts/"
+  done
+  git -C "$real_repo" add -A
+  git -C "$real_repo" commit -q --allow-empty -m "real tree with local edits"
+  fixture_script=$script
+  script="$real_repo/scripts/changed-tests.sh"
 
-real_case() {
+  real_case() {
+    git -C "$real_repo" reset -q --hard
+    git -C "$real_repo" clean -fdq
+    clear_logs
+    echo "// changed" >>"$real_repo/$1"
+    RUN_CWD="$real_repo" DRY_RUN=1 run_script --base HEAD
+    expect_ok
+  }
+
+  case_name="real map: an intent-services-only src change selects the event-taxonomy golden"
+  real_case crates/intent-services/src/lib.rs
+  [[ "$stdout" == *"[test-changed] cargo nextest run -p intent-transport --lib -E '(binary_id(=intent-transport)&test(/^(events::tests::emit_path_taxonomy)::/))'"* ]] ||
+    fail "$case_name: plan was"$'\n'"$stdout"
+
+  case_name="real map: --check-map accepts the real map"
   git -C "$real_repo" reset -q --hard
-  git -C "$real_repo" clean -fdq
-  clear_logs
-  echo "// changed" >>"$real_repo/$1"
-  RUN_CWD="$real_repo" DRY_RUN=1 run_script --base HEAD
+  RUN_CWD="$real_repo" run_script --check-map
   expect_ok
+  script=$fixture_script
 }
-
-case_name="real map: an intent-services-only src change selects the event-taxonomy golden"
-real_case crates/intent-services/src/lib.rs
-[[ "$stdout" == *"[test-changed] cargo nextest run -p intent-transport --lib -E '(binary_id(=intent-transport)&test(/^(events::tests::emit_path_taxonomy)::/))'"* ]] ||
-  fail "$case_name: plan was"$'\n'"$stdout"
-
-case_name="real map: --check-map accepts the real map"
-git -C "$real_repo" reset -q --hard
-RUN_CWD="$real_repo" run_script --check-map
-expect_ok
-script=$fixture_script
+[[ -n "${CHANGED_TESTS_TEST_BASH:-}" ]] || real_tree_cases
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

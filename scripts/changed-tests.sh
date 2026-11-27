@@ -661,7 +661,8 @@ reader_target() {
 # reads no other crate's source opts out with a line carrying
 # "changed-tests: not a source reader: <reason>". It is covered by an entry
 # naming its module, an enclosing one or a module inside it, or naming its
-# target whole (for a suite module: a suite binary that declares it). Appends one map_errors line per uncovered reader.
+# target whole (for a suite module: a suite binary that declares it).
+# Appends one map_errors line per uncovered reader.
 check_source_readers() {
   local manifest crate alternation="" hits line file lit lit_crate readers=$'\n' anchors entry_glob e_crate e_binary e_module covered
   local marker='changed-tests: not a source reader:'
@@ -700,7 +701,7 @@ check_source_readers() {
   while IFS= read -r file; do
     [[ -n "$file" ]] || continue
     if grep -qF "$marker" "$file"; then
-      grep -qE "$marker[[:blank:]]*[^[:blank:]]" "$file" ||
+      grep -qE "${marker}[[:blank:]]*[^[:blank:]]" "$file" ||
         map_errors+="$file: '$marker' needs a reason after the colon"$'\n'
       continue
     fi
