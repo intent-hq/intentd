@@ -179,7 +179,10 @@ impl PgStore {
     /// over, which no holder can tell: every holder is matched on its own
     /// lease id too. Commits with `tx`. Never the tenant lease: only the
     /// tenant claim and its release write that row (`lease.rs`).
+    /// Lease rows are owner-only: a request handle is refused, writing
+    /// nothing (its caller's transaction rolls back).
     pub(crate) async fn retire_lease(&self, tx: &mut WriteTx, lease: &Lease) -> Result<()> {
+        self.refuse_request_role("a store lease retirement")?;
         if lease.scope() == TENANT_SCOPE {
             return Err(Error::InvalidParams(
                 "the tenant lease is never retired".to_owned(),

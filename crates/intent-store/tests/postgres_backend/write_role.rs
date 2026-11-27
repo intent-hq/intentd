@@ -25,11 +25,14 @@ use intent_core::nodes::{
     LeaseFence, LeaseFenceKind, LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter,
     NodeKind, NodeLease, NodeOs, NodeRecord, NodeState,
 };
-use intent_core::{ActorType, EventActor, WorkspaceId};
+use intent_core::{ActorType, AgentId, EventActor, WorkspaceId};
 use intent_store::postgres::{
     PgPool, PostgresOptions, TenantId, TenantLease, WriteRole, WriterLimits,
 };
-use intent_store::{Error, LeaseKeeper, NewEvent, Store, TenantState};
+use intent_store::{
+    Error, LeaseKeeper, NewEvent, PersistedCompletionWatch, PersistedDelegationGroup, Store,
+    TenantState,
+};
 use intentd_test_support::test_timeout;
 
 use super::harness::{hold_writer_lock, sqlite_store, test_db, writer_lock_waiters, TestDb};
@@ -519,6 +522,150 @@ async fn link_ownership_writes_refuse_a_request_handle() {
             .unwrap(),
         NodeCounter(5)
     );
+}
+
+/// Rows of `tenant` in `table`, by an admin read.
+async fn count_rows(admin: &PgPool, table: &str, tenant: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table} WHERE tenant_id = $1"
+    )))
+    .bind(tenant)
+    .fetch_one(admin)
+    .await
+    .expect("count rows")
+}
+
+/// Held delivery claims of `tenant` (live lease rows of the completion
+/// watch and delegation group scopes).
+async fn held_delivery_claims(admin: &PgPool, tenant: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM lease WHERE tenant_id = $1 \
+         AND scope IN ('completion-watch', 'delegation-group') AND lease_id IS NOT NULL",
+    )
+    .bind(tenant)
+    .fetch_one(admin)
+    .await
+    .expect("count delivery claims")
+}
+
+fn completion_watch(id: &str, group: Option<&str>) -> PersistedCompletionWatch {
+    PersistedCompletionWatch {
+        id: id.into(),
+        parent_workspace_id: WorkspaceId("__chief__".into()),
+        child_workspace_id: WorkspaceId("ws-child".into()),
+        parent_agent_id: AgentId("parent".into()),
+        parent_agent_name: "parent".into(),
+        child_agent_id: AgentId(format!("child-{id}")),
+        group_id: group.map(Into::into),
+        report_delivered: false,
+        wake_on_attention: false,
+        completion_only: false,
+        created_at: "2026-11-27T00:00:00.000Z".into(),
+    }
+}
+
+fn delegation_group(id: &str) -> PersistedDelegationGroup {
+    PersistedDelegationGroup {
+        group_id: id.into(),
+        workspace_id: WorkspaceId("__chief__".into()),
+        parent_agent_id: AgentId("parent".into()),
+        await_mode: "after_all".into(),
+        expected_agent_ids: vec![AgentId("child-w2".into())],
+        completed_agent_ids: vec![AgentId("child-w2".into())],
+        deleted_agent_ids: vec![],
+        sealed: true,
+        delivered: false,
+        event_summaries: vec![],
+        raw_events_json: vec![],
+        created_at: "2026-11-27T00:00:00.000Z".into(),
+        updated_at: "2026-11-27T00:00:00.000Z".into(),
+    }
+}
+
+/// Settling a delivery retires its claim, a store lease row, so it is owner
+/// work: with a valid keeper the owner acquired, both settlement paths
+/// refuse a request handle and change nothing (the watch, group and claim
+/// rows, and no delivery marker). The owner then settles them.
+#[tokio::test]
+async fn delivery_settlement_refuses_a_request_handle() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "write-role-delivery";
+    let (a, _lease_a) = open_owned(&db.app, tenant, "a", LONG_TTL).await;
+    let replica = open_request(&db.app, tenant, "replica").await;
+    a.upsert_completion_watch(&completion_watch("w1", None))
+        .await
+        .unwrap();
+    a.upsert_completion_watch(&completion_watch("w2", Some("g1")))
+        .await
+        .unwrap();
+    a.upsert_delegation_group(&delegation_group("g1"))
+        .await
+        .unwrap();
+    let watch_claim = a
+        .claim_completion_watch("w1", LONG_TTL)
+        .await
+        .unwrap()
+        .expect("the owner claims the watch");
+    let group_claim = a
+        .claim_delegation_group("g1", LONG_TTL)
+        .await
+        .unwrap()
+        .expect("the owner claims the group");
+    let (parent, child) = (AgentId("parent".into()), AgentId("child-w1".into()));
+
+    for (who, store) in [
+        ("replica", &replica),
+        ("owner's request writer", &a.request_writer()),
+    ] {
+        assert_not_owner(
+            store
+                .retire_completion_watch_after_delivery(
+                    "w1",
+                    &parent,
+                    &child,
+                    Some("completion-1"),
+                    "2026-11-27T00:00:01.000Z",
+                    &watch_claim,
+                )
+                .await,
+            who,
+        );
+        assert_not_owner(
+            store
+                .settle_delegation_group_after_delivery("g1", &[], &group_claim)
+                .await,
+            who,
+        );
+    }
+
+    assert_eq!(count_rows(&db.admin, "completion_watch", tenant).await, 2);
+    assert_eq!(count_rows(&db.admin, "delegation_group", tenant).await, 1);
+    assert_eq!(
+        count_rows(&db.admin, "completion_wake_delivery", tenant).await,
+        0
+    );
+    assert_eq!(held_delivery_claims(&db.admin, tenant).await, 2);
+
+    // No delivery marker here: it references agent rows this test has not
+    // seeded. The refused calls above passed one, and wrote none.
+    a.retire_completion_watch_after_delivery(
+        "w1",
+        &parent,
+        &child,
+        None,
+        "2026-11-27T00:00:01.000Z",
+        &watch_claim,
+    )
+    .await
+    .expect("the owner retires the watch");
+    a.settle_delegation_group_after_delivery("g1", &[], &group_claim)
+        .await
+        .expect("the owner settles the group");
+    assert_eq!(count_rows(&db.admin, "completion_watch", tenant).await, 0);
+    assert_eq!(count_rows(&db.admin, "delegation_group", tenant).await, 0);
+    assert_eq!(held_delivery_claims(&db.admin, tenant).await, 0);
 }
 
 /// A request write still takes the tenant writer lock (so commit order
