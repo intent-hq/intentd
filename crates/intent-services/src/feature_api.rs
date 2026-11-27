@@ -546,7 +546,13 @@ mod unit_tests {
         let tmp = TempDb::new();
         let bare = services(&tmp).await;
         assert!(bare.feature_assets_root().is_none());
-        assert!(bare.feature_workspaces_root().is_none());
+        let scratch_root = bare
+            .feature_workspaces_root()
+            .expect("an isolated Services owns a scratch workspaces root");
+        assert!(
+            scratch_root.parent().is_some_and(std::path::Path::is_dir),
+            "the scratch root lives in the isolated instance's own dir"
+        );
         assert!(bare.feature_event_bus().is_none());
         assert!(!bare.feature_store_tasks().is_closed());
         assert!(bare.feature_script_monitor_lane().try_lock().is_ok());

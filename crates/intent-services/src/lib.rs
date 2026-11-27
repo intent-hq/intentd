@@ -994,7 +994,10 @@ pub struct Services {
     /// Root directory `workspace.create` provisions worktrees under
     /// (`<root>/<workspaceId>/<repo-slug>`). `None` resolves the default at
     /// call time: `$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces` (the
-    /// FE's `WorkspaceConfig.WORKSPACES_BASE`). Tests inject a temp dir.
+    /// FE's `WorkspaceConfig.WORKSPACES_BASE`). The test constructors
+    /// (`new_isolated`, `new_with_file_secrets`, `new_repository_fixture`)
+    /// set it to their owned scratch dir; `new` / `new_with_secret_file`
+    /// leave it `None`.
     workspaces_root: Option<PathBuf>,
     /// Wall-clock bound for the `workspace.create` base-refresh fetch.
     /// `None` keeps the production default (100 s); tests inject a short
@@ -1378,10 +1381,12 @@ pub struct Services {
     /// Production wiring uses the daemon default (`$INTENTD_SECRETS_FILE`);
     /// tests inject a scratch path.
     gitlab_secret_store: intent_core::FileSecretStore,
-    /// Owns the scratch secrets directory of a [`Services::new_isolated`]
-    /// instance (removed when the last clone drops); `None` otherwise.
+    /// Owns the scratch directory of a test-constructed instance
+    /// ([`Services::new_isolated`] keeps its secrets file there, and every
+    /// test constructor its default workspaces root); removed when the last
+    /// clone drops. `None` for production constructors.
     #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
-    isolated_secrets_dir: Option<Arc<tempfile::TempDir>>,
+    isolated_scratch_dir: Option<Arc<tempfile::TempDir>>,
     /// Serialises refresh / persist / delete of the GitLab credential pair
     /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
     /// clones.
@@ -1786,6 +1791,20 @@ pub(crate) const DELIVERY_CLAIM_TTL: std::time::Duration = std::time::Duration::
 #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
 pub const ISOLATED_GITHUB_API_BASE_URI: &str = "http://127.0.0.1:0";
 
+/// A fresh scratch directory for one test-constructed [`Services`]
+/// ([`Services::isolated_for_tests`] owns it).
+///
+/// # Panics
+///
+/// When the directory cannot be created.
+#[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+fn isolated_scratch_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("intentd-test-services-")
+        .tempdir()
+        .expect("create isolated services scratch dir")
+}
+
 impl Services {
     /// Wire the services surface over a persistence handle, keeping secrets in
     /// the process-wide default file (`~/intent/.secrets.json` or
@@ -1815,12 +1834,15 @@ impl Services {
     /// forgets [`Services::with_github_api_base_uri`],
     /// [`Services::with_github_login_base_uri`] or
     /// [`Services::with_gitlab_api_base_uri`] gets a local connection error
-    /// instead of reaching api.github.com, github.com or gitlab.com. The scratch dir lives
-    /// until the last clone drops. Use this in every test: under nextest the
-    /// default constructor only avoids the real home by falling back to one
-    /// scratch store shared by the whole test process (see
-    /// [`intent_core::test_isolation`]), and plain `cargo test` has no guard
-    /// at all.
+    /// instead of reaching api.github.com, github.com or gitlab.com. The
+    /// workspaces root defaults to `<scratch>/workspaces`, never
+    /// `$INTENTD_WORKSPACES_DIR` or `~/intent/workspaces`: a test that needs
+    /// a given root passes it with [`Services::with_workspaces_root`]. The
+    /// scratch dir lives until the last clone drops. Use this in every test:
+    /// under nextest the default constructor only avoids the real home by
+    /// falling back to one scratch store shared by the whole test process
+    /// (see [`intent_core::test_isolation`]), and plain `cargo test` has no
+    /// guard at all.
     ///
     /// # Panics
     ///
@@ -1829,14 +1851,21 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
     #[must_use]
     pub fn new_isolated(store: Store) -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("intentd-test-secrets-")
-            .tempdir()
-            .expect("create isolated secrets dir");
-        let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
-        let mut services = Self::new_with_repository_sources(store, secrets, None);
-        services.isolated_secrets_dir = Some(Arc::new(dir));
-        services.with_isolated_forge_bases()
+        let scratch = isolated_scratch_dir();
+        let secrets = intent_core::FileSecretStore::with_path(scratch.path().join(".secrets.json"));
+        Self::new_with_repository_sources(store, secrets, None).isolated_for_tests(scratch)
+    }
+
+    /// Every test constructor ends here: it takes ownership of `scratch`,
+    /// roots workspaces at `<scratch>/workspaces` (so no test `Services` can
+    /// resolve [`default_workspaces_root`] unless a caller passes that root
+    /// explicitly) and starts each forge base at
+    /// [`ISOLATED_GITHUB_API_BASE_URI`].
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    fn isolated_for_tests(mut self, scratch: tempfile::TempDir) -> Self {
+        self.workspaces_root = Some(scratch.path().join("workspaces"));
+        self.isolated_scratch_dir = Some(Arc::new(scratch));
+        self.with_isolated_forge_bases()
     }
 
     /// Every test constructor starts each forge base at
@@ -1858,7 +1887,8 @@ impl Services {
         store: Store,
         file_secrets: intent_core::FileSecretStore,
     ) -> Self {
-        Self::new_with_repository_sources(store, file_secrets, None).with_isolated_forge_bases()
+        Self::new_with_repository_sources(store, file_secrets, None)
+            .isolated_for_tests(isolated_scratch_dir())
     }
 
     /// Hidden test support: select disposable original sources before attachment.
@@ -1871,7 +1901,8 @@ impl Services {
         secrets: intent_core::FileSecretStore,
         descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
     ) -> Self {
-        Self::new_with_repository_sources(store, secrets, descriptor).with_isolated_forge_bases()
+        Self::new_with_repository_sources(store, secrets, descriptor)
+            .isolated_for_tests(isolated_scratch_dir())
     }
 
     fn new_with_repository_sources(
@@ -2043,7 +2074,7 @@ impl Services {
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
             gitlab_secret_store,
             #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
-            isolated_secrets_dir: None,
+            isolated_scratch_dir: None,
             gitlab_credential_gate,
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),

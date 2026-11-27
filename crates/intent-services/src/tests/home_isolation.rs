@@ -176,3 +176,36 @@ async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
 
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }
+
+/// `Services::new_isolated` with no explicit root owns a scratch workspaces
+/// root: it never resolves the default (`$INTENTD_WORKSPACES_DIR`, else the
+/// home's `~/intent/workspaces`). Plain `cargo test` has no hermetic guard,
+/// so a test that deleted a workspace under the default reached the real
+/// workspaces root. The root is removed when the last clone drops.
+#[tokio::test]
+async fn home_isolation_isolated_services_own_a_scratch_workspaces_root() {
+    let home = SentinelHome::new();
+    let env_root = home.dir.path().join("env-workspaces");
+    std::env::set_var(WORKSPACES_DIR, &env_root);
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+
+    let services = Services::new_isolated(store);
+    let root = services
+        .configured_workspaces_root()
+        .map(Path::to_path_buf)
+        .expect("new_isolated must own a workspaces root");
+    assert!(
+        !root.starts_with(home.dir.path()),
+        "the isolated root {} must not be the home workspaces root or the env override",
+        root.display()
+    );
+    assert_ne!(root, env_root);
+
+    std::fs::create_dir_all(root.join("probe")).expect("create under scratch root");
+    let clone = services.clone();
+    drop(services);
+    assert!(root.exists(), "a live clone keeps the scratch root");
+    drop(clone);
+    assert!(!root.exists(), "the last clone removes the scratch root");
+}
