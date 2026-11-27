@@ -483,13 +483,26 @@ async fn rollback_or_poison(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) 
 /// Takes the connection by value: COMMIT/ROLLBACK is the last statement of
 /// the transaction either way, and the rollback path consumes it.
 pub(crate) async fn commit_with_rollback_guard<T>(
-    conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     body_result: Result<T>,
     context: &str,
 ) -> Result<T> {
-    commit_with_rollback_guard_holding(conn, body_result, context)
-        .await
-        .map(|(v, _conn)| v)
+    // Not a wrapper over `commit_with_rollback_guard_holding`: every SQLite
+    // write awaits this, and a nested future would grow every write's poll
+    // frame (the workspace.create stack budget, `tests/workspace_create_stack.rs`).
+    match body_result {
+        Ok(v) => {
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                rollback_or_poison(conn).await;
+                return Err(Error::Internal(format!("{context}: {e}")));
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            rollback_or_poison(conn).await;
+            Err(e)
+        }
+    }
 }
 
 /// [`commit_with_rollback_guard`], returning the connection after a
