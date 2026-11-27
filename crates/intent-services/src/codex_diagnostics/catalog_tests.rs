@@ -406,17 +406,9 @@ child.on('exit',code=>process.exit(code||0));
         let npx = events.iter().find(|v| v["role"] == "npx").unwrap();
         assert_eq!(
             npx["args"],
-            json!([
-                "--workspaces=false",
-                "--ignore-scripts=false",
-                "--include=optional",
-                format!(
-                    "--allow-scripts={}",
-                    intent_providers::config::CODEX_ACP_NPX_PACKAGE
-                ),
-                "-y",
+            json!(intent_acp::spawn::npx_run_args(
                 intent_providers::config::CODEX_ACP_NPX_PACKAGE
-            ])
+            ))
         );
         fixture.assert_clean();
     }
