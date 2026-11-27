@@ -11,6 +11,7 @@
 //! anything else          -> exit REJECT_EXIT, argv on stderr
 //! ```
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::spawn::npx_run_args;
@@ -95,11 +96,12 @@ impl FakeNpx {
         let arity = if self.trailing_args { "-ge" } else { "=" };
         let mut checks = format!("[ \"$#\" {arity} {count} ] || npx_reject \"$@\"\n");
         for (index, arg) in expected.iter().enumerate() {
-            checks.push_str(&format!(
-                "[ \"${{{}}}\" = {} ] || npx_reject \"$@\"\n",
+            let _ = writeln!(
+                checks,
+                "[ \"${{{}}}\" = {} ] || npx_reject \"$@\"",
                 index + 1,
                 sh_quote(arg)
-            ));
+            );
         }
         format!(
             "#!/bin/sh\n\
@@ -240,7 +242,10 @@ mod tests {
             format!("{DEFAULT_VERSION}\n")
         );
         assert_eq!(
-            stdout(&run(&FakeNpx::new(PACKAGE).version("10.9.2").then(body), &probe)),
+            stdout(&run(
+                &FakeNpx::new(PACKAGE).version("10.9.2").then(body),
+                &probe
+            )),
             "10.9.2\n"
         );
         let custom = FakeNpx::new(PACKAGE)
@@ -265,8 +270,7 @@ mod tests {
         let npx = Path::new("/usr/bin/npx");
         let mut launches = 0;
         for provider in intent_providers::ACP_PROVIDERS {
-            let Some(package) = provider.npx_only_package.or(provider.fallback_npx_package)
-            else {
+            let Some(package) = provider.npx_only_package.or(provider.fallback_npx_package) else {
                 continue;
             };
             let mut opts = SpawnOptions::new(provider);

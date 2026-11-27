@@ -28,7 +28,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use intent_acp::spawn::{npm_workspace_selector_env_keys, NPX_NO_WORKSPACES_ARG};
+use intent_acp::spawn::npm_workspace_selector_env_keys;
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
 use intent_acp::{

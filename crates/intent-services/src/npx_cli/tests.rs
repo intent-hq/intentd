@@ -323,10 +323,7 @@ async fn assert_public_launches_succeed() {
         1,
         "all entrypoints share the cached verdict"
     );
-    assert_eq!(
-        lines("packages"),
-        vec![npx().command_line(); 4]
-    );
+    assert_eq!(lines("packages"), vec![npx().command_line(); 4]);
     assert!(lines("native").is_empty());
 }
 

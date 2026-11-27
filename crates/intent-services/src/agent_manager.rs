@@ -25123,9 +25123,8 @@ mod rebuild_spawn_opts_tests {
         let cmd = intent_acp::spawn::build_command(&rebuilt);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
-        let prefix = intent_acp::spawn::npx_run_args(
-            provider.npx_only_package.expect("codex is npx-only"),
-        );
+        let prefix =
+            intent_acp::spawn::npx_run_args(provider.npx_only_package.expect("codex is npx-only"));
         assert_eq!(args[..prefix.len()], prefix);
     }
 
