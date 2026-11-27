@@ -1,3 +1,0 @@
-# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
-crates/intent-svc-runtime/src/browser_tabs/browser_routing_tests.rs 1
-crates/intent-svc-runtime/src/script_output_store/tests.rs 1

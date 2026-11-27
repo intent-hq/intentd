@@ -57,6 +57,7 @@ impl BlobFile for PartialWrites {
 }
 
 /// [`LocalBlobStorage`] whose `replace` fails while [`FAIL_RENAME`] is set.
+// pause-point: allow — fails renames on demand, never holds an operation
 #[derive(Debug)]
 struct RenameGate(LocalBlobStorage);
 
