@@ -43,7 +43,9 @@
 # `--features a/b,c/d`; an item no plan takes is noted. A plan whose only
 # targets are --test targets that all build empty without a feature
 # (`#![cfg(feature = "f")]` or `#![cfg(all(feature = "f", ...))]` on the root
-# file) and whose features are off would fail in nextest as "no tests to run";
+# file) that is off -- not in LIST, and not named by the crate's own manifest
+# (default, another feature, a dev-dependency on itself) -- would fail in
+# nextest as "no tests to run";
 # the script fails it first (exit 2, before any test runs, DRY_RUN too) naming
 # the FEATURES value to rerun with. --instrumented, like its --no-tests=warn,
 # notes it and runs on.
@@ -1069,18 +1071,52 @@ crate_declares_feature() {
 }
 
 # Sets gate_features to the features crate $1's test target $2 needs to build
-# any test: those its root file's inner #![cfg(...)] requires. An any() or
-# not() gate is left alone (another branch may hold).
+# any test: those the inner #![cfg(...)] attributes at the top of its root
+# tests/$2.rs require, multi-line ones included. A feature under not() is not
+# required, and an any() gate is left alone (another branch may hold).
+# Returns 1 when the crate has no such root (the planner selects a
+# tests/<dir>/main.rs suite only through --tests).
 target_gate() {
-  local file="crates/$1/tests/$2.rs" line re='feature[[:space:]]*=[[:space:]]*"([^"]*)"'
+  local file="crates/$1/tests/$2.rs" line attr="" re='feature[[:space:]]*=[[:space:]]*"([^"]*)"'
+  local not_re='not\([^()]*\)'
   gate_features=""
-  [[ -f "$file" ]] || return 0
-  line=$(grep -m1 '^[[:space:]]*#!\[cfg(' "$file") || return 0
-  case "$line" in *'any('* | *'not('*) return 0 ;; esac
-  while [[ "$line" =~ $re ]]; do
-    gate_features+=" ${BASH_REMATCH[1]}"
-    line=${line#*"${BASH_REMATCH[0]}"}
-  done
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    # A trailing comment would hide the closing bracket.
+    [[ "$line" == '//'* ]] || line=${line%%//*}
+    line=${line%"${line##*[![:space:]]}"}
+    if [[ -z "$attr" ]]; then
+      case "$line" in
+        '' | '//'*) continue ;;
+        '#!['*) attr=$line ;;
+        *) break ;;
+      esac
+    else
+      attr+=" $line"
+    fi
+    [[ "$attr" == *']' ]] || continue
+    if [[ "$attr" == '#![cfg('* && "$attr" != *'any('* ]]; then
+      while [[ "$attr" =~ $not_re ]]; do
+        attr=${attr/"${BASH_REMATCH[0]}"/}
+      done
+      while [[ "$attr" =~ $re ]]; do
+        gate_features+=" ${BASH_REMATCH[1]}"
+        attr=${attr#*"${BASH_REMATCH[0]}"}
+      done
+    fi
+    attr=""
+  done <"$file"
+  return 0
+}
+
+# Whether crate $1's own manifest may turn feature $2 on: it names "$2" as a
+# string (its default list, another feature's list, or a dev-dependency on
+# itself) outside a required-features line, which only asks for it. Cargo then
+# decides, so the gate is left to it.
+manifest_enables() {
+  [[ -f "crates/$1/Cargo.toml" ]] || return 1
+  grep -F "\"$2\"" "crates/$1/Cargo.toml" | grep -qv '^[[:space:]]*required-features'
 }
 
 # The --features items, one per line (commas and spaces both separate them).
@@ -1136,15 +1172,18 @@ while IFS= read -r plan; do
     applied+=" $item "
   done <<<"$feature_items"
   runnable=$whole
+  rooted=""
   needed=""
   notes=""
   for crate in $plan_crates; do
     for test in $plan_tests; do
-      target_gate "$crate" "$test"
+      target_gate "$crate" "$test" || continue
       missing=""
       for feature in $gate_features; do
-        feature_on "$crate" "$feature" || missing+="${missing:+,}$crate/$feature"
+        feature_on "$crate" "$feature" || manifest_enables "$crate" "$feature" ||
+          missing+="${missing:+,}$crate/$feature"
       done
+      rooted=1
       if [[ -z "$missing" ]]; then
         runnable=1
         continue
@@ -1153,6 +1192,8 @@ while IFS= read -r plan; do
       [[ ",$needed," == *",$missing,"* ]] || needed+="${needed:+,}$missing"
     done
   done
+  # No root found (a [[test]] path elsewhere): leave it to cargo.
+  [[ -n "$rooted" ]] || runnable=1
   if [[ -z "$runnable" ]]; then
     gated_off+="$plan runs no tests: its targets build only with FEATURES=$needed; rerun with it"$'\n'
   elif [[ -n "$notes" ]]; then

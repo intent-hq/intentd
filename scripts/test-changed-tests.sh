@@ -1928,12 +1928,21 @@ expect_cov "-p gamma --lib --bins --tests"
 # fail as "no tests to run"; the script fails it first, naming the FEATURES
 # value (intent-hq/intent: test-changed dropped FEATURES=intentd-orchestrator/postgres).
 feature_fixture() {
-  write crates/orch/Cargo.toml $'[package]\nname = "orch"\n\n[features]\n# a comment\npostgres = ["alpha/extra"]\nextra = []\n\n[dependencies]\nalpha = { path = "../alpha" }'
+  write crates/orch/Cargo.toml $'[package]\nname = "orch"\n\n[features]\n# a comment\npostgres = ["alpha/extra"]\nextra = []\n\n[dependencies]\nalpha = { path = "../alpha" }\n\n[[bin]]\nname = "orch"\nrequired-features = ["postgres"]'
   write crates/orch/src/lib.rs
-  write crates/orch/tests/gated.rs $'//! Needs the postgres feature.\n#![cfg(feature = "postgres")]\n\nuse alpha as _;'
+  write crates/orch/tests/gated.rs $'//! Needs the postgres feature.\n#![cfg(feature = "postgres")] // the store\n\nuse alpha as _;'
   write crates/orch/tests/gated_unix.rs $'#![cfg(all(feature = "postgres", unix))]'
   write crates/orch/tests/either.rs $'#![cfg(any(feature = "postgres", unix))]'
   write crates/orch/tests/plain.rs
+  write crates/orch/tests/multi.rs $'//! Multi-line gate.\n#![cfg(all(\n    feature = "postgres",\n    not(windows),\n))]'
+  write crates/orch/tests/second.rs $'#![cfg(not(windows))]\n#![allow(unused)]\n#![cfg(feature = "postgres")]'
+  # opt turns its gating features on itself: by default, from another
+  # feature, or through a dev-dependency on itself.
+  write crates/opt/Cargo.toml $'[package]\nname = "opt"\n\n[features]\ndefault = ["db"]\ndb = []\nfull = ["more"]\nmore = []\nseam = []\n\n[dev-dependencies]\nopt = { path = ".", features = ["seam"] }'
+  write crates/opt/tests/by_default.rs $'#![cfg(feature = "db")]'
+  write crates/opt/tests/by_feature.rs $'#![cfg(feature = "more")]'
+  write crates/opt/tests/by_dev_dep.rs $'#![cfg(feature = "seam")]'
+  write crates/gamma/tests/gated.rs
   commit_all "feature fixture"
 }
 
@@ -2001,6 +2010,35 @@ run_script --base HEAD --features orch/extra
 clear_logs
 NEXTEST_RUNNER="$bin_dir/runner" run_script --base HEAD
 [[ "$status" -eq 2 && -z "$runner_log" ]] || fail "$case_name: runner ran or exit $status: $runner_log"
+
+case_name="multi-line and later inner cfg gates fail early too"
+for target in multi second; do
+  reset_repo
+  feature_fixture
+  edit "crates/orch/tests/$target.rs"
+  run_script --base HEAD
+  [[ "$status" -eq 2 && "$stderr" == *"-p orch --test $target runs no tests: its targets build only with FEATURES=orch/postgres"* ]] ||
+    fail "$case_name ($target) exited $status: $stderr"
+done
+
+case_name="a gate the crate's own manifest can turn on is left to cargo"
+reset_repo
+feature_fixture
+edit crates/opt/tests/by_default.rs
+edit crates/opt/tests/by_feature.rs
+edit crates/opt/tests/by_dev_dep.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p opt --test by_default --test by_dev_dep --test by_feature"
+
+case_name="a gated target grouped with an ungated one of the same name runs"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+edit crates/gamma/tests/gated.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p gamma -p orch --test gated"
 
 case_name="a gated selection runs once its feature is on"
 reset_repo
