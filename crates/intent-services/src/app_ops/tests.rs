@@ -17,6 +17,8 @@ use super::bundle::{self, bundle_hash};
 use crate::Services;
 
 struct Fx {
+    /// Keeps the scratch tree alive; read only by the unix symlink test.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "read only by a unix-only test"))]
     dir: tempfile::TempDir,
     svc: Services,
     ws: WorkspaceId,
