@@ -518,6 +518,12 @@ mod tests;
 /// assets dir and git bundle are exported separately, and runtime state
 /// (hooks, PR monitors, agent queues) is rehydrated from imported rows on the
 /// target.
+///
+/// `sqlx::migrate!` embeds `migrations/` at compile time, and the CI compile
+/// cache (sccache) keys on Rust sources only: a change that renames or
+/// renumbers a migration without touching a `.rs` file of this crate can be
+/// served a stale build (intentd#3861 renumbered 0203 to 0204 and got the
+/// old, duplicated embedding back).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// Persistence handle: the one storage API the rest of the daemon uses.
