@@ -257,13 +257,13 @@ async fn ancestry_older_poll_cannot_overwrite_newer_on_demand_comparison() {
         )
         .await
     });
-    gate.entered.notified().await;
+    gate.reached().await;
     mock.edit(|s| {
         s.pr["baseRef"]["target"]["oid"] = json!(NEXT_BASE);
         s.compare = json!({"behind_by":3});
     });
     let newer = read(&mock, &cache, PrReadPolicy::REFRESH).await;
-    gate.release.add_permits(1);
+    gate.release(1);
     let older = poll.await.unwrap().unwrap();
     assert_eq!(wire(&older)["ancestry"]["baseSha"], BASE);
     let served = read(
@@ -415,9 +415,9 @@ async fn ancestry_authorization_change_during_compare_cannot_populate_cache() {
         )
         .await
     });
-    gate.entered.notified().await;
+    gate.reached().await;
     intent_sourcecontrol::cache_scope::invalidate_authorization();
-    gate.release.add_permits(1);
+    gate.release(1);
     assert!(poll.await.unwrap().is_err());
     assert_eq!(pr_cache_len(&cache), 0);
 }

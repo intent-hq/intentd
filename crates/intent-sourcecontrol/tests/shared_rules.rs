@@ -126,11 +126,11 @@ async fn shared_rules_concurrent_expiry_counts_joined_reuse() {
     with_traffic(traffic.clone(), async {
         let leader = shared(&mock.sc, &repo, "main");
         let follower = async {
-            gate.entered.notified().await;
+            gate.reached().await;
             let read = shared(&mock.sc, &repo, "main");
             tokio::pin!(read);
             tokio::select! {biased; result = &mut read => panic!("unexpected early result {result:?}"), () = std::future::ready(()) => {}}
-            gate.release.add_permits(100);
+            gate.release(100);
             read.await.unwrap()
         };
         let (a,b) = tokio::join!(leader, follower);
@@ -152,12 +152,12 @@ async fn shared_rules_force_during_fetch_never_reuses_older_work() {
     let gate = mock.gate("/rules/branches/");
     let first = shared(&mock.sc, &repo, "main");
     let forced = async {
-        gate.entered.notified().await;
+        gate.reached().await;
         policy(&mock, 3);
         let read = with_freshness(Duration::ZERO, mock.sc.branch_rules(&repo, "main"));
         tokio::pin!(read);
         tokio::select! {biased; result = &mut read => panic!("unexpected early result {result:?}"), () = std::future::ready(()) => {}}
-        gate.release.add_permits(100);
+        gate.release(100);
         read.await.unwrap()
     };
     let (a, b) = tokio::join!(first, forced);
@@ -176,11 +176,11 @@ async fn shared_rules_auth_replacement_during_fetch_cannot_publish() {
     let gate = mock.gate("/rules/branches/");
     let old = shared(&mock.sc, &repo, "main");
     let replace = async {
-        gate.entered.notified().await;
+        gate.reached().await;
         intent_sourcecontrol::cache_scope::invalidate_authorization();
         policy(&mock, 3);
         let new = GitHubSourceControl::new("fixture-token", Some(&mock.base)).unwrap();
-        gate.release.add_permits(100);
+        gate.release(100);
         shared(&new, &repo, "main").await.unwrap()
     };
     let (old, new) = tokio::join!(old, replace);
@@ -199,13 +199,13 @@ async fn shared_rules_cancelled_leader_allows_waiter_recovery() {
     let repo = RepoRef::new("o", "r");
     let sc = mock.sc.clone();
     let leader = tokio::spawn(async move { shared(&sc, &RepoRef::new("o", "r"), "main").await });
-    gate.entered.notified().await;
+    gate.reached().await;
     let read = shared(&mock.sc, &repo, "main");
     tokio::pin!(read);
     tokio::select! {biased; result = &mut read => panic!("unexpected early result {result:?}"), () = std::future::ready(()) => {}}
     leader.abort();
     assert!(leader.await.unwrap_err().is_cancelled());
-    gate.release.add_permits(100);
+    gate.release(100);
     read.await.unwrap();
     shared(&mock.sc, &repo, "main").await.unwrap();
     assert_eq!(mock.calls("/rules/branches/"), 2);
@@ -235,11 +235,11 @@ async fn shared_rules_errors_coalesce_but_recover_without_caching_unknown_as_emp
         let gate = mock.gate("/rules/branches/");
         let leader = shared(&mock.sc, &repo, "main");
         let follower = async {
-            gate.entered.notified().await;
+            gate.reached().await;
             let read = shared(&mock.sc, &repo, "main");
             tokio::pin!(read);
             tokio::select! {biased; result = &mut read => panic!("unexpected early result {result:?}"), () = std::future::ready(()) => {}}
-            gate.release.add_permits(100);
+            gate.release(100);
             read.await
         };
         let (a, b) = tokio::join!(leader, follower);
@@ -288,7 +288,7 @@ async fn shared_rules_eviction_is_bounded_and_live_slots_are_not_detached() {
         readers.push(tokio::spawn(async move {
             shared(&sc, &RepoRef::new("o", "r"), &format!("busy-{n}")).await
         }));
-        gate.entered.notified().await;
+        gate.reached().await;
     }
     assert!(shared(&mock.sc, &repo, "overflow").await.is_err());
     assert_eq!(
@@ -300,7 +300,7 @@ async fn shared_rules_eviction_is_bounded_and_live_slots_are_not_detached() {
     let follower = shared(&mock.sc, &repo, "busy-0");
     tokio::pin!(follower);
     tokio::select! {biased; result = &mut follower => panic!("unexpected early result {result:?}"), () = std::future::ready(()) => {}}
-    gate.release.add_permits(1000);
+    gate.release(1000);
     follower.await.unwrap();
     for reader in readers {
         reader.await.unwrap().unwrap();
@@ -352,7 +352,7 @@ async fn shared_rules_overlapping_forced_demands_share_one_newer_fill() {
     with_traffic(traffic.clone(), async {
         let old = shared(&mock.sc, &repo, "main");
         let forced = async {
-            gate.entered.notified().await;
+            gate.reached().await;
             policy(&mock, 3);
             let a = with_freshness(Duration::ZERO, mock.sc.branch_rules(&repo, "main"));
             let b = with_freshness(Duration::ZERO, mock.sc.branch_rules(&repo, "main"));
@@ -361,7 +361,7 @@ async fn shared_rules_overlapping_forced_demands_share_one_newer_fill() {
             // neither may join the already-started old policy observation.
             tokio::select! {biased; r = &mut a => panic!("early result {r:?}"), () = std::future::ready(()) => {}}
             tokio::select! {biased; r = &mut b => panic!("early result {r:?}"), () = std::future::ready(()) => {}}
-            gate.release.add_permits(100);
+            gate.release(100);
             let (a, b) = tokio::join!(a, b);
             assert_eq!(a.as_ref().unwrap().required_approving_review_count, Some(3));
             assert_eq!(a.unwrap(), b.unwrap());

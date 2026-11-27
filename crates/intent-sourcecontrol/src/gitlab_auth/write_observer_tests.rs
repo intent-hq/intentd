@@ -1,5 +1,7 @@
 use super::*;
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
+
+use intentd_test_support::PausePoint;
 
 #[derive(Default)]
 struct Observer {
@@ -7,10 +9,8 @@ struct Observer {
     deny: bool,
     users: Mutex<Vec<Option<GitlabUser>>>,
     outcomes: Mutex<Vec<GitlabWriteOutcome>>,
-    entered: tokio::sync::Notify,
     done: tokio::sync::Notify,
-    paused: Mutex<bool>,
-    release: Condvar,
+    pause: Option<Arc<PausePoint>>,
 }
 impl GitlabWriteObserver for Observer {
     fn before_write(&self) -> Result<()> {
@@ -20,10 +20,8 @@ impl GitlabWriteObserver for Observer {
         if let Some((store, expected)) = self.before.lock().unwrap().take() {
             assert_eq!(store.load(SECRET_ACCOUNT).unwrap(), Some(expected));
         }
-        self.entered.notify_one();
-        let mut paused = self.paused.lock().unwrap();
-        while *paused {
-            paused = self.release.wait(paused).unwrap();
+        if let Some(pause) = &self.pause {
+            pause.pause_blocking();
         }
         Ok(())
     }
@@ -96,15 +94,16 @@ async fn observed_rejected_owner_never_writes_or_claims_settlement() {
 #[tokio::test]
 async fn observed_timeout_keeps_original_writer_and_lease_until_actual_completion() {
     let (_dir, store) = temp_store();
+    let pause = PausePoint::new("gitlab before_write");
     let observer = Arc::new(Observer {
-        paused: Mutex::new(true),
+        pause: Some(pause.clone()),
         ..Observer::default()
     });
     let lease = Arc::new(());
     let weak = Arc::downgrade(&lease);
     let output = store.clone();
     let completion = observer.clone();
-    let work = tokio::spawn(async move {
+    let mut work = tokio::spawn(async move {
         run_blocking_observed(
             move || output.store(SECRET_ACCOUNT, "after-timeout"),
             "persist",
@@ -114,13 +113,15 @@ async fn observed_timeout_keeps_original_writer_and_lease_until_actual_completio
         )
         .await
     });
-    observer.entered.notified().await;
-    assert!(work.await.unwrap().is_err());
+    let timed_out = match pause.reached(&mut work).await {
+        Some(out) => out,
+        None => work.await,
+    };
+    assert!(timed_out.unwrap().is_err());
     assert!(observer.outcomes.lock().unwrap().is_empty());
     assert!(weak.upgrade().is_some());
     assert_eq!(store.load(SECRET_ACCOUNT).unwrap(), None);
-    *observer.paused.lock().unwrap() = false;
-    observer.release.notify_all();
+    pause.release();
     observer.done.notified().await;
     assert_eq!(
         store.load(SECRET_ACCOUNT).unwrap().as_deref(),
