@@ -6,11 +6,14 @@
 //! - An **unclaimed** handle (`open_postgres`) keeps today's rule: it writes
 //!   only while no process ever claimed the tenant.
 //! - A **request** handle (`open_postgres_request`, `Store::request_writer`)
-//!   still takes the tenant writer lock and reads the tenant state, but
+//!   still takes the tenant writer lock, reads the tenant state and guards
+//!   the leases of its work. In a process that never claimed the tenant it
 //!   skips the owner comparison, so an owner takeover does not refuse it. In
-//!   a process whose claim fenced itself it refuses, because that process's
-//!   in-memory gates are not converted yet.
-//! - Owner-only writes (lease rows, tenant claims and state moves, and
+//!   a process that holds a claim it still compares the owner (a mismatch
+//!   fires the claim's fence), because that process's in-memory gates are
+//!   not converted yet.
+//! - Owner-only writes (store lease rows, tenant claims, state moves and
+//!   lease renew/release, and the machine link ownership rows through
 //!   `begin_owner_write`) refuse a request handle with `Error::NotOwner`.
 //!
 //! Each "process" here is a store opened through the `*_as_process` test
@@ -18,6 +21,10 @@
 
 use std::time::Duration;
 
+use intent_core::nodes::{
+    LeaseFence, LeaseFenceKind, LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter,
+    NodeKind, NodeLease, NodeOs, NodeRecord, NodeState,
+};
 use intent_core::{ActorType, EventActor, WorkspaceId};
 use intent_store::postgres::{
     PgPool, PostgresOptions, TenantId, TenantLease, WriteRole, WriterLimits,
@@ -236,12 +243,14 @@ async fn a_request_handle_writes_across_an_owner_takeover() {
     assert_eq!(event_ns(&db.admin, tenant).await, vec![1, 2, 3, 4, 5]);
 }
 
-/// `Store::request_writer` of an owner store writes across a takeover
-/// until its process's claim fences itself; then it refuses, because that
-/// process's in-memory gates are not converted yet. The owner store it came
-/// from keeps its owner role.
+/// `Store::request_writer` of an owner store: a request handle in a process
+/// that holds a claim. That process's in-memory gates are not converted
+/// yet, so its request writes stop as soon as it lost the tenant: the first
+/// one to see the takeover under the writer lock fires the claim's fence
+/// and refuses, as an owner write would. Owner-only writes refuse it all
+/// along. The owner store it came from keeps its owner role.
 #[tokio::test]
-async fn a_request_writer_of_an_owner_store_writes_until_its_process_fences() {
+async fn a_request_writer_of_an_owner_store_stops_at_a_takeover() {
     let Some(db) = test_db(false).await else {
         return;
     };
@@ -261,26 +270,19 @@ async fn a_request_writer_of_an_owner_store_writes_until_its_process_fences() {
     let (_b, _lease_b) = open_owned(&db.app, tenant, "b", LONG_TTL).await;
     let fence = a.tenant_fence().expect("a's claim");
     assert!(!fence.is_fenced(), "nothing in a has seen the takeover yet");
-    requests
-        .insert_event_seq(&event(2))
-        .await
-        .expect("no owner comparison: the takeover does not refuse it");
-    assert!(
-        !fence.is_fenced(),
-        "a request write does not fire the fence"
+    assert_not_owner(
+        requests.insert_event_seq(&event(98)).await,
+        "a request write in a process that lost the tenant",
     );
-
-    // The owner store still compares the owner, and its refusal fires a's
-    // fence.
-    assert_not_owner(a.insert_event_seq(&event(98)).await, "the owner store");
-    assert!(fence.is_fenced());
+    assert!(fence.is_fenced(), "the request write fired a's fence");
     let message = assert_not_owner(
         requests.insert_event_seq(&event(99)).await,
         "a request write in a fenced process",
     );
     assert!(message.contains("fenced itself"), "{message}");
+    assert_not_owner(a.insert_event_seq(&event(97)).await, "the owner store");
 
-    assert_eq!(event_ns(&db.admin, tenant).await, vec![1, 2]);
+    assert_eq!(event_ns(&db.admin, tenant).await, vec![1]);
 }
 
 /// An unclaimed handle keeps today's rule: it writes while no process ever
@@ -299,6 +301,10 @@ async fn an_unclaimed_handle_keeps_todays_rule() {
         .await
         .expect("never claimed");
     unclaimed
+        .probe_owner_write()
+        .await
+        .expect("an owner-only write while never claimed");
+    unclaimed
         .acquire_lease(SCOPE, "before", LONG_TTL)
         .await
         .expect("acquire")
@@ -312,6 +318,10 @@ async fn an_unclaimed_handle_keeps_todays_rule() {
         "claimed once, lease expired",
     );
     assert!(message.contains("never claimed"), "{message}");
+    assert_not_owner(
+        unclaimed.probe_owner_write().await,
+        "owner-only, claimed once",
+    );
     unclaimed
         .acquire_lease(SCOPE, "after", LONG_TTL)
         .await
@@ -383,6 +393,132 @@ async fn owner_only_writes_refuse_a_request_handle() {
     a.move_tenant_state(TenantState::Closing)
         .await
         .expect("the owner moves the state");
+}
+
+fn node(id: &str) -> NodeRecord {
+    NodeRecord {
+        id: id.into(),
+        head_id: "head-1".into(),
+        node_identity: format!("identity-{id}"),
+        name: id.into(),
+        kind: NodeKind::Static,
+        os: NodeOs::Linux,
+        arch: NodeArch::X86_64,
+        state: NodeState::Offline,
+        draining: false,
+        capacity: NodeCapacity {
+            max_agents: 4,
+            reserved_agents: 0,
+            memory_budget_bytes: 1 << 30,
+            used_memory_bytes: 0,
+            exclusive_reserved: false,
+        },
+        version: "1.0.0".into(),
+        endpoint: Some("wss://node.example:443/node".into()),
+        certificate_sha256: Some("a".repeat(64)),
+        last_seen_at: None,
+    }
+}
+
+fn node_lease(record: &NodeRecord, lease_id: &str) -> NodeLease {
+    NodeLease {
+        owner: LeaseOwner {
+            head_id: record.head_id.clone(),
+            node_id: record.id.clone(),
+            node_identity: record.node_identity.clone(),
+            lease_id: lease_id.into(),
+            incarnation: "00000000-0000-4000-8000-000000000001".into(),
+        },
+        state: LeaseState::Acquiring,
+        created_at: "2026-11-27T00:00:00.000Z".into(),
+        last_seen_at: None,
+        ack_seq: NodeCounter(0),
+        link_generation: NodeCounter(0),
+        release_requested: false,
+        fence: None,
+    }
+}
+
+/// The machine link ownership rows (`execution_node`, `node_lease`) are
+/// owner work: every write of them refuses a request handle, from another
+/// process or from the owner's own, and changes nothing. The owner still
+/// writes them.
+#[tokio::test]
+async fn link_ownership_writes_refuse_a_request_handle() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    let tenant = "write-role-links";
+    let (a, _lease_a) = open_owned(&db.app, tenant, "a", LONG_TTL).await;
+    let replica = open_request(&db.app, tenant, "replica").await;
+    let record = node("node-a");
+    let initial = node_lease(&record, "lease-a");
+    let owner = initial.owner.clone();
+    a.enroll_node(&record, &initial)
+        .await
+        .expect("the owner enrolls");
+
+    for (who, store) in [
+        ("replica", &replica),
+        ("owner's request writer", &a.request_writer()),
+    ] {
+        let other = node("node-b");
+        assert_not_owner(
+            store
+                .enroll_node(&other, &node_lease(&other, "lease-b"))
+                .await,
+            who,
+        );
+        assert_not_owner(
+            store
+                .renew_machine_lease(&record, &node_lease(&record, "lease-c"), NodeCounter(1))
+                .await,
+            who,
+        );
+        assert_not_owner(store.end_machine_leases(&record.id, "head-1").await, who);
+        assert_not_owner(
+            store.transition_node_lease(&owner, LeaseState::Ready).await,
+            who,
+        );
+        assert_not_owner(store.next_node_link_generation(&owner).await, who);
+        assert_not_owner(store.request_node_lease_release(&owner).await, who);
+        assert_not_owner(
+            store
+                .record_node_welcome(&owner, NodeOs::Macos, NodeArch::Aarch64, 8, "2.0.0")
+                .await,
+            who,
+        );
+        assert_not_owner(
+            store.advance_node_lease_ack(&owner, NodeCounter(5)).await,
+            who,
+        );
+        assert_not_owner(
+            store
+                .finish_node_lease(
+                    &owner,
+                    LeaseState::Lost,
+                    LeaseFence {
+                        kind: LeaseFenceKind::ProcessesStopped,
+                        recorded_at: "2026-11-27T00:00:01.000Z".into(),
+                    },
+                )
+                .await,
+            who,
+        );
+    }
+
+    let unchanged = a.get_node_lease(&owner).await.unwrap();
+    assert_eq!(unchanged, initial, "no request write reached the lease");
+    assert!(a.find_execution_node("node-b").await.unwrap().is_none());
+    a.record_node_welcome(&owner, NodeOs::Macos, NodeArch::Aarch64, 8, "2.0.0")
+        .await
+        .expect("the owner records the welcome");
+    assert_eq!(
+        a.advance_node_lease_ack(&owner, NodeCounter(5))
+            .await
+            .unwrap(),
+        NodeCounter(5)
+    );
 }
 
 /// A request write still takes the tenant writer lock (so commit order

@@ -1373,9 +1373,11 @@ pub(crate) enum Fence {
     LeaseRelease,
     /// A request write ([`WriteRole::Request`]): the writer lock, the
     /// tenant state and the scoped lease guards as [`Self::Check`], but no
-    /// owner comparison, so an owner takeover does not refuse it. In a
-    /// process that claimed the tenant it still refuses once that claim's
-    /// fence fired: the process's in-memory gates are not converted yet.
+    /// owner comparison in a process that never claimed the tenant, so an
+    /// owner takeover does not refuse it. In a process that holds a claim
+    /// it compares the owner as [`Self::Check`] does (a mismatch fires the
+    /// claim's fence): that process's in-memory gates are not converted
+    /// yet, so its request writes stop as soon as it lost the tenant.
     Request,
 }
 
@@ -1418,9 +1420,12 @@ pub enum WriteRole {
     /// A handle for request writes
     /// ([`Store::open_postgres_request`](crate::Store::open_postgres_request),
     /// [`Store::request_writer`](crate::Store::request_writer)): it takes
-    /// the writer lock but skips the owner comparison. Owner-only writes
-    /// (lease rows, tenant claims and state moves, `begin_owner_write`)
-    /// refuse it with `Error::NotOwner`.
+    /// the writer lock but, in a process that never claimed the tenant,
+    /// skips the owner comparison (see [`Fence::Request`]). Owner-only
+    /// writes refuse it with `Error::NotOwner`: store lease rows, tenant
+    /// claims, state moves and tenant lease renewal and release, and the
+    /// machine link ownership rows (`execution_node`, `node_lease`; through
+    /// `begin_owner_write`).
     Request,
     /// A handle that never claimed the tenant
     /// ([`Store::open_postgres`](crate::Store::open_postgres)), for admin
@@ -1583,23 +1588,17 @@ impl PgStore {
     ///
     /// **Role.** The fence above is that of an owner or unclaimed handle. A
     /// request handle ([`WriteRole::Request`]) takes [`Fence::Request`]
-    /// instead: the same lock, state check and lease guards, without the
-    /// owner comparison.
+    /// instead: the same lock, state check and lease guards, with the owner
+    /// comparison only in a process that holds a claim.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         self.begin_write_as(self.role.fence()).await
     }
 
-    /// [`Self::begin_write`] for owner-only work: refuses a request handle
-    /// with [`Error::NotOwner`] before it takes the slot, then runs the
-    /// owner fence ([`Fence::Check`]). An unclaimed handle keeps its rule.
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(
-            dead_code,
-            reason = "no owner-only repository uses it yet; lease, claim and state writes are \
-                      owner-only through begin_write_as"
-        )
-    )]
+    /// [`Self::begin_write`] for owner-only work (the machine link
+    /// ownership rows in `nodes.rs`): refuses a request handle with
+    /// [`Error::NotOwner`] before it takes the slot, then runs the owner
+    /// fence ([`Fence::Check`]). An unclaimed handle keeps its rule there:
+    /// it writes only while no process ever claimed the tenant.
     pub(crate) async fn begin_owner_write(&self) -> Result<WriteTx> {
         self.begin_write_as(Fence::Check).await
     }
@@ -1688,11 +1687,15 @@ impl PgStore {
                     )));
                 }
                 Ok(writer) => {
-                    if fence == Fence::Check {
-                        if let Err(e) = self.claim.check(self.tenant(), &writer) {
-                            let _ = tx.rollback().await;
-                            return Err(e);
-                        }
+                    let owner = match fence {
+                        Fence::Check => self.claim.check(self.tenant(), &writer),
+                        Fence::Request => self.claim.check_if_claimed(self.tenant(), &writer),
+                        // Claims, state moves and lease writes: no owner check.
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = owner {
+                        let _ = tx.rollback().await;
+                        return Err(e);
                     }
                     // After the owner check, so a takeover still fires this
                     // process's fence.

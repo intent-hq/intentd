@@ -222,6 +222,18 @@ impl ClaimSlot {
         checked
     }
 
+    /// For a request write ([`super::Fence::Request`]): no claim passes
+    /// (a replica never compares the owner); a claim is checked as
+    /// [`Self::check`] does, because this process's in-memory gates are not
+    /// converted yet, so its request writes must stop, and fire its fence,
+    /// as soon as it lost the tenant.
+    pub(crate) fn check_if_claimed(&self, tenant: &str, row: &WriterRow) -> Result<()> {
+        if self.get().is_none() {
+            return Ok(());
+        }
+        self.check(tenant, row)
+    }
+
     /// The fence: may a store of this process write, given the tenant lease
     /// it read under the writer lock?
     ///

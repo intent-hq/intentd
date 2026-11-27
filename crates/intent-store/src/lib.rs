@@ -553,17 +553,20 @@ impl Store {
 
     /// This store for request writes: a Postgres handle with the request
     /// write role (`postgres::WriteRole::Request`) sharing this one's process-local
-    /// gates (its claim included), for an owner process's RPC path. Its
-    /// writes skip the owner comparison but refuse once this process's
-    /// claim fenced itself; owner-only writes refuse it. On `SQLite` (one
-    /// daemon per database) it is this store.
+    /// gates (its claim included), for an owner process's RPC path. While
+    /// this process holds a claim its writes still compare the owner, so
+    /// they stop at a takeover; owner-only writes refuse it. Taken from a
+    /// store that never claimed, it is not an admin escape hatch: in a
+    /// process with no claim it skips the owner comparison, so it writes to
+    /// a tenant another process owns. On `SQLite` (one daemon per database)
+    /// it is this store.
     #[must_use]
     pub fn request_writer(&self) -> Self {
         match &self.backend {
             Backend::Sqlite(_) => self.clone(),
             #[cfg(feature = "postgres")]
             Backend::Postgres(store) => Self {
-                backend: Backend::Postgres(store.with_role(postgres::WriteRole::Request)),
+                backend: Backend::Postgres(Box::new(store.with_role(postgres::WriteRole::Request))),
             },
         }
     }
@@ -584,7 +587,7 @@ impl Store {
         match &self.backend {
             Backend::Sqlite(_) => Ok(()),
             #[cfg(feature = "postgres")]
-            Backend::Postgres(store) => store.probe_owner_write().await,
+            Backend::Postgres(store) => postgres::boxed_call(|| store.probe_owner_write()).await,
         }
     }
 
