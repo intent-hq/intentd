@@ -2116,6 +2116,11 @@ impl PgStore {
         revoke_guest: bool,
     ) -> Result<HostMemberRemoval> {
         let tenant = self.tenant();
+        // The removal deletes queued instructions and bumps queue versions:
+        // it is a queue write too (see `QueueVersions`).
+        let queue_write = self.queue_versions.write_lock().await;
+        let write_id = uuid::Uuid::new_v4().to_string();
+        let mut bumped = Vec::new();
         let mut tx = self.begin_write().await?;
         if let Some(owner) = owner {
             if !is_primary(&mut tx, tenant, owner).await? {
@@ -2209,18 +2214,12 @@ impl PgStore {
                 revoked.sort();
                 result.revoked_invites = revoked;
             }
-            sqlx::query(
-                "DELETE FROM agent_queue WHERE tenant_id = $1 AND CASE WHEN \
-                 sqlite_json_valid(payload) THEN sqlite_json_extract(payload, \
-                 '$.messageMetadata.fromPrincipalId') END = $2",
-            )
-            .bind(tenant)
-            .bind(&principal_id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+            bumped = self
+                .sweep_principal_queue_rows(&mut tx, principal_id, &write_id)
+                .await?;
         }
-        tx.commit().await.map_err(db)?;
+        self.commit_queue_write(tx, queue_write, write_id, bumped)
+            .await?;
         Ok(result)
     }
 }

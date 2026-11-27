@@ -15,7 +15,7 @@
 //! Text ordering uses `COLLATE "C"` to match `SQLite`'s byte order, with
 //! `row_seq` (insertion order) breaking ties.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use intent_core::prompt_breakdown::PromptBreakdown;
 use intent_core::{
@@ -3056,6 +3056,104 @@ impl PgStore {
     /// other process writes between the check and the bump). Returns the
     /// new version to record once `tx` commits, or `None` when the agent has
     /// no session row (nothing to version; its queue rows cannot exist).
+    /// The principals among `rows`' instruction authors
+    /// (`messageMetadata.fromPrincipalId`) whose instructions are revoked
+    /// now: a removal recorded a revocation and no live credential was
+    /// issued since (the rule of `principal_instructions_revoked`). Read in
+    /// the queue write's own transaction, under the writer lock, so a
+    /// removal committed by any process before it is seen: the
+    /// cross-process half of the `human_instruction_authority` gate.
+    async fn revoked_instruction_authors(
+        &self,
+        conn: &mut PgConnection,
+        rows: &[AgentQueueRow],
+    ) -> Result<HashSet<String>> {
+        let mut authors: Vec<&str> = rows.iter().filter_map(instruction_author).collect();
+        if authors.is_empty() {
+            return Ok(HashSet::new());
+        }
+        authors.sort_unstable();
+        authors.dedup();
+        let revoked: Vec<String> = sqlx::query_scalar(
+            "SELECT r.principal_id FROM principal_revocation r \
+             WHERE r.tenant_id = $1 AND r.principal_id = ANY($2) \
+             AND NOT EXISTS (SELECT 1 FROM principal_credential c \
+                 WHERE c.tenant_id = $1 AND c.principal_id = r.principal_id \
+                 AND c.revoked_at IS NULL)",
+        )
+        .bind(self.tenant())
+        .bind(&authors)
+        .fetch_all(conn)
+        .await
+        .map_err(db)?;
+        Ok(revoked.into_iter().collect())
+    }
+
+    /// `rows` without the instructions of revoked authors
+    /// ([`Self::revoked_instruction_authors`]); `None` when none is dropped.
+    async fn without_revoked_instructions(
+        &self,
+        conn: &mut PgConnection,
+        rows: &[AgentQueueRow],
+    ) -> Result<Option<Vec<AgentQueueRow>>> {
+        let revoked = self.revoked_instruction_authors(conn, rows).await?;
+        if revoked.is_empty() {
+            return Ok(None);
+        }
+        let kept: Vec<AgentQueueRow> = rows
+            .iter()
+            .filter(|row| instruction_author(row).is_none_or(|author| !revoked.contains(author)))
+            .cloned()
+            .collect();
+        tracing::info!(
+            agent = rows.first().map_or("", |row| row.agent_id.0.as_str()),
+            dropped = rows.len() - kept.len(),
+            "agent queue write dropped instructions of revoked principals"
+        );
+        Ok(Some(kept))
+    }
+
+    /// Deletes `principal_id`'s queued instructions in a removal's `tx` and
+    /// bumps the queue version of every agent it touched, so another
+    /// process that still holds them refreshes or merges instead of writing
+    /// them back. This process's own version is recorded with the commit
+    /// only when it was current; otherwise its next write merges as usual.
+    /// The caller holds the process's queue write lock and commits with
+    /// [`Self::commit_queue_write`].
+    pub(super) async fn sweep_principal_queue_rows(
+        &self,
+        tx: &mut WriteTx,
+        principal_id: &intent_core::PrincipalId,
+        write_id: &str,
+    ) -> Result<Vec<QueueBump>> {
+        let mut agents: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM agent_queue WHERE tenant_id = $1 AND CASE WHEN \
+             sqlite_json_valid(payload) THEN sqlite_json_extract(payload, \
+             '$.messageMetadata.fromPrincipalId') END = $2 RETURNING agent_id",
+        )
+        .bind(self.tenant())
+        .bind(&principal_id.0)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db)?;
+        agents.sort_unstable();
+        agents.dedup();
+        let mut bumped = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let agent = AgentId(agent);
+            let Some(current) = self.stored_queue_version(tx, &agent).await? else {
+                continue;
+            };
+            let next = current + 1;
+            self.set_queue_version(tx, &agent, next, write_id).await?;
+            if current == self.queue_versions.seen(&agent) {
+                let rest = self.agent_queue_rows_in(tx, &agent).await?;
+                bumped.push((agent, Some(next), agent_queue_base(&rest)));
+            }
+        }
+        Ok(bumped)
+    }
+
     /// The stored queue version of `agent_id` (0 when never written), or
     /// `None` when the agent has no session row (nothing to version).
     async fn stored_queue_version(
@@ -3166,7 +3264,7 @@ impl PgStore {
     /// conflicts and logs rather than overwrite. The caller holds the
     /// process's queue write lock throughout, so no other queue write of
     /// this process runs between the commit and this recovery.
-    async fn commit_queue_write(
+    pub(super) async fn commit_queue_write(
         &self,
         tx: WriteTx,
         queue_write: tokio::sync::OwnedMutexGuard<()>,
@@ -3288,6 +3386,8 @@ impl PgStore {
         let next = self
             .bump_queue_version(&mut tx, agent_id, &write_id)
             .await?;
+        let kept = self.without_revoked_instructions(&mut tx, rows).await?;
+        let rows = kept.as_deref().unwrap_or(rows);
         sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2")
             .bind(self.tenant())
             .bind(&agent_id.0)
@@ -3358,6 +3458,12 @@ impl PgStore {
         if let Some(next) = next {
             self.set_queue_version(&mut tx, agent_id, next, &write_id)
                 .await?;
+        }
+        if let Some(kept) = self
+            .without_revoked_instructions(&mut tx, sync.merged.as_deref().unwrap_or(rows))
+            .await?
+        {
+            sync.merged = Some(kept);
         }
         let written = sync.merged.as_deref().unwrap_or(rows);
         sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2")
@@ -3430,6 +3536,8 @@ impl PgStore {
         } else {
             self.bump_queue_version(&mut tx, to, &write_id).await?
         };
+        let kept = self.without_revoked_instructions(&mut tx, rows).await?;
+        let rows = kept.as_deref().unwrap_or(rows);
         sqlx::query("DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id IN ($2, $3)")
             .bind(self.tenant())
             .bind(&from.0)
@@ -4180,6 +4288,15 @@ impl PgStore {
     }
 }
 
+/// The principal a queued instruction came from
+/// (`messageMetadata.fromPrincipalId`), as the removal sweep reads it.
+fn instruction_author(row: &AgentQueueRow) -> Option<&str> {
+    row.payload
+        .get("messageMetadata")?
+        .get("fromPrincipalId")?
+        .as_str()
+}
+
 /// The queue version this process last loaded or wrote, per agent, shared by
 /// every store of the tenant in the process (`tenant_registry`), like the
 /// note lanes. A queue replace compares the stored version with it (batch G
@@ -4213,7 +4330,7 @@ struct VersionMap {
 
 /// One agent's queue write: the agent, its new version (`None` when it has
 /// no session row) and the queue written.
-type QueueBump = (AgentId, Option<i64>, AgentQueueBase);
+pub(super) type QueueBump = (AgentId, Option<i64>, AgentQueueBase);
 
 impl QueueVersions {
     fn map(&self) -> std::sync::MutexGuard<'_, VersionMap> {
@@ -4224,7 +4341,7 @@ impl QueueVersions {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn write_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn write_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
         std::sync::Arc::clone(&self.write_lock).lock_owned().await
     }
 
