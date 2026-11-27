@@ -162,7 +162,33 @@ impl Store {
     ) -> Result<()> {
         let held = claim.lease().await;
         let lease = claimed(&held, COMPLETION_WATCH_LEASE_SCOPE, watch_id)?;
-        dispatch!(self, backend => Box::pin(backend.retire_completion_watch_after_delivery(watch_id, parent_agent_id, child_agent_id, completion_identity, delivered_at, lease)).await)
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                Box::pin(backend.retire_completion_watch_after_delivery(
+                    watch_id,
+                    parent_agent_id,
+                    child_agent_id,
+                    completion_identity,
+                    delivered_at,
+                    lease,
+                ))
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                crate::postgres::boxed_call(|| {
+                    backend.retire_completion_watch_after_delivery(
+                        watch_id,
+                        parent_agent_id,
+                        child_agent_id,
+                        completion_identity,
+                        delivered_at,
+                        lease,
+                    )
+                })
+                .await
+            }
+        }
     }
 
     /// Atomically settle a delivered delegation group: failed children that
@@ -225,9 +251,10 @@ impl Store {
             }
             #[cfg(feature = "postgres")]
             crate::Backend::Postgres(backend) => {
-                backend
-                    .upsert_completion_watch_guarded(w, Some(lease))
-                    .await
+                crate::postgres::boxed_call(|| {
+                    backend.upsert_completion_watch_guarded(w, Some(lease))
+                })
+                .await
             }
         }
     }

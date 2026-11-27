@@ -364,7 +364,7 @@ impl TenantSecretStore {
             ));
         }
         Ok(Self {
-            store: pg.clone(),
+            store: (**pg).clone(),
             keyring,
             runtime,
         })

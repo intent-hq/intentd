@@ -574,7 +574,9 @@ impl crate::Store {
     /// Renew the claim at `epoch` only (see [`Self::renew_tenant_lease`]).
     async fn renew_tenant_lease_at(&self, ttl: Duration, epoch: i64) -> Result<OffsetDateTime> {
         match &self.backend {
-            crate::Backend::Postgres(store) => store.renew_lease(ttl, Some(epoch)).await,
+            crate::Backend::Postgres(store) => {
+                super::boxed_call(|| store.renew_lease(ttl, Some(epoch))).await
+            }
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -611,7 +613,9 @@ impl crate::Store {
     /// statement fails.
     pub async fn claim_tenant(&self, instance: &str, ttl: Duration) -> Result<TenantClaim> {
         match &self.backend {
-            crate::Backend::Postgres(store) => store.claim_lease(instance, ttl).await,
+            crate::Backend::Postgres(store) => {
+                super::boxed_call(|| store.claim_lease(instance, ttl)).await
+            }
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -627,7 +631,9 @@ impl crate::Store {
     /// lease may still be held: retry before it expires).
     pub async fn renew_tenant_lease(&self, ttl: Duration) -> Result<OffsetDateTime> {
         match &self.backend {
-            crate::Backend::Postgres(store) => store.renew_lease(ttl, None).await,
+            crate::Backend::Postgres(store) => {
+                super::boxed_call(|| store.renew_lease(ttl, None)).await
+            }
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -653,7 +659,9 @@ impl crate::Store {
     /// when the statement fails (the lease then lapses after its TTL).
     pub async fn release_tenant_lease(&self, epoch: i64) -> Result<bool> {
         match &self.backend {
-            crate::Backend::Postgres(store) => store.release_lease(epoch).await,
+            crate::Backend::Postgres(store) => {
+                super::boxed_call(|| store.release_lease(epoch)).await
+            }
             crate::Backend::Sqlite(_) => Err(no_lease_on_sqlite()),
         }
     }
@@ -772,7 +780,7 @@ impl crate::Store {
         store.provision().await?;
         Ok(Ok((
             Self {
-                backend: crate::Backend::Postgres(store),
+                backend: crate::Backend::Postgres(Box::new(store)),
             },
             lease,
         )))

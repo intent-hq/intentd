@@ -1,0 +1,152 @@
+//! The `postgres` feature must not grow `Store` or its futures.
+//!
+//! A `Store` future holds whichever backend future it awaits, so a Postgres
+//! future held inline makes it as large as that future even on a `SQLite`
+//! store, and every caller's future and debug poll frame grows with it. In
+//! `intent-services` that added up to 100-300 KiB per frame and overflowed
+//! 30 tests, only in builds with the feature (`dispatch!` now awaits Postgres
+//! futures through [`super::boxed_call`], and `Backend` boxes the
+//! `PgStore`). These tests measure a `SQLite` store and unpolled futures on
+//! it: each must stay within a few words of its `SQLite` counterpart.
+
+use std::mem::{size_of, size_of_val};
+
+use intent_core::{AgentId, WorkspaceId};
+
+use crate::{AgentQueueRow, Backend, SqliteStore, Store};
+
+/// Room for the wrapper's own state: its arguments, `&self`, the backend
+/// borrow and the boxed Postgres arm's pointer. A Postgres future held
+/// inline exceeds it by kilobytes.
+const WRAPPER_SLACK: usize = 256;
+
+#[test]
+fn store_stays_at_sqlite_size_with_the_postgres_feature() {
+    // Every `Services` clone and many futures hold one or more `Store`s; an
+    // inline `PgStore` grew the workspace.create block by 848 bytes.
+    let (store, sqlite) = (size_of::<Store>(), size_of::<SqliteStore>());
+    assert!(
+        store <= sqlite + 16,
+        "Store is {store} bytes, SqliteStore {sqlite}: keep Backend::Postgres boxed so the \
+         postgres feature does not grow every Store"
+    );
+}
+
+#[tokio::test]
+async fn store_futures_stay_at_sqlite_size_with_the_postgres_feature() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::open(&dir.path().join("store.db"))
+        .await
+        .expect("open store");
+    let Backend::Sqlite(sqlite) = &store.backend else {
+        unreachable!("Store::open opens SQLite")
+    };
+    let agent = AgentId::from("future-size-agent");
+    let workspace = WorkspaceId::from("future-size-workspace");
+    let rows: Vec<AgentQueueRow> = Vec::new();
+
+    // Never polled: only the generated layouts are measured.
+    let measured = [
+        (
+            "get_agent_session_summary (dispatch!)",
+            size_of_val(&store.get_agent_session_summary(&agent)),
+            size_of_val(&sqlite.get_agent_session_summary(&agent)),
+        ),
+        (
+            "get_workspace (dispatch!)",
+            size_of_val(&store.get_workspace(&workspace)),
+            size_of_val(&sqlite.get_workspace(&workspace)),
+        ),
+        (
+            "script_monitor_pending_for_agent (dispatch!)",
+            size_of_val(&store.script_monitor_pending_for_agent(&agent)),
+            size_of_val(&sqlite.script_monitor_pending_for_agent(&agent)),
+        ),
+        (
+            "sync_agent_queue (hand-written arms)",
+            size_of_val(&store.sync_agent_queue(&agent, &rows, &[])),
+            size_of_val(&sqlite.replace_agent_queue(&agent, &rows)),
+        ),
+        (
+            "refresh_agent_queue (hand-written arms; SQLite awaits nothing)",
+            size_of_val(&store.refresh_agent_queue(&agent, &rows)),
+            0,
+        ),
+    ];
+    let over: Vec<String> = measured
+        .iter()
+        .filter(|(_, wrapper, inner)| *wrapper > inner + WRAPPER_SLACK)
+        .map(|(name, wrapper, inner)| {
+            format!("Store::{name} is {wrapper} bytes; its SQLite future is {inner}")
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{}. A Store method holds its Postgres future inline: await it through \
+         `crate::postgres::boxed_call(|| backend.method(args))` (dispatch!'s \
+         `backend.method(args).await` form does). Held inline, it grows every caller's \
+         future and debug poll frame and overflows intent-services test stacks in builds \
+         with the postgres feature. All sizes (Store, SQLite): {measured:?}",
+        over.join("; ")
+    );
+}
+
+/// The sampled sizes above cover `dispatch!` and a few hand-written arms;
+/// this covers every hand-written one. A `Backend::Postgres(..)` match arm
+/// in `src/` whose body awaits must await through `boxed_call` (two arms
+/// that main added after the fix awaited inline). Arms inside the
+/// `dispatch!` / `sqlite_only!` / `pending_postgres!` definitions (`$`
+/// tokens) are the macros themselves.
+#[test]
+fn hand_written_postgres_arms_await_through_boxed_call() {
+    let src = intentd_test_support::source_lint::package_dir().join("src");
+    let mut files = vec![src.clone()];
+    let mut offenders = Vec::new();
+    while let Some(path) = files.pop() {
+        if path.is_dir() {
+            files.extend(
+                std::fs::read_dir(&path)
+                    .expect("read src dir")
+                    .map(|entry| entry.expect("dir entry").path()),
+            );
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !(line.contains("Backend::Postgres(") && line.contains("=>")) || line.contains('$') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let mut arm = vec![*line];
+            for next in &lines[index + 1..] {
+                let next_indent = next.len() - next.trim_start().len();
+                if !next.trim().is_empty() && next_indent <= indent {
+                    if next.trim_start().starts_with('}') && next_indent == indent {
+                        arm.push(next);
+                    }
+                    break;
+                }
+                arm.push(next);
+            }
+            let body = arm.join("\n");
+            if body.contains(".await") && !body.contains("boxed_call") {
+                offenders.push(format!(
+                    "{}:{}",
+                    path.strip_prefix(&src).unwrap_or(&path).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "Postgres arms awaiting inline: {offenders:?}. Await them through \
+         `crate::postgres::boxed_call(|| backend.method(args))`: an inline Postgres future \
+         grows the Store future and every debug poll frame that awaits it"
+    );
+}

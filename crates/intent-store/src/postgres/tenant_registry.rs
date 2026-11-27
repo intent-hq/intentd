@@ -137,7 +137,7 @@ impl crate::Store {
             queue_versions,
             process_token,
             tenant_state,
-        } = a;
+        } = &**a;
         // A gate is shared when both stores hold the same one and it is the
         // one in this store's registry entry.
         Some([

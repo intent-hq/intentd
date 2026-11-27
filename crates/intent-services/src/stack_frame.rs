@@ -30,6 +30,12 @@
 //! `tests::workspace_create_stack::workspace_create_runs_within_reduced_stack`
 //! (a reduced-stack run of the create cases that overflowed
 //! `wss_workspace_create_context_links_round_trip_and_validation`).
+//!
+//! Every `Store` future sits under these frames too, so the store keeps
+//! them the same size with its `postgres` feature on (`intent_store`'s
+//! `dispatch!` boxes Postgres futures; holding them inline overflowed 30
+//! tests in that build only). CI's `check` job runs these guards with
+//! the feature.
 
 use std::future::Future;
 use std::pin::Pin;

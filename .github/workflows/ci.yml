@@ -632,6 +632,28 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
         run: "./scripts/ci-killed-rustc-retry.sh cargo test -p intent-services --lib claude_adapter_contract::"
+      # intent-services with the Postgres store compiled in (on a SQLite store:
+      # no database). Postgres futures are far larger than SQLite ones, and one
+      # held inline grows every Store future and every debug poll frame above
+      # it: 30 intent-services tests overflowed in that build only. Runs the
+      # stack and future-size guards and the deepest of those tests. Here, not
+      # in its own job: on a stock 16 GB runner the runner killed this
+      # intent-services test compile (2 of 4 runs). Tests are named, so
+      # test-ci-test-policy.py fails when one is renamed.
+      - name: Stack guards with the Postgres store compiled in
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: '1'
+        run: >-
+          ./scripts/ci-killed-rustc-retry.sh cargo test -p intent-services --features intent-store/postgres --lib --
+          future_size
+          reduced_stack
+          agent_manager::tests::second_pre_output_transport_failure_takes_terminal_path
+          agent_ops::tests::after_all_group_waits_for_
+          agent_ops::tests::group_wake_
+          repository_read_source::tests::sql_effects::
+          repository_read_source::tests::polling::qualified_scheduler_
+          pr_monitor::tests::qualified_and_legacy_
+          pr_monitor::tests::qualified_isolation::
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
       # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -2876,6 +2898,7 @@ jobs:
         run: cargo clippy -p intentd-orchestrator --features postgres --all-targets --no-deps -- -D warnings
       - name: Orchestrator tests
         run: cargo nextest run -p intentd-orchestrator --features postgres
+
 
   # intent-passkey (the WebAuthn sidecar, its own Cargo workspace under
   # intent-passkey/) links libdbus, libudev and libpam, so it stays out of the daemon

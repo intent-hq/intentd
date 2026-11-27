@@ -562,6 +562,7 @@ def violations(workflow, policy):
 REQUIRED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Real Claude adapter utility-session contract"): 1,
+    ("check", "Stack guards with the Postgres store compiled in"): 1,
     ("check", "Source lints"): 1,
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 2,
     ("check", "No provider CLIs on the runner"): 1,
@@ -1019,6 +1020,7 @@ else:
 NAMED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Real Claude adapter utility-session contract"): 1,
+    ("check", "Stack guards with the Postgres store compiled in"): 9,
     ("check", "Source lints"): 1,
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 5,
     ("check", "No provider CLIs on the runner"): 1,
