@@ -1,6 +1,6 @@
 [package]
 name = "intent-sentry"
-version = "0.11.308"
+version = "0.11.309"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

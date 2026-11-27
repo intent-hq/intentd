@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.309] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- *(providers)* Reinstall npm-run CLIs whose native binary was never installed ([#3827](https://github.com/intent-hq/intentd/pull/3827))
+
+
 ## [0.11.308] - 2026-11-27
 
 ### 🐛 Bug Fixes
