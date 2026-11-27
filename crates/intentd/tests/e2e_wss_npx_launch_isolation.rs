@@ -344,7 +344,10 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 /// `--no-workspaces` is absent from the argv. It fails like npm when that
 /// root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc`
 /// names a `script-shell` that does not exist (`ENOENT`, exit 254), and
-/// otherwise execs the mock fixture under `node`.
+/// otherwise execs the mock fixture under `node`. The shared argv check
+/// already rejects a launch without `--workspaces=false`, so the walk always
+/// sees the switch; it stays to prove the launch dir's sentinel manifest is
+/// the root npm picks.
 const FAKE_NPX_SCRIPT: &str = r#"printf '%s\n' "$PWD" >> '__REPORT__.cwd'
 printf '%s\n' "$*" >> '__REPORT__.args'
 printf '%s\n' "$CLAUDE_CODE_EXECUTABLE" >> '__REPORT__.runtime'

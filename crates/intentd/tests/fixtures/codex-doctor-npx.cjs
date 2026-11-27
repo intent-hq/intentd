@@ -1,6 +1,6 @@
 // Copy a deterministic package into the isolated npm cache. Never invoke npm.
-// The shared fake npx checks the launch argv and passes only the arguments
-// after the package.
+// The shared fake npx checks the launch argv (exactly the production argv,
+// so `args` is empty) and passes only the arguments after the package.
 const fs = require('node:fs');
 const path = require('node:path');
 const args = process.argv.slice(2);

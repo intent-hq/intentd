@@ -69,6 +69,7 @@ impl FakeNpx {
 
     /// Shell lines that run after the argv check, with the original `"$@"`.
     /// `shift "$npx_prefix_len"` leaves only the arguments after the package.
+    /// Without a body, an accepted launch exits 0.
     #[must_use]
     pub fn then(mut self, script: &str) -> Self {
         script.clone_into(&mut self.body);

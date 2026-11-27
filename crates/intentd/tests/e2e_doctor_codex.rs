@@ -121,7 +121,6 @@ impl Fixture {
         )
         .unwrap();
         FakeNpx::new(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-            .allow_trailing_args()
             .then(&format!(
                 "shift \"$npx_prefix_len\"\nexec node {} \"$@\"",
                 sh_quote(npx_fixture.to_str().unwrap())
