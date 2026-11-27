@@ -727,13 +727,15 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     use std::io::{Read as _, Write as _};
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
-    /// Kills the helper when a failed assertion ends the test early.
-    struct KillOnDrop(u32);
-    impl Drop for KillOnDrop {
+    /// The helper, killed and reaped through its one owner when the test
+    /// ends before it exits, so no bare pid is ever signalled.
+    struct Helper(std::process::Child);
+    impl Drop for Helper {
         fn drop(&mut self) {
-            let _ = Command::new("kill")
-                .args(["-9", &self.0.to_string()])
-                .status();
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
         }
     }
 
@@ -756,22 +758,24 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
         assert_eq!(&sent, b"0000");
         request
     });
-    let mut helper = Command::new(helper_dir.join(HELPER_NAME))
-        .args(["origin", &remote(AGENT).url()])
-        .env(SOCKET_ENV, &socket)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let reaper = KillOnDrop(helper.id());
+    let mut helper = Helper(
+        Command::new(helper_dir.join(HELPER_NAME))
+            .args(["origin", &remote(AGENT).url()])
+            .env(SOCKET_ENV, &socket)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     // As git does: ask for the service, then keep stdin open while it
     // waits for the answer.
-    let mut stdin = helper.stdin.take().unwrap();
+    let mut stdin = helper.0.stdin.take().unwrap();
     stdin.write_all(b"connect git-receive-pack\n").unwrap();
     stdin.flush().unwrap();
     let mut accepted = [0; 1];
     helper
+        .0
         .stdout
         .as_mut()
         .unwrap()
@@ -782,23 +786,20 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     stdin.flush().unwrap();
     let request = tokio::time::timeout(wait(), node).await.unwrap().unwrap();
     assert!(request.starts_with("git-receive-pack "), "{request}");
-    let mut stdout = helper.stdout.take().unwrap();
-    let exited = tokio::task::spawn_blocking(move || {
-        let mut output = Vec::new();
-        let _ = stdout.read_to_end(&mut output);
-        helper.wait().unwrap()
-    });
-    let status = tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        exited,
-    )
-    .await;
-    drop(stdin);
-    let Ok(status) = status else {
-        drop(reaper);
-        panic!("the helper did not exit when its session ended, with git's stdin still open");
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
+    let exited = loop {
+        if let Some(status) = helper.0.try_wait().unwrap() {
+            break Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        // timing-guard: poll interval while the helper exits
+        tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // Exited and reaped: its pid may name another process now.
-    std::mem::forget(reaper);
-    assert!(status.unwrap().code().is_some());
+    let status =
+        exited.expect("the helper did not exit when its session ended, with git's stdin still open");
+    drop(stdin);
+    assert!(status.code().is_some(), "{status:?}");
 }
