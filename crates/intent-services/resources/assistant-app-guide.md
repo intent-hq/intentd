@@ -1705,7 +1705,7 @@ grouping choices keep their behavior.
 
 ## Set aside workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts; src/store/renderer/slices/hud/hud-selectors.ts; src/features/hud/components/HudHeaderFilters.svelte; src/routes/dock/+page.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts; src/store/renderer/slices/hud/hud-selectors.ts; src/features/hud/components/HudHeaderFilters.svelte; src/features/hud/grid/HudWorkspaceGrid.svelte; src/routes/dock/+page.svelte. -->
 
 Use **Set aside** on a Home workspace row, card or menu. List view moves it into a collapsed
 **Set aside** section; board view shows it in the **Set aside** column on the right.
@@ -1722,8 +1722,9 @@ Home organization, saved in this app for the current account and daemon; it does
 not hide the workspace for collaborators or mark its work complete.
 
 The HUD also leaves set-aside workspaces out of its grid, counters, attention list and
-event feed. To include them, open its status filter and turn on **Show set aside**; the
-HUD remembers this choice. The Dock's workspace list always leaves them out. Workspace
+event feed. To include them, open its status filter and turn on **Show set aside** (the
+row appears only while something is set aside), or choose **Show N set aside** when the
+grid is empty. The HUD remembers this choice. The Dock's workspace list always leaves them out. Workspace
 tabs keep their status badges either way. Older versions may show set-aside workspaces
 in the HUD and Dock.
 
