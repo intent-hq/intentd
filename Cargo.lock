@@ -2960,6 +2960,7 @@ version = "0.0.0"
 dependencies = [
  "nix 0.31.3",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

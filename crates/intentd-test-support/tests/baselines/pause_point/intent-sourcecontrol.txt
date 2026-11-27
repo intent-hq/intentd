@@ -1,0 +1,3 @@
+# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
+crates/intent-sourcecontrol/src/gitlab_auth/write_observer_tests.rs 1
+crates/intent-sourcecontrol/tests/support/qwen.rs 1
