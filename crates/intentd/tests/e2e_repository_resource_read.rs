@@ -10,6 +10,7 @@ use intent_store::Store;
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
 };
+use intentd_test_support::PausePoint;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -23,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 fn acquire() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))
@@ -33,16 +33,27 @@ const MEMBER: &str = "ededededededededededededededededededededededededededededed
 const GUEST: &str = "abababababababababababababababababababababababababababababababab";
 const INSTANCE: &str = "https://forge.test:8443/install";
 const PROJECT: &str = "Team/Sub/Project";
-#[derive(Default)]
 struct Provider {
     routes: Mutex<Vec<(String, String)>>,
     replies: Mutex<HashMap<String, (u16, Value)>>,
     next_pages: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
-    entered: Notify,
-    release: Notify,
+    hold: PausePoint,
     active: AtomicUsize,
     completed: AtomicUsize,
+}
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            routes: Mutex::default(),
+            replies: Mutex::default(),
+            next_pages: Mutex::default(),
+            pause: Mutex::default(),
+            hold: PausePoint::unshared("held provider response"),
+            active: AtomicUsize::default(),
+            completed: AtomicUsize::default(),
+        }
+    }
 }
 struct Server {
     host: GitlabHost,
@@ -105,7 +116,7 @@ impl Server {
                             // request changes the configured reply before this hold is released.
                             let reply={let replies=state.replies.lock().unwrap();replies.get(&path).or_else(||replies.get(route)).cloned().unwrap_or_else(||default_reply(route))};
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
-                            if pause {state.entered.notify_one();state.release.notified().await;}
+                            if pause {state.hold.pause().await;}
                             let body=reply.1.to_string();
                             let next={let pages=state.next_pages.lock().unwrap();pages.get(&path).or_else(||pages.get(route)).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default()};
                             let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{next}RateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
@@ -138,7 +149,7 @@ impl Server {
         );
     }
     async fn finish(mut self) {
-        self.state.release.notify_waiters();
+        self.state.hold.release();
         self.stop.take().unwrap().send(()).unwrap();
         tokio::time::timeout(acquire(), self.task.take().unwrap())
             .await
@@ -156,7 +167,7 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        self.state.release.notify_waiters();
+        self.state.hold.release();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }

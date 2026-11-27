@@ -567,11 +567,11 @@ async fn checkout_private_reply_after_host_revocation_is_denied_on_original_sock
         client.close().await;
         result
     });
-    tokio::time::timeout(acquire(), server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.hold.wait_reached())
         .await
         .unwrap();
     h.store.remove_host_member(&h.member).await.unwrap();
-    server.state.release.notify_one();
+    server.state.hold.release();
     let response = tokio::time::timeout(acquire(), pending)
         .await
         .unwrap()
@@ -649,7 +649,7 @@ async fn checkout_public_tls_auth_settings_transition_and_cancel_preserve_full_p
         starter.close().await;
         result
     });
-    tokio::time::timeout(acquire(), server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.hold.wait_reached())
         .await
         .unwrap();
     assert_eq!(
@@ -672,7 +672,7 @@ async fn checkout_public_tls_auth_settings_transition_and_cancel_preserve_full_p
         )["cancelled"],
         true
     );
-    server.state.release.notify_one();
+    server.state.hold.release();
     let cancelled = tokio::time::timeout(acquire(), pending)
         .await
         .unwrap()
