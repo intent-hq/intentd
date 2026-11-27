@@ -164,10 +164,11 @@ async fn relay_backend_with(
 
 /// A [`relay_backend`] that dials its sandboxes only over their tunnel,
 /// through [`write_tailcat_client`]. Also returns the dir where serves mark
-/// their address joined.
+/// their address joined; the backend owns it, so it goes after the backend
+/// stops.
 async fn tunneled_backend(
     prefix: &str,
-) -> Option<(CloudBackend, std::path::PathBuf, tempfile::TempDir)> {
+) -> Option<(CloudBackend, std::path::PathBuf, std::path::PathBuf)> {
     if intent_providers::resolve_on_path("python3").is_none() {
         eprintln!("skipping the tunneled E2B e2e: python3 not on PATH");
         return None;
@@ -176,7 +177,7 @@ async fn tunneled_backend(
     let client = write_tailcat_client(joined.path());
     let client = client.to_string_lossy().into_owned();
     let dir = joined.path().to_string_lossy().into_owned();
-    let (backend, log) = relay_backend_with(
+    let (mut backend, log) = relay_backend_with(
         prefix,
         &[
             ("INTENTD_E2B_DIRECT_HOST", ""),
@@ -185,7 +186,9 @@ async fn tunneled_backend(
         ],
     )
     .await?;
-    Some((backend, log, joined))
+    let joined_dir = joined.path().to_owned();
+    backend.dirs.push(joined);
+    Some((backend, log, joined_dir))
 }
 
 fn placed(ws_id: &str, provider: &str, name: &str) -> Value {
@@ -582,7 +585,7 @@ async fn a_resumed_tunnel_that_never_joins_its_relay_is_restarted() {
     let seen = seen + tailcat_lines(&log, seen).len();
 
     // The relay is back: the next resume starts a tunnel that never joins.
-    std::fs::write(joined.path().join("stuck"), "").unwrap();
+    std::fs::write(joined.join("stuck"), "").unwrap();
     set_relay(rpc_ws, 63, &relay.url).await;
     ok(
         rpc_ws,
@@ -593,7 +596,7 @@ async fn a_resumed_tunnel_that_never_joins_its_relay_is_restarted() {
     .await;
     reply_containing(rpc_ws, agent, "while the relay is down", 65).await;
     assert!(
-        !joined.path().join("stuck").exists(),
+        !joined.join("stuck").exists(),
         "no tunnel started after the relay came back"
     );
     let serves: Vec<String> = tailcat_lines(&log, seen)

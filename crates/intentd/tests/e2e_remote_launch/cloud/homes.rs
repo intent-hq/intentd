@@ -487,8 +487,9 @@ async fn seed_people(head_dir: &Path) -> String {
 
 /// An orchestrator serving homes, with only a cloud entry on its machine
 /// list, against a fake E2B; a host member and a guest are known. Its
-/// `Drop` stops the backend before the fake, which owns the scratch dir,
-/// goes; no field can be moved out (E0509).
+/// `Drop` stops the backend before any field drops, so the backend is gone
+/// before the fake (which owns the scratch dir); no field can be moved out
+/// (E0509).
 struct CloudHomes {
     rpc_ws: common::TlsWs,
     head: common::DaemonGuard,

@@ -298,9 +298,10 @@ async fn refused(rpc_ws: &mut common::TlsWs, id: i64, method: &str, params: Valu
 /// A backend against a fake Vercel, with one settings minute of 100 ms,
 /// an API-key profile (`keyed_ref`) and one connection for calls.
 ///
-/// Its `Drop` stops the backend before the fake, which owns the scratch dir
-/// the backend's data dir is in, goes. A test borrows its fields: moving
-/// one out is a compile error (E0509), so none can drop early or late.
+/// Its `Drop` stops the backend before any field drops, so the backend is
+/// gone before the fake (which owns the scratch dir holding the backend's
+/// data dir). A test borrows its fields: moving one out is a compile error
+/// (E0509), so none can drop early or late.
 struct VercelBackend {
     head: common::DaemonGuard,
     port: u16,

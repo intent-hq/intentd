@@ -1661,9 +1661,10 @@ fn configure_params(extra: Value) -> Value {
 /// its event connection ([`agent_events`]) right before the step that
 /// waits for an event.
 ///
-/// Its `Drop` stops the backend before the fake, which owns the scratch dir
-/// the backend's data dir is in, goes. A test borrows its fields: moving
-/// one out is a compile error (E0509), so none can drop early or late.
+/// Its `Drop` stops the backend before any field drops, so the backend is
+/// gone before the fake (which owns the scratch dir holding the backend's
+/// data dir). A test borrows its fields: moving one out is a compile error
+/// (E0509), so none can drop early or late.
 struct CloudBackend {
     repo: std::path::PathBuf,
     head_dir: std::path::PathBuf,
@@ -1674,6 +1675,8 @@ struct CloudBackend {
     keyed_ref: String,
     rpc_ws: common::TlsWs,
     fake: Arc<FakeE2b>,
+    /// Dirs the backend uses outside the scratch dir, removed after it stops.
+    dirs: Vec<tempfile::TempDir>,
 }
 
 impl CloudBackend {
@@ -1745,6 +1748,7 @@ impl CloudBackend {
             keyed_ref,
             rpc_ws,
             fake,
+            dirs: Vec::new(),
         })
     }
 }
