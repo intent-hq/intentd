@@ -9,7 +9,7 @@ use super::*;
 fn sharing(id: &str, owner: &str) -> LaunchCommand {
     LaunchCommand {
         is_sub_agent: true,
-        checkout_of: Some(AgentId::from(owner).into()),
+        checkout_of: Some(Box::new(AgentId::from(owner).into())),
         forge: None,
         forge_fetch: None,
         forge_fetch_modules: Vec::new(),

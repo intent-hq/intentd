@@ -605,6 +605,8 @@ struct Agent {
     /// The launch's provider id and model, for the memory report.
     provider: String,
     model: Option<String>,
+    /// The launch's reasoning effort, applied after the model.
+    reasoning_effort: Option<String>,
     /// The launch's display labels, for the memory report only.
     labels: intent_core::node_link::LaunchLabels,
     /// The provider process's pid while it runs, for the memory sampler.
@@ -1586,6 +1588,7 @@ impl Runner {
             workspace_id,
             provider,
             model,
+            reasoning_effort,
             base_commit,
             repo_key,
             profile_env,
@@ -1645,7 +1648,7 @@ impl Runner {
         }
         // An agent sharing the workspace's home checkout (nodeProtocol 19)
         // has no checkout owner agent: it works in the home's.
-        let (checkout_of, home) = match checkout_of {
+        let (checkout_of, home) = match checkout_of.map(|of| *of) {
             None => (None, None),
             Some(CheckoutOf::Agent(owner)) => (Some(owner), None),
             Some(CheckoutOf::Home(home)) if home.workspace_id == workspace_id => (None, Some(home)),
@@ -1731,6 +1734,7 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             provider: provider.clone(),
             model: model.clone(),
+            reasoning_effort,
             labels: *labels,
             root_pid: Mutex::new(None),
             base_commit,
@@ -2864,7 +2868,9 @@ impl Runner {
             {
                 match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id).await
                 {
-                    Ok(()) => return Ok(recorded.session_id),
+                    Ok(options) => {
+                        return Ok((recorded.session_id, options, Some(recorded.effort_default)))
+                    }
                     Err(error) => {
                         tracing::warn!(agent = %agent.id, %error, "node: could not load the agent's provider session; starting a new one");
                     }
@@ -2877,11 +2883,15 @@ impl Runner {
                 agent.session_meta.new.clone(),
             )
             .await?;
-            Ok::<_, intent_acp::AcpError>(session.session_id.to_string())
+            let options = session
+                .config_options
+                .map(|options| serde_json::json!(options));
+            Ok::<_, intent_acp::AcpError>((session.session_id.to_string(), options, None))
         };
-        let session = tokio::select! {
+        // `loaded` holds a loaded session's recorded default effort.
+        let (session, options, loaded) = tokio::select! {
             result = setup => match result {
-                Ok(session) => session,
+                Ok(opened) => opened,
                 Err(error) => {
                     agent.note_auth_failure(&error);
                     if intent_services::provider_auth::is_auth_required(&error) {
@@ -2911,6 +2921,48 @@ impl Runner {
             }
             _ = &mut *stop => return Outcome::Stopped,
         };
+        // A provider without a CLI model flag takes the model on its session,
+        // then the effort, as a local spawn's does (intent-hq/intent#10197).
+        let applied = async {
+            let response = intent_services::apply_session_model(
+                connection,
+                &launch.config,
+                &session,
+                agent.model.as_deref(),
+                options.as_ref(),
+            )
+            .await?;
+            let effort = intent_services::AgentManager::session_model_effort(
+                &launch.config,
+                agent.model.as_deref(),
+                agent.reasoning_effort.as_deref(),
+            );
+            let baseline = match &loaded {
+                None => intent_services::EffortBaseline::Opening,
+                Some(recorded) => intent_services::EffortBaseline::Recorded(recorded.as_deref()),
+            };
+            Ok::<_, intent_core::Error>(
+                intent_services::apply_session_effort(
+                    connection,
+                    &session,
+                    options.as_ref(),
+                    response.as_ref(),
+                    effort.as_deref(),
+                    baseline,
+                )
+                .await,
+            )
+        };
+        let effort_default = tokio::select! {
+            result = applied => match result {
+                Ok(default) => default,
+                Err(error) => return Outcome::StartFailed(error.to_string(), false),
+            },
+            status = child.wait() => {
+                return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()), None);
+            }
+            _ = &mut *stop => return Outcome::Stopped,
+        };
         // Record what the provider started during setup before any prompt
         // can make it exit: once it has exited, helpers in their own process
         // groups are no longer its descendants.
@@ -2926,6 +2978,7 @@ impl Runner {
             session_id: session.clone(),
             provider: agent.provider.clone(),
             model: agent.model.clone(),
+            effort_default,
         };
         if let Err(error) = self
             .inner
@@ -3783,7 +3836,7 @@ async fn load_recorded(
     cwd: &std::path::Path,
     mcp: Vec<intent_acp::session::McpServer>,
     session_id: &str,
-) -> Result<(), intent_acp::AcpError> {
+) -> Result<Option<Value>, intent_acp::AcpError> {
     let (ack, acked) = oneshot::channel();
     if agent.marks.send(Mark::Replaying { ack }).is_err() {
         return Err(intent_acp::AcpError::Protocol(
@@ -3802,7 +3855,11 @@ async fn load_recorded(
         agent.session_meta.load.clone(),
     )
     .await
-    .map(drop);
+    .map(|loaded| {
+        loaded
+            .config_options
+            .map(|options| serde_json::json!(options))
+    });
     let (ack, acked) = oneshot::channel();
     if replay.end(Some(ack)) {
         let _ = acked.await;

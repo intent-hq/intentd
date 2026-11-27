@@ -43,6 +43,7 @@ fn launch_frame() -> LinkFrame {
         workspace_id: WorkspaceId::from_string("ws-1"),
         provider: "claude-code".into(),
         model: Some("opus".into()),
+        reasoning_effort: None,
         base_commit: "abc123".into(),
         repo_key: "repo".into(),
         agent_features: json!({ "apiToken": "tok-secret", "inputTokens": 12 }),

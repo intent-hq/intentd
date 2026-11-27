@@ -300,6 +300,10 @@ pub(super) struct ProviderSession {
     pub(super) session_id: String,
     pub(super) provider: String,
     pub(super) model: Option<String>,
+    /// The reasoning effort the session opened on, its default: a load
+    /// with a cleared effort restores it. Absent from older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) effort_default: Option<String>,
 }
 
 /// Whether `id` is safe as one path component.

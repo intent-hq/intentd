@@ -1622,6 +1622,11 @@ pub struct LaunchCommand {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The session's reasoning effort, applied after the model as a local
+    /// session's is. Any protocol: an older machine ignores it and runs the
+    /// provider's default effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The commit head recorded as the agent's `base` ref; the node fetches
     /// it over the git connection and checks it out for the agent.
     pub base_commit: String,
@@ -1657,7 +1662,7 @@ pub struct LaunchCommand {
     /// `checkout`. Sent only on a link of [`SHARED_CHECKOUT_PROTOCOL`] or
     /// later, and naming a home only on [`HOMES_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout_of: Option<CheckoutOf>,
+    pub checkout_of: Option<Box<CheckoutOf>>,
     /// A top-level agent's GitHub branch and remote. Sent only on a link of
     /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
