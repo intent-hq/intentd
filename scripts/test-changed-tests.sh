@@ -1922,6 +1922,120 @@ run_script --instrumented --base HEAD
 expect_ok
 expect_cov "-p gamma --lib --bins --tests"
 
+# --features LIST (make test-changed / coverage-changed FEATURES=...) reaches
+# the plans of the crates that have each feature. A selection whose every test
+# target is cfg-gated on a feature that is off would build empty binaries and
+# fail as "no tests to run"; the script fails it first, naming the FEATURES
+# value (intent-hq/intent: test-changed dropped FEATURES=intentd-orchestrator/postgres).
+feature_fixture() {
+  write crates/orch/Cargo.toml $'[package]\nname = "orch"\n\n[features]\n# a comment\npostgres = ["alpha/extra"]\nextra = []\n\n[dependencies]\nalpha = { path = "../alpha" }'
+  write crates/orch/src/lib.rs
+  write crates/orch/tests/gated.rs $'//! Needs the postgres feature.\n#![cfg(feature = "postgres")]\n\nuse alpha as _;'
+  write crates/orch/tests/gated_unix.rs $'#![cfg(all(feature = "postgres", unix))]'
+  write crates/orch/tests/either.rs $'#![cfg(any(feature = "postgres", unix))]'
+  write crates/orch/tests/plain.rs
+  commit_all "feature fixture"
+}
+
+case_name="--features reaches the plan of the crate that has the feature"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+edit crates/alpha/tests/one.rs
+DRY_RUN=1 run_script --base HEAD --features orch/postgres
+expect_ok
+expect_plan "-p alpha --test one" "-p orch --test gated --features orch/postgres"
+[[ -z "$cargo_log" ]] || fail "$case_name dry run invoked cargo: $cargo_log"
+clear_logs
+run_script --base HEAD --features=orch/postgres
+expect_ok
+expect_cargo "-p alpha --test one" "-p orch --test gated --features orch/postgres"
+clear_logs
+NEXTEST_RUNNER="$bin_dir/runner" run_script --base HEAD --features orch/postgres
+expect_ok
+expect_runner --plan "-p alpha --test one" --plan "-p orch --test gated --features orch/postgres" --base HEAD --label test-changed
+clear_logs
+run_script --base HEAD --instrumented --features orch/postgres
+expect_ok
+expect_cov "-p alpha --test one" "-p orch --test gated --features orch/postgres"
+
+case_name="a bare --features name reaches every plan whose crate declares it"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+edit crates/alpha/tests/one.rs
+run_script --base HEAD --features postgres
+expect_ok
+expect_cargo "-p alpha --test one" "-p orch --test gated --features postgres"
+
+case_name="a --features list may mix commas and spaces"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+run_script --base HEAD --features ' orch/postgres, orch/extra '
+expect_ok
+expect_cargo "-p orch --test gated --features orch/postgres,orch/extra"
+
+case_name="a --features item no selected crate has is noted, not applied"
+reset_repo
+feature_fixture
+edit crates/alpha/tests/one.rs
+run_script --base HEAD --features orch/postgres
+[[ "$status" -eq 0 ]] || fail "$case_name exited $status: $stderr"
+expect_cargo "-p alpha --test one"
+[[ "$stdout" == *"[test-changed] note: FEATURES orch/postgres matches no selected crate"* ]] || fail "$case_name: no note: $stdout"
+
+case_name="a selection gated on a feature that is off fails early naming FEATURES"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+edit crates/orch/tests/gated_unix.rs
+edit crates/alpha/tests/one.rs
+DRY_RUN=1 run_script --base HEAD
+[[ "$status" -eq 2 ]] || fail "$case_name exited $status (expected 2): $stderr"
+[[ "$stderr" == *"[test-changed] -p orch --test gated --test gated_unix runs no tests: its targets build only with FEATURES=orch/postgres; rerun with it"* ]] || fail "$case_name stderr: $stderr"
+clear_logs
+run_script --base HEAD --features orch/extra
+[[ "$status" -eq 2 ]] || fail "$case_name exited $status with another feature (expected 2): $stderr"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
+clear_logs
+NEXTEST_RUNNER="$bin_dir/runner" run_script --base HEAD
+[[ "$status" -eq 2 && -z "$runner_log" ]] || fail "$case_name: runner ran or exit $status: $runner_log"
+
+case_name="a gated selection runs once its feature is on"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated_unix.rs
+run_script --base HEAD --features postgres
+expect_ok
+expect_cargo "-p orch --test gated_unix --features postgres"
+
+case_name="a selection with an ungated target runs and notes the gated one"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+edit crates/orch/tests/either.rs
+edit crates/orch/tests/plain.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p orch --test either --test gated --test plain"
+[[ "$stdout" == *"[test-changed] note: --test gated of orch builds only with FEATURES=orch/postgres; this run leaves it out"* ]] || fail "$case_name: no note: $stdout"
+[[ "$stdout" != *"either of orch"* ]] || fail "$case_name: an any() gate was noted: $stdout"
+
+case_name="an instrumented gated selection warns and runs, as --no-tests=warn does"
+reset_repo
+feature_fixture
+edit crates/orch/tests/gated.rs
+run_script --base HEAD --instrumented
+[[ "$status" -eq 0 ]] || fail "$case_name exited $status: $stderr"
+expect_cov "-p orch --test gated"
+[[ "$stdout" == *"[coverage-changed] note: -p orch --test gated runs no tests: its targets build only with FEATURES=orch/postgres"* ]] || fail "$case_name: no note: $stdout"
+
+case_name="--features needs a value"
+reset_repo
+run_script --features
+[[ "$status" -eq 2 && "$stderr" == "Usage: "*"[--features LIST]"* ]] || fail "$case_name exited $status: $stderr"
+
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0
 

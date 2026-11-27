@@ -3,7 +3,7 @@
 #
 #   scripts/changed-tests.sh [--dry-run] [--base REF] [--instrumented]
 #                            [--build-jobs N] [--test-threads N] [--runner CMD]
-#                            [--plan-json PATH] [--check-map]
+#                            [--plan-json PATH] [--features LIST] [--check-map]
 #   scripts/changed-tests.sh --print-edges | --print-rdeps
 #
 # Each flag falls back to an environment variable: DRY_RUN=1, BASE (default
@@ -35,6 +35,18 @@
 # No `cargo llvm-cov clean`, no report: the point is executing the changed
 # tests under instrumentation (intent-hq/intentd#1947), not a coverage number.
 # --instrumented cannot be combined with --runner (usage error).
+#
+# --features LIST (Cargo features, comma- or space-separated; the monorepo
+# `make test-changed` / `coverage-changed` FEATURES=...) joins each plan whose
+# crates it names: `<c>/<f>` the plans with -p <c>, a bare `<f>` the plans with
+# a crate declaring <f> under [features]. It appears in the printed plan as
+# `--features a/b,c/d`; an item no plan takes is noted. A plan whose only
+# targets are --test targets that all build empty without a feature
+# (`#![cfg(feature = "f")]` or `#![cfg(all(feature = "f", ...))]` on the root
+# file) and whose features are off would fail in nextest as "no tests to run";
+# the script fails it first (exit 2, before any test runs, DRY_RUN too) naming
+# the FEATURES value to rerun with. --instrumented, like its --no-tests=warn,
+# notes it and runs on.
 #
 # The changed set is `git diff --name-only $(git merge-base HEAD BASE)`
 # (committed, staged and unstaged edits) plus the untracked files from
@@ -147,9 +159,10 @@ instrumented=""
 plan_json=""
 check_map=""
 print_mode=""
+features=""
 
 usage() {
-  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map] | --print-edges | --print-rdeps" >&2
+  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--features LIST] [--check-map] | --print-edges | --print-rdeps" >&2
   exit 2
 }
 
@@ -165,7 +178,8 @@ while (($# > 0)); do
     --test-threads=*) test_threads=${1#--test-threads=} ;;
     --runner=*) runner=${1#--runner=} ;;
     --plan-json=*) plan_json=${1#--plan-json=} ;;
-    --base | --build-jobs | --test-threads | --runner | --plan-json)
+    --features=*) features=${1#--features=} ;;
+    --base | --build-jobs | --test-threads | --runner | --plan-json | --features)
       [[ $# -ge 2 && -n "$2" ]] || usage
       case "$1" in
         --base) base=$2 ;;
@@ -173,6 +187,7 @@ while (($# > 0)); do
         --test-threads) test_threads=$2 ;;
         --runner) runner=$2 ;;
         --plan-json) plan_json=$2 ;;
+        --features) features=$2 ;;
       esac
       shift
       ;;
@@ -1031,6 +1046,137 @@ while IFS=$'\t' read -r crate filter; do
   done <<<"$selections"
   plans+="$members$filter"$'\n'
 done <<<"$selections"
+
+# Whether crate $1's manifest declares feature $2 under [features].
+crate_declares_feature() {
+  local manifest="crates/$1/Cargo.toml" line section="" key
+  [[ -f "$manifest" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in
+      '['*) section=$line ;;
+      '#'*) ;;
+      *=*)
+        [[ "$section" == '[features]'* ]] || continue
+        key=${line%%=*}
+        key=${key%"${key##*[![:space:]]}"}
+        key=${key//\"/}
+        [[ "$key" != "$2" ]] || return 0
+        ;;
+    esac
+  done <"$manifest"
+  return 1
+}
+
+# Sets gate_features to the features crate $1's test target $2 needs to build
+# any test: those its root file's inner #![cfg(...)] requires. An any() or
+# not() gate is left alone (another branch may hold).
+target_gate() {
+  local file="crates/$1/tests/$2.rs" line re='feature[[:space:]]*=[[:space:]]*"([^"]*)"'
+  gate_features=""
+  [[ -f "$file" ]] || return 0
+  line=$(grep -m1 '^[[:space:]]*#!\[cfg(' "$file") || return 0
+  case "$line" in *'any('* | *'not('*) return 0 ;; esac
+  while [[ "$line" =~ $re ]]; do
+    gate_features+=" ${BASH_REMATCH[1]}"
+    line=${line#*"${BASH_REMATCH[0]}"}
+  done
+}
+
+# The --features items, one per line (commas and spaces both separate them).
+feature_items=""
+IFS=', ' read -r -a feature_words <<<"$features" || true
+for item in ${feature_words[@]+"${feature_words[@]}"}; do
+  [[ -z "$item" || "$feature_items" == *$'\n'"$item"$'\n'* || "$feature_items" == "$item"$'\n'* ]] ||
+    feature_items+="$item"$'\n'
+done
+
+# Whether feature $2 of crate $1 is on.
+feature_on() {
+  [[ $'\n'"$feature_items" == *$'\n'"$1/$2"$'\n'* || $'\n'"$feature_items" == *$'\n'"$2"$'\n'* ]]
+}
+
+# Each plan takes the --features items its crates have, and a plan whose
+# every target builds empty without a feature that is off fails here, before
+# nextest reports "no tests to run" (see the header).
+featured=""
+applied=""
+gated_off=""
+while IFS= read -r plan; do
+  [[ -n "$plan" ]] || continue
+  plan=${plan% }
+  plan_crates=""
+  plan_tests=""
+  whole=""
+  previous=""
+  # shellcheck disable=SC2086 # plan words carry no glob characters
+  for word in $plan; do
+    case "$previous" in
+      -p) plan_crates+="$word " ;;
+      --test) plan_tests+="$word " ;;
+    esac
+    case "$word" in --lib | --bins | --tests) whole=1 ;; esac
+    previous=$word
+  done
+  [[ -n "$plan_tests" ]] || whole=1
+  plan_features=""
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    case "$item" in
+      */*) [[ " $plan_crates" == *" ${item%%/*} "* ]] || continue ;;
+      *)
+        declared=""
+        for crate in $plan_crates; do
+          ! crate_declares_feature "$crate" "$item" || declared=1
+        done
+        [[ -n "$declared" ]] || continue
+        ;;
+    esac
+    plan_features+="${plan_features:+,}$item"
+    applied+=" $item "
+  done <<<"$feature_items"
+  runnable=$whole
+  needed=""
+  notes=""
+  for crate in $plan_crates; do
+    for test in $plan_tests; do
+      target_gate "$crate" "$test"
+      missing=""
+      for feature in $gate_features; do
+        feature_on "$crate" "$feature" || missing+="${missing:+,}$crate/$feature"
+      done
+      if [[ -z "$missing" ]]; then
+        runnable=1
+        continue
+      fi
+      notes+="--test $test of $crate builds only with FEATURES=$missing; this run leaves it out"$'\n'
+      [[ ",$needed," == *",$missing,"* ]] || needed+="${needed:+,}$missing"
+    done
+  done
+  if [[ -z "$runnable" ]]; then
+    gated_off+="$plan runs no tests: its targets build only with FEATURES=$needed; rerun with it"$'\n'
+  elif [[ -n "$notes" ]]; then
+    while IFS= read -r note; do
+      [[ -z "$note" ]] || log "note: $note"
+    done <<<"$notes"
+  fi
+  featured+="$plan${plan_features:+ --features $plan_features}"$'\n'
+done <<<"$plans"
+plans=$featured
+while IFS= read -r item; do
+  [[ -z "$item" || "$applied" == *" $item "* ]] || log "note: FEATURES $item matches no selected crate; it is not applied"
+done <<<"$feature_items"
+if [[ -n "$gated_off" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ -n "$instrumented" ]]; then
+      log "note: $line"
+    else
+      echo "[$label] $line" >&2
+    fi
+  done <<<"$gated_off"
+  [[ -n "$instrumented" ]] || exit 2
+fi
 
 export_plans
 
