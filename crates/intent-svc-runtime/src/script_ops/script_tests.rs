@@ -753,7 +753,7 @@ async fn a_mid_stream_snapshot_joins_live_events_exactly() {
         .script_start(h.ws.clone(), id.clone())
         .await
         .expect("start");
-    let mut events = output_events_until(&mut sub, b"tick-50\n").await;
+    let mut events = output_events_until(&mut sub, b"tick-50\r\n").await;
     let (reply, data) = cursor_reply(&h, &id).await;
     events.extend(output_events_until(&mut sub, b"TICKS-DONE").await);
     let (run, _, stream) = contiguous_run(&events);
