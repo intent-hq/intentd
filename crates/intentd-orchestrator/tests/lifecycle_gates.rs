@@ -24,6 +24,14 @@ use intent_store::{
 };
 use intentd_test_support::test_timeout;
 
+/// How many times a restore must find the agent's retirement lease held
+/// before it counts as waiting for a retire retry's hold. A lease released
+/// in the background (the retry's own first hold, in an implementation that
+/// read the mark under another hold) frees the key within milliseconds; a
+/// restore really waiting finds it held again and again as its backoff grows
+/// (20, 40, 80 ms).
+const RESTORE_WAITS: u64 = 4;
+
 async fn pool() -> Option<PgPool> {
     let Ok(url) = std::env::var("INTENT_STORE_TEST_PG_URL") else {
         assert!(
@@ -417,4 +425,78 @@ async fn an_archive_that_lost_its_lease_writes_nothing_and_another_process_finis
         .expect("another process archives it");
     assert!(archived.archived);
     assert!(store_b.get_workspace(&ws).await.unwrap().archived);
+}
+
+/// An idempotent retire retry of a retired agent re-runs its resource
+/// release under the same hold that read the retired mark, so a restore in
+/// another process waits for it and the retry never sweeps a restored
+/// agent: the restore is seen waiting for the agent's lease (never done)
+/// while the retry is held inside its cleanup, and it lands after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retire_retry_never_sweeps_an_agent_restored_meanwhile() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant("lifecycle-retire-retry");
+    let store_a = open(&pool, &tenant, "process-a").await;
+    let store_b = open(&pool, &tenant, "process-b").await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = services(store_a, &dir);
+    let b = services(store_b.clone(), &dir);
+    let ws = seed_workspace(&store_b).await;
+    let agent = seed_agent(&store_b, &ws, &format!("agent-retired-{tenant}")).await;
+    seed_agent(&store_b, &ws, &format!("agent-staying-{tenant}")).await;
+    with_caller(
+        wire_owner(),
+        a.agent_retire_op_for_test(agent.clone(), None, None),
+    )
+    .await
+    .expect("the first retire");
+    // The first retire releases its lease in the background: wait until the
+    // key is free, so only the retry's hold can make the restore wait.
+    tokio::time::timeout(
+        test_timeout(Duration::from_secs(30)),
+        store_b.hold_lifecycle_lease(AGENT_RETIREMENT_SCOPE, agent.as_str()),
+    )
+    .await
+    .expect("the first retire's lease is released")
+    .unwrap()
+    .release()
+    .await;
+
+    let park = park_lifecycle_step_for_test(steps::RETIRE_RETRY_CLEANUP, agent.as_str());
+    let mut retry = tokio::spawn({
+        let (a, agent) = (a.clone(), agent.clone());
+        with_caller(wire_owner(), async move {
+            a.agent_retire_op_for_test(agent, None, None).await
+        })
+    });
+    wait_parked(&park, &mut retry).await;
+    let tried =
+        intent_store::contended_lease_attempts_for_tests(AGENT_RETIREMENT_SCOPE, agent.as_str());
+    let restore = tokio::spawn({
+        let (b, agent) = (b.clone(), agent.clone());
+        async move { b.agent_restore_op_for_test(agent, None).await }
+    });
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
+        while intent_store::contended_lease_attempts_for_tests(
+            AGENT_RETIREMENT_SCOPE,
+            agent.as_str(),
+        ) < tried + RESTORE_WAITS
+        {
+            assert!(
+                !restore.is_finished(),
+                "the restore ran while the retry was inside its cleanup"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the restore waits for the retry's hold");
+
+    park.release.notify_one();
+    let retried = finish(retry).await.expect("the retry");
+    assert_eq!(retried["alreadyRetired"], true, "{retried}");
+    let restored = finish(restore).await.expect("the restore");
+    assert_eq!(restored["restored"], true, "{restored}");
+    let row = store_b.get_agent_session_summary(&agent).await.unwrap();
+    assert_eq!(row.retired_at, None, "the restore landed after the retry");
 }

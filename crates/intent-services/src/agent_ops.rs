@@ -8370,16 +8370,21 @@ impl Services {
         let session = {
             // An idempotent retry also waits for the winning retire's cleanup.
             let gate = self.agent_retirement_gates.for_agent(&agent_id);
-            let _retirement = gate.lock().await?;
-            self.store.get_agent_session_summary(&agent_id).await?
-        };
-        if let Some(ws) = workspace_id.as_ref() {
-            if session.workspace_id != *ws {
-                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            let retirement = gate.lock().await?;
+            let session = self.store.get_agent_session_summary(&agent_id).await?;
+            if let Some(ws) = workspace_id.as_ref() {
+                if session.workspace_id != *ws {
+                    return Err(Error::NotFound(format!("agent session {agent_id}")));
+                }
             }
-        }
+            if session.retired_at.is_some() {
+                // Under the same hold as the read, so a restore cannot land
+                // in between and have its agent swept.
+                self.finish_retired_cleanup(&agent_id, &retirement).await?;
+            }
+            session
+        };
         if let Some(existing) = session.retired_at.clone() {
-            self.finish_retired_cleanup(&agent_id).await?;
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
         // Guard: an agent (`ws.agent.retire`, including from its hooks) may
@@ -8708,12 +8713,19 @@ impl Services {
     }
 
     /// Re-runs the release of a retired agent's resources (idempotent
-    /// sweeps) under its retirement gate, for an idempotent retire retry: a
-    /// retire whose lease was lost after its mark committed stopped before
-    /// its cleanup was done.
-    async fn finish_retired_cleanup(&self, agent_id: &AgentId) -> Result<()> {
-        let gate = self.agent_retirement_gates.for_agent(agent_id);
-        let retirement = gate.lock().await?;
+    /// sweeps) for an idempotent retire retry: a retire whose lease was lost
+    /// after its mark committed stopped before its cleanup was done. Call
+    /// it under the retirement hold that read the retired mark.
+    async fn finish_retired_cleanup(
+        &self,
+        agent_id: &AgentId,
+        retirement: &crate::RetirementGuard,
+    ) -> Result<()> {
+        crate::lifecycle_fence::park(
+            crate::lifecycle_fence::steps::RETIRE_RETRY_CLEANUP,
+            agent_id.as_str(),
+        )
+        .await;
         retirement
             .guard_writes(Box::pin(self.release_retired_agent(agent_id)))
             .await;

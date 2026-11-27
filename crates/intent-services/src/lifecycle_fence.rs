@@ -22,6 +22,10 @@ pub mod steps {
     /// workspace-retirement lease when the last-top-level guard applies),
     /// right before the retired mark is written (key: agent id).
     pub const RETIRE_BEFORE_MARK: &str = "agent-retire:before-mark";
+    /// An idempotent retire retry of a retired agent, under the hold that
+    /// read its retired mark, right before it re-runs the resource release
+    /// (key: agent id).
+    pub const RETIRE_RETRY_CLEANUP: &str = "agent-retire:retry-cleanup";
     /// `workspace.archive`, under the archive-fence lease, right before the
     /// Archived flip commits (key: workspace id).
     pub const ARCHIVE_BEFORE_COMMIT: &str = "workspace-archive:before-commit";
