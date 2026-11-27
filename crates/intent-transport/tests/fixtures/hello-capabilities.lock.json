@@ -1,0 +1,7 @@
+{
+  "lockVersion": 1,
+  "sourceRepository": "intent-hq/intent",
+  "sourcePath": "docs/protocol/fixtures/hello/capabilities.json",
+  "sourceCommit": "74c3966b2297a4b92f65670cd26cab21ce154ffd",
+  "fileSha256": "5753e68df0b3373795146062b471ab00619ab6bc8f6a551d29e2bc049dc8d694"
+}

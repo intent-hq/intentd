@@ -455,7 +455,7 @@ jobs:
               console.log(`${file} ${lock.sourceCommit} ${lock.sourcePath}`);
             }')
           mapfile -t locks <<<"$discovered"
-          # Guard the discovery itself: five copies are adopted today.
+          # Guard the discovery itself: at least five copies are adopted.
           if [ "${#locks[@]}" -lt 5 ]; then
             echo "::error::expected at least 5 intent-hq/intent fixture locks, found ${#locks[@]}"
             exit 1
