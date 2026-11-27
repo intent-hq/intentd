@@ -2191,6 +2191,25 @@ expect_map_valid 4
 write crates/gamma/tests/smoke.rs $'// changed-tests: not a source reader:\nconst ALPHA: &str = "../alpha/src/lib.rs";'
 expect_reader_error "crates/gamma/tests/smoke.rs: 'changed-tests: not a source reader:' needs a reason after the colon"
 
+# Prints, NUL-separated, every path under pathspecs $2... of checkout $1 that
+# differs from HEAD, staged or not (both sides of a rename), plus untracked
+# files.
+local_edits() {
+  local root=$1
+  shift
+  git -C "$root" -c core.quotePath=false diff --no-renames --name-only -z HEAD -- "$@" &&
+    git -C "$root" -c core.quotePath=false ls-files -z --others --exclude-standard -- "$@"
+}
+
+# A staged rename must list its old path too, so the copy drops it: the copy
+# starts from HEAD, and a stale reader left there fails the map check.
+case_name="the real-tree copy lists both sides of a staged rename"
+reset_repo
+g mv crates/gamma/tests/smoke.rs crates/gamma/tests/smoke_renamed.rs
+edits=$(local_edits "$repo" 'crates/*.rs' | while IFS= read -r -d '' file; do printf '%s\n' "$file"; done)
+[[ "$edits" == *"crates/gamma/tests/smoke.rs"* && "$edits" == *"crates/gamma/tests/smoke_renamed.rs"* ]] ||
+  fail "$case_name: listed"$'\n'"$edits"
+
 # The real tree: the fixtures above pin the mechanism, these cases pin the real
 # map's data (intentd#3835 changed only intent-services/src, passed
 # test-changed and was ejected from the merge queue by intent-transport's
@@ -2221,8 +2240,7 @@ real_tree_cases() {
     fail "cannot check out the real tree"
   # Uncommitted edits, staged or not, against HEAD (which the copy checks
   # out) and untracked files are copied; deleted ones removed.
-  { git -C "$real_root" -c core.quotePath=false diff --name-only -z HEAD -- "${real_specs[@]}" &&
-    git -C "$real_root" -c core.quotePath=false ls-files -z --others --exclude-standard -- "${real_specs[@]}"; } >"$temp_dir/real-files" ||
+  local_edits "$real_root" "${real_specs[@]}" >"$temp_dir/real-files" ||
     fail "cannot list the real tree's edits"
   while IFS= read -r -d '' file; do
     if [[ -f "$real_root/$file" ]]; then
