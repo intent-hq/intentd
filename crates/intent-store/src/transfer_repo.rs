@@ -619,8 +619,7 @@ impl crate::SqliteStore {
                 .map_err(|_| Error::Internal("export test barrier poisoned".into()))?
                 .take();
             if let Some(barrier) = barrier {
-                barrier.entered.notify_one();
-                barrier.release.notified().await;
+                barrier.pause().await;
             }
         }
         crate::transfer_authorship::capture(&mut tx, &mut out).await?;

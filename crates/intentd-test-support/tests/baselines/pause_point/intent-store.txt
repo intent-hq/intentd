@@ -1,6 +1,0 @@
-# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
-crates/intent-store/src/desktop_repo.rs 1
-crates/intent-store/src/repository_lifecycle/wire_authority_tests.rs 1
-crates/intent-store/src/repository_selection_repo/tests.rs 2
-crates/intent-store/src/tests/workspace_delete.rs 1
-crates/intent-store/src/transfer_authorship.rs 1
