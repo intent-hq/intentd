@@ -594,3 +594,194 @@ async fn full_list_bounds_an_oversized_singleton_row() {
         .expect("get");
     assert_eq!(whole["command"], quotes);
 }
+
+/// One `script:output` event: its bytes and, for run-log output, its
+/// `(runId, daemonBootId, startOffset, endOffset)`.
+struct OutputEvent {
+    bytes: Vec<u8>,
+    cursor: Option<(String, String, u64, u64)>,
+}
+
+fn position(v: &Value, key: &str) -> u64 {
+    v[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("{key} is a decimal string: {v:?}"))
+        .parse()
+        .expect("decimal position")
+}
+
+/// Every `script:output` event until the streamed bytes contain `marker`.
+async fn output_events_until(sub: &mut Subscription, marker: &[u8]) -> Vec<OutputEvent> {
+    let mut events: Vec<OutputEvent> = Vec::new();
+    let mut seen = Vec::new();
+    drain_until(sub, LIVENESS, |v| {
+        if v["type"] != "script:output" {
+            return None;
+        }
+        let data = &v["data"];
+        let bytes = decode(data["chunk"].as_str().expect("chunk"));
+        let cursor = data.get("runId").map(|run| {
+            (
+                run.as_str().expect("runId").to_owned(),
+                data["daemonBootId"]
+                    .as_str()
+                    .expect("daemonBootId")
+                    .to_owned(),
+                position(data, "startOffset"),
+                position(data, "endOffset"),
+            )
+        });
+        seen.extend_from_slice(&bytes);
+        events.push(OutputEvent { bytes, cursor });
+        contains(&seen, marker).then_some(())
+    })
+    .await;
+    events
+}
+
+/// The log events' bytes, after checking they form one contiguous stream of
+/// one run from position 0. Returns `(runId, bootId, bytes)`.
+fn contiguous_run(events: &[OutputEvent]) -> (String, String, Vec<u8>) {
+    let mut run: Option<(String, String)> = None;
+    let mut bytes = Vec::new();
+    for (cursor, chunk) in events
+        .iter()
+        .filter_map(|e| e.cursor.as_ref().map(|c| (c, &e.bytes)))
+    {
+        let (r, boot, start, end) = cursor;
+        let id = (r.clone(), boot.clone());
+        assert_eq!(run.get_or_insert_with(|| id.clone()), &id, "one stream");
+        assert_eq!(*start, bytes.len() as u64, "events are contiguous");
+        bytes.extend_from_slice(chunk);
+        assert_eq!(*end, bytes.len() as u64, "range length is the chunk length");
+    }
+    let (run, boot) = run.expect("log output streamed");
+    (run, boot, bytes)
+}
+
+async fn cursor_reply(h: &Harness, id: &str) -> (Value, Vec<u8>) {
+    let reply = h
+        .services
+        .script_output_cursor(h.ws.clone(), id.to_owned(), Some(10_000))
+        .await
+        .expect("cursor output");
+    let data = decode(reply["data"].as_str().expect("base64 data"));
+    (reply, data)
+}
+
+/// `script:output` positions continue across a service auto-restart (the
+/// run's log is appended to), restart from 0 on a new run, and agree with
+/// the `cursor: true` reply byte for byte. Restart notices are not in the
+/// log and carry no positions.
+#[intent_test_macros::daemon_test]
+async fn output_positions_span_auto_restarts_and_match_the_cursor_reply() {
+    let mut h = harness().await;
+    h.services = h.services.clone().with_script_too_fast_ms(0);
+    let mut sub = subscribe(&h);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let flag = dir.path().join("flag");
+    let cmd = format!(
+        "if [ -e \"{p}\" ]; then i=0; while [ $i -lt 300 ]; do echo second-$i; i=$((i+1)); done; echo SECOND-DONE; exec {KEEPALIVE}; \
+         else : > \"{p}\"; i=0; while [ $i -lt 300 ]; do echo first-$i; i=$((i+1)); done; fi",
+        p = flag.display()
+    );
+    let id = create(&h, "restarts", &cmd, ScriptMode::Service).await;
+    h.services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .expect("start");
+    let events = output_events_until(&mut sub, b"SECOND-DONE").await;
+    let (run, boot, stream) = contiguous_run(&events);
+    assert!(contains(&stream, b"first-299") && contains(&stream, b"second-299"));
+    let notices: Vec<_> = events.iter().filter(|e| e.cursor.is_none()).collect();
+    assert!(
+        notices.iter().any(|e| contains(&e.bytes, b"Restarting")),
+        "the restart notice streams without positions"
+    );
+    assert!(
+        !contains(&stream, b"Restarting"),
+        "notices are not log output"
+    );
+
+    let (reply, data) = cursor_reply(&h, &id).await;
+    assert_eq!(reply["runId"], run.as_str());
+    assert_eq!(reply["daemonBootId"], boot.as_str());
+    assert_eq!(reply["startOffset"], "0");
+    assert_eq!(reply["logStartOffset"], "0");
+    assert_eq!(reply["endOffset"], stream.len().to_string());
+    assert_eq!(
+        data, stream,
+        "the reply holds exactly the streamed log bytes"
+    );
+
+    // A new run is a new stream from 0.
+    h.services
+        .script_stop(h.ws.clone(), id.clone())
+        .await
+        .expect("stop");
+    h.services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .expect("restart");
+    let events = output_events_until(&mut sub, b"SECOND-DONE").await;
+    let fresh: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.cursor.as_ref().is_some_and(|c| c.0 != run))
+        .collect();
+    let (new_run, _, new_stream) = contiguous_run(&fresh);
+    let (reply, data) = cursor_reply(&h, &id).await;
+    assert_eq!(reply["runId"], new_run.as_str());
+    assert_eq!(data, new_stream);
+    h.services
+        .script_stop(h.ws.clone(), id)
+        .await
+        .expect("stop");
+}
+
+/// A snapshot read while output streams ends on an event boundary: the
+/// events at or past its `endOffset` continue it with no byte repeated or
+/// missing.
+#[intent_test_macros::daemon_test]
+async fn a_mid_stream_snapshot_joins_live_events_exactly() {
+    let h = harness().await;
+    let mut sub = subscribe(&h);
+    let cmd = format!(
+        "i=0; while [ $i -lt 400 ]; do echo tick-$i; i=$((i+1)); sleep 0.002; done; echo TICKS-DONE; exec {KEEPALIVE}"
+    );
+    let id = create(&h, "ticks", &cmd, ScriptMode::Service).await;
+    h.services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .expect("start");
+    let mut events = output_events_until(&mut sub, b"tick-50\r\n").await;
+    let (reply, data) = cursor_reply(&h, &id).await;
+    events.extend(output_events_until(&mut sub, b"TICKS-DONE").await);
+    let (run, _, stream) = contiguous_run(&events);
+    assert_eq!(reply["runId"], run.as_str());
+    let end = position(&reply, "endOffset");
+    assert_eq!(position(&reply, "startOffset"), 0);
+    assert_eq!(
+        data,
+        &stream[..data.len()],
+        "the snapshot is the stream's prefix"
+    );
+    assert_eq!(data.len() as u64, end);
+    assert!(
+        events
+            .iter()
+            .filter_map(|e| e.cursor.as_ref())
+            .all(|c| c.3 <= end || c.2 >= end),
+        "no live chunk straddles the snapshot end"
+    );
+    let mut joined = data.clone();
+    for e in &events {
+        if e.cursor.as_ref().is_some_and(|c| c.2 >= end) {
+            joined.extend_from_slice(&e.bytes);
+        }
+    }
+    assert_eq!(joined, stream, "snapshot + later chunks rebuild the stream");
+    h.services
+        .script_stop(h.ws.clone(), id)
+        .await
+        .expect("stop");
+}

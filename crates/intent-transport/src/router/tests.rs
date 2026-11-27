@@ -2127,6 +2127,18 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn script_output_cursor(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let _ = workspace_id;
+            Ok(serde_json::json!({ "scriptId": script_id, "maxLines": max_lines }))
+        })
+    }
+
     fn script_status(
         &self,
         workspace_id: WorkspaceId,
@@ -6971,6 +6983,31 @@ async fn script_lifecycle_and_run_dispatch() {
         .expect("script.output result is a string");
     assert!(out.starts_with('['), "header line present: {out:?}");
     assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
+
+    // `cursor: true` selects the positioned reply (`scriptOutputCursor: 1`).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"workspaceId":"ws-1","scriptId":"s-1","maxLines":10,"cursor":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["scriptId"], serde_json::json!("s-1"));
+    assert_eq!(v["result"]["maxLines"], serde_json::json!(10));
+    // `cursor: false` keeps the bare string.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"script.output","params":{"workspaceId":"ws-1","scriptId":"s-1","cursor":false}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"].is_string(), "{v:?}");
+    // The cursor form has no pages.
+    for extra in [r#""paginate":true"#, r#""nextToken":"t""#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"script.output","params":{{"workspaceId":"ws-1","scriptId":"s-1","cursor":true,{extra}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{extra}: {v:?}");
+    }
 
     // Missing scriptId → -32602.
     let v =

@@ -716,6 +716,7 @@ impl RuntimePort for FakeRuntime {
         fn script_stop<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn script_restart<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn script_output<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String, max_lines: Option<i64>, paginate: Option<bool>, page_token: Option<String>) -> BoxFuture<'a, Result<serde_json::Value>>;
+        fn script_output_cursor<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String, max_lines: Option<i64>) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn script_status<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn script_run<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String, max_lines: Option<i64>, timeout_seconds: Option<i64>) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_schedule<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, agent_id: AgentId, params: serde_json::Value) -> BoxFuture<'a, Result<serde_json::Value>>;

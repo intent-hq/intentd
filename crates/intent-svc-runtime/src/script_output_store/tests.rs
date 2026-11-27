@@ -12,6 +12,48 @@ thread_local! {
     /// Tests set this to make every compaction replace fail, like Windows
     /// refusing to replace a log another process holds open.
     static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Bytes appends may still write before failing, like a disk filling up
+    /// mid-write; `None` never fails.
+    static WRITE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A log handle whose writes stop at [`WRITE_BUDGET`], leaving a prefix on disk.
+#[derive(Debug)]
+struct PartialWrites(Box<dyn BlobFile>);
+
+impl Read for PartialWrites {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Seek for PartialWrites {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl io::Write for PartialWrites {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match WRITE_BUDGET.with(std::cell::Cell::get) {
+            None => self.0.write(buf),
+            Some(0) => Err(io::Error::other("disk full")),
+            Some(left) => {
+                let written = self.0.write(&buf[..left.min(buf.len())])?;
+                WRITE_BUDGET.with(|b| b.set(Some(left - written)));
+                Ok(written)
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl BlobFile for PartialWrites {
+    fn len(&self) -> io::Result<u64> {
+        self.0.len()
+    }
 }
 
 /// [`LocalBlobStorage`] whose `replace` fails while [`FAIL_RENAME`] is set.
@@ -23,7 +65,7 @@ impl BlobStorage for RenameGate {
         self.0.display_path(key)
     }
     fn open_append(&self, key: &BlobKey) -> io::Result<Box<dyn BlobFile>> {
-        self.0.open_append(key)
+        Ok(Box::new(PartialWrites(self.0.open_append(key)?)))
     }
     fn replace(&self, key: &BlobKey, contents: &[u8]) -> io::Result<Box<dyn BlobFile>> {
         if FAIL_RENAME.with(std::cell::Cell::get) {
@@ -964,4 +1006,313 @@ fn paginate_budgets_bytes_and_rebuilds_an_oversized_escape_heavy_line() {
         newest_first,
         vec!["old".to_owned(), wide.clone(), wide.clone(), wide, quotes]
     );
+}
+
+/// The first `n` numbered lines: stream position `p` holds byte `p` of this.
+fn numbered_stream(n: usize) -> Vec<u8> {
+    (0..n).map(numbered_line).collect::<String>().into_bytes()
+}
+
+/// Every cursor read is an exact slice of the run's output stream.
+fn assert_cursor_slice(tail: &CursorTail, stream: &[u8]) {
+    let (start, end) = (
+        usize::try_from(tail.start).unwrap(),
+        usize::try_from(tail.end).unwrap(),
+    );
+    assert!(tail.log_start <= tail.start && tail.start <= tail.end);
+    assert_eq!(tail.bytes.len(), end - start, "range length {tail:?}");
+    assert_eq!(
+        tail.bytes,
+        &stream[start..end],
+        "bytes sit at their positions"
+    );
+}
+
+fn cursor(store: &ScriptOutputStore, lines: usize) -> CursorTail {
+    store
+        .cursor_tail("ws", "s", "r", lines, u64::MAX)
+        .unwrap()
+        .expect("log exists")
+}
+
+#[test]
+fn cursor_positions_follow_chunk_boundaries() {
+    let (_dir, store) = store(1 << 20);
+    let mut w = store.open_writer("ws", "s", "r");
+    assert_eq!(w.end(), 0);
+    let stream = numbered_stream(10);
+    for chunk in stream.chunks(7) {
+        let before = w.end();
+        w.append(chunk);
+        assert_eq!(w.end(), before + chunk.len() as u64);
+    }
+    let all = cursor(&store, 10_000);
+    assert_eq!((all.start, all.end, all.log_start), (0, 400, 0));
+    assert_eq!(all.total_lines, 11);
+    assert_cursor_slice(&all, &stream);
+    let last_two = cursor(&store, 3);
+    assert_eq!(
+        last_two.start, 320,
+        "the newest lines start at their position"
+    );
+    assert_cursor_slice(&last_two, &stream);
+}
+
+#[test]
+fn cursor_positions_survive_cap_compaction() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    let stream = numbered_stream(200);
+    for line in stream.chunks(40) {
+        w.append(line);
+    }
+    assert_eq!(w.end(), 8000, "the count never drops with the oldest bytes");
+    let tail = cursor(&store, 10_000);
+    assert_eq!(tail.end, 8000);
+    assert!(tail.log_start > 0, "the cap dropped older output");
+    assert_eq!(tail.start, tail.log_start);
+    assert_eq!(tail.end - tail.log_start, w.len());
+    assert_cursor_slice(&tail, &stream);
+}
+
+#[test]
+fn reopening_a_run_continues_its_positions() {
+    let (_dir, store) = store(1000);
+    let stream = numbered_stream(120);
+    let mut lines = stream.chunks(40);
+    {
+        let mut first = store.open_writer("ws", "s", "r");
+        for line in lines.by_ref().take(60) {
+            first.append(line);
+        }
+    }
+    let mut second = store.open_writer("ws", "s", "r");
+    assert_eq!(
+        second.end(),
+        2400,
+        "a service auto-restart appends at the run's end"
+    );
+    for line in lines {
+        second.append(line);
+    }
+    assert_eq!(second.end(), 4800);
+    assert_cursor_slice(&cursor(&store, 10_000), &stream);
+}
+
+#[test]
+fn reopening_under_a_smaller_cap_keeps_positions() {
+    let (_dir, mut store) = store(4000);
+    let stream = numbered_stream(100);
+    store.open_writer("ws", "s", "r").append(&stream);
+    store.set_max_bytes_per_run(1000);
+    let w = store.open_writer("ws", "s", "r");
+    assert_eq!(w.end(), 4000);
+    let tail = cursor(&store, 10_000);
+    assert!(
+        tail.log_start >= 3000,
+        "reopen compaction moved the log start"
+    );
+    assert_cursor_slice(&tail, &stream);
+}
+
+/// Regression (cursor review): a straggling earlier process of the run must
+/// not write into the positions a newer writer of the same run hands out.
+#[test]
+fn a_newer_writer_supersedes_an_older_one() {
+    let (_dir, store) = store(1000);
+    let stream = numbered_stream(4);
+    let mut old = store.open_writer("ws", "s", "r");
+    old.append(&stream[..40]);
+    let mut new = store.open_writer("ws", "s", "r");
+    assert_eq!(new.end(), 40);
+    old.append(b"straggler output\n");
+    new.append(&stream[40..160]);
+    assert_eq!(new.end(), 160);
+    let tail = cursor(&store, 10_000);
+    assert_eq!((tail.start, tail.end), (0, 160));
+    assert_cursor_slice(&tail, &stream);
+}
+
+/// Regression (cursor review): a run whose log never opened still answers
+/// at its end position, never at 0.
+#[test]
+fn a_run_without_a_log_reads_at_its_end() {
+    let (dir, store) = store(1024);
+    fs::create_dir_all(dir.path().join("script-output")).unwrap();
+    fs::write(dir.path().join("script-output").join("ws"), b"not a dir").unwrap();
+    let mut w = store.open_writer("ws", "s", "r");
+    w.append(b"streamed but not saved");
+    let tail = cursor(&store, 10);
+    assert_eq!((tail.start, tail.end, tail.log_start), (22, 22, 22));
+    assert!(tail.bytes.is_empty());
+}
+
+#[test]
+fn unsaved_output_still_advances_positions() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    let stream = numbered_stream(200);
+    with_failing_rename(|| {
+        for line in stream.chunks(40).take(100) {
+            w.append(line);
+        }
+    });
+    assert_eq!(w.len(), 2000, "output past twice the cap is not saved");
+    assert_eq!(w.end(), 4000, "but it still has positions");
+    let tail = cursor(&store, 1);
+    assert_eq!(tail.end, 4000);
+    for line in stream.chunks(40).skip(100) {
+        w.append(line);
+    }
+    let tail = cursor(&store, 5);
+    assert_eq!(tail.end, 8000);
+    assert_cursor_slice(&tail, &stream);
+}
+
+/// Regression (intent#10218 review): output dropped while compaction fails,
+/// then saved again once it recovers, must not shift the saved bytes' positions.
+/// Cursor reads cover only the contiguous output after the newest hole.
+#[test]
+fn cursor_reads_never_span_an_unsaved_hole() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    let stream = numbered_stream(200);
+    let mut lines = stream.chunks(40);
+    with_failing_rename(|| {
+        for line in lines.by_ref().take(60) {
+            w.append(line);
+        }
+    });
+    assert_eq!(w.len(), 2000, "lines 50..60 were not saved");
+    let tail = cursor(&store, 10_000);
+    assert_eq!(tail.end, 2400);
+    assert_eq!(
+        tail.log_start, 2400,
+        "nothing saved is contiguous with the end yet"
+    );
+    assert!(tail.bytes.is_empty());
+    for line in lines {
+        w.append(line);
+        let tail = cursor(&store, 10_000);
+        assert_eq!(tail.end, w.end());
+        assert!(tail.log_start >= 2400, "never reaches back across the hole");
+        assert_cursor_slice(&tail, &stream);
+    }
+}
+
+/// Regression (intentd#3837 review): a write that fails after saving part of
+/// a chunk, then a reopen of the same run (a service auto-restart), must not
+/// give the saved bytes new positions.
+#[test]
+fn reopening_after_a_partial_write_keeps_positions() {
+    let (_dir, store) = store(1000);
+    let stream = numbered_stream(10);
+    {
+        let mut w = store.open_writer("ws", "s", "r");
+        w.append(&stream[..100]);
+        WRITE_BUDGET.with(|b| b.set(Some(20)));
+        w.append(&stream[100..140]);
+        WRITE_BUDGET.with(|b| b.set(None));
+        assert!(!w.is_enabled());
+        assert_eq!(w.end(), 140);
+    }
+    let mut w = store.open_writer("ws", "s", "r");
+    assert_eq!(w.end(), 140, "the run continues at its end");
+    let tail = cursor(&store, 10_000);
+    assert_eq!(
+        (tail.start, tail.end),
+        (140, 140),
+        "no saved byte is known to sit before 140"
+    );
+    w.append(&stream[140..200]);
+    let tail = cursor(&store, 10_000);
+    assert_eq!((tail.log_start, tail.end), (140, 200));
+    assert_cursor_slice(&tail, &stream);
+}
+
+#[test]
+fn a_disabled_writer_still_advances_positions() {
+    let (dir, store) = store(1024);
+    fs::create_dir_all(dir.path().join("script-output")).unwrap();
+    fs::write(dir.path().join("script-output").join("ws"), b"not a dir").unwrap();
+    let mut w = store.open_writer("ws", "s", "r");
+    assert!(!w.is_enabled());
+    w.append(b"streamed but not saved");
+    assert_eq!(w.end(), 22);
+}
+
+#[test]
+fn a_new_store_counts_an_existing_log_from_zero() {
+    let (dir, store) = store(1000);
+    let stream = numbered_stream(100);
+    store.open_writer("ws", "s", "r").append(&stream);
+    let next_boot = ScriptOutputStore::new(dir.path(), 1000);
+    let tail = next_boot
+        .cursor_tail("ws", "s", "r", 10_000, u64::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.log_start, 0);
+    assert_eq!(tail.end, tail.bytes.len() as u64);
+    assert_eq!(next_boot.open_writer("ws", "s", "r").end(), tail.end);
+}
+
+#[test]
+fn cursor_byte_window_starts_on_a_line() {
+    let (_dir, store) = store(1 << 20);
+    let stream = numbered_stream(100);
+    store.open_writer("ws", "s", "r").append(&stream);
+    let tail = store
+        .cursor_tail("ws", "s", "r", 10_000, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.end, 4000);
+    assert_eq!(tail.start, 3920, "the cut realigns after the next newline");
+    assert_cursor_slice(&tail, &stream);
+    let mut w = store.open_writer("ws", "s", "x");
+    w.append(&[b'a'; 300]);
+    let tail = store.cursor_tail("ws", "s", "x", 10, 100).unwrap().unwrap();
+    assert_eq!(
+        (tail.start, tail.end),
+        (200, 300),
+        "no newline: keep the window"
+    );
+}
+
+#[test]
+fn cursor_of_missing_and_empty_logs() {
+    let (_dir, store) = store(1024);
+    assert!(store
+        .cursor_tail("ws", "s", "r", 10, u64::MAX)
+        .unwrap()
+        .is_none());
+    let w = store.open_writer("ws", "s", "r");
+    let tail = cursor(&store, 10);
+    assert_eq!((tail.start, tail.end, tail.log_start), (0, 0, 0));
+    assert!(tail.bytes.is_empty());
+    drop(w);
+}
+
+/// A reader racing appends and compactions always gets bytes that sit
+/// exactly at the positions it reports.
+#[test]
+fn cursor_reads_are_atomic_with_appends_and_compaction() {
+    let (_dir, store) = store(2000);
+    let stream = numbered_stream(3000);
+    let writer_store = store.clone();
+    let writer_stream = stream.clone();
+    let writer = std::thread::spawn(move || {
+        let mut w = writer_store.open_writer("ws", "s", "r");
+        for line in writer_stream.chunks(40) {
+            w.append(line);
+        }
+    });
+    let mut reads = 0;
+    while !writer.is_finished() || reads == 0 {
+        if let Some(tail) = store.cursor_tail("ws", "s", "r", 30, u64::MAX).unwrap() {
+            assert_cursor_slice(&tail, &stream);
+            reads += 1;
+        }
+    }
+    writer.join().unwrap();
+    assert_cursor_slice(&cursor(&store, 10_000), &stream);
 }

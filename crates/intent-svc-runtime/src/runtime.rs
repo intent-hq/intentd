@@ -791,6 +791,24 @@ impl RuntimePort for RuntimeFeature {
         })
     }
 
+    fn script_output_cursor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            svc.require_saved_script_operator(&workspace_id, &script_id, "script.output")
+                .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
+            mgr.output_cursor(&workspace_id, &script_id, max_lines)
+                .await
+        })
+    }
+
     fn script_status<'a>(
         &'a self,
         svc: &'a Services,

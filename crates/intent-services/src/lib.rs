@@ -19910,6 +19910,9 @@ impl WorkspaceApi for Services {
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));
+            // `script.output` `cursor: true` and positioned `script:output`
+            // events (§5.8 output cursors).
+            caps.insert("scriptOutputCursor".into(), serde_json::json!(1));
             // Conversation goal (§5.5): `/goal`, `agent.setGoal` and the
             // per-turn goal block.
             caps.insert("conversationGoal".into(), serde_json::json!(1));
@@ -22109,6 +22112,12 @@ impl WorkspaceApi for Services {
                 paginate: Option<bool>,
                 page_token: Option<String>,
             ) -> BoxFuture<'_, Result<serde_json::Value>> => script_output;
+            fn script_output_cursor(
+                &self,
+                workspace_id: WorkspaceId,
+                script_id: String,
+                max_lines: Option<i64>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_output_cursor;
             fn script_status(&self, workspace_id: WorkspaceId, script_id: String)
                 -> BoxFuture<'_, Result<serde_json::Value>> => script_status;
             fn script_machine_run(
