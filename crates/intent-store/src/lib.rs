@@ -155,8 +155,10 @@ mod orchestrator_only;
 pub use orchestrator_only::OrchestratorOnly;
 mod pr_monitor_repo;
 pub use intent_core::tenant_fence::TenantFence;
+mod invite_nonce_repo;
 mod presence_focus_repo;
 mod principal_repo;
+mod quota;
 mod repository_authority_repo;
 mod repository_lifecycle;
 mod repository_selection_repo;
@@ -247,6 +249,7 @@ pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,
 };
+pub use invite_nonce_repo::{InviteNonce, InviteNonceCaps};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use node_invite_repo::{NodeInvite, NodeInviteRefusal, NodeInviteRevocation};
 pub use note_search_repo::{NoteFtsCursor, NoteFtsMatch, NoteFtsOptions};
@@ -261,6 +264,7 @@ pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
     InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
 };
+pub use quota::QuotaWrite;
 pub use repository_authority_repo::{
     AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
     RepositoryHostAuthoritySnapshot, RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,

@@ -1,6 +1,6 @@
 //! A reserved `SQLite` writer, with no authority reconstructed from stored data.
 use super::{
-    kind_word, pending_to_db, provider_word, state_to_db, validate_monitor_target,
+    kind_word, pending_to_db, provider_word, state_to_db, validate_monitor_target, AgentId,
     MonitorTargetProvenance, PrMonitor, QualifiedPrMonitor, QueryBuilder, Result, ReviewTarget,
     Sqlite, Store, COLUMNS, TARGET_COLUMNS,
 };
@@ -37,6 +37,28 @@ impl PreparedMonitorWrite {
     /// Panics if called directly on an asynchronous runtime worker.
     pub fn commit(self) -> Result<bool> {
         tokio::runtime::Handle::current().block_on(self.finish())
+    }
+
+    /// Admit this write under `agent`'s PR-monitor quota: count the agent's
+    /// active monitors in the reserved transaction (Postgres locks the
+    /// agent's quota row first) and return the count when it is at or above
+    /// `max`; the caller then drops the write, which rolls back. `None`
+    /// admits: no other admission for the agent can count until this
+    /// write commits or rolls back. Call it for a write that makes `agent`
+    /// the owner of one more active monitor (an insert, or a replacement
+    /// that moves the row to `agent`).
+    ///
+    /// # Errors
+    /// A database failure.
+    pub async fn admit_under_quota(&mut self, agent: &AgentId, max: u64) -> Result<Option<u64>> {
+        match &mut self.inner {
+            PreparedInner::Sqlite { transaction, .. } => {
+                let active = super::quota::sqlite_active_monitors(transaction, agent).await?;
+                Ok((active >= max).then_some(active))
+            }
+            #[cfg(feature = "postgres")]
+            PreparedInner::Postgres(write) => write.admit_under_quota(agent, max).await,
+        }
     }
 
     #[cfg(feature = "postgres")]
