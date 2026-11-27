@@ -63,7 +63,11 @@ fn attachment_upload_idle_ttl() -> Duration {
 /// `abort` need between calls. Lives in [`Services::attachment_uploads`];
 /// in-memory only.
 pub(crate) struct AttachmentUploadSession {
-    pub workspace_id: WorkspaceId,
+    /// The workspace the attachment is placed into; `None` for an
+    /// `app-package` upload (§5.60 "Package upload"), which has no
+    /// workspace, is consumed by `app.install` instead of `commit`, and is
+    /// open only to the administrator user.
+    pub workspace_id: Option<WorkspaceId>,
     pub file_name: String,
     pub mime_type: Option<String>,
     /// `<workspaces_root>/.attachment-upload-staging/<uploadId>/`.
@@ -631,7 +635,8 @@ impl Services {
                 uploads
                     .iter_mut()
                     .find(|(_, s)| {
-                        s.workspace_id == workspace_id && s.idempotency_key.as_ref() == Some(key)
+                        s.workspace_id.as_ref() == Some(&workspace_id)
+                            && s.idempotency_key.as_ref() == Some(key)
                     })
                     .map(|(id, s)| {
                         let same_payload = s.fingerprint() == fingerprint;
@@ -643,7 +648,7 @@ impl Services {
             });
             let live = uploads
                 .values()
-                .filter(|s| s.workspace_id == workspace_id)
+                .filter(|s| s.workspace_id.as_ref() == Some(&workspace_id))
                 .count();
             if let Some((existing_id, existing_dir, same_payload)) = same_key {
                 if same_payload {
@@ -660,7 +665,7 @@ impl Services {
                 )))
             } else {
                 let session = AttachmentUploadSession {
-                    workspace_id,
+                    workspace_id: Some(workspace_id),
                     file_name,
                     mime_type,
                     staging_dir: staging_dir.clone(),
@@ -787,7 +792,7 @@ impl Services {
             .lock()
             .expect("attachment upload registry poisoned")
             .get(upload_id)
-            .map(|session| session.workspace_id.clone())
+            .and_then(|session| session.workspace_id.clone())
     }
 
     /// Multiplayer w3 membership recheck for an upload continuation
@@ -804,9 +809,23 @@ impl Services {
             .get(upload_id)
             .map(|s| s.workspace_id.clone());
         match workspace_id {
-            Some(workspace_id) => self.require_member(&workspace_id).await,
-            None => Ok(()),
+            Some(Some(workspace_id)) => self.require_member(&workspace_id).await,
+            // An app-package upload answers any other caller as an unknown
+            // upload, so it cannot be probed (§5.60 "Package upload").
+            Some(None) if !app_package_caller_ok() => Err(Error::NotFound(format!(
+                "no attachment upload in progress: {upload_id}"
+            ))),
+            Some(None) | None => Ok(()),
         }
+    }
+
+    /// Whether `upload_id` is a live `app-package` upload.
+    pub(crate) fn is_app_package_upload(&self, upload_id: &str) -> bool {
+        self.attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get(upload_id)
+            .is_some_and(|s| s.workspace_id.is_none())
     }
 
     /// Refuse an upload continuation that writes (`chunk` / `commit`) when
@@ -820,7 +839,7 @@ impl Services {
             .lock()
             .expect("attachment upload registry poisoned")
             .get(upload_id)
-            .map(|s| s.workspace_id.clone());
+            .and_then(|s| s.workspace_id.clone());
         match workspace_id {
             Some(workspace_id) => self.refuse_if_retired(&workspace_id).await,
             None => Ok(()),
@@ -839,7 +858,7 @@ impl Services {
                 .expect("attachment upload registry poisoned");
             let ids: Vec<String> = uploads
                 .iter()
-                .filter(|(_, s)| &s.workspace_id == workspace_id)
+                .filter(|(_, s)| s.workspace_id.as_ref() == Some(workspace_id))
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.iter()
@@ -992,6 +1011,11 @@ impl Services {
             let session = uploads.get_mut(&upload_id).ok_or_else(|| {
                 Error::NotFound(format!("no attachment upload in progress: {upload_id}"))
             })?;
+            let Some(workspace_id) = session.workspace_id.clone() else {
+                return Err(Error::InvalidParams(format!(
+                    "upload {upload_id} is an app-package upload: use app.install"
+                )));
+            };
             if session.committing {
                 return Err(Error::InvalidParams(format!(
                     "upload {upload_id} is already committing"
@@ -1017,7 +1041,7 @@ impl Services {
                 session.staging_dir.clone(),
                 session.declared_size,
                 session.declared_sha256.clone(),
-                session.workspace_id.clone(),
+                workspace_id,
                 session.file_name.clone(),
                 session.mime_type.clone(),
                 seqs,
@@ -1144,6 +1168,215 @@ impl Services {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
         Ok(result)
+    }
+}
+
+/// Maximum live `app-package` uploads per daemon (§5.60 "Package upload").
+pub(crate) const APP_PACKAGE_MAX_SESSIONS: usize = 2;
+
+/// The caller an `app-package` upload is open to: the administrator user,
+/// never an agent (§5.60 "Package upload").
+pub(crate) fn app_package_caller_ok() -> bool {
+    !matches!(
+        intent_core::current_caller(),
+        Some(intent_core::Caller::Agent { .. })
+    ) && Services::require_administrator("an app-package upload").is_ok()
+}
+
+/// A verified `app-package` upload claimed by `app.install`: the assembled
+/// package file, while the session is flagged `committing`.
+pub(crate) struct AppPackageClaim {
+    pub(crate) package: PathBuf,
+}
+
+impl Services {
+    /// `file.attachmentUpload.begin { purpose: "app-package" }` (§5.60
+    /// "Package upload"): the same header checks as an attachment begin,
+    /// without a workspace, with the package size cap, and at most
+    /// [`APP_PACKAGE_MAX_SESSIONS`] live per daemon. The caller is checked
+    /// by the trait entry point.
+    pub(crate) async fn file_app_package_upload_begin_op(
+        &self,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+    ) -> Result<serde_json::Value> {
+        if file_name.trim().is_empty() {
+            return Err(Error::InvalidParams(
+                "fileName must not be empty".to_string(),
+            ));
+        }
+        if crate::file_ops::sanitize_attachment_name(&file_name).is_none() {
+            return Err(Error::InvalidParams(format!(
+                "invalid app package fileName: {file_name:?}"
+            )));
+        }
+        if size_bytes == 0 {
+            return Err(Error::InvalidParams(
+                "sizeBytes must be positive".to_string(),
+            ));
+        }
+        let cap = crate::app_ops::package::MAX_PACKAGE_BYTES;
+        if size_bytes > cap {
+            return Err(Error::InvalidParams(format!(
+                "sizeBytes {size_bytes} exceeds the {cap} byte app package cap"
+            )));
+        }
+        let sha = sha256.trim().to_ascii_lowercase();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::InvalidParams(
+                "sha256 must be 64 hex characters".to_string(),
+            ));
+        }
+        let upload_id = format!("upload-{}", uuid::Uuid::new_v4());
+        let staging_dir = self.attachment_upload_staging_root().join(&upload_id);
+        // Registered before the directory exists, as an attachment begin.
+        let expired_dirs;
+        let admitted = {
+            let mut uploads = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned");
+            expired_dirs = drain_expired_sessions(&mut uploads);
+            let live = uploads
+                .values()
+                .filter(|s| s.workspace_id.is_none())
+                .count();
+            if live >= APP_PACKAGE_MAX_SESSIONS {
+                Err(Error::InvalidParams(format!(
+                    "{live} app package uploads are in progress (max \
+                     {APP_PACKAGE_MAX_SESSIONS}) — install or abort one before beginning another"
+                )))
+            } else {
+                uploads.insert(
+                    upload_id.clone(),
+                    AttachmentUploadSession {
+                        workspace_id: None,
+                        file_name,
+                        mime_type: None,
+                        staging_dir: staging_dir.clone(),
+                        declared_size: size_bytes,
+                        declared_sha256: sha,
+                        chunk_sizes: HashMap::new(),
+                        committing: false,
+                        last_activity: Instant::now(),
+                        idempotency_key: None,
+                    },
+                );
+                Ok(())
+            }
+        };
+        for dir in expired_dirs {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        admitted?;
+        self.sweep_orphaned_upload_staging_dirs().await;
+        if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
+            self.attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned")
+                .remove(&upload_id);
+            return Err(Error::Internal(format!(
+                "create app package staging dir failed: {e}"
+            )));
+        }
+        Ok(serde_json::json!({
+            "uploadId": upload_id,
+            "maxChunkBytes": ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES,
+        }))
+    }
+
+    /// Claim and verify a complete `app-package` upload for `app.install`:
+    /// the same checks as a commit (declared size, gap-free seqs from 0,
+    /// SHA-256), with the session flagged `committing` so chunks, aborts
+    /// and a second install wait. `Err` carries the `upload-invalid`
+    /// detail; on `Err` the session (if any) is left as it was. The caller
+    /// ends the claim with [`Self::app_package_upload_release`] or
+    /// [`Self::app_package_upload_finish`].
+    pub(crate) async fn app_package_upload_claim(
+        &self,
+        upload_id: &str,
+    ) -> std::result::Result<AppPackageClaim, String> {
+        self.reclaim_upload_if_expired(upload_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (staging_dir, declared_size, declared_sha, seqs) = {
+            let mut uploads = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned");
+            let session = uploads
+                .get_mut(upload_id)
+                .ok_or_else(|| format!("no app package upload in progress: {upload_id}"))?;
+            if session.workspace_id.is_some() {
+                return Err(format!("upload {upload_id} is not an app-package upload"));
+            }
+            if session.committing {
+                return Err(format!(
+                    "upload {upload_id} is busy with another install — retry when it returns"
+                ));
+            }
+            session.last_activity = Instant::now();
+            let received = session.received_bytes();
+            if received != session.declared_size {
+                return Err(format!(
+                    "upload incomplete: received {received} of {} declared bytes",
+                    session.declared_size
+                ));
+            }
+            let mut seqs: Vec<u64> = session.chunk_sizes.keys().copied().collect();
+            seqs.sort_unstable();
+            if seqs.first() != Some(&0) || seqs.last() != Some(&(seqs.len() as u64 - 1)) {
+                return Err(format!(
+                    "chunk sequence has gaps: got seqs {seqs:?}, expected contiguous from 0"
+                ));
+            }
+            session.committing = true;
+            (
+                session.staging_dir.clone(),
+                session.declared_size,
+                session.declared_sha256.clone(),
+                seqs,
+            )
+        };
+        let package = staging_dir.join("assembled");
+        let assembled = package.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            assemble_and_verify(
+                &staging_dir,
+                &seqs,
+                declared_size,
+                &declared_sha,
+                &assembled,
+            )
+        })
+        .await
+        .map_err(|e| format!("app package assembly task failed: {e}"))
+        .and_then(|r| r.map_err(|e| e.to_string()));
+        if let Err(detail) = verified {
+            self.release_failed_commit_claim(upload_id);
+            return Err(detail);
+        }
+        Ok(AppPackageClaim { package })
+    }
+
+    /// End a claim and keep the upload (a `dryRun` or a failed install), so
+    /// the client can install again or abort.
+    pub(crate) fn app_package_upload_release(&self, upload_id: &str) {
+        self.release_failed_commit_claim(upload_id);
+    }
+
+    /// End a claim and the upload (a successful install): the session is
+    /// removed and its staging deleted.
+    pub(crate) async fn app_package_upload_finish(&self, upload_id: &str) {
+        let session = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .remove(upload_id);
+        if let Some(session) = session {
+            let _ = tokio::fs::remove_dir_all(&session.staging_dir).await;
+        }
     }
 }
 
@@ -2279,7 +2512,7 @@ mod tests {
         svc.attachment_uploads.lock().unwrap().insert(
             "upload-live".to_string(),
             super::AttachmentUploadSession {
-                workspace_id: ws.clone(),
+                workspace_id: Some(ws.clone()),
                 file_name: "live.bin".to_string(),
                 mime_type: None,
                 staging_dir: live_dir.clone(),
