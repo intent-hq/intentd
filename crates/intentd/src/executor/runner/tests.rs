@@ -115,9 +115,27 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
     Some(harness_with(node, max_agents, args))
 }
 
+/// [`harness`] with the fixture provider's capabilities changed by `tune`.
+fn tuned_harness(args: &[&str], tune: impl FnOnce(&mut ProviderConfig)) -> Option<Harness> {
+    let Some(node) = intent_providers::resolve_on_path("node") else {
+        eprintln!("skipping node runner test: node not on PATH");
+        return None;
+    };
+    Some(harness_tuned(node, 2, args, tune))
+}
+
 /// [`harness`] with the fixture provider run by `node`. Tests that never
 /// start a provider (profile resolution) pass any path and never skip.
 fn harness_with(node: PathBuf, max_agents: u32, args: &[&str]) -> Harness {
+    harness_tuned(node, max_agents, args, |_| {})
+}
+
+fn harness_tuned(
+    node: PathBuf,
+    max_agents: u32,
+    args: &[&str],
+    tune: impl FnOnce(&mut ProviderConfig),
+) -> Harness {
     let script = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -127,10 +145,11 @@ fn harness_with(node: PathBuf, max_agents: u32, args: &[&str]) -> Harness {
         args.iter()
             .map(|a| &*Box::leak((*a).to_owned().into_boxed_str())),
     );
-    let config = ProviderConfig {
+    let mut config = ProviderConfig {
         base_args: Box::leak(base_args.into_boxed_slice()),
         ..*intent_providers::find_provider(PROVIDER).unwrap()
     };
+    tune(&mut config);
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
@@ -1416,6 +1435,92 @@ async fn node_runner_opens_the_provider_session_with_heads_session_meta() {
     );
 }
 
+/// The machine applies the requested model to the provider session before
+/// the agent is ready, as a local spawn does: claude-code (and codex, cursor,
+/// antigravity) take it as the `model` config option, grok by
+/// `session/set_model`, since none has a CLI model flag
+/// (intent-hq/intent#10197). No model or `default` sends nothing.
+#[tokio::test]
+async fn node_runner_applies_the_launch_model_to_the_provider_session() {
+    let applied = |h: &Harness, id: &str| -> Vec<Value> {
+        let path = h
+            .storage
+            .agent_dir(&AgentId::from(id))
+            .unwrap()
+            .join("session-model.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let with_model = |id: &str, model: Option<&str>| LaunchCommand {
+        model: model.map(str::to_owned),
+        ..launch(id)
+    };
+    let Some(h) = tuned_harness(&[], |config| {
+        config.supports_config_option_model = true;
+    }) else {
+        return;
+    };
+    h.runner.launch(with_model("a1", Some("opus"))).await;
+    h.runner.launch(with_model("a2", Some("default"))).await;
+    wait_for(&h.runner, "start", started("a1")).await;
+    wait_for(&h.runner, "start", started("a2")).await;
+    assert_eq!(
+        applied(&h, "a1"),
+        vec![json!({
+            "method": "session/set_config_option",
+            "sessionId": "node-test-session",
+            "configId": "model",
+            "value": "opus",
+        })]
+    );
+    assert_eq!(applied(&h, "a2"), Vec::<Value>::new());
+
+    let Some(h) = tuned_harness(&[], |config| config.supports_set_model = true) else {
+        return;
+    };
+    h.runner.launch(with_model("g1", Some("grok-5"))).await;
+    wait_for(&h.runner, "start", started("g1")).await;
+    assert_eq!(
+        applied(&h, "g1"),
+        vec![
+            json!({ "method": "session/set_model", "sessionId": "node-test-session", "modelId": "grok-5" })
+        ]
+    );
+}
+
+/// A provider whose model selection must succeed (codex, cursor,
+/// antigravity) fails the start when it rejects the model, instead of
+/// running on its default; others keep their default and start.
+#[tokio::test]
+async fn node_runner_fails_the_start_when_a_required_model_is_rejected() {
+    let with_model = |id: &str| LaunchCommand {
+        model: Some("gpt-unknown".into()),
+        ..launch(id)
+    };
+    let Some(h) = tuned_harness(&["--reject-model"], |config| {
+        config.supports_config_option_model = true;
+        config.config_option_model_required = true;
+    }) else {
+        return;
+    };
+    h.runner.launch(with_model("c1")).await;
+    let all = wait_for(&h.runner, "exit", exited("c1")).await;
+    assert!(!all.iter().any(started("c1")), "{all:#?}");
+    let error = exit_error(find(&all, exited("c1"))).unwrap_or_default();
+    assert!(error.contains("gpt-unknown"), "{error}");
+
+    let Some(h) = tuned_harness(&["--reject-model"], |config| {
+        config.supports_config_option_model = true;
+    }) else {
+        return;
+    };
+    h.runner.launch(with_model("k1")).await;
+    wait_for(&h.runner, "start", started("k1")).await;
+}
+
 const CANARY: &str = "canary-profile-secret-5b1e";
 /// A seven-byte credential: masked because of its variable's name.
 const SHORT_SECRET: &str = "s3cr3t!";
@@ -1793,7 +1898,7 @@ fn the_redactor_masks_tool_payloads_but_keeps_schema_identifiers() {
         );
         let redactor = Redactor::new(Some(&profile));
         let mut params = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call-1",
@@ -1855,7 +1960,7 @@ fn the_redactor_keeps_resource_and_location_keys() {
         );
         let redactor = Redactor::new(Some(&profile));
         let mut resource = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
@@ -1876,7 +1981,7 @@ fn the_redactor_keeps_resource_and_location_keys() {
         );
         assert!(embedded.get("uri").is_some(), "{secret}: {resource}");
         let mut tool = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-1",
@@ -2034,7 +2139,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         });
 
         let mut chunk = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
@@ -2062,7 +2167,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         assert!(parses(&chunk), "{secret}: unparseable {chunk}");
 
         let mut tool = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-1",
@@ -2092,7 +2197,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         assert!(parses(&tool), "{secret}: unparseable {tool}");
 
         let mut config = json!({
-            "sessionId": "s1",
+            "sessionId": "node-test-session",
             "update": {
                 "sessionUpdate": "config_option_update",
                 "configOptions": [{
@@ -2125,7 +2230,7 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
     );
     let redactor = Redactor::new(Some(&profile));
     let mut chunk = json!({
-        "sessionId": "s1",
+        "sessionId": "node-test-session",
         "update": {
             "sessionUpdate": "agent_message_chunk",
             "content": {
@@ -2141,7 +2246,7 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
         json!(["user", "[redacted]"])
     );
     let mut config = json!({
-        "sessionId": "s1",
+        "sessionId": "node-test-session",
         "update": {
             "sessionUpdate": "config_option_update",
             "configOptions": [{ "id": "model", "name": "Model", "type": secret, "currentValue": "x" }],

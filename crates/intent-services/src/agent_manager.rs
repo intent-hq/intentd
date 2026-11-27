@@ -3642,6 +3642,159 @@ pub(crate) fn local_launch_overlay_in(
     profile.clone().with_api_key_home(home)
 }
 
+/// Best-effort post-session model application, gated per provider
+/// capability (parity with the reference acp-provider): `session/set_model`
+/// for providers whose ACP subcommand has no CLI model flag
+/// (`supports_set_model`; grok today), and
+/// `session/set_config_option { configId: "model" }` for providers that
+/// expose the model as a session config option
+/// (`supports_config_option_model`; claude-code, pi, and codex today —
+/// codex's pinned npx adapter ignores `-c model=…` argv overrides and
+/// its `session/set_model` handler rejects our id formats, but it
+/// advertises a bare-id `configOptions[id="model"]` select). Compound ids
+/// are honored only when their provider prefix matches the running
+/// provider (a stale id from a pre-spawn provider switch must not be
+/// sent); bare ids are treated as provider-local. The `default` sentinel
+/// and empty ids are no-ops. A rejected required selection (codex, cursor,
+/// antigravity) fails startup; the caller discards the child. Other providers
+/// retain best-effort behavior.
+/// Returns the config-option response so thinking choices can follow the
+/// selected model before the stored reasoning effort is applied.
+/// Shared by local spawns and machine (remote) launches, which open the
+/// session themselves (intent-hq/intent#10197).
+///
+/// # Errors
+///
+/// A selection the provider must apply (`config_option_model_required`, or
+/// any Cursor pick) that it rejects or cannot be sent.
+pub async fn apply_session_model(
+    conn: &Connection,
+    provider: &ProviderConfig,
+    acp_session_id: &str,
+    stored_model: Option<&str>,
+    advertised_options: Option<&Value>,
+) -> Result<Option<Value>> {
+    if provider.id == "cursor" {
+        return apply_cursor_session_model(conn, acp_session_id, stored_model, advertised_options)
+            .await;
+    }
+    if let Some(model_id) = AgentManager::set_model_target(provider, stored_model) {
+        match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
+            Ok(()) => {
+                tracing::debug!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    "session/set_model accepted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    error = %e,
+                    "session/set_model failed; provider keeps its default model"
+                );
+            }
+        }
+    }
+    if let Some(model_id) = AgentManager::config_option_model_target(provider, stored_model) {
+        match intent_acp::session::set_session_config_option_response(
+            conn,
+            acp_session_id,
+            "model",
+            model_id,
+        )
+        .await
+        {
+            Ok(response) => {
+                tracing::debug!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    "session/set_config_option accepted"
+                );
+                return Ok(Some(response));
+            }
+            Err(e) => {
+                // Codex and Antigravity: an explicit selection must
+                // succeed before any prompt (or successful model-change
+                // notice) is sent.
+                if provider.config_option_model_required {
+                    return Err(match &e {
+                        intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
+                            Error::InvalidParams(format!(
+                                "Could not apply {} model '{model_id}': {e}. Select a supported model and retry.",
+                                provider.short_name
+                            ))
+                        }
+                        // Preserve the ACP detail for the existing spawn
+                        // retry classifier; a transport or timeout failure
+                        // does not mean the selected model is unsupported.
+                        _ => Error::Internal(format!(
+                            "session/set_config_option failed: {e}"
+                        )),
+                    });
+                }
+                tracing::warn!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    error = %e,
+                    "session/set_config_option failed; provider keeps its default model"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Cursor: map the stored base model (`cursor/list_available_models`
+/// ids; `default` = Auto) onto this session's own `model` option variant
+/// and apply it with `session/set_config_option`. No stored model applies
+/// Auto (skipped only when the session offers no Auto option). A model the session does not offer,
+/// or one Cursor rejects, fails setup with an actionable error before
+/// any prompt is sent. Cursor also saves the applied model as the
+/// user's CLI default (accepted product behavior).
+async fn apply_cursor_session_model(
+    conn: &Connection,
+    acp_session_id: &str,
+    stored_model: Option<&str>,
+    advertised_options: Option<&Value>,
+) -> Result<Option<Value>> {
+    let explicit = stored_model
+        .map(|m| m.strip_prefix("cursor:").unwrap_or(m).trim())
+        .filter(|m| !m.is_empty());
+    // No stored model means Auto, not whatever the user's Cursor CLI
+    // default became after an earlier pick (every applied pick is saved
+    // as that default), so API and delegated agents never inherit it.
+    let pick = explicit.unwrap_or(intent_providers::cursor::CURSOR_AUTO_MODEL);
+    let Some(value) = advertised_options
+        .and_then(|options| intent_providers::cursor::cursor_session_model_value(options, pick))
+    else {
+        if explicit.is_none() {
+            return Ok(None);
+        }
+        return Err(Error::InvalidInput(format!(
+            "Cursor does not offer model '{pick}' for this account. Refresh the Cursor model list and pick an available model; no prompt was sent."
+        )));
+    };
+    match intent_acp::session::set_session_config_option_response(
+        conn,
+        acp_session_id,
+        "model",
+        &value,
+    )
+    .await
+    {
+        Ok(response) => Ok(Some(response)),
+        Err(error) => Err(Error::InvalidInput(format!(
+                "Cursor rejected model '{pick}' ({value}): {error}. Refresh the Cursor model list and pick another model; no prompt was sent."
+        ))),
+    }
+}
+
 impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.
@@ -5973,24 +6126,9 @@ impl AgentManager {
         }
     }
 
-    /// Best-effort post-session model application, gated per provider
-    /// capability (parity with the reference acp-provider): `session/set_model`
-    /// for providers whose ACP subcommand has no CLI model flag
-    /// (`supports_set_model`; grok today), and
-    /// `session/set_config_option { configId: "model" }` for providers that
-    /// expose the model as a session config option
-    /// (`supports_config_option_model`; claude-code, pi, and codex today —
-    /// codex's pinned npx adapter ignores `-c model=…` argv overrides and
-    /// its `session/set_model` handler rejects our id formats, but it
-    /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
-    /// are honored only when their provider prefix matches the running
-    /// provider (a stale id from a pre-spawn provider switch must not be
-    /// sent); bare ids are treated as provider-local. The `default` sentinel
-    /// and empty ids are no-ops. Codex rejection fails startup and discards
-    /// the child so a retry cannot reuse its default model. Other providers
-    /// retain best-effort behavior.
-    /// Retain the config-option response so thinking choices can follow the
-    /// selected model before applying the stored reasoning effort.
+    /// Best-effort post-session model application ([`apply_session_model`]);
+    /// a failure that must stop startup also discards the child so a retry
+    /// cannot reuse its default model.
     async fn maybe_apply_session_model(
         &self,
         conn: &Connection,
@@ -6000,139 +6138,18 @@ impl AgentManager {
         stored_model: Option<&str>,
         advertised_options: Option<&Value>,
     ) -> Result<Option<Value>> {
-        if provider.id == "cursor" {
-            return self
-                .apply_cursor_session_model(
-                    conn,
-                    agent_id,
-                    acp_session_id,
-                    stored_model,
-                    advertised_options,
-                )
-                .await;
-        }
-        if let Some(model_id) = Self::set_model_target(provider, stored_model) {
-            match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
-                Ok(()) => {
-                    tracing::debug!(
-                        provider = provider.id,
-                        session_id = acp_session_id,
-                        model = %model_id,
-                        "session/set_model accepted"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = provider.id,
-                        session_id = acp_session_id,
-                        model = %model_id,
-                        error = %e,
-                        "session/set_model failed; provider keeps its default model"
-                    );
-                }
-            }
-        }
-        if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
-            match intent_acp::session::set_session_config_option_response(
-                conn,
-                acp_session_id,
-                "model",
-                model_id,
-            )
-            .await
-            {
-                Ok(response) => {
-                    tracing::debug!(
-                        provider = provider.id,
-                        session_id = acp_session_id,
-                        model = %model_id,
-                        "session/set_config_option accepted"
-                    );
-                    return Ok(Some(response));
-                }
-                Err(e) => {
-                    // Codex and Antigravity: an explicit selection must
-                    // succeed before any prompt (or successful model-change
-                    // notice) is sent.
-                    if provider.config_option_model_required {
-                        self.kill_child_only(agent_id).await;
-                        return Err(match &e {
-                            intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
-                                Error::InvalidParams(format!(
-                                    "Could not apply {} model '{model_id}': {e}. Select a supported model and retry.",
-                                    provider.short_name
-                                ))
-                            }
-                            // Preserve the ACP detail for the existing spawn
-                            // retry classifier; a transport or timeout failure
-                            // does not mean the selected model is unsupported.
-                            _ => Error::Internal(format!(
-                                "session/set_config_option failed: {e}"
-                            )),
-                        });
-                    }
-                    tracing::warn!(
-                        provider = provider.id,
-                        session_id = acp_session_id,
-                        model = %model_id,
-                        error = %e,
-                        "session/set_config_option failed; provider keeps its default model"
-                    );
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Cursor: map the stored base model (`cursor/list_available_models`
-    /// ids; `default` = Auto) onto this session's own `model` option variant
-    /// and apply it with `session/set_config_option`. No stored model applies
-    /// Auto (skipped only when the session offers no Auto option). A model the session does not offer,
-    /// or one Cursor rejects, fails setup with an actionable error before
-    /// any prompt is sent. Cursor also saves the applied model as the
-    /// user's CLI default (accepted product behavior).
-    async fn apply_cursor_session_model(
-        &self,
-        conn: &Connection,
-        agent_id: &AgentId,
-        acp_session_id: &str,
-        stored_model: Option<&str>,
-        advertised_options: Option<&Value>,
-    ) -> Result<Option<Value>> {
-        let explicit = stored_model
-            .map(|m| m.strip_prefix("cursor:").unwrap_or(m).trim())
-            .filter(|m| !m.is_empty());
-        // No stored model means Auto, not whatever the user's Cursor CLI
-        // default became after an earlier pick (every applied pick is saved
-        // as that default), so API and delegated agents never inherit it.
-        let pick = explicit.unwrap_or(intent_providers::cursor::CURSOR_AUTO_MODEL);
-        let Some(value) = advertised_options.and_then(|options| {
-            intent_providers::cursor::cursor_session_model_value(options, pick)
-        }) else {
-            if explicit.is_none() {
-                return Ok(None);
-            }
-            self.kill_child_only(agent_id).await;
-            return Err(Error::InvalidInput(format!(
-                "Cursor does not offer model '{pick}' for this account. Refresh the Cursor model list and pick an available model; no prompt was sent."
-            )));
-        };
-        match intent_acp::session::set_session_config_option_response(
+        let applied = apply_session_model(
             conn,
+            provider,
             acp_session_id,
-            "model",
-            &value,
+            stored_model,
+            advertised_options,
         )
-        .await
-        {
-            Ok(response) => Ok(Some(response)),
-            Err(error) => {
-                self.kill_child_only(agent_id).await;
-                Err(Error::InvalidInput(format!(
-                    "Cursor rejected model '{pick}' ({value}): {error}. Refresh the Cursor model list and pick another model; no prompt was sent."
-                )))
-            }
+        .await;
+        if applied.is_err() {
+            self.kill_child_only(agent_id).await;
         }
+        applied
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via

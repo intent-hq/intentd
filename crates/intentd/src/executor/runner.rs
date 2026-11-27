@@ -2864,7 +2864,7 @@ impl Runner {
             {
                 match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id).await
                 {
-                    Ok(()) => return Ok(recorded.session_id),
+                    Ok(options) => return Ok((recorded.session_id, options)),
                     Err(error) => {
                         tracing::warn!(agent = %agent.id, %error, "node: could not load the agent's provider session; starting a new one");
                     }
@@ -2877,11 +2877,14 @@ impl Runner {
                 agent.session_meta.new.clone(),
             )
             .await?;
-            Ok::<_, intent_acp::AcpError>(session.session_id.to_string())
+            let options = session
+                .config_options
+                .map(|options| serde_json::json!(options));
+            Ok::<_, intent_acp::AcpError>((session.session_id.to_string(), options))
         };
-        let session = tokio::select! {
+        let (session, options) = tokio::select! {
             result = setup => match result {
-                Ok(session) => session,
+                Ok(opened) => opened,
                 Err(error) => {
                     agent.note_auth_failure(&error);
                     if intent_services::provider_auth::is_auth_required(&error) {
@@ -2911,6 +2914,24 @@ impl Runner {
             }
             _ = &mut *stop => return Outcome::Stopped,
         };
+        // A provider without a CLI model flag takes the model on its session,
+        // as a local spawn's does (intent-hq/intent#10197).
+        let applied = intent_services::apply_session_model(
+            connection,
+            &launch.config,
+            &session,
+            agent.model.as_deref(),
+            options.as_ref(),
+        );
+        tokio::select! {
+            result = applied => if let Err(error) = result {
+                return Outcome::StartFailed(error.to_string(), false);
+            },
+            status = child.wait() => {
+                return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()), None);
+            }
+            _ = &mut *stop => return Outcome::Stopped,
+        }
         // Record what the provider started during setup before any prompt
         // can make it exit: once it has exited, helpers in their own process
         // groups are no longer its descendants.
@@ -3783,7 +3804,7 @@ async fn load_recorded(
     cwd: &std::path::Path,
     mcp: Vec<intent_acp::session::McpServer>,
     session_id: &str,
-) -> Result<(), intent_acp::AcpError> {
+) -> Result<Option<Value>, intent_acp::AcpError> {
     let (ack, acked) = oneshot::channel();
     if agent.marks.send(Mark::Replaying { ack }).is_err() {
         return Err(intent_acp::AcpError::Protocol(
@@ -3802,7 +3823,11 @@ async fn load_recorded(
         agent.session_meta.load.clone(),
     )
     .await
-    .map(drop);
+    .map(|loaded| {
+        loaded
+            .config_options
+            .map(|options| serde_json::json!(options))
+    });
     let (ack, acked) = oneshot::channel();
     if replay.end(Some(ack)) {
         let _ = acked.await;

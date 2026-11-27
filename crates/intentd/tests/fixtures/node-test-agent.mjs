@@ -22,6 +22,11 @@
 //   --crash-on-load         exit with 4 when asked to session/load, while a
 //                           helper keeps its stdout open (the load never
 //                           answers, so its exit is seen first)
+//   --reject-model          refuse session/set_config_option and
+//                           session/set_model with ACP's invalid-params error
+//
+// session/set_config_option and session/set_model append their params as a
+// JSON line to `session-model.jsonl` in its working directory.
 //
 // With sessions, a prompt "recall <word>" streams "recall <word>: yes" when
 // an earlier prompt of the session contained <word>, else ": no".
@@ -286,6 +291,13 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       if (stored.length) setTimeout(() => replay(stored[stored.length - 1]), 10);
       return;
     }
+    case 'session/set_config_option':
+    case 'session/set_model':
+      fs.appendFileSync('session-model.jsonl', `${JSON.stringify({ method: msg.method, ...msg.params })}\n`);
+      if (argv.includes('--reject-model')) {
+        return send({ id: msg.id, error: { code: -32602, message: 'unknown model' } });
+      }
+      return send({ id: msg.id, result: msg.method === 'session/set_model' ? {} : { configOptions: [] } });
     case 'session/prompt': {
       const text = promptText(msg.params);
       // A specialist's role reminder leads its prompts: echo-raw,

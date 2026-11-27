@@ -396,7 +396,7 @@ pub mod auggie_discovery {
 }
 
 pub use agent_manager::{
-    compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
+    apply_session_model, compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
     resolve_provider_launch, AgentManager, AgentMemorySnapshot, BusEventSink, ProcessRegistry,
     ProcessSample, ProviderLaunchSpec, RemoteAgentMemory, RemoteAgentRoot, RemoteOwner,
     TreeMemoryProbe, TreeSample,
