@@ -913,7 +913,8 @@ mod tests {
         use std::sync::Arc;
         use std::task::{Context, Poll};
 
-        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use crate::conn::read_delivery_tests::FixtureApi;
+        use intentd_test_support::PausePoint;
         use tokio::io::{AsyncWrite, AsyncWriteExt as _};
         use tokio::sync::Notify;
 
@@ -952,7 +953,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let handler = Arc::new(Gate::default());
+        let handler = PausePoint::new("handler");
         let api = Arc::new(FixtureApi::holding_handler(handler.clone()));
         let failed = Arc::new(Notify::new());
         let limiter = crate::rpc_limit::RpcLimiter::new(1);
@@ -971,7 +972,7 @@ mod tests {
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"settings.get\",\"params\":{\"path\":\"private\"}}\n").await.unwrap();
         tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-            handler.entered.notified(),
+            handler.wait_reached(),
         )
         .await
         .unwrap();
@@ -1004,7 +1005,7 @@ mod tests {
         )
         .await
         .expect("writer failure must cancel the physical connection");
-        handler.release.notify_one();
+        handler.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             async {
@@ -1028,7 +1029,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_carrier_late_local_binding_cannot_escape_listener_retirement() {
-        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use crate::conn::read_delivery_tests::FixtureApi;
+        use intentd_test_support::PausePoint;
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -1041,7 +1043,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let primary = Arc::new(Gate::default());
+        let primary = PausePoint::new("primary");
         let api = Arc::new(FixtureApi::holding_primary(primary.clone()));
         let listener = crate::context::ReadListenerGuard::default();
         let (mut input, reader) = tokio::io::duplex(2048);
@@ -1059,13 +1061,13 @@ mod tests {
         ));
         tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-            primary.entered.notified(),
+            primary.wait_reached(),
         )
         .await
         .unwrap();
         assert!(api.connections.lock().unwrap().is_empty());
         drop(listener);
-        primary.release.notify_one();
+        primary.release();
         let mut lines = BufReader::new(output).lines();
         for path in ["private", "ordinary"] {
             let request = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"settings.get","params":{"path":path}});

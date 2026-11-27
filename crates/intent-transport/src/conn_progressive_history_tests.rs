@@ -2,12 +2,11 @@
 use super::*;
 use intent_core::{ActorType, BoxFuture, EventActor};
 use intent_store::{NewEvent, Store};
-use tokio::sync::Notify;
+use intentd_test_support::PausePoint;
 use tokio::time::{timeout, Duration};
 
 struct HeldHistory {
-    entered: Notify,
-    release: Notify,
+    pause: PausePoint,
 }
 impl WorkspaceApi for HeldHistory {
     fn agent_get(
@@ -27,8 +26,7 @@ impl WorkspaceApi for HeldHistory {
     ) -> BoxFuture<'_, intent_core::Result<Value>> {
         Box::pin(async move {
             if before.is_some() {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
                 return Ok(
                     json!({"messages":[{"id":"old-1","seq":1,"contentBlocks":[]}],"totalMessages":3}),
                 );
@@ -61,8 +59,7 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
     let bus = EventBus::new(Store::open(&dir.path().join("bus.db")).await.unwrap());
     let sub = bus.subscribe(SubscriptionFilter::default());
     let api = Arc::new(HeldHistory {
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::unshared("held history read"),
     });
     let (tx, mut rx) = outbound_channel();
     let handle = tokio::spawn(chat_subscription_loop(
@@ -95,7 +92,7 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
     );
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        api.entered.notified(),
+        api.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -137,7 +134,7 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
         recovery["params"]["snapshot"]["historyDelivery"],
         "progressive"
     );
-    api.release.notify_one();
+    api.pause.release();
     drop(bus);
     assert_eq!(
         timeout(
@@ -161,8 +158,7 @@ async fn progressive_history_closed_client_cancels_held_read() {
     let bus = EventBus::new(Store::open(&dir.path().join("bus.db")).await.unwrap());
     let sub = bus.subscribe(SubscriptionFilter::default());
     let api = Arc::new(HeldHistory {
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::unshared("held history read"),
     });
     let (tx, mut rx) = outbound_channel();
     let handle = tokio::spawn(chat_subscription_loop(
@@ -188,7 +184,7 @@ async fn progressive_history_closed_client_cancels_held_read() {
     .unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        api.entered.notified(),
+        api.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -212,8 +208,7 @@ async fn progressive_history_membership_revocation_cancels_held_read() {
     let sub = bus.subscribe(SubscriptionFilter::default());
     let membership_events = bus.subscribe(SubscriptionFilter::default());
     let api = Arc::new(HeldHistory {
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::unshared("held history read"),
     });
     let dyn_api: Arc<dyn WorkspaceApi> = api.clone();
     let principal_id = intent_core::PrincipalId::new();
@@ -249,7 +244,7 @@ async fn progressive_history_membership_revocation_cancels_held_read() {
     .unwrap();
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        api.entered.notified(),
+        api.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -397,8 +392,7 @@ impl WorkspaceApi for HeldFirstHistory {
                     Err(intent_core::Error::Internal("lookup failed".into()))
                 }
                 WorkspaceLookup::Held => {
-                    self.0.entered.notify_one();
-                    self.0.release.notified().await;
+                    self.0.pause.pause().await;
                     self.0.agent_get(id, workspace).await
                 }
             }
@@ -412,8 +406,7 @@ impl WorkspaceApi for HeldFirstHistory {
     ) -> BoxFuture<'_, intent_core::Result<Value>> {
         Box::pin(async move {
             if before.is_none() {
-                self.0.entered.notify_one();
-                self.0.release.notified().await;
+                self.0.pause.pause().await;
                 Ok(
                     json!({"messages":[{"id":"captured-before-unshare","seq":2,"contentBlocks":[]}],"totalMessages":3}),
                 )
@@ -431,8 +424,7 @@ async fn progressive_history_first_read_cancels_on_closed_client() {
     let sub = bus.subscribe(SubscriptionFilter::default());
     let api = Arc::new(HeldFirstHistory(
         HeldHistory {
-            entered: Notify::new(),
-            release: Notify::new(),
+            pause: PausePoint::unshared("held history read"),
         },
         WorkspaceLookup::Ready,
     ));
@@ -453,7 +445,7 @@ async fn progressive_history_first_read_cancels_on_closed_client() {
     ));
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        api.0.entered.notified(),
+        api.0.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -492,8 +484,7 @@ async fn assert_first_snapshot_revoked(lookup: WorkspaceLookup) {
     let membership_events = bus.subscribe(SubscriptionFilter::default());
     let api = Arc::new(HeldFirstHistory(
         HeldHistory {
-            entered: Notify::new(),
-            release: Notify::new(),
+            pause: PausePoint::unshared("held history read"),
         },
         lookup,
     ));
@@ -524,7 +515,7 @@ async fn assert_first_snapshot_revoked(lookup: WorkspaceLookup) {
     ));
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        api.0.entered.notified(),
+        api.0.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -543,7 +534,7 @@ async fn assert_first_snapshot_revoked(lookup: WorkspaceLookup) {
         data: json!({"changes":{"members":true,"removedPrincipalId":principal_id}}),
     });
     if !matches!(lookup, WorkspaceLookup::Held) {
-        api.0.release.notify_one();
+        api.0.pause.release();
     }
     let result = timeout(
         intentd_test_support::test_timeout(Duration::from_secs(2)),
@@ -573,8 +564,7 @@ async fn progressive_history_first_enqueue_prioritizes_revocation_over_ready_cap
     let sub = bus.subscribe(SubscriptionFilter::default());
     let membership_events = bus.subscribe(SubscriptionFilter::default());
     let api: Arc<dyn WorkspaceApi> = Arc::new(HeldHistory {
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::unshared("held history read"),
     });
     let principal_id = intent_core::PrincipalId::new();
     let caller = intent_core::Caller::Wire {
@@ -667,7 +657,9 @@ impl WorkspaceApi for HeldInitialOverlay {
     ) -> BoxFuture<'_, intent_core::Result<Value>> {
         if self.fail_read {
             Box::pin(async move {
-                self.held.entered.notify_one();
+                // Arrive without holding: a waiting permit lets it straight through.
+                self.held.pause.release();
+                self.held.pause.pause().await;
                 Err(intent_core::Error::Internal(
                     "transient history read".into(),
                 ))
@@ -679,8 +671,7 @@ impl WorkspaceApi for HeldInitialOverlay {
 
     fn agent_activity_flags(&self, _: AgentId) -> BoxFuture<'_, Value> {
         Box::pin(async move {
-            self.held.entered.notify_one();
-            self.held.release.notified().await;
+            self.held.pause.pause().await;
             json!({})
         })
     }
@@ -696,8 +687,7 @@ async fn progressive_history_initial_overlay_and_retry_are_cancellable() {
             let membership_events = bus.subscribe(SubscriptionFilter::default());
             let api = Arc::new(HeldInitialOverlay {
                 held: HeldHistory {
-                    entered: Notify::new(),
-                    release: Notify::new(),
+                    pause: PausePoint::unshared("held history read"),
                 },
                 fail_read,
             });
@@ -728,7 +718,7 @@ async fn progressive_history_initial_overlay_and_retry_are_cancellable() {
             ));
             timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(10)),
-                api.held.entered.notified(),
+                api.held.pause.wait_reached(),
             )
             .await
             .unwrap();
@@ -776,8 +766,7 @@ async fn progressive_history_first_enqueue_cancels_on_closed_client() {
     let bus = EventBus::new(Store::open(&dir.path().join("bus.db")).await.unwrap());
     let sub = bus.subscribe(SubscriptionFilter::default());
     let api: Arc<dyn WorkspaceApi> = Arc::new(HeldHistory {
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::unshared("held history read"),
     });
     let (tx, rx) = outbound_channel();
     while tx.bulk_sender().try_send("occupied".into()).is_ok() {}
