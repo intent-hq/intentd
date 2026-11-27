@@ -716,3 +716,77 @@ async fn a_dropped_push_leaves_heads_refs_whole_and_the_next_push_lands() {
     assert_eq!(lock_files(&head.join(".git")), Vec::<PathBuf>::new());
     no_push_processes(head, &fixture.socket).await;
 }
+
+/// A session that ends before git has its answer (the link closed under a
+/// push, as when a cloud sandbox is paused): the helper exits at once, so
+/// git fails the push, even though git still holds the helper's stdin open.
+/// A helper whose exit waited for its blocked stdin read held the push, and
+/// with it the agent's stop acknowledgement, until the push timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
+    use std::io::{Read as _, Write as _};
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let dir = test_tempdir_in("/tmp", "itd-helper-");
+    let helper_dir = dir.path().join("bin");
+    NodeGit::install_helper(&helper_dir, Path::new(env!("CARGO_BIN_EXE_intentd"))).unwrap();
+    let socket = dir.path().join("git.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    // A node that accepts the session, then loses its connection to head.
+    let node = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = tokio::io::BufReader::new(read);
+        let mut request = String::new();
+        read.read_line(&mut request).await.unwrap();
+        write.write_all(&[0]).await.unwrap();
+        // The helper is forwarding git's input: its next stdin read waits.
+        let mut sent = [0; 4];
+        read.read_exact(&mut sent).await.unwrap();
+        assert_eq!(&sent, b"0000");
+        request
+    });
+    let mut helper = Command::new(helper_dir.join(HELPER_NAME))
+        .args(["origin", &remote(AGENT).url()])
+        .env(SOCKET_ENV, &socket)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // As git does: ask for the service, then keep stdin open while it
+    // waits for the answer.
+    let mut stdin = helper.stdin.take().unwrap();
+    stdin.write_all(b"connect git-receive-pack\n").unwrap();
+    stdin.flush().unwrap();
+    let mut accepted = [0; 1];
+    helper
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut accepted)
+        .unwrap();
+    assert_eq!(&accepted, b"\n");
+    stdin.write_all(b"0000").unwrap();
+    stdin.flush().unwrap();
+    let request = tokio::time::timeout(wait(), node).await.unwrap().unwrap();
+    assert!(request.starts_with("git-receive-pack "), "{request}");
+    let mut stdout = helper.stdout.take().unwrap();
+    let pid = helper.id();
+    let exited = tokio::task::spawn_blocking(move || {
+        let mut output = Vec::new();
+        let _ = stdout.read_to_end(&mut output);
+        helper.wait().unwrap()
+    });
+    let status = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        exited,
+    )
+    .await;
+    drop(stdin);
+    let Ok(status) = status else {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        panic!("the helper did not exit when its session ended, with git's stdin still open");
+    };
+    assert!(status.unwrap().code().is_some());
+}
