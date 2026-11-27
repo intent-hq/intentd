@@ -11,9 +11,9 @@ release-plz.yml's planning job also runs it before `release-plz release-pr`
 are cached with retries; scripts/test-release-plz-network.py keeps it there.
 ci.yml's `check`, `windows-cross-lint`, `macos-cross-lint` and `coverage-changed` jobs run it
 before their first build (PR jobs failed on the HTTP2 framing error, e.g. job
-126375150115), and so does nightly-payload-sweep.yml's `sweep` job (run
-41963501305, intent-hq/intent#8585); scripts/test-ci-cargo-network.py keeps
-it in both.
+126375150115), and so do nightly-payload-sweep.yml's `sweep` job (run
+41963501305, intent-hq/intent#8585) and nightly-npm-provider-smoke.yml's
+`smoke` job; scripts/test-ci-cargo-network.py keeps it in all of them.
 scripts/test-optional-intel-dist-network.py covers the retry handling offline.
 
 Run: python3 -I -B scripts/fetch-locked-crates.py
