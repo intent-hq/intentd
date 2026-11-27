@@ -1129,7 +1129,10 @@ fn cursor_reads_never_span_an_unsaved_hole() {
     assert_eq!(w.len(), 2000, "lines 50..60 were not saved");
     let tail = cursor(&store, 10_000);
     assert_eq!(tail.end, 2400);
-    assert_eq!(tail.log_start, 2400, "nothing saved is contiguous with the end yet");
+    assert_eq!(
+        tail.log_start, 2400,
+        "nothing saved is contiguous with the end yet"
+    );
     assert!(tail.bytes.is_empty());
     for line in lines {
         w.append(line);

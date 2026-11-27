@@ -400,7 +400,9 @@ impl ScriptOutputStore {
             return Ok(None);
         };
         let file = &mut *file;
-        let cut = tail_cut(file, len, max_lines.max(1)).map_err(err)?.max(from);
+        let cut = tail_cut(file, len, max_lines.max(1))
+            .map_err(err)?
+            .max(from);
         let bytes = if len - cut > max_bytes {
             newest_bytes_at_line_start(file, len, max_bytes).map_err(err)?
         } else {
@@ -440,7 +442,12 @@ impl ScriptOutputStore {
             return Ok(None);
         };
         let len = s.len.min(file.len()?);
-        Ok(Some((file, s.base + s.len - len, s.contiguous.min(len), len)))
+        Ok(Some((
+            file,
+            s.base + s.len - len,
+            s.contiguous.min(len),
+            len,
+        )))
     }
 
     /// The newest→oldest `{ items, nextToken }` page of a run's log lines —
@@ -849,7 +856,9 @@ enum Written {
     /// The log was rewritten to its newest bytes plus the chunk; `dropped`
     /// bytes of the old log are gone (a chunk past the cap also loses its
     /// oldest bytes, and then `dropped` is the whole old log).
-    Compacted { dropped: u64 },
+    Compacted {
+        dropped: u64,
+    },
     /// The chunk was not saved.
     Dropped,
 }
