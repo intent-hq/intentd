@@ -49,6 +49,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use intent_core::{Error, Result, SchemaMismatch};
+
+use crate::event_repo::{CommittedEvents, EventSeq, NewEvent};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, Postgres};
 use sqlx::Transaction;
 
@@ -1121,11 +1123,20 @@ fn dollar_tag(s: &str) -> Option<&str> {
 /// [`PgStore::begin_write`] makes one. Helpers that write inside a caller's
 /// transaction take `&mut WriteTx`, so they cannot run without the lock.
 /// It also holds the store's writer slot until it ends.
+///
+/// [`Self::append_event`] inserts an event in the transaction; such a
+/// transaction ends with [`Self::commit_handing_off`], which gives the
+/// events to a [`CommittedEvents`] after COMMIT and before the slot is
+/// released.
 pub(crate) struct WriteTx {
     tx: Transaction<'static, Postgres>,
     _slot: tokio::sync::OwnedSemaphorePermit,
     /// The tenant's `tenant_writer` row as the lock returned it.
     writer: WriterRow,
+    /// The tenant the lock was taken for, which appended events belong to.
+    tenant: TenantId,
+    /// Events appended in this transaction, in seq order.
+    appended: Vec<(intent_core::Event, EventSeq)>,
 }
 
 impl WriteTx {
@@ -1134,8 +1145,47 @@ impl WriteTx {
         &self.writer
     }
 
+    /// Commit a transaction that appended no event. One that did must end
+    /// with [`Self::commit_handing_off`], or its events are never handed
+    /// off.
     pub(crate) async fn commit(self) -> std::result::Result<(), sqlx::Error> {
+        debug_assert!(
+            self.appended.is_empty(),
+            "a WriteTx that appended events must commit with commit_handing_off"
+        );
         self.tx.commit().await
+    }
+
+    /// Insert `ev` in this transaction (the same insert as
+    /// `PgStore::insert_event_seq`) and return its seq. The event is handed
+    /// off by [`Self::commit_handing_off`] only if the transaction commits.
+    pub(crate) async fn append_event(&mut self, ev: &NewEvent) -> Result<EventSeq> {
+        let tenant = self.tenant.clone();
+        let (event, seq) = events::insert_event_on(self, tenant.as_str(), ev).await?;
+        self.appended.push((event, seq));
+        Ok(seq)
+    }
+
+    /// Commit, then hand the appended events to `after_commit` in seq order
+    /// while this transaction still holds the writer slot, so the next
+    /// writer of this process commits (and hands off) after them. Returns
+    /// the appended events. Nothing is handed off when the commit fails.
+    pub(crate) async fn commit_handing_off(
+        self,
+        after_commit: &dyn CommittedEvents,
+    ) -> Result<Vec<(intent_core::Event, EventSeq)>> {
+        let Self {
+            tx,
+            _slot: slot,
+            appended,
+            ..
+        } = self;
+        tx.commit().await.map_err(db)?;
+        if !appended.is_empty() {
+            after_commit.committed(&appended);
+        }
+        drop(slot);
+        Ok(appended)
     }
 
     /// Commit, keeping the writer slot: the caller finishes what must happen
@@ -1710,6 +1760,8 @@ impl PgStore {
                         tx,
                         _slot: slot,
                         writer,
+                        tenant: self.tenant.clone(),
+                        appended: Vec::new(),
                     };
                     // Work under a lease writes only while it holds it
                     // (`lease_write_guard`); lease writes and claims do not.

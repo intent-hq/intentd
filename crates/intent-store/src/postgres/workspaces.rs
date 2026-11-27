@@ -23,12 +23,14 @@ use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::Row;
 
 use super::{db, PgStore};
+use crate::event_repo::{CommittedEvents, EventSeq, NewEvent};
 use crate::workspace_git_root_repo as roots;
 use crate::workspace_repo::{
     self as ws_repo, PullRequestLink, RepositoryWorkspaceDeleteDisposition,
     RepositoryWorkspaceDeleteOutcome, WorkspaceContentClock,
 };
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow};
+use intent_core::Event;
 
 /// The `workspace_id` children `SQLite` deletes explicitly after notes'
 /// comments, in its order; the others cascade from the workspace row.
@@ -1196,6 +1198,36 @@ impl PgStore {
             None,
         )
         .await
+    }
+
+    pub async fn set_workspace_browser_client_with_event(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+        event: &NewEvent,
+        after_commit: &dyn CommittedEvents,
+    ) -> Result<(Event, EventSeq)> {
+        let mut tx = self.begin_write().await?;
+        let updated = sqlx::query(
+            "UPDATE workspace SET browser_client_id = $3 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(self.tenant())
+        .bind(&id.0)
+        .bind(client_id.map(|c| c.0.as_str()))
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if updated == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Err(not_found(id));
+        }
+        tx.append_event(event).await?;
+        tx.commit_handing_off(after_commit)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal("browser pin: no appended event".into()))
     }
 
     pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {

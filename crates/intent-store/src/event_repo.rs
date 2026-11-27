@@ -102,6 +102,136 @@ pub struct NewEvent {
 /// The seq stays inside the daemon: it is not part of [`Event`] or the wire.
 pub type EventSeq = u64;
 
+/// Takes the events a domain write appended in its own transaction, once
+/// that transaction committed: the after-commit half of the event append
+/// (monorepo `docs/ARCHITECTURE.md`, "Owner work vs request writes",
+/// Decisions). The event bus implements it to put the events on its fabric
+/// without a second insert.
+///
+/// The store calls [`Self::committed`] once per committed transaction that
+/// appended events, with all of them in seq order, after COMMIT returned
+/// and before this process's next writer of the tenant can commit: on
+/// Postgres the transaction still holds the tenant's writer slot, on
+/// `SQLite` the write connection. So within one process hand-offs follow
+/// seq order. A transaction that rolls back or fails to commit hands off
+/// nothing.
+///
+/// Events the bus's batching writer inserts ([`Store::insert_events`]) are
+/// not handed off here; it broadcasts them itself after its own commit, so
+/// it orders its events against a hand-off only by commit, not on the
+/// fabric.
+///
+/// It runs while the slot is held, so it must not wait and must not write
+/// to the store.
+pub trait CommittedEvents: Send + Sync {
+    /// The committed transaction's appended events, in seq order.
+    fn committed(&self, events: &[(Event, EventSeq)]);
+}
+
+/// A [`CommittedEvents`] that hands off nothing: the appended events are
+/// durable only (a caller with no event bus).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHandOff;
+
+impl CommittedEvents for NoHandOff {
+    fn committed(&self, _events: &[(Event, EventSeq)]) {}
+}
+
+/// A `SQLite` write transaction (`BEGIN IMMEDIATE` on the sole write
+/// connection) that can append events, the `SQLite` twin of the Postgres
+/// `WriteTx` append. Finish it with [`Self::finish`] on every path: it
+/// commits or rolls back, and only a commit hands the appended events off.
+pub(crate) struct SqliteEventTx {
+    conn: sqlx::pool::PoolConnection<Sqlite>,
+    appended: Vec<(Event, EventSeq)>,
+}
+
+impl SqliteEventTx {
+    /// Take the write connection and open the transaction.
+    pub(crate) async fn begin(store: &crate::SqliteStore) -> Result<Self> {
+        let mut conn = store
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+        Ok(Self {
+            conn,
+            appended: Vec::new(),
+        })
+    }
+
+    /// The transaction's connection, for the domain statements.
+    pub(crate) fn conn(&mut self) -> &mut sqlx::SqliteConnection {
+        &mut self.conn
+    }
+
+    /// Insert `ev` in this transaction and return its seq. It is handed off
+    /// only if the transaction commits.
+    pub(crate) async fn append_event(&mut self, ev: &NewEvent) -> Result<EventSeq> {
+        let (event, seq) = insert_event_with(&mut *self.conn, ev).await?;
+        self.appended.push((event, seq));
+        Ok(seq)
+    }
+
+    /// Commit when `body` is `Ok` and hand the appended events to
+    /// `after_commit` while the write connection is still held; roll back
+    /// otherwise. Returns the body's value and the appended events.
+    pub(crate) async fn finish<T>(
+        self,
+        body: Result<T>,
+        after_commit: &dyn CommittedEvents,
+    ) -> Result<(T, Vec<(Event, EventSeq)>)> {
+        let Self { conn, appended } = self;
+        let (value, conn) =
+            crate::commit_with_rollback_guard_holding(conn, body, "commit failed").await?;
+        if !appended.is_empty() {
+            after_commit.committed(&appended);
+        }
+        drop(conn);
+        Ok((value, appended))
+    }
+}
+
+/// Insert one event through `executor`, minting its id; returns the
+/// persisted event and its seq (the row's `rowid`).
+async fn insert_event_with<'c, E>(executor: E, ev: &NewEvent) -> Result<(Event, EventSeq)>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
+    let id = Uuid::now_v7().to_string();
+    let actor_json = serde_json::to_string(&ev.actor)
+        .map_err(|e| Error::Internal(format!("encode actor failed: {e}")))?;
+    let data_json = serde_json::to_string(&ev.data)
+        .map_err(|e| Error::Internal(format!("encode data_json failed: {e}")))?;
+    let metadata_json = ev
+        .metadata
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| Error::Internal(format!("encode metadata_json failed: {e}")))?;
+    let sql =
+        format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING rowid");
+    let rowid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(&id)
+        .bind(&ev.workspace_id.0)
+        .bind(&ev.timestamp)
+        .bind(&ev.event_type)
+        .bind(&actor_json)
+        .bind(&ev.session_id)
+        .bind(&ev.correlation_id)
+        .bind(&ev.parent_event_id)
+        .bind(&metadata_json)
+        .bind(&data_json)
+        .fetch_one(executor)
+        .await
+        .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
+    Ok((persisted_event(ev, id), seq_from_db(rowid)?))
+}
+
 /// Filter for [`Store::query_events`]. All set fields are AND-combined; unset
 /// fields are ignored. Results are ordered newest-first (`timestamp` DESC).
 #[derive(Debug, Clone, Default)]
@@ -289,35 +419,7 @@ impl crate::SqliteStore {
     }
 
     pub async fn insert_event_seq(&self, ev: &NewEvent) -> Result<(Event, EventSeq)> {
-        let id = Uuid::now_v7().to_string();
-        let actor_json = serde_json::to_string(&ev.actor)
-            .map_err(|e| Error::Internal(format!("encode actor failed: {e}")))?;
-        let data_json = serde_json::to_string(&ev.data)
-            .map_err(|e| Error::Internal(format!("encode data_json failed: {e}")))?;
-        let metadata_json = ev
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| Error::Internal(format!("encode metadata_json failed: {e}")))?;
-        let sql = format!(
-            "INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING rowid"
-        );
-        let rowid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
-            .bind(&id)
-            .bind(&ev.workspace_id.0)
-            .bind(&ev.timestamp)
-            .bind(&ev.event_type)
-            .bind(&actor_json)
-            .bind(&ev.session_id)
-            .bind(&ev.correlation_id)
-            .bind(&ev.parent_event_id)
-            .bind(&metadata_json)
-            .bind(&data_json)
-            .fetch_one(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
-        Ok((persisted_event(ev, id), seq_from_db(rowid)?))
+        insert_event_with(self.write_pool(), ev).await
     }
 
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
