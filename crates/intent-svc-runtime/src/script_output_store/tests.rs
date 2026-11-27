@@ -1081,9 +1081,9 @@ fn writers_of_one_run_share_its_positions() {
     let mut b = store.open_writer("ws", "s", "r");
     for (i, line) in stream.chunks(40).enumerate() {
         if i % 2 == 0 {
-            a.append(line)
+            a.append(line);
         } else {
-            b.append(line)
+            b.append(line);
         }
     }
     assert_eq!((a.end(), b.end()), (3200, 3200));

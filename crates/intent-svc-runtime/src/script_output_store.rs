@@ -122,6 +122,10 @@ impl RunState {
 /// exactly that.
 type Runs = Arc<Mutex<HashMap<BlobKey, Arc<Mutex<RunState>>>>>;
 
+/// An open run log, the stream position of its first byte, and the length
+/// to read.
+type PositionedRead = (Box<dyn BlobFile>, u64, u64);
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -411,7 +415,7 @@ impl ScriptOutputStore {
 
     /// Open a run's log with the stream position of its first byte and the
     /// length to read, taken atomically with the run's writes.
-    fn positioned_read(&self, key: &BlobKey) -> io::Result<Option<(Box<dyn BlobFile>, u64, u64)>> {
+    fn positioned_read(&self, key: &BlobKey) -> io::Result<Option<PositionedRead>> {
         // Held throughout, so no writer opens (or reopens) the run meanwhile.
         let runs = lock(&self.runs);
         let Some(state) = runs.get(key) else {
