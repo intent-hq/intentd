@@ -1537,6 +1537,7 @@ impl WsInner {
     {
         enum Input {
             Revoked(std::result::Result<intent_core::PrincipalRevocation, ()>),
+            AppEnded,
             RoleChanged(bool),
             Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
             Outbound(crate::OutboundFrame),
@@ -1621,6 +1622,7 @@ impl WsInner {
             loop {
                 // Only revocation has priority; keep ordinary traffic fair so
                 // a queued request burst cannot starve replies or heartbeats.
+                let app_end = subs.app.end_signal();
                 let input = if subs.pairing.revoked {
                     Input::Revoked(Err(()))
                 } else {
@@ -1628,6 +1630,7 @@ impl WsInner {
                         biased;
                         () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
                         revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
+                        () = crate::app_conn::wait_end(app_end) => Input::AppEnded,
                         input = async {
                             tokio::select! {
                                 change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
@@ -1639,6 +1642,37 @@ impl WsInner {
                     }
                 };
                 match input {
+                    Input::AppEnded => {
+                        // Intent apps (§5.60): the app session ended or an
+                        // attach failed. Flush the replies already answered,
+                        // then close with 1008.
+                        read_connection.retire();
+                        subs = ConnSubs::default();
+                        reverse.close();
+                        let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                        while !app_tx.priority_idle() {
+                            let next =
+                                tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
+                            let Ok(Some(frame)) = next else { break };
+                            if frame.is_private() || frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES
+                            {
+                                continue;
+                            }
+                            if !matches!(
+                                tokio::time::timeout_at(deadline, frame.write_wss(&mut sink)).await,
+                                Ok(Ok(()))
+                            ) {
+                                break;
+                            }
+                        }
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Policy,
+                                reason: "app session ended".into(),
+                            })))
+                            .await;
+                        break;
+                    }
                     Input::Revoked(revoked) => {
                         match revoked {
                             Ok(ref revocation)

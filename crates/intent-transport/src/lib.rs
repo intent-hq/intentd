@@ -70,6 +70,7 @@ fn disable_node_compile_cache() {
 mod accept_backoff;
 pub mod agent_rpc;
 mod agent_workers;
+mod app_conn;
 pub mod auth;
 mod backends;
 pub(crate) mod browser;

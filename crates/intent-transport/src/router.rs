@@ -547,6 +547,12 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // envelope the connection-level allowlist emits, with the reason in
         // `data.detail` so a client cannot tell the two refusals apart by
         // code or message.
+        // Intent apps (§5.60): the typed refusal travels as given.
+        Error::App(app) => RpcErr {
+            code: app.rpc_code,
+            message: app.message,
+            data: Some(app.data),
+        },
         Error::Forbidden(detail) => RpcErr {
             code: crate::catalog::FORBIDDEN_ERROR_CODE,
             message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
@@ -1376,6 +1382,7 @@ async fn dispatch(
         "principal" => {
             crate::stack_frame::boxed_await(|| principal_methods(api, method, params)).await
         }
+        "app" => crate::stack_frame::boxed_await(|| app_methods(api, method, params)).await,
         "presence" => {
             crate::stack_frame::boxed_await(|| presence_methods(api, method, params)).await
         }
@@ -5290,6 +5297,47 @@ async fn principal_methods(
         }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
+}
+
+async fn app_methods(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    // Intent apps (PROTOCOL §5.60, Labs): the router `app.*` methods. The
+    // service layer checks the caller of each (administrator, user-only, or
+    // app principal); the transport has already applied the guest, member
+    // and app allowlists at the inbound chokepoint. `app.session.attach` is
+    // a fast path in `conn.rs`, never routed here.
+    #[expect(
+        clippy::match_like_matches_macro,
+        reason = "one `\"method\" =>` arm per line, as the catalog golden extractor reads them"
+    )]
+    let known = match method {
+        "app.approve" => true,
+        "app.complete" => true,
+        "app.get" => true,
+        "app.install" => true,
+        "app.list" => true,
+        "app.models.list" => true,
+        "app.notify" => true,
+        "app.readBundle" => true,
+        "app.revoke" => true,
+        "app.session.close" => true,
+        "app.session.open" => true,
+        "app.storage.delete" => true,
+        "app.storage.get" => true,
+        "app.storage.list" => true,
+        "app.storage.set" => true,
+        "app.uninstall" => true,
+        _ => false,
+    };
+    if !known {
+        return Err(rpc(METHOD_NOT_FOUND, "Method not found"));
+    }
+    api.app_call(method.to_owned(), params.clone())
+        .await
+        .map_err(domain_to_rpc)
 }
 
 async fn push_methods(api: &dyn WorkspaceApi, method: &str) -> Result<Value, RpcErr> {

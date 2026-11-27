@@ -65,6 +65,7 @@ mod acp_adapter;
 mod agent_locks;
 mod agent_rpc;
 mod agent_rpc_backends;
+pub(crate) mod app_ops;
 pub use agent_rpc::RPC_CALL_PROPOSAL_KIND;
 mod agent_manager;
 mod agent_ops;
@@ -1154,6 +1155,10 @@ pub struct Services {
     /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
     /// the composition root calls [`Services::with_provider_profiles_dir`].
     provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
+    /// Intent apps (PROTOCOL §5.60): library root, session table and rate
+    /// limits. A per-instance temp root until the composition root calls
+    /// [`Services::with_apps_dir`].
+    apps: Arc<app_ops::AppsState>,
     /// Live profile processes and the settings fingerprint each started
     /// with (PROTOCOL §5.54 activation); in-memory, per daemon process.
     profile_activation: Arc<profile_activation::ProfileActivation>,
@@ -1992,6 +1997,7 @@ impl Services {
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
             provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
+            apps: Arc::new(app_ops::AppsState::new(app_ops::default_apps_root())),
             profile_activation: profile_activation.clone(),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
@@ -5573,6 +5579,14 @@ impl Services {
             data_dir: data_dir.to_path_buf(),
             max_bytes_per_run: intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
         };
+        self
+    }
+
+    /// Keep the Intent apps library under `<data_dir>/apps` (PROTOCOL
+    /// §5.60). Composition-root only — call before the surface is shared.
+    #[must_use]
+    pub fn with_apps_dir(mut self, data_dir: &Path) -> Self {
+        self.apps = Arc::new(app_ops::AppsState::new(app_ops::apps_root(data_dir)));
         self
     }
 
@@ -35352,6 +35366,29 @@ impl WorkspaceApi for Services {
 
     fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.principal_me_op().await })
+    }
+
+    // ========================================================================
+    // app.* (Intent apps, PROTOCOL §5.60) — see `app_ops`.
+    // ========================================================================
+
+    fn app_call(
+        &self,
+        method: String,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.app_call_op(&method, &params).await })
+    }
+
+    fn app_session_attach(
+        &self,
+        token: String,
+    ) -> BoxFuture<'_, Result<intent_core::apps::AppAttachment>> {
+        Box::pin(async move { self.app_session_attach_op(&token) })
+    }
+
+    fn app_sessions_end(&self, session_ids: Vec<String>) -> BoxFuture<'_, ()> {
+        Box::pin(async move { self.app_sessions_end_op(&session_ids) })
     }
 
     fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {

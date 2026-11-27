@@ -124,6 +124,31 @@ pub struct Row {
 /// the method becomes reachable.
 pub const CANNOT_EXERCISE: &[(&str, &str, &str)] = &[
     (
+        "app.get",
+        "-32602",
+        "Intent apps (§5.60): the fixture installs no app, so the sweep's ids name none (app-not-found). One app record of fixed fields; bundle paths are capped at 512 bytes.",
+    ),
+    (
+        "app.list",
+        "ok",
+        "Intent apps (§5.60): the fixture installs no app (the library holds only apps the owner installed by hand). Each record is about 1 KiB of fixed fields.",
+    ),
+    (
+        "app.models.list",
+        "-32003",
+        "App-principal method (§5.60): an administrator connection is refused (`app principal required`). One row per one-shot provider with its cached models.",
+    ),
+    (
+        "app.storage.get",
+        "-32003",
+        "App-principal method (§5.60): an administrator connection is refused (`app principal required`). One value, at most 256 KiB by the set rule.",
+    ),
+    (
+        "app.storage.list",
+        "-32003",
+        "App-principal method (§5.60): an administrator connection is refused (`app principal required`). At most 1000 keys of at most 256 bytes.",
+    ),
+    (
         "server.pairingInfo",
         "-32601",
         "Answered from the ServerPairingInfo the intentd composition root passes to its listeners; intent-app cannot build one. One fixed pairing record.",

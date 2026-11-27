@@ -327,6 +327,10 @@ pub(crate) struct ConnSubs {
     /// per-connection cap; entries torn down via `events.unsubscribe` are
     /// pruned against `subs` before counting.
     worker_subs: HashSet<String>,
+    /// Intent apps (§5.60): the frame counter for `app.session.attach`, the
+    /// app binding, its close signal, and the sessions this connection
+    /// opened (ended when it drops).
+    pub(crate) app: crate::app_conn::AppConn,
 }
 
 impl Drop for ConnSubs {
@@ -579,6 +583,42 @@ async fn process_captured_frame(
     outbound.shutdown = Some(limiter.clone());
     let out_tx = &outbound;
     let parsed = serde_json::from_str::<Value>(raw).ok();
+    // Intent apps (§5.60) — the app chokepoint runs before every other
+    // path, reverse responses and `system.startupStatus` included. Every
+    // frame counts toward `app.session.attach`'s first-request rule.
+    let earlier_frames = subs.app.note_frame();
+    if let Some(app) = subs.app.bound().cloned() {
+        return dispatch_app_frame(
+            app,
+            parsed.as_ref(),
+            raw,
+            api,
+            out_tx,
+            limiter,
+            request_guard,
+        )
+        .await;
+    }
+    if let Some(value) = &parsed {
+        let (rpc_id, method) = panic_guard::request_identity(value);
+        if crate::app_conn::is_attach(&method) {
+            // Only an administrator connection may narrow itself; a guest or
+            // host member gets the connection-level refusal, like for any
+            // method on no non-administrator allowlist.
+            if crate::context::is_non_administrator_caller() {
+                return refuse_forbidden(&method, rpc_id, out_tx).await;
+            }
+            return crate::app_conn::handle_attach(
+                value,
+                rpc_id,
+                earlier_frames == 0,
+                api,
+                out_tx,
+                &mut subs.app,
+            )
+            .await;
+        }
+    }
     if let Some(value) = &parsed {
         if let crate::router::EnvelopeCheck::Valid {
             echo_id,
@@ -656,6 +696,25 @@ async fn process_captured_frame(
             if !member || !catalog::member_may_call(&method) {
                 return refuse_forbidden(&method, rpc_id, out_tx).await;
             }
+        }
+        // `app.session.open` (§5.60) answers on the read loop so the session
+        // is tied to this connection before the token leaves: when the
+        // connection closes, the sessions it opened end.
+        if method == "app.session.open" {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                handle_message(api.as_ref(), raw),
+            )
+            .await;
+            let Some(frame) = frame else { return true };
+            if let Some(session_id) = serde_json::from_str::<Value>(&frame)
+                .ok()
+                .and_then(|v| v["result"]["sessionId"].as_str().map(str::to_owned))
+            {
+                subs.app.opened(api, session_id);
+            }
+            return out_tx.send_priority(frame).await.is_ok();
         }
         if let Some(control) = control {
             if let Some(req) =
@@ -1190,6 +1249,68 @@ async fn process_captured_frame(
             })
             .await;
     });
+    true
+}
+
+/// Dispatch one frame of an attached app connection (§5.60). The level
+/// allowlist is exact and default-deny; an allowed method runs on the
+/// router with only [`Caller::App`] bound (no wire credential, no desktop
+/// connection), never inside the administrator frame context the read loop
+/// captured, so no service can see this request as the owner's.
+async fn dispatch_app_frame(
+    app: Arc<intent_core::apps::AppPrincipal>,
+    parsed: Option<&Value>,
+    raw: &str,
+    api: &Arc<dyn WorkspaceApi>,
+    out_tx: &OutboundSender,
+    limiter: &RpcLimiter,
+    request_guard: crate::rpc_limit::RequestGuard,
+) -> bool {
+    let (mut rpc_id, method) = parsed.map_or_else(
+        || (Some(Value::Null), String::new()),
+        panic_guard::request_identity,
+    );
+    // Only a real notification (an object naming a method) goes unanswered;
+    // a batch array or other shapeless frame gets a null-id refusal.
+    if rpc_id.is_none() && method.is_empty() {
+        rpc_id = Some(Value::Null);
+    }
+    if !crate::app_conn::app_allows(&app, &method) {
+        tracing::debug!(
+            method,
+            app_id = %app.app_id,
+            "refusing RPC: method is not on the app allowlist"
+        );
+        return refuse_forbidden(&method, rpc_id, out_tx).await;
+    }
+    let Ok(slot) = out_tx.reserve_priority().await else {
+        return false;
+    };
+    let permit = match limiter.try_acquire() {
+        Ok(permit) => permit,
+        Err(overloaded) => {
+            drop(slot);
+            return reject_overloaded(&method, rpc_id, out_tx, overloaded).await;
+        }
+    };
+    let api = Arc::clone(api);
+    let raw = raw.to_string();
+    let is_tcp = crate::context::is_tcp_connection();
+    tokio::spawn(crate::context::with_credential_context(
+        is_tcp,
+        Some(intent_core::Caller::App(app)),
+        None,
+        None,
+        async move {
+            let _request_guard = request_guard;
+            finish_slow_path_rpc(
+                permit,
+                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
+                slot,
+            )
+            .await;
+        },
+    ));
     true
 }
 
@@ -3235,6 +3356,9 @@ pub(crate) mod read_delivery_tests;
 
 #[cfg(test)]
 mod monitor_event_tests;
+
+#[cfg(test)]
+mod app_chokepoint_tests;
 
 #[cfg(test)]
 mod tests {

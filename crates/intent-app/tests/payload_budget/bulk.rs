@@ -8,6 +8,9 @@
 //!   of the big workspace holds at most the chunk cap.
 //! - `git.showFileChunk` / `note.readAssetChunk` (cap param `length`): the
 //!   same as `file.readChunk`, on a committed blob and a note asset.
+//! - `app.readBundle` (server cap, the 16 MiB bundle file limit): a 1 MiB
+//!   file of an installed app is served whole, over the read budget and
+//!   under the cap and the frame cap.
 //!
 //! It also checks the legacy form of the capped whole-object reads
 //! (`file.read`, `git.showFile`, `note.readAsset` without `maxBytes`, whose
@@ -28,6 +31,7 @@ use crate::rows::Ctx;
 
 /// Every `BulkTransfer` method this module checks.
 pub const METHODS: &[&str] = &[
+    "app.readBundle",
     "file.readChunk",
     "git.showFileChunk",
     "note.readAssetChunk",
@@ -186,6 +190,59 @@ pub async fn sweep(
             "over-cap-whole"
         };
         line(&mut report, method, variant, &r);
+    }
+
+    // app.readBundle: one installed file, whole; install refuses any file
+    // over the cap, so the reply is at most the cap before base64.
+    let (bundle_param, bundle_cap) = declared_cap("app.readBundle");
+    assert_eq!(bundle_param, None, "app.readBundle has no cap param");
+    let app_dir = daemon.state.worktree.join(BULK_DIR).join("app");
+    std::fs::create_dir_all(&app_dir).expect("bulk app dir");
+    std::fs::write(
+        app_dir.join("intent-app.json"),
+        json!({
+            "manifestVersion": 1, "id": "bulk-app", "name": "Bulk", "version": "1.0.0",
+            "permissions": { "level": 1 }
+        })
+        .to_string(),
+    )
+    .expect("bulk app manifest");
+    std::fs::write(app_dir.join("index.html"), "<p>bulk</p>").expect("bulk app entry");
+    let big: Vec<u8> = (0..1024 * 1024)
+        .map(|i| u8::try_from(i % 241).unwrap_or(0))
+        .collect();
+    std::fs::write(app_dir.join("big.bin"), &big).expect("bulk app file");
+    let installed = client
+        .call(
+            "app.install",
+            &json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/app"), "replace": true }),
+        )
+        .await;
+    if let Some(e) = installed.error() {
+        fail(format!("bulk app.readBundle: install failed: {e}"));
+    } else {
+        let r = client
+            .call(
+                "app.readBundle",
+                &json!({ "appId": "bulk-app", "path": "big.bin" }),
+            )
+            .await;
+        let size = r.result()["sizeBytes"].as_u64().unwrap_or(u64::MAX);
+        if r.error().is_some()
+            || usize::try_from(size).unwrap_or(usize::MAX) > bundle_cap
+            || size < 1024 * 1024
+            || r.bytes > frame_cap
+        {
+            fail(format!(
+                "bulk app.readBundle: expected the whole 1 MiB file under cap {bundle_cap}, got {} bytes: {}",
+                r.bytes,
+                r.frame.to_string().chars().take(200).collect::<String>()
+            ));
+        }
+        line(&mut report, "app.readBundle", "whole-file", &r);
+        let _ = client
+            .call("app.uninstall", &json!({ "appId": "bulk-app" }))
+            .await;
     }
 
     // workspace.export.read: every server-cut chunk is under the chunk cap.

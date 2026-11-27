@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 #[cfg(test)]
 mod node_mode_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// JSON-RPC error code for a request the bound principal may not make:
 /// a non-administrator calling a method outside [`COLLABORATOR_METHODS`],
@@ -35,7 +35,7 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 318 canonical methods routed through the per-namespace dispatch matches in
+/// These are the 334 canonical methods routed through the per-namespace dispatch matches in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -109,6 +109,22 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.wakeOrCreate",
     "agent.workers.list",
     "agent.workers.stop",
+    "app.approve",
+    "app.complete",
+    "app.get",
+    "app.install",
+    "app.list",
+    "app.models.list",
+    "app.notify",
+    "app.readBundle",
+    "app.revoke",
+    "app.session.close",
+    "app.session.open",
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "app.uninstall",
     "client.list",
     "cloudMachines.configure",
     "cloudMachines.kill",
@@ -521,6 +537,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "agent.workers.subscribe",
+    "app.session.attach",
     "backends.report",
     "browser.closeTab",
     "browser.exec",
@@ -905,6 +922,50 @@ pub(crate) fn collaborator_may_call(method: &str) -> bool {
         .contains(canonical_method(method))
 }
 
+/// Intent apps (PROTOCOL §5.60, Labs) — the default-deny allowlist of an
+/// app connection at approved level 1 ("Default"). The same inbound
+/// chokepoint as [`COLLABORATOR_METHODS`] applies it, before every classify
+/// and dispatch path; an app connection is never checked against the
+/// collaborator list. Exact names: no alias canonicalisation. Frozen by the
+/// golden in `catalog/tests.rs`.
+pub const APP_LEVEL1_METHODS: &[&str] = &[
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "principal.me",
+];
+
+/// Level 2 ("App features"): level 1 plus notifications and model calls.
+/// The service layer checks the `notifications` / `models` feature grants.
+pub const APP_LEVEL2_METHODS: &[&str] = &[
+    "app.complete",
+    "app.models.list",
+    "app.notify",
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "principal.me",
+];
+
+/// Level 3 ("Full access"): exactly level 2 in M1. Level 3 cannot be
+/// approved yet (`level-unavailable`), so no connection is bound at it.
+pub const APP_LEVEL3_METHODS: &[&str] = APP_LEVEL2_METHODS;
+
+/// Whether an app connection bound at `level` may call `method`. Exact
+/// match on the raw wire name; any other level (none exist) refuses all.
+#[must_use]
+pub(crate) fn app_may_call(level: u8, method: &str) -> bool {
+    let list = match level {
+        1 => APP_LEVEL1_METHODS,
+        2 => APP_LEVEL2_METHODS,
+        3 => APP_LEVEL3_METHODS,
+        _ => return false,
+    };
+    list.contains(&method)
+}
+
 /// Additional workspace management and shared execution methods for current host
 /// members. Host/account administration and collaboration credentials stay excluded.
 /// Services still validate the referenced workspace, resource and actor; fast paths
@@ -1264,6 +1325,10 @@ pub const AGENT_FORBIDDEN_METHODS: &[(&str, &str)] = &[
 /// [`PayloadClass::Subscription`] method and every `*.subscribe` /
 /// `*.unsubscribe` channel. Each entry is `(canonical method, reason)`.
 pub const AGENT_UNSUPPORTED_METHODS: &[(&str, &str)] = &[
+    (
+        "app.session.attach",
+        "Binds an app connection (first request only).",
+    ),
     ("client.hello", "Binds a client connection."),
     ("drafts.clear", "Needs a client.hello binding."),
     ("drafts.get", "Needs a client.hello binding."),
@@ -1593,6 +1658,23 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     bounded("agent.workers.list", "Background workers of one agent."),
     mutation("agent.workers.stop", "Stops a background worker."),
     subscription("agent.workers.subscribe", "Registers a worker subscription; the seq-0 snapshot is listed in SNAPSHOT_CHANNELS."),
+    mutation("app.approve", "Approves an app for its installed bundle hash."),
+    mutation("app.complete", "App one-shot model completion; spends tokens."),
+    bounded("app.get", "One installed app record."),
+    mutation("app.install", "Installs or replaces an app bundle in the library."),
+    bounded("app.list", "The installed app records."),
+    bounded("app.models.list", "The one-shot providers and their cached models, for an app."),
+    mutation("app.notify", "Validates and rate-limits an app notification."),
+    bulk("app.readBundle", None, 16 * 1024 * 1024, "One installed bundle file, whole (at most 16 MiB before base64)."),
+    mutation("app.revoke", "Revokes an app approval and ends its session."),
+    mutation("app.session.attach", "Narrows a fresh connection to an app principal."),
+    mutation("app.session.close", "Ends an app session."),
+    mutation("app.session.open", "Opens an app session and mints its token."),
+    mutation("app.storage.delete", "Deletes one app storage key."),
+    bounded("app.storage.get", "One app storage value (at most 256 KiB)."),
+    bounded("app.storage.list", "One page of app storage keys (at most 1000 of 256 bytes)."),
+    mutation("app.storage.set", "Writes one app storage key."),
+    mutation("app.uninstall", "Removes an app, its files and its storage."),
     mutation("backends.report", "An owner app reports the backends it holds credentials for (no tokens)."),
     mutation("browser.closeTab", "Closes a tab."),
     mutation("browser.exec", "Reverse RPC that drives the client browser."),

@@ -42,7 +42,8 @@ enum Spawn {
 const HOST: &str = "crates/intent-transport/src/host.rs";
 
 const MODELS: Gate = Gate::Fn("agent_ops.rs", "models_list_op");
-const COMPLETE: Gate = Gate::Fn("complete_ops.rs", "agent_complete_once_op");
+// The shared route of `agent.completeOnce` and `app.complete` (§5.60).
+const COMPLETE: Gate = Gate::Fn("complete_ops.rs", "complete_once_on_route");
 const MACHINE: Gate = Gate::Fn("complete_ops/remote.rs", "machine_one_shot");
 const ENHANCE: Gate = Gate::Fn("enhance_ops.rs", "agent_enhance_prompt_op");
 const SCRATCH: Gate = Gate::Fn("agent_manager/scratch_adapter.rs", "open_scratch_adapter");

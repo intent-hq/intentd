@@ -425,11 +425,22 @@ where
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
+    let mut app_ended = false;
     let connection = async {
         loop {
             line.clear();
-            match read_line_bounded(&mut reader, &mut line, crate::MAX_INBOUND_MESSAGE_BYTES).await
-            {
+            // Intent apps (§5.60): an ended app session (or a failed attach)
+            // closes the connection: EOF after the queued replies flush.
+            let app_end = subs.app.end_signal();
+            let read = tokio::select! {
+                biased;
+                () = crate::app_conn::wait_end(app_end) => {
+                    app_ended = true;
+                    break Ok(());
+                }
+                read = read_line_bounded(&mut reader, &mut line, crate::MAX_INBOUND_MESSAGE_BYTES) => read,
+            };
+            match read {
                 // An orderly input half-close leaves the peer's response
                 // reader alive. Drain admitted replies during cleanup; only
                 // recovery/security failure hard-cancels the writer.
@@ -519,9 +530,26 @@ where
     drop(reverse_guard);
     drop(reverse);
     drop(out_tx);
-    let _ = writer.await;
+    if app_ended {
+        // In-flight app calls hold sender clones; the app must still see
+        // EOF promptly (§5.60 "Session end"), so the flush is bounded.
+        let mut writer = writer;
+        if tokio::time::timeout(APP_END_FLUSH_GRACE, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+    } else {
+        let _ = writer.await;
+    }
     io_result
 }
+
+/// How long an ended app connection may keep flushing answered replies
+/// before its socket closes.
+#[cfg(any(unix, windows))]
+const APP_END_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Outcome of one bounded line read (see [`read_line_bounded`]).
 #[cfg(any(unix, windows))]

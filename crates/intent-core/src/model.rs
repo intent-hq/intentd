@@ -6337,7 +6337,7 @@ impl ScriptStartedBy {
                 agent_id: agent_id.clone(),
             }),
             Caller::Wire { .. } => Some(Self::User),
-            Caller::Daemon | Caller::Executor { .. } => None,
+            Caller::Daemon | Caller::Executor { .. } | Caller::App(_) => None,
         }
     }
 
