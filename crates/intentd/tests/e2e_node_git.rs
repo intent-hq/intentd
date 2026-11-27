@@ -727,18 +727,6 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     use std::io::{Read as _, Write as _};
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
-    /// The helper, killed and reaped through its one owner when the test
-    /// ends before it exits, so no bare pid is ever signalled.
-    struct Helper(std::process::Child);
-    impl Drop for Helper {
-        fn drop(&mut self) {
-            if matches!(self.0.try_wait(), Ok(None)) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-    }
-
     let dir = test_tempdir_in("/tmp", "itd-helper-");
     let helper_dir = dir.path().join("bin");
     NodeGit::install_helper(&helper_dir, Path::new(env!("CARGO_BIN_EXE_intentd"))).unwrap();
@@ -758,24 +746,23 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
         assert_eq!(&sent, b"0000");
         request
     });
-    let mut helper = Helper(
+    // Killed and reaped through its one owner if the test ends first.
+    let mut helper = intentd_test_support::GuardedChild::spawn(
         Command::new(helper_dir.join(HELPER_NAME))
             .args(["origin", &remote(AGENT).url()])
             .env(SOCKET_ENV, &socket)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+            .stderr(std::process::Stdio::null()),
+    )
+    .unwrap();
     // As git does: ask for the service, then keep stdin open while it
     // waits for the answer.
-    let mut stdin = helper.0.stdin.take().unwrap();
+    let mut stdin = helper.stdin.take().unwrap();
     stdin.write_all(b"connect git-receive-pack\n").unwrap();
     stdin.flush().unwrap();
     let mut accepted = [0; 1];
     helper
-        .0
         .stdout
         .as_mut()
         .unwrap()
@@ -789,7 +776,7 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     let exited = loop {
-        if let Some(status) = helper.0.try_wait().unwrap() {
+        if let Some(status) = helper.try_wait().unwrap() {
             break Some(status);
         }
         if tokio::time::Instant::now() >= deadline {
