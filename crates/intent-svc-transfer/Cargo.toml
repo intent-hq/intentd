@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-transfer"
-version = "0.11.306"
+version = "0.11.307"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
