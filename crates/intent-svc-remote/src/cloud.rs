@@ -21,7 +21,7 @@ pub(crate) mod config;
 pub(crate) mod home;
 pub(crate) mod lifecycle;
 mod methods;
-mod start;
+pub(crate) mod start;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
