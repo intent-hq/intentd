@@ -1773,9 +1773,9 @@ async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
         &monitored,
     );
     let change = async {
-        gate.entered.notified().await;
+        gate.reached().await;
         intent_sourcecontrol::cache_scope::invalidate_authorization();
-        gate.release.add_permits(100);
+        gate.release(100);
     };
     let (result, ()) = tokio::join!(poll, change);
     assert!(
@@ -1814,7 +1814,7 @@ async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confi
             &monitored,
         );
         let confirm = async {
-            gate.entered.notified().await;
+            gate.reached().await;
             mock.edit(|s| {
                 s.pr["state"] = json!(if terminal == PrState::Merged {
                     "MERGED"
@@ -1827,7 +1827,7 @@ async fn shared_discovery_repair_late_open_observation_cannot_erase_merged_confi
                 .await
                 .unwrap();
             assert_eq!(merged.state, terminal);
-            gate.release.add_permits(100);
+            gate.release(100);
         };
         let (old, ()) = tokio::join!(old_full, confirm);
         assert_eq!(
@@ -1926,7 +1926,7 @@ async fn shared_rules_concurrent_http_misses_coalesce() {
     with_traffic(traffic.clone(), async {
         let first = read_pr_via(mock.sc.as_ref(), &repo, 1, &cache, PrReadPolicy::Poll, &monitored);
         let second = async {
-            gate.entered.notified().await;
+            gate.reached().await;
             let read = read_pr_via(mock.sc.as_ref(), &repo, 2, &cache, PrReadPolicy::Poll, &monitored);
             tokio::pin!(read);
             tokio::select! {
@@ -1934,7 +1934,7 @@ async fn shared_rules_concurrent_http_misses_coalesce() {
                 r = &mut read => panic!("rules response must remain gated: {r:?}"),
                 () = async { while mock.calls("GetPrObservation") < 2 { tokio::task::yield_now().await; } } => {}
             }
-            gate.release.add_permits(100);
+            gate.release(100);
             read.await.unwrap()
         };
         let (a,b) = tokio::join!(first, second);

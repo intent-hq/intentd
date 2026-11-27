@@ -327,8 +327,21 @@ fn bound_check_cursor(query: &str, vars: &Value) -> usize {
 
 pub struct ResponseGate {
     path: String,
-    pub entered: tokio::sync::Notify,
-    pub release: tokio::sync::Semaphore,
+    pause: intentd_test_support::PausePoint,
+}
+
+impl ResponseGate {
+    /// Wait for the next gated request to arrive (bounded by `test_timeout`).
+    pub async fn reached(&self) {
+        self.pause.wait_reached().await;
+    }
+
+    /// Let `permits` gated requests (held or still to come) through.
+    pub fn release(&self, permits: usize) {
+        for _ in 0..permits {
+            self.pause.release();
+        }
+    }
 }
 
 pub struct MockQwen {
@@ -377,8 +390,7 @@ impl MockQwen {
     pub fn gate(&self, path: &str) -> Arc<ResponseGate> {
         let gate = Arc::new(ResponseGate {
             path: path.into(),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Semaphore::new(0),
+            pause: intentd_test_support::PausePoint::unshared(format!("response {path}")),
         });
         *self.gate.lock().unwrap() = Some(gate.clone());
         gate
@@ -485,8 +497,7 @@ async fn serve(
         .clone()
         .filter(|g| target.contains(&g.path));
     if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.acquire().await.unwrap().forget();
+        gate.pause.pause().await;
     }
     let body = body.to_string();
     let resource = if target == "/graphql" {
