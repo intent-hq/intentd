@@ -615,7 +615,7 @@ impl Services {
             // transaction: the lock above orders this process only, and
             // another process may re-key the identity before the insert.
             #[cfg(any(test, feature = "test-hooks"))]
-            if let Some(park) = self.identity_parks.mint.get() {
+            if let Some(park) = self.delivery_guards.identity.mint.get() {
                 park.pause().await;
             }
             match self

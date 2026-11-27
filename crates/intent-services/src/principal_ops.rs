@@ -1555,7 +1555,7 @@ impl Services {
         }
         updated.updated_at = now_iso();
         #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(park) = self.identity_parks.write.get() {
+        if let Some(park) = self.delivery_guards.identity.write.get() {
             park.pause().await;
         }
         // The lock state and the row are checked again in the write's own

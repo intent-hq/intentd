@@ -500,6 +500,12 @@ pub(crate) struct DeliveryGuards {
     /// Test seam: parks a poisoned-queue migration right before it takes
     /// the persist gate. Unset in production.
     pub(crate) migration_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seams inside the identity transition (see [`IdentityParks`]).
+    /// Kept in this shared `Arc` rather than a `Services` field: every
+    /// future holding a `Services` clone grows with it, and the create
+    /// path's reduced-stack guard has no room for that.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) identity: IdentityParks,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.
@@ -1418,9 +1424,6 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
-    /// Test seams inside the identity transition (see [`IdentityParks`]).
-    #[cfg(any(test, feature = "test-hooks"))]
-    identity_parks: Arc<IdentityParks>,
     /// Bumped by every `identity.provider` write; an in-flight re-key
     /// commits only when it still holds the current generation (see
     /// [`principal_ops::IdentityRekeyGeneration`]). Shared across clones.
@@ -2086,8 +2089,6 @@ impl Services {
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(any(test, feature = "test-hooks"))]
-            identity_parks: Arc::default(),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
             discussion_control_gates: Arc::default(),
@@ -3391,7 +3392,7 @@ impl Services {
     /// Test seam: park an invite mint right before its insert.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_invite_mint_park(self, park: Arc<intentd_test_support::PausePoint>) -> Self {
-        let _ = self.identity_parks.mint.set(park);
+        let _ = self.delivery_guards.identity.mint.set(park);
         self
     }
 
@@ -3401,7 +3402,7 @@ impl Services {
         self,
         park: Arc<intentd_test_support::PausePoint>,
     ) -> Self {
-        let _ = self.identity_parks.write.set(park);
+        let _ = self.delivery_guards.identity.write.set(park);
         self
     }
 
