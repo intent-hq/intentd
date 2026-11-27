@@ -798,8 +798,8 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
         // timing-guard: poll interval while the helper exits
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let status =
-        exited.expect("the helper did not exit when its session ended, with git's stdin still open");
+    let status = exited
+        .expect("the helper did not exit when its session ended, with git's stdin still open");
     drop(stdin);
     assert!(status.code().is_some(), "{status:?}");
 }
