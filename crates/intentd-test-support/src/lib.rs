@@ -27,6 +27,12 @@
 //!   instead of racing a fixed `sleep`. A hold gives up on its own (exit
 //!   [`Barrier::ABANDONED_EXIT_CODE`]) once the test's directory is gone or
 //!   its deadline passes, so a fake can never outlive its test.
+//! - [`PausePoint`]: hold an in-process operation at a chosen spot until the
+//!   test releases it. Every wait is bounded by [`test_timeout`] even under
+//!   plain `cargo test` (no nextest slow-timeout), and the test side reports
+//!   the operation's error when it ends before the pause point — a
+//!   hand-rolled `Gate` / `Pause` / `Park` once waited six hours on such an
+//!   operation (`pause_point_lint`).
 //! - [`assert_link_supports`]: a node link's agreed protocol carries a
 //!   feature, as `agreed >= FEATURE_PROTOCOL`; an exact match breaks on the
 //!   next protocol bump (`link_protocol_exact_lint`).
@@ -61,6 +67,7 @@ mod egress;
 #[cfg(unix)]
 mod guarded_child;
 mod link_protocol;
+mod pause_point;
 #[cfg(unix)]
 mod process_group;
 pub mod source_lint;
@@ -74,6 +81,7 @@ pub use egress::{
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
 pub use link_protocol::assert_link_supports;
+pub use pause_point::{PausePoint, DEFAULT_HOLD_TIMEOUT, DEFAULT_REACH_TIMEOUT};
 #[cfg(unix)]
 pub use process_group::{is_running, ProcessGroup};
 pub use timeout::{

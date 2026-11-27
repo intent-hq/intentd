@@ -1,0 +1,6 @@
+# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
+crates/intent-transport/src/auth/tests.rs 1
+crates/intent-transport/src/conn.rs 1
+crates/intent-transport/src/conn/presence_focus.rs 1
+crates/intent-transport/src/conn/read_delivery_tests.rs 1
+crates/intent-transport/src/conn_progressive_history_tests.rs 1

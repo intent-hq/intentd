@@ -1,0 +1,6 @@
+# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
+crates/intentd/src/executor/tests/home_calls.rs 1
+crates/intentd/tests/e2e_repository_resource_read.rs 1
+crates/intentd/tests/e2e_wss_invite_join.rs 1
+crates/intentd/tests/wss_integration/imported_queue_authorization.rs 1
+crates/intentd/tests/wss_integration/personal_pairing.rs 2

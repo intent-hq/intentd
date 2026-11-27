@@ -1,0 +1,6 @@
+# Hand-rolled test pause points not yet moved to intentd_test_support::PausePoint (pause_point_lint). Ratchets down only.
+crates/intent-acp/src/callback_registration/tests.rs 1
+crates/intent-acp/src/mcp_bridge/guidance_tests.rs 1
+crates/intent-acp/src/mcp_server/private_results/tests.rs 1
+crates/intent-acp/src/tests.rs 1
+crates/intent-acp/src/transport.rs 1
