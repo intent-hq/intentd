@@ -1061,3 +1061,49 @@ async fn a_restarted_disk_only_intentd_dials_as_resumed() {
         );
     }
 }
+
+/// A new sandbox's first handshake can fail on a busy host although its
+/// intentd is up (it just minted the backend's credential). The start dials
+/// again until the sandbox answers, instead of failing the agent (and
+/// deleting the sandbox) after one connect.
+#[tokio::test]
+async fn a_new_sandbox_s_first_bind_dials_again_until_it_answers() {
+    let (mut machine, _backend, node) = exposed().await;
+    machine.stop().await;
+    let node: crate::Node = Arc::new(node);
+    let binding = tokio::spawn({
+        let node = node.clone();
+        async move { crate::cloud::start::first_bind(&node, wait()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !binding.is_finished(),
+        "an unanswered first dial is not the start's failure"
+    );
+    machine.restart().await;
+    tokio::time::timeout(wait(), binding)
+        .await
+        .expect("binds once the sandbox answers")
+        .unwrap()
+        .expect("the first bind succeeds");
+    assert!(node.current_link().is_some());
+    machine.accept().await;
+}
+
+/// A sandbox that never answers fails the start once the first-bind budget
+/// is spent, with the connect's `machine-unreachable`.
+#[tokio::test]
+async fn a_new_sandbox_that_never_answers_fails_after_the_first_bind_budget() {
+    let (machine, _backend, node) = exposed().await;
+    machine.stop().await;
+    let node: crate::Node = Arc::new(node);
+    let error = crate::cloud::start::first_bind(&node, Duration::from_millis(500))
+        .await
+        .expect_err("nothing answers");
+    match error {
+        Error::RemoteMachine(failure) => {
+            assert_eq!(failure.data["code"], crate::connect::MACHINE_UNREACHABLE);
+        }
+        other => panic!("expected machine-unreachable, got {other:?}"),
+    }
+}

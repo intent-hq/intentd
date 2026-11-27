@@ -30,6 +30,11 @@ use crate::RemoteFeature;
 /// Longest wait for a sandbox start: create, boot, tunnel and probe.
 pub(crate) const START_WAIT: Duration = Duration::from_secs(10 * 60);
 
+/// Longest a new sandbox's first bind may take. Its intentd has minted the
+/// backend's credential, so it is up, but on a busy host its first
+/// handshake can miss one connect's budget.
+const FIRST_BIND_WAIT: Duration = Duration::from_secs(60);
+
 /// Longest cloud machine row name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
@@ -1146,6 +1151,7 @@ async fn link(
     shares: Option<intent_core::HomeId>,
 ) -> Result<()> {
     let node = feature.node(svc, machine_id).await?;
+    first_bind(&node, FIRST_BIND_WAIT).await?;
     let lease_id = node.status().lease_id;
     let session = svc.store().get_agent_session_summary(agent_id).await?;
     let mut view =
@@ -1186,6 +1192,35 @@ async fn link(
     svc.publish_agent_placement_changed(workspace_id, agent_id)
         .await;
     Ok(())
+}
+
+/// Bind the first link to a new sandbox: a connect that finds it
+/// unreachable dials again, until `budget` is spent. No dial starts after
+/// `budget`; the last one may end up to one connect's budget later. The
+/// delay between dials grows to an eighth of `budget`, at most 4 s.
+///
+/// # Errors
+///
+/// The last connect's error: `machine-unreachable` once `budget` is spent,
+/// any other at once.
+pub(crate) async fn first_bind(node: &crate::Node, budget: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let longest = (budget / 8).min(Duration::from_secs(4));
+    let mut delay = Duration::from_millis(250).min(longest);
+    loop {
+        let error = match node.connect().await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let unreachable = matches!(&error, Error::RemoteMachine(failure)
+            if failure.data["code"] == crate::connect::MACHINE_UNREACHABLE);
+        if !unreachable || tokio::time::Instant::now() + delay >= deadline {
+            return Err(error);
+        }
+        tracing::info!(machine = %node.machine_id(), %error, "cloud machine: the new sandbox did not answer its first dial; dialing again");
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(longest);
+    }
 }
 
 /// Remove cloud machine `row` for good: final stops for its agents (at most

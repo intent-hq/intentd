@@ -26,10 +26,15 @@ pub fn dispatch_argv0() -> Option<ExitCode> {
         .build()
         .map_err(|error| intent_core::Error::Internal(error.to_string()))
         .and_then(|runtime| {
-            runtime.block_on(intent_transport::node_link::run_git_remote_helper(
+            let result = runtime.block_on(intent_transport::node_link::run_git_remote_helper(
                 &url,
                 Path::new(&socket),
-            ))
+            ));
+            // A session that ends before git has its answer leaves a stdin
+            // read blocked while git waits for our output: dropping the
+            // runtime would wait for that read forever, and hold the push.
+            runtime.shutdown_background();
+            result
         });
     Some(match result {
         Ok(()) => ExitCode::SUCCESS,
