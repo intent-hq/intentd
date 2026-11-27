@@ -181,8 +181,9 @@ pub async fn ensure_in(
             "--no-audit",
             "--no-fund",
             "--loglevel=error",
-            "--prefix",
         ])
+        .args(intent_providers::NPM_INSTALL_ARGS)
+        .arg("--prefix")
         .arg(staging.path())
         .arg(&spec)
         .current_dir(staging.path())

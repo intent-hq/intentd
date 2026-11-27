@@ -827,6 +827,11 @@ pub(crate) async fn fetch_opencode_models() -> ProviderModelsFetch {
     let Some(cli) = crate::provider_cli_launch::ProviderCli::resolve("opencode", None) else {
         return ProviderModelsFetch::unavailable("opencode", "opencode binary not found");
     };
+    cli.remove_unfinished_install(
+        "opencode",
+        crate::provider_cli_launch::UNFINISHED_INSTALL_GRACE,
+    )
+    .await;
     let timeout = cli.timeout(OPENCODE_CLI_TIMEOUT);
     match run_opencode_models_cli(cli.command(&["models"]), timeout).await {
         Ok(stdout) => {
@@ -891,6 +896,8 @@ async fn fetch_grok_models_for(overlay: Option<intent_acp::ProfileEnv>) -> Provi
     let Some(cli) = crate::provider_cli_launch::ProviderCli::resolve("grok", None) else {
         return ProviderModelsFetch::unavailable("grok", "grok binary not found");
     };
+    cli.remove_unfinished_install("grok", crate::provider_cli_launch::UNFINISHED_INSTALL_GRACE)
+        .await;
     let timeout = cli.timeout(GROK_CLI_TIMEOUT);
     let mut command = cli.command(&["models"]);
     if let Some(overlay) = &overlay {

@@ -1828,6 +1828,8 @@ rl.on('line', (line) => {
                     observed["argv"],
                     json!([
                         "--workspaces=false",
+                        "--ignore-scripts=false",
+                        "--include=optional",
                         "-y",
                         intent_providers::config::CODEX_ACP_NPX_PACKAGE
                     ])

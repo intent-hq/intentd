@@ -76,6 +76,12 @@ async fn first_use_installs_the_exact_spec_and_later_uses_skip_npm() {
         recorded[0].ends_with("@openai/codex@0.160.1"),
         "{recorded:?}"
     );
+    // A user npm config that skips install scripts or optional packages
+    // leaves Claude Code's stub `claude` ("native binary not installed").
+    assert!(
+        recorded[0].contains("--ignore-scripts=false --include=optional"),
+        "{recorded:?}"
+    );
 
     let again = ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
         .await

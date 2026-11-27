@@ -62,12 +62,13 @@ fn cli_requirement(id: &str, auto_pinned: bool) -> Value {
 
 fn npx_login_command_hint(p: &ProviderConfig, auto_pinned: bool) -> Option<String> {
     let hint = p.npx_login_command_hint()?;
-    let Some(rest) = hint.strip_prefix("npx -y ") else {
+    let prefix = format!("npx {} -y ", intent_providers::NPM_INSTALL_ARGS.join(" "));
+    let Some(rest) = hint.strip_prefix(&prefix) else {
         return Some(hint);
     };
     let (spec, args) = rest.split_once(' ').unwrap_or((rest, ""));
     Some(
-        format!("npx -y {} {args}", package(spec, auto_pinned))
+        format!("{prefix}{} {args}", package(spec, auto_pinned))
             .trim_end()
             .to_owned(),
     )

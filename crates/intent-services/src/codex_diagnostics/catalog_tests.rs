@@ -408,6 +408,8 @@ child.on('exit',code=>process.exit(code||0));
             npx["args"],
             json!([
                 "--workspaces=false",
+                "--ignore-scripts=false",
+                "--include=optional",
                 "-y",
                 intent_providers::config::CODEX_ACP_NPX_PACKAGE
             ])

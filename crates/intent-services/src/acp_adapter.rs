@@ -438,11 +438,12 @@ impl AcpAdapterCommand {
             installed: None,
             profile: None,
             program: npx,
-            args: vec![
-                NPX_NO_WORKSPACES_ARG.to_string(),
-                "-y".to_string(),
-                package.to_string(),
-            ],
+            args: [NPX_NO_WORKSPACES_ARG]
+                .into_iter()
+                .chain(intent_providers::NPM_INSTALL_ARGS)
+                .chain(["-y", package])
+                .map(String::from)
+                .collect(),
             envs: Vec::new(),
             envs_removed: Vec::new(),
             cwd: None,
@@ -1666,6 +1667,8 @@ exit 0
             cmd.args,
             [
                 NPX_NO_WORKSPACES_ARG,
+                "--ignore-scripts=false",
+                "--include=optional",
                 "-y",
                 "codex-acp@1.2.3",
                 "--model",
