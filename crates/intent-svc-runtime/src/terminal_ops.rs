@@ -2319,7 +2319,9 @@ mod tests {
             &pty,
             bus,
             &dir,
-            "(trap '' HUP; exec sleep 30) &\nprintf PARENT_DONE",
+            // Ignore SIGHUP before forking so the grandchild inherits it: a
+            // trap set inside the subshell races the shell's exit.
+            "trap '' HUP\nsleep 30 &\nprintf PARENT_DONE",
         )
         .await;
 
