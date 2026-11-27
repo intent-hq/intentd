@@ -24,7 +24,7 @@
 //!   A handle stops at `drop(handle)`, at a statement naming it that kills or
 //!   reaps it (`kill` without a graceful signal, `kill_tree`, `wait`,
 //!   `wait_with_output`, `SIGKILL`, `await_wss_stopped`, or
-//!   `wait_with_timeout` whose statement also unwraps the `Option`) or calls
+//!   `wait_with_timeout` with `.unwrap().expect(..)` chained onto it) or calls
 //!   a helper that does, or when its block ends. `try_wait`, a timed wait that
 //!   may have returned `Ok(None)`, and a `SIGTERM` / `SIGINT` / `SIGHUP` alone
 //!   do not stop it: the daemon may still be writing.
@@ -102,6 +102,25 @@ const STOP_PRIMITIVES: &[&str] = &[
 ];
 const GRACEFUL_SIGNALS: &[&str] = &["SIGTERM", "SIGINT", "SIGHUP"];
 
+/// How many `.unwrap()` / `.expect(..)` calls chain directly onto the call
+/// whose argument list closes at `close`.
+fn chained_unwraps(tokens: &[Token], mut close: usize) -> usize {
+    let mut count = 0;
+    while tokens.get(close + 1).is_some_and(|t| t.is("."))
+        && tokens
+            .get(close + 2)
+            .is_some_and(|t| t.is("unwrap") || t.is("expect"))
+        && tokens.get(close + 3).is_some_and(|t| t.is("("))
+    {
+        let Some(next) = matching_close(tokens, close + 3) else {
+            break;
+        };
+        count += 1;
+        close = next;
+    }
+    count
+}
+
 /// Whether `tokens[k]` stops a daemon within the statement `range`.
 fn is_stop(tokens: &[Token], k: usize, range: (usize, usize)) -> bool {
     let t = &tokens[k];
@@ -112,13 +131,11 @@ fn is_stop(tokens: &[Token], k: usize, range: (usize, usize)) -> bool {
         return false;
     }
     if t.is("wait_with_timeout") {
-        // `Ok(None)` is a timeout with the daemon still running: only a
-        // statement that also unwraps the `Option` establishes the exit.
-        let close = matching_close(tokens, k + 1).unwrap_or(k + 1);
-        return (close + 1..range.1)
-            .filter(|&j| tokens[j].is("unwrap") || tokens[j].is("expect"))
-            .count()
-            >= 2;
+        // `Ok(None)` is a timeout with the daemon still running: only
+        // unwrapping both the `Result` and the `Option` of this very call
+        // (`.unwrap().expect(..)` chained onto it) establishes the exit.
+        return matching_close(tokens, k + 1)
+            .is_some_and(|close| chained_unwraps(tokens, close) >= 2);
     }
     !t.is("kill")
         || !(range.0..range.1).any(|j| GRACEFUL_SIGNALS.contains(&tokens[j].text.as_str()))
@@ -1304,6 +1321,8 @@ async fn t(d: &Path, s: &Store) {
     s.insert_note(&n).await.unwrap();
     let timed_out = daemon.wait_with_timeout(limit).unwrap();
     s.insert_note(&n).await.unwrap();
+    assert_eq!(daemon.wait_with_timeout(limit).unwrap(), daemon.try_wait().unwrap());
+    s.insert_note(&n).await.unwrap();
     daemon.wait().unwrap();
     s.insert_note(&n).await.unwrap();
 }
@@ -1314,6 +1333,7 @@ async fn t(d: &Path, s: &Store) {
             (5, "s.insert_note".to_owned()),
             (7, "s.insert_note".to_owned()),
             (9, "s.insert_note".to_owned()),
+            (11, "s.insert_note".to_owned()),
         ]
     );
 }
