@@ -9,7 +9,8 @@ multiplexing and raises cargo's own retries for every job, and the heavy PR
 jobs download the locked crates with backoff before their first build.
 nightly-payload-sweep.yml's full-scale job gets the same settings and fetch:
 its first `cargo test` died on the same framing error (serde_with, run
-41963501305, intent-hq/intent#8585), so the fixture test never ran.
+41963501305, intent-hq/intent#8585), so the fixture test never ran;
+nightly-npm-provider-smoke.yml's build follows it.
 Requires PyYAML.
 
 Run: python3 -B scripts/test-ci-cargo-network.py
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / '.github/workflows/ci.yml'
 RELEASE_PLZ = ROOT / '.github/workflows/release-plz.yml'
 NIGHTLY_SWEEP = ROOT / '.github/workflows/nightly-payload-sweep.yml'
+NPM_PROVIDER_SMOKE = ROOT / '.github/workflows/nightly-npm-provider-smoke.yml'
 FETCH_RUN = 'python3 -I -B scripts/fetch-locked-crates.py'
 NETWORK_ENV = {'CARGO_HTTP_MULTIPLEXING': 'false', 'CARGO_NET_RETRY': '10'}
 # PR-reachable jobs that build the workspace; each fetches before its first build.
@@ -89,8 +91,10 @@ class CiCargoNetwork(unittest.TestCase):
 
 
 class NightlyPayloadSweepCargoNetwork(unittest.TestCase):
+    workflow, job_id = NIGHTLY_SWEEP, 'sweep'
+
     def setUp(self):
-        self.job = load(NIGHTLY_SWEEP)['jobs']['sweep']
+        self.job = load(self.workflow)['jobs'][self.job_id]
         self.steps = self.job['steps']
 
     def test_job_env_disables_multiplexing_and_raises_retries(self):
@@ -113,7 +117,11 @@ class NightlyPayloadSweepCargoNetwork(unittest.TestCase):
         self.assertNotIn('continue-on-error', self.steps[fetch], 'a failed fetch fails the job')
 
     def test_fetch_script_documents_this_caller(self):
-        self.assertIn('nightly-payload-sweep.yml', (ROOT / 'scripts/fetch-locked-crates.py').read_text())
+        self.assertIn(self.workflow.name, (ROOT / 'scripts/fetch-locked-crates.py').read_text())
+
+
+class NightlyNpmProviderSmokeCargoNetwork(NightlyPayloadSweepCargoNetwork):
+    workflow, job_id = NPM_PROVIDER_SMOKE, 'smoke'
 
 
 if __name__ == '__main__':

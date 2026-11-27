@@ -35,6 +35,30 @@ impl ProviderCli {
         })
     }
 
+    /// [`Self::npx`], else Intent's bundled Codex / Claude Code CLI package
+    /// through npx, with the command the package provides.
+    pub(crate) fn npx_with_bundled(provider_id: &str) -> Option<(Self, &'static str)> {
+        let provider = intent_providers::find_provider(provider_id)?;
+        if let Some(cli) = Self::npx(provider_id) {
+            return Some((cli, provider.command));
+        }
+        let bundled = intent_providers::adapter_cli::missing_fallback(provider_id)?;
+        let npx = if provider_id == "codex" {
+            intent_providers::find_codex_npx()
+        } else {
+            intent_providers::find_npx()
+        }?;
+        let command =
+            intent_providers::installed_cli::InstalledCli::for_provider(provider_id)?.command();
+        Some((
+            Self::Npx {
+                npx,
+                package: bundled.spec(),
+            },
+            command,
+        ))
+    }
+
     /// The executable and the arguments that come before the CLI's own.
     pub(crate) fn program(&self) -> (&Path, Vec<String>) {
         match self {

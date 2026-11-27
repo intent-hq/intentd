@@ -76,7 +76,7 @@ fn install_lock() -> &'static Mutex<()> {
 }
 
 /// npm from the same toolchain as the adapter's npx.
-fn find_npm() -> Option<PathBuf> {
+pub(crate) fn find_npm() -> Option<PathBuf> {
     let npx = intent_providers::find_npx()?;
     let dir = npx.parent()?;
     let names: &[&str] = if cfg!(windows) {

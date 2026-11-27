@@ -1264,25 +1264,7 @@ fn npx_probe(
     provider_id: &'static str,
 ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = AuthVerdict> + Send>>> {
     let provider = intent_providers::find_provider(provider_id)?;
-    let (cli, command) =
-        if let Some(cli) = crate::provider_cli_launch::ProviderCli::npx(provider_id) {
-            (cli, provider.command)
-        } else {
-            let bundled = intent_providers::adapter_cli::missing_fallback(provider_id)?;
-            let npx = if provider_id == "codex" {
-                intent_providers::find_codex_npx()
-            } else {
-                intent_providers::find_npx()
-            }?;
-            let cli = crate::provider_cli_launch::ProviderCli::Npx {
-                npx,
-                package: bundled.spec(),
-            };
-            (
-                cli,
-                intent_providers::installed_cli::InstalledCli::for_provider(provider_id)?.command(),
-            )
-        };
+    let (cli, command) = crate::provider_cli_launch::ProviderCli::npx_with_bundled(provider_id)?;
     let auth_args = provider.auth_check_args.unwrap_or_default();
     Some(Box::pin(async move {
         if auth_args.is_empty() || !cli.runs_without_download(CLI_AUTH_TIMEOUT).await {

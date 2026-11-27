@@ -264,6 +264,8 @@ mod nested_repos;
 mod note_merge;
 pub mod note_ops;
 mod note_write;
+#[cfg(test)]
+mod npm_provider_smoke;
 mod npx_cli;
 #[expect(
     dead_code,
