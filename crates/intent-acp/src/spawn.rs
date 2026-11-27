@@ -1553,9 +1553,8 @@ mod build_command_tests {
 
     #[test]
     fn claude_code_npx_spawn_argv_is_pinned() {
-        // The exact spawn argv for claude-code: `<npx> --workspaces=false
-        // <npx_install_args> -y <pinned package>` — no other args
-        // (claude-code has no base args).
+        // The exact spawn argv for claude-code: `<npx> <npx_run_args>` — no
+        // other args (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1565,17 +1564,7 @@ mod build_command_tests {
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
         // The package itself is the registry golden's fact.
-        assert_eq!(
-            args,
-            vec![
-                "--workspaces=false".to_string(),
-                "--ignore-scripts=false".to_string(),
-                "--include=optional".to_string(),
-                format!("--allow-scripts={}", provider.npx_only_package.unwrap()),
-                "-y".to_string(),
-                provider.npx_only_package.unwrap().to_string(),
-            ]
-        );
+        assert_eq!(args, npx_run_args(provider.npx_only_package.unwrap()));
     }
 
     #[test]
