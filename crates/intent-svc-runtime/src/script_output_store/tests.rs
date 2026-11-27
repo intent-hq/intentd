@@ -1112,6 +1112,34 @@ fn unsaved_output_still_advances_positions() {
     assert_cursor_slice(&tail, &stream);
 }
 
+/// Regression (intent#10218 review): output dropped while compaction fails,
+/// then saved again once it recovers, must not shift the saved bytes' positions.
+/// Cursor reads cover only the contiguous output after the newest hole.
+#[test]
+fn cursor_reads_never_span_an_unsaved_hole() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    let stream = numbered_stream(200);
+    let mut lines = stream.chunks(40);
+    with_failing_rename(|| {
+        for line in lines.by_ref().take(60) {
+            w.append(line);
+        }
+    });
+    assert_eq!(w.len(), 2000, "lines 50..60 were not saved");
+    let tail = cursor(&store, 10_000);
+    assert_eq!(tail.end, 2400);
+    assert_eq!(tail.log_start, 2400, "nothing saved is contiguous with the end yet");
+    assert!(tail.bytes.is_empty());
+    for line in lines {
+        w.append(line);
+        let tail = cursor(&store, 10_000);
+        assert_eq!(tail.end, w.end());
+        assert!(tail.log_start >= 2400, "never reaches back across the hole");
+        assert_cursor_slice(&tail, &stream);
+    }
+}
+
 #[test]
 fn a_disabled_writer_still_advances_positions() {
     let (dir, store) = store(1024);

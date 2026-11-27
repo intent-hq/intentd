@@ -85,9 +85,10 @@ pub(crate) struct CursorTail {
     pub bytes: Vec<u8>,
     pub start: u64,
     pub end: u64,
-    /// Position of the oldest byte the log keeps.
+    /// Position of the oldest byte the log keeps contiguous with the end
+    /// (saved output older than unsaved output is left out).
     pub log_start: u64,
-    /// `split('\n')` line count of the whole log.
+    /// `split('\n')` line count from `log_start`.
     pub total_lines: usize,
 }
 
@@ -98,7 +99,11 @@ struct RunState {
     /// Bytes in the log.
     len: u64,
     /// Stream position of the log's first byte (`base + len` is the end).
+    /// Bytes before `contiguous` precede output that was not saved, so their
+    /// positions are unknown and cursor reads leave them out.
     base: u64,
+    /// Log offset where the bytes contiguous with the end begin.
+    contiguous: u64,
     cap: u64,
     retry: CompactionRetry,
     writers: usize,
@@ -110,6 +115,7 @@ impl RunState {
             file: None,
             len: 0,
             base: 0,
+            contiguous: 0,
             cap,
             retry: CompactionRetry::default(),
             writers: 0,
@@ -118,13 +124,13 @@ impl RunState {
 }
 
 /// Run states by log key. Lock order: this map, then a run's state. An entry
-/// with no writer and `base == 0` is dropped, since a missing entry means
-/// exactly that.
+/// with no writer, `base == 0` and `contiguous == 0` is dropped, since a
+/// missing entry means exactly that.
 type Runs = Arc<Mutex<HashMap<BlobKey, Arc<Mutex<RunState>>>>>;
 
-/// An open run log, the stream position of its first byte, and the length
-/// to read.
-type PositionedRead = (Box<dyn BlobFile>, u64, u64);
+/// An open run log, the stream position of its first byte, and the log
+/// range `[from, len)` to read: the bytes contiguous with the run's end.
+type PositionedRead = (Box<dyn BlobFile>, u64, u64, u64);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -298,6 +304,10 @@ impl ScriptOutputStore {
                         } else {
                             0
                         };
+                        if on_disk != s.len {
+                            s.contiguous = 0;
+                        }
+                        s.contiguous = s.contiguous.saturating_sub(on_disk - len);
                         s.base = base + (on_disk - len);
                         s.len = len;
                         s.file = Some(file);
@@ -386,11 +396,11 @@ impl ScriptOutputStore {
     ) -> Result<Option<CursorTail>> {
         let key = Self::run_key(workspace_id, script_id, run_id)?;
         let err = |e: io::Error| self.key_err(&key, &e);
-        let Some((mut file, base, len)) = self.positioned_read(&key).map_err(err)? else {
+        let Some((mut file, base, from, len)) = self.positioned_read(&key).map_err(err)? else {
             return Ok(None);
         };
         let file = &mut *file;
-        let cut = tail_cut(file, len, max_lines.max(1)).map_err(err)?;
+        let cut = tail_cut(file, len, max_lines.max(1)).map_err(err)?.max(from);
         let bytes = if len - cut > max_bytes {
             newest_bytes_at_line_start(file, len, max_bytes).map_err(err)?
         } else {
@@ -402,12 +412,12 @@ impl ScriptOutputStore {
                 .map_err(err)?;
             bytes
         };
-        file.seek(SeekFrom::Start(0)).map_err(err)?;
-        let total_lines = count_newlines(&mut (&mut *file).take(len)).map_err(err)? + 1;
+        file.seek(SeekFrom::Start(from)).map_err(err)?;
+        let total_lines = count_newlines(&mut (&mut *file).take(len - from)).map_err(err)? + 1;
         Ok(Some(CursorTail {
             start: base + len - bytes.len() as u64,
             end: base + len,
-            log_start: base,
+            log_start: base + from,
             total_lines,
             bytes,
         }))
@@ -423,14 +433,14 @@ impl ScriptOutputStore {
                 return Ok(None);
             };
             let len = file.len()?;
-            return Ok(Some((file, 0, len)));
+            return Ok(Some((file, 0, 0, len)));
         };
         let s = lock(state);
         let Some(file) = self.storage.open_read(key)? else {
             return Ok(None);
         };
         let len = s.len.min(file.len()?);
-        Ok(Some((file, s.base + s.len - len, len)))
+        Ok(Some((file, s.base + s.len - len, s.contiguous.min(len), len)))
     }
 
     /// The newest→oldest `{ items, nextToken }` page of a run's log lines —
@@ -705,16 +715,27 @@ impl RunOutputWriter {
         let mut guard = lock(&self.state);
         let s = &mut *guard;
         let end = s.base + s.len + chunk.len() as u64;
-        if let (Some(file), Some(key)) = (s.file.as_mut(), self.key.as_ref()) {
-            let log = Log {
-                storage: &*self.storage,
-                key,
-                path: &self.path,
-            };
-            if let Err(e) = write_capped(log, file, &mut s.len, s.cap, &mut s.retry, chunk) {
-                tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
-                s.file = None;
+        let written = match (s.file.as_mut(), self.key.as_ref()) {
+            (Some(file), Some(key)) => {
+                let log = Log {
+                    storage: &*self.storage,
+                    key,
+                    path: &self.path,
+                };
+                write_capped(log, file, &mut s.len, s.cap, &mut s.retry, chunk).unwrap_or_else(
+                    |e| {
+                        tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
+                        s.file = None;
+                        Written::Dropped
+                    },
+                )
             }
+            _ => Written::Dropped,
+        };
+        match written {
+            Written::Appended => {}
+            Written::Compacted { dropped } => s.contiguous = s.contiguous.saturating_sub(dropped),
+            Written::Dropped => s.contiguous = s.len,
         }
         s.base = end - s.len;
     }
@@ -730,7 +751,10 @@ impl Drop for RunOutputWriter {
             return;
         }
         s.file = None;
-        if s.base == 0 && runs.get(key).is_some_and(|r| Arc::ptr_eq(r, &self.state)) {
+        if s.base == 0
+            && s.contiguous == 0
+            && runs.get(key).is_some_and(|r| Arc::ptr_eq(r, &self.state))
+        {
             drop(s);
             runs.remove(key);
         }
@@ -761,7 +785,7 @@ fn write_capped(
     cap: u64,
     retry: &mut CompactionRetry,
     chunk: &[u8],
-) -> io::Result<()> {
+) -> io::Result<Written> {
     let chunk_len = chunk.len() as u64;
     let new_len = len.saturating_add(chunk_len);
     if new_len <= cap {
@@ -773,7 +797,7 @@ fn write_capped(
         return if fits_fallback {
             append_chunk(&mut **file, len, chunk)
         } else {
-            Ok(())
+            Ok(Written::Dropped)
         };
     }
     // `cap` fits in usize whenever the chunk does not (chunk_len > cap below).
@@ -788,13 +812,14 @@ fn write_capped(
     } else {
         chunk
     };
+    let dropped = *len - kept.len() as u64;
     kept.extend_from_slice(tail);
     match log.storage.replace(log.key, &kept) {
         Ok(new_file) => {
             *file = new_file;
             *len = kept.len() as u64;
             retry.credit = 0;
-            Ok(())
+            Ok(Written::Compacted { dropped })
         }
         Err(e) => {
             if !retry.warned {
@@ -805,17 +830,28 @@ fn write_capped(
             if fits_fallback {
                 append_chunk(&mut **file, len, chunk)
             } else {
-                Ok(())
+                Ok(Written::Dropped)
             }
         }
     }
 }
 
-fn append_chunk(file: &mut dyn BlobFile, len: &mut u64, chunk: &[u8]) -> io::Result<()> {
+fn append_chunk(file: &mut dyn BlobFile, len: &mut u64, chunk: &[u8]) -> io::Result<Written> {
     file.write_all(chunk)?;
     file.flush()?;
     *len += chunk.len() as u64;
-    Ok(())
+    Ok(Written::Appended)
+}
+
+/// What [`write_capped`] did with a chunk.
+enum Written {
+    Appended,
+    /// The log was rewritten to its newest bytes plus the chunk; `dropped`
+    /// bytes of the old log are gone (a chunk past the cap also loses its
+    /// oldest bytes, and then `dropped` is the whole old log).
+    Compacted { dropped: u64 },
+    /// The chunk was not saved.
+    Dropped,
 }
 
 /// The newest `budget` bytes of a `len`-byte file, starting after the first
