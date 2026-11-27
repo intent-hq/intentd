@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.315] - 2026-11-27
+
+### 🚀 Features
+
+- *(store)* Add a write role per Postgres store handle ([#3859](https://github.com/intent-hq/intentd/pull/3859))
+
+
 ## [0.11.314] - 2026-11-27
 
 ### 🐛 Bug Fixes
