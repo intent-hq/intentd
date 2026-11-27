@@ -1371,12 +1371,71 @@ pub(crate) enum Fence {
     /// also while the tenant is closing or closed. A release only gives the
     /// work up; refusing it would leave the key held until its TTL.
     LeaseRelease,
+    /// A request write ([`WriteRole::Request`]): the writer lock, the
+    /// tenant state and the scoped lease guards as [`Self::Check`], but no
+    /// owner comparison, so an owner takeover does not refuse it. In a
+    /// process that claimed the tenant it still refuses once that claim's
+    /// fence fired: the process's in-memory gates are not converted yet.
+    Request,
 }
 
 impl Fence {
     /// Whether a write under this fence needs the tenant open.
     fn needs_open(self) -> bool {
-        matches!(self, Self::Check | Self::LeaseOnly)
+        matches!(self, Self::Check | Self::LeaseOnly | Self::Request)
+    }
+
+    /// Whether a write under this fence refuses once this process's claim
+    /// fenced itself, and guards the leases of the work it runs under
+    /// (`lease_write_guard`).
+    fn serves_work(self) -> bool {
+        matches!(self, Self::Check | Self::Request)
+    }
+
+    /// The write, for an error.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Check => "an owner write",
+            Self::Skip => "a tenant claim or state move",
+            Self::LeaseOnly => "a store lease write",
+            Self::LeaseRelease => "a store lease release",
+            Self::Request => "a request write",
+        }
+    }
+}
+
+/// What a store handle may write, in orchestrator mode. A property of one
+/// handle, not of the tenant's shared state (`tenant_registry`): one
+/// process can hold an owner handle for its loops and a request handle for
+/// its RPCs. See `docs/ARCHITECTURE.md` (monorepo), "Owner work vs request
+/// writes (orchestrator mode)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteRole {
+    /// The handle of a process that claimed the tenant
+    /// ([`Store::open_postgres_owned`](crate::Store::open_postgres_owned)):
+    /// it writes only while the tenant lease names that claim.
+    Owner,
+    /// A handle for request writes
+    /// ([`Store::open_postgres_request`](crate::Store::open_postgres_request),
+    /// [`Store::request_writer`](crate::Store::request_writer)): it takes
+    /// the writer lock but skips the owner comparison. Owner-only writes
+    /// (lease rows, tenant claims and state moves, `begin_owner_write`)
+    /// refuse it with `Error::NotOwner`.
+    Request,
+    /// A handle that never claimed the tenant
+    /// ([`Store::open_postgres`](crate::Store::open_postgres)), for admin
+    /// and repair tools: it writes only while no process ever claimed the
+    /// tenant.
+    Unclaimed,
+}
+
+impl WriteRole {
+    /// The fence [`PgStore::begin_write`] takes for this role.
+    fn fence(self) -> Fence {
+        match self {
+            Self::Owner | Self::Unclaimed => Fence::Check,
+            Self::Request => Fence::Request,
+        }
     }
 }
 
@@ -1385,6 +1444,9 @@ pub(crate) struct PgStore {
     pool: PgPool,
     tenant: TenantId,
     options: PostgresOptions,
+    /// What this handle may write; per handle, never shared (see
+    /// [`WriteRole`]).
+    role: WriteRole,
     /// Per-note content-write locks; see `note_write_lock`. Process-local,
     /// shared by every open of this tenant (`tenant_registry`).
     note_write_lanes: Arc<crate::note_write_lock::NoteWriteLanes>,
@@ -1518,17 +1580,65 @@ impl PgStore {
     /// back and the call fails with [`Error::TenantClosed`], whoever holds
     /// the lease. A state move takes the same row lock, so a write already
     /// holding it commits first and every later one sees the move.
+    ///
+    /// **Role.** The fence above is that of an owner or unclaimed handle. A
+    /// request handle ([`WriteRole::Request`]) takes [`Fence::Request`]
+    /// instead: the same lock, state check and lease guards, without the
+    /// owner comparison.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
+        self.begin_write_as(self.role.fence()).await
+    }
+
+    /// [`Self::begin_write`] for owner-only work: refuses a request handle
+    /// with [`Error::NotOwner`] before it takes the slot, then runs the
+    /// owner fence ([`Fence::Check`]). An unclaimed handle keeps its rule.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            dead_code,
+            reason = "no owner-only repository uses it yet; lease, claim and state writes are \
+                      owner-only through begin_write_as"
+        )
+    )]
+    pub(crate) async fn begin_owner_write(&self) -> Result<WriteTx> {
         self.begin_write_as(Fence::Check).await
     }
 
-    /// [`Self::begin_write`], with or without the fence check: only a claim
-    /// skips it, because a claim is how the fence changes.
+    /// Refuse owner-only work (`what`) on a request handle.
+    pub(crate) fn refuse_request_role(&self, what: &str) -> Result<()> {
+        if self.role == WriteRole::Request {
+            return Err(Error::NotOwner(format!(
+                "tenant {}: {what} is owner-only, and this store handle writes for requests; \
+                 nothing was written",
+                self.tenant()
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::begin_write`] under `fence`. Only the handle's role maps to
+    /// [`Fence::Request`] (and a request handle takes no other fence: the
+    /// others are owner-only work); a claim or a state move skips the
+    /// owner check, because they are how the fence and the state change.
     pub(crate) async fn begin_write_as(&self, fence: Fence) -> Result<WriteTx> {
+        match (self.role, fence) {
+            (WriteRole::Request, Fence::Request) => {}
+            (WriteRole::Request, fence) => {
+                self.refuse_request_role(fence.describe())?;
+            }
+            (role, Fence::Request) => {
+                return Err(Error::Internal(format!(
+                    "tenant {}: a {role:?} store handle took the request fence; nothing was \
+                     written",
+                    self.tenant()
+                )));
+            }
+            _ => {}
+        }
         // A fenced claim writes nothing: refuse before taking the slot. A
         // writer that passes here and the fence fires while it waits is
         // refused by the check under the lock below.
-        if fence == Fence::Check {
+        if fence.serves_work() {
             self.claim.refuse_if_fenced(self.tenant())?;
         }
         let limits = self.options.writer;
@@ -1597,7 +1707,7 @@ impl PgStore {
                     };
                     // Work under a lease writes only while it holds it
                     // (`lease_write_guard`); lease writes and claims do not.
-                    if fence == Fence::Check {
+                    if fence.serves_work() {
                         if let Err(e) = self.guard_scoped_leases(&mut tx).await {
                             let _ = tx.rollback().await;
                             return Err(e);
@@ -1651,7 +1761,53 @@ impl crate::Store {
     ) -> Result<Self> {
         // Every open of this tenant in this process shares one set of gates.
         let key = tenant_registry::tenant_key(&pool, &tenant);
-        Self::open_postgres_keyed(pool, tenant, options, key).await
+        Self::open_postgres_keyed(pool, tenant, options, key, WriteRole::Unclaimed).await
+    }
+
+    /// [`Self::open_postgres`] for request writes ([`WriteRole::Request`]):
+    /// for a process that serves a tenant's client requests without owning
+    /// it. Its writes take the tenant writer lock and read the tenant state
+    /// but skip the owner comparison, so they go on across an owner
+    /// takeover; owner-only writes (lease rows, tenant claims and state
+    /// moves) refuse it with `Error::NotOwner`. It provisions the tenant's
+    /// seed rows like [`Self::open_postgres`], but runs no owner sweep.
+    ///
+    /// No caller serves requests through it yet: a request handle is safe
+    /// for an RPC only once every in-process gate that RPC touches has a
+    /// database guard (see [`WriteRole`]).
+    ///
+    /// # Errors
+    /// As [`Self::open_postgres`], without the `NotOwner` of an unclaimed
+    /// open.
+    pub async fn open_postgres_request(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        _orchestrator: crate::OrchestratorOnly,
+    ) -> Result<Self> {
+        let key = tenant_registry::tenant_key(&pool, &tenant);
+        Self::open_postgres_keyed(pool, tenant, options, key, WriteRole::Request).await
+    }
+
+    /// Test-only: [`Self::open_postgres_request`] as if from another
+    /// process named `process` (see [`Self::open_postgres_as_process`]).
+    ///
+    /// # Errors
+    /// As [`Self::open_postgres_request`].
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn open_postgres_request_as_process(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        process: &str,
+        _orchestrator: crate::OrchestratorOnly,
+    ) -> Result<Self> {
+        let key = format!(
+            "{}@process:{process}",
+            tenant_registry::tenant_key(&pool, &tenant)
+        );
+        Self::open_postgres_keyed(pool, tenant, options, key, WriteRole::Request).await
     }
 
     /// Test-only: [`Self::open_postgres`] as if from another process named
@@ -1675,7 +1831,7 @@ impl crate::Store {
             "{}@process:{process}",
             tenant_registry::tenant_key(&pool, &tenant)
         );
-        Self::open_postgres_keyed(pool, tenant, options, key).await
+        Self::open_postgres_keyed(pool, tenant, options, key, WriteRole::Unclaimed).await
     }
 
     async fn open_postgres_keyed(
@@ -1683,8 +1839,9 @@ impl crate::Store {
         tenant: TenantId,
         options: PostgresOptions,
         key: String,
+        role: WriteRole,
     ) -> Result<Self> {
-        let store = PgStore::for_key(pool, tenant, options, key);
+        let store = PgStore::for_key(pool, tenant, options, key, role);
         // The schema gate comes first: a daemon whose schema does not match
         // its build refuses before it writes anything (no seed rows, and no
         // later startup step such as a lease).
@@ -1697,8 +1854,11 @@ impl crate::Store {
         };
         open(store.provision().await)?;
         // Unleased opens only (one process per tenant by design); see
-        // `clear_foreign_claims_once`. The leased open does not call it.
-        open(store.clear_foreign_claims_once().await)?;
+        // `clear_foreign_claims_once`. The leased open does not call it, and
+        // neither does a request open: it is owner work.
+        if role == WriteRole::Unclaimed {
+            open(store.clear_foreign_claims_once().await)?;
+        }
         Ok(Self {
             backend: crate::Backend::Postgres(Box::new(store)),
         })
@@ -1710,17 +1870,31 @@ impl crate::Store {
 /// the tenant, its claim included.
 pub(crate) fn state_mover(pool: PgPool, tenant: TenantId) -> PgStore {
     let key = tenant_registry::tenant_key(&pool, &tenant);
-    PgStore::for_key(pool, tenant, PostgresOptions::default(), key)
+    PgStore::for_key(
+        pool,
+        tenant,
+        PostgresOptions::default(),
+        key,
+        WriteRole::Unclaimed,
+    )
 }
 
 impl PgStore {
-    /// A store sharing the process-local gates registered under `key`.
-    fn for_key(pool: PgPool, tenant: TenantId, options: PostgresOptions, key: String) -> Self {
+    /// A store with `role` sharing the process-local gates registered under
+    /// `key`.
+    fn for_key(
+        pool: PgPool,
+        tenant: TenantId,
+        options: PostgresOptions,
+        key: String,
+        role: WriteRole,
+    ) -> Self {
         let shared = tenant_registry::tenant_state(key);
         PgStore {
             pool,
             tenant,
             options,
+            role,
             note_write_lanes: Arc::clone(&shared.note_write_lanes),
             task_event_baselines: Arc::clone(&shared.task_event_baselines),
             task_events_enabled: Arc::clone(&shared.task_events_enabled),
@@ -1749,7 +1923,36 @@ impl PgStore {
     }
 }
 
+impl PgStore {
+    /// This handle with `role`, sharing every process-local gate (the
+    /// claim included).
+    pub(crate) fn with_role(&self, role: WriteRole) -> Self {
+        Self {
+            role,
+            ..self.clone()
+        }
+    }
+
+    /// Test-only: take an owner write ([`Self::begin_owner_write`]) and
+    /// roll it back.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn probe_owner_write(&self) -> Result<()> {
+        let tx: WriteTx = self.begin_owner_write().await?;
+        tx.rollback().await.map_err(db)
+    }
+}
+
 impl crate::Store {
+    /// The write role of this Postgres store handle ([`WriteRole`]);
+    /// `None` on `SQLite`, where one daemon owns the database.
+    #[must_use]
+    pub fn postgres_write_role(&self) -> Option<WriteRole> {
+        match &self.backend {
+            crate::Backend::Postgres(store) => Some(store.role),
+            crate::Backend::Sqlite(_) => None,
+        }
+    }
+
     /// Writers of this Postgres store's tenant, through any of its stores in
     /// this process, waiting for the writer slot or the tenant writer lock;
     /// 0 on `SQLite`. For tests that need a writer to be queued before they
