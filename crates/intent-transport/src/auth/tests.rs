@@ -716,17 +716,15 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             let new = new.clone();
             async move { store.store_token(&new).await }
         });
-        let early = backing.pause.reached(&mut writer).await;
         if cancel {
-            assert!(early.is_none(), "the write timeout is 10s: {early:?}");
+            // The 10 s write budget outlasts the pause: the writer is held.
+            assert!(backing.pause.reached(&mut writer).await.is_none());
             writer.abort();
             assert!(writer.await.unwrap_err().is_cancelled());
         } else {
-            let out = match early {
-                Some(out) => out,
-                None => writer.await,
-            };
-            assert!(out.unwrap().is_err());
+            // The 20 ms budget may expire before the blocking write arrives.
+            backing.pause.wait_reached().await;
+            assert!(writer.await.unwrap().is_err());
         }
         let authority = LegacyAdmission {
             store: store.clone(),
