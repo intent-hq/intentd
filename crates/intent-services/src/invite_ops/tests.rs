@@ -135,6 +135,52 @@ pub(super) fn invite_kind<T: std::fmt::Debug>(r: &Result<T>) -> InviteErrorKind 
     }
 }
 
+/// Outstanding nonces: rows of `invite_nonce`, claimed ones included.
+pub(super) async fn outstanding_nonces(store: &Store) -> u64 {
+    store.count_invite_nonces().await.expect("count nonces")
+}
+
+/// Whether nonce `n` is outstanding and free to claim (not held by a prove).
+async fn nonce_open(store: &Store, n: &str) -> bool {
+    let claimed: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT claimed_at_ms FROM invite_nonce WHERE nonce_hash = ?")
+            .bind(hash_secret(n))
+            .fetch_optional(store.read_pool())
+            .await
+            .expect("read nonce");
+    matches!(claimed, Some(None))
+}
+
+/// Every outstanding nonce's lifetime has passed.
+async fn expire_nonces(store: &Store) {
+    sqlx::query("UPDATE invite_nonce SET expires_at_ms = 0")
+        .execute(store.write_pool())
+        .await
+        .expect("expire nonces");
+}
+
+/// Spend the tenant's nonce capacity with nonces of other invites, as other
+/// links would.
+async fn spend_nonce_capacity(store: &Store) {
+    let now = unix_ms(SystemTime::now());
+    for i in 0..MAX_OUTSTANDING_NONCES {
+        let nonce = InviteNonce {
+            invite_id: format!("other-invite-{i}"),
+            scope: InviteScope::Workspace,
+            authorization_generation: 0,
+            issued_at_ms: now,
+            expires_at_ms: now + 600_000,
+        };
+        assert_eq!(
+            store
+                .issue_invite_nonce(&format!("other-{i}"), &nonce, now, NONCE_CAPS)
+                .await
+                .expect("issue"),
+            QuotaWrite::Written
+        );
+    }
+}
+
 pub(super) fn id_of(created: &Value) -> String {
     created["invite"]["id"]
         .as_str()
@@ -1492,7 +1538,6 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
     let f = fixture(&tmp).await;
     let (ws2, invite_id, secret) = f.second_workspace_invite().await;
 
-    let permits_before = f.services.invite_nonce_permits.available_permits();
     let r = f
         .services
         .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
@@ -1504,23 +1549,13 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
         "{r}"
     );
     assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        permits_before,
-        "inspect never touches the nonce permits"
+        outstanding_nonces(&f.store).await,
+        0,
+        "inspect issues no nonce"
     );
-    assert!(f.services.invite_nonces.lock().await.is_empty());
 
     // Spent nonce capacity does not affect inspect.
-    let _all: Vec<_> = (0..permits_before)
-        .map(|_| {
-            f.services
-                .invite_nonce_permits
-                .clone()
-                .try_acquire_owned()
-                .expect("permit")
-        })
-        .collect();
-    assert_eq!(f.services.invite_nonce_permits.available_permits(), 0);
+    spend_nonce_capacity(&f.store).await;
     f.services
         .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
         .await
@@ -1710,11 +1745,7 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites() {
             assert_eq!(invite_kind(&result), kind, "{state}: {result:?}");
         }
     }
-    assert!(f.services.invite_nonces.lock().await.is_empty());
-    assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        MAX_OUTSTANDING_NONCES
-    );
+    assert_eq!(outstanding_nonces(&f.store).await, 0);
 }
 
 /// `invite.accept` with the credential a prior join minted: the same
@@ -1796,7 +1827,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
         4,
         "no new principal row"
     );
-    assert!(f.services.invite_nonces.lock().await.is_empty());
+    assert_eq!(outstanding_nonces(&f.store).await, 0);
 
     let batch = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -2228,14 +2259,18 @@ async fn challenge_issues_a_nonce_without_a_flow() {
     let expires = a["nonceExpiresAt"].as_str().expect("nonceExpiresAt");
     assert!(expires > before.as_str(), "{expires} > {before}");
     assert!(expires < iso_after(NONCE_TTL.as_secs() + 5).as_str());
-    {
-        let nonces = f.services.invite_nonces.lock().await;
-        assert_eq!(nonces.len(), 2);
-        assert!(nonces.values().all(|s| s.invite_id == invite_id));
-    }
-    assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        MAX_OUTSTANDING_NONCES - 2
+    let invites: Vec<String> = sqlx::query_scalar("SELECT invite_id FROM invite_nonce")
+        .fetch_all(f.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(invites, vec![invite_id.clone(), invite_id.clone()]);
+    let stored: Vec<String> = sqlx::query_scalar("SELECT nonce_hash FROM invite_nonce")
+        .fetch_all(f.store.read_pool())
+        .await
+        .unwrap();
+    assert!(
+        stored.contains(&hash_secret(&nonce)) && !stored.contains(&nonce),
+        "rows are keyed by the nonce's hash, never the nonce"
     );
 
     let r = f
@@ -2252,7 +2287,7 @@ async fn challenge_issues_a_nonce_without_a_flow() {
         .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
-    assert_eq!(f.services.invite_nonces.lock().await.len(), 2);
+    assert_eq!(outstanding_nonces(&f.store).await, 2);
 }
 
 /// One invite may hold at most `MAX_NONCES_PER_INVITE` outstanding nonces
@@ -2279,8 +2314,8 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::FlowBusy);
     assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        MAX_OUTSTANDING_NONCES - MAX_NONCES_PER_INVITE
+        outstanding_nonces(&f.store).await,
+        MAX_NONCES_PER_INVITE as u64
     );
     // Another invite is not affected by this one's bound.
     let (_, other_id, other_secret) = f.second_workspace_invite().await;
@@ -2290,18 +2325,42 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
         .expect("other invite still challenges");
 
     // Age every nonce past its lifetime: the next challenge purges them.
-    for slot in f.services.invite_nonces.lock().await.values_mut() {
-        slot.expires_at = Instant::now() - Duration::from_secs(1);
-    }
+    expire_nonces(&f.store).await;
     f.services
         .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("challenge after purge");
-    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
-    assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        MAX_OUTSTANDING_NONCES - 1
+    assert_eq!(outstanding_nonces(&f.store).await, 1);
+}
+
+/// The tenant-wide bound: with `MAX_OUTSTANDING_NONCES` outstanding (of
+/// other invites), a challenge is `FlowBusy` and issues nothing; once they
+/// expire it succeeds.
+#[tokio::test]
+async fn challenge_bounds_outstanding_nonces_in_all() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
     );
+    spend_nonce_capacity(&f.store).await;
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::FlowBusy);
+    assert_eq!(
+        outstanding_nonces(&f.store).await,
+        MAX_OUTSTANDING_NONCES as u64
+    );
+    expire_nonces(&f.store).await;
+    f.services
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
+        .await
+        .expect("challenge once the others expired");
+    assert_eq!(outstanding_nonces(&f.store).await, 1);
 }
 
 /// The happy path: a gist owned by the claimed login (case-insensitively),
@@ -2367,11 +2426,7 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
     assert_eq!(row.github_user_id, Some(4242));
     assert_eq!(row.login.as_deref(), Some("guest"));
     assert_eq!(row.display_name.as_deref(), Some("guest name"));
-    assert!(f.services.invite_nonces.lock().await.is_empty(), "consumed");
-    assert_eq!(
-        f.services.invite_nonce_permits.available_permits(),
-        MAX_OUTSTANDING_NONCES
-    );
+    assert_eq!(outstanding_nonces(&f.store).await, 0, "consumed");
     let invite = f
         .store
         .get_workspace_invite(&invite_id)
@@ -2487,11 +2542,7 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
         let r = prove(&f, &n, gist_id, login).await;
         assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid, "{gist_id}");
         assert!(
-            !f.services
-                .invite_nonces
-                .lock()
-                .await
-                .contains_key(n.as_str()),
+            !nonce_open(&f.store, &n).await,
             "{gist_id}: the nonce is spent, not restored"
         );
         // The nonce is spent by the attempt: a matching gist is now too late.
@@ -2527,8 +2578,8 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
     assert!(matches!(r, Err(Error::InvalidParams(_))), "{r:?}");
     // Only `n` is left: refusals before the nonce lookup (closed invite,
     // malformed claim) leave it outstanding until its TTL.
-    let nonces = f.services.invite_nonces.lock().await;
-    assert_eq!(nonces.keys().collect::<Vec<_>>(), vec![&n]);
+    assert_eq!(outstanding_nonces(&f.store).await, 1);
+    assert!(nonce_open(&f.store, &n).await);
 }
 
 /// An expired nonce is `ProofExpired` (and spent); GitHub failing is
@@ -2568,7 +2619,7 @@ async fn prove_reports_expiry_and_unreachable_github() {
         )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
-    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
+    assert!(nonce_open(&f.store, &n).await, "released for a retry");
     // Unreachable on the account lookup as well (unscripted login →
     // `Unsupported` stands in for a transport failure).
     let mut forge = StubForge::default();
@@ -2587,13 +2638,11 @@ async fn prove_reports_expiry_and_unreachable_github() {
         )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
-    assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
+    assert!(nonce_open(&f.store, &n).await, "released for a retry");
     with_forge(&mut f, vec![("ok", Ok(gist("guest", Some(&n))))]);
 
     // Expired: spent, and no forge call is made.
-    for slot in f.services.invite_nonces.lock().await.values_mut() {
-        slot.expires_at = Instant::now() - Duration::from_secs(1);
-    }
+    expire_nonces(&f.store).await;
     let r = f
         .services
         .invite_prove_op(
@@ -2605,7 +2654,7 @@ async fn prove_reports_expiry_and_unreachable_github() {
         )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::ProofExpired);
-    assert!(f.services.invite_nonces.lock().await.is_empty());
+    assert_eq!(outstanding_nonces(&f.store).await, 0);
     let r = f
         .services
         .invite_prove_op(

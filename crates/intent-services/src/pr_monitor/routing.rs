@@ -212,14 +212,16 @@ impl Services {
             .as_ref()
             .is_none_or(|m| &m.monitor().agent_id != agent)
         {
-            let cap = self.pr_monitor_max_per_agent() as usize;
+            // An early refusal before the provider read; the write counts
+            // again under the agent's quota lock.
+            let cap = self.pr_monitor_max_per_agent();
             let active = self
                 .store
                 .list_active_pr_monitors_by_agent(agent)
                 .await?
-                .len();
-            if active >= cap {
-                return Err(Error::InvalidParams(format!("pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory")));
+                .len() as u64;
+            if active >= u64::from(cap) {
+                return Err(crate::pr_monitor::pr_monitor_cap_error(active, cap));
             }
         }
         let ReadOutcome::Managed { result, .. } = prepared
@@ -355,7 +357,8 @@ impl Services {
             };
             #[cfg(test)]
             self.monitor_write_ready();
-            let write = self.store.prepare_monitor_insert(&monitor, &target).await?;
+            let mut write = self.store.prepare_monitor_insert(&monitor, &target).await?;
+            self.admit_monitor_write(&mut write, agent).await?;
             authority.commit(self, write).await?.then_some(monitor)
         }
         .ok_or_else(|| {
@@ -387,6 +390,21 @@ impl Services {
         Ok(out)
     }
 
+    /// Admit a prepared write that makes `agent` own one more active monitor
+    /// under its quota, in the write's own transaction; at the cap the write
+    /// is dropped (rolled back) and the registration refused.
+    async fn admit_monitor_write(
+        &self,
+        write: &mut intent_store::PreparedMonitorWrite,
+        agent: &AgentId,
+    ) -> Result<()> {
+        let cap = self.pr_monitor_max_per_agent();
+        match write.admit_under_quota(agent, u64::from(cap)).await? {
+            None => Ok(()),
+            Some(active) => Err(crate::pr_monitor::pr_monitor_cap_error(active, cap)),
+        }
+    }
+
     /// Qualified deferred registrations retain their private binding even with
     /// no baseline. A nonempty envelope is not a successful provider poll.
     async fn refresh_qualified_monitor(
@@ -408,10 +426,14 @@ impl Services {
         monitor.updated_at = baseline.now;
         #[cfg(test)]
         self.monitor_write_ready();
-        let write = self
+        let mut write = self
             .store
             .prepare_monitor_replace(&expected, &monitor)
             .await?;
+        if expected.monitor().agent_id != *agent {
+            // An ownership transfer counts against the adopter's quota.
+            self.admit_monitor_write(&mut write, agent).await?;
+        }
         if !authority.commit(self, write).await? {
             return Ok(None);
         }
