@@ -251,9 +251,10 @@ impl Store {
             }
             #[cfg(feature = "postgres")]
             crate::Backend::Postgres(backend) => {
-                backend
-                    .upsert_completion_watch_guarded(w, Some(lease))
-                    .await
+                crate::postgres::boxed_call(|| {
+                    backend.upsert_completion_watch_guarded(w, Some(lease))
+                })
+                .await
             }
         }
     }

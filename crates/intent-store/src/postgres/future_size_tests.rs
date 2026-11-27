@@ -90,3 +90,63 @@ async fn store_futures_stay_at_sqlite_size_with_the_postgres_feature() {
         over.join("; ")
     );
 }
+
+/// The sampled sizes above cover `dispatch!` and a few hand-written arms;
+/// this covers every hand-written one. A `Backend::Postgres(..)` match arm
+/// in `src/` whose body awaits must await through `boxed_call` (two arms
+/// that main added after the fix awaited inline). Arms inside the
+/// `dispatch!` / `sqlite_only!` / `pending_postgres!` definitions (`$`
+/// tokens) are the macros themselves.
+#[test]
+fn hand_written_postgres_arms_await_through_boxed_call() {
+    let src = intentd_test_support::source_lint::package_dir().join("src");
+    let mut files = vec![src.clone()];
+    let mut offenders = Vec::new();
+    while let Some(path) = files.pop() {
+        if path.is_dir() {
+            files.extend(
+                std::fs::read_dir(&path)
+                    .expect("read src dir")
+                    .map(|entry| entry.expect("dir entry").path()),
+            );
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !(line.contains("Backend::Postgres(") && line.contains("=>")) || line.contains('$') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let mut arm = vec![*line];
+            for next in &lines[index + 1..] {
+                let next_indent = next.len() - next.trim_start().len();
+                if !next.trim().is_empty() && next_indent <= indent {
+                    if next.trim_start().starts_with('}') && next_indent == indent {
+                        arm.push(next);
+                    }
+                    break;
+                }
+                arm.push(next);
+            }
+            let body = arm.join("\n");
+            if body.contains(".await") && !body.contains("boxed_call") {
+                offenders.push(format!(
+                    "{}:{}",
+                    path.strip_prefix(&src).unwrap_or(&path).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "Postgres arms awaiting inline: {offenders:?}. Await them through \
+         `crate::postgres::boxed_call(|| backend.method(args))`: an inline Postgres future \
+         grows the Store future and every debug poll frame that awaits it"
+    );
+}
