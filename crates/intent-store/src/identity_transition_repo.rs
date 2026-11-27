@@ -86,7 +86,9 @@ impl Store {
                 self.upsert_principal(principal).await
             }
             #[cfg(feature = "postgres")]
-            crate::Backend::Postgres(pg) => pg.upsert_principal_checked(principal, check).await,
+            crate::Backend::Postgres(pg) => {
+                crate::postgres::boxed_call(|| pg.upsert_principal_checked(principal, check)).await
+            }
         }
     }
 
@@ -112,8 +114,10 @@ impl Store {
             }
             #[cfg(feature = "postgres")]
             crate::Backend::Postgres(pg) => {
-                pg.insert_workspace_invite_within_cap_as(invite, max_guests, issuer_identity)
-                    .await
+                crate::postgres::boxed_call(|| {
+                    pg.insert_workspace_invite_within_cap_as(invite, max_guests, issuer_identity)
+                })
+                .await
             }
         }
     }
@@ -136,7 +140,10 @@ impl Store {
                 self.insert_host_invite(invite).await
             }
             #[cfg(feature = "postgres")]
-            crate::Backend::Postgres(pg) => pg.insert_host_invite_as(invite, issuer_identity).await,
+            crate::Backend::Postgres(pg) => {
+                crate::postgres::boxed_call(|| pg.insert_host_invite_as(invite, issuer_identity))
+                    .await
+            }
         }
     }
 
