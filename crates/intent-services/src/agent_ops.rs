@@ -23224,30 +23224,6 @@ fn legacy_auggie_shape(mut out: Value) -> Value {
     out
 }
 
-#[cfg(test)]
-mod legacy_auggie_shape_tests {
-    use super::legacy_auggie_shape;
-    use serde_json::json;
-
-    /// An overridden auggie Default's catalog answers the legacy call in the
-    /// legacy shape, never with a provider-scoped field.
-    #[test]
-    fn keeps_the_legacy_shape() {
-        let ok = legacy_auggie_shape(json!({
-            "providerId": "auggie", "models": [{ "id": "m" }], "source": "auggie", "stale": true,
-        }));
-        assert_eq!(
-            ok,
-            json!({ "models": [{ "id": "m" }], "source": "auggie", "stale": true })
-        );
-        let failed = legacy_auggie_shape(json!({
-            "providerId": "auggie", "models": [], "source": "static",
-            "warning": "auggie CLI unavailable", "warningKind": "cli-missing",
-        }));
-        assert_eq!(failed, json!({ "models": [], "source": "static" }));
-    }
-}
-
 /// A won questions-dismissed notice claim (`Store::claim_dismissal_notice`).
 /// [`Self::keep`] once the notice is delivered; [`Self::release`] or a drop
 /// (a cancelled dismissal) gives it back, so a retried dismissal notifies.
@@ -23316,5 +23292,29 @@ async fn release_dismissal_notice(
             error = %e,
             "failed to release the dismissal notice claim; a retry will not notify"
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_auggie_shape_tests {
+    use super::legacy_auggie_shape;
+    use serde_json::json;
+
+    /// An overridden auggie Default's catalog answers the legacy call in the
+    /// legacy shape, never with a provider-scoped field.
+    #[test]
+    fn keeps_the_legacy_shape() {
+        let ok = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [{ "id": "m" }], "source": "auggie", "stale": true,
+        }));
+        assert_eq!(
+            ok,
+            json!({ "models": [{ "id": "m" }], "source": "auggie", "stale": true })
+        );
+        let failed = legacy_auggie_shape(json!({
+            "providerId": "auggie", "models": [], "source": "static",
+            "warning": "auggie CLI unavailable", "warningKind": "cli-missing",
+        }));
+        assert_eq!(failed, json!({ "models": [], "source": "static" }));
     }
 }

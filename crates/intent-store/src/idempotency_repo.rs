@@ -21,6 +21,7 @@ impl IdempotencyClaim {
         Self(token)
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) fn token(&self) -> &str {
         &self.0
     }

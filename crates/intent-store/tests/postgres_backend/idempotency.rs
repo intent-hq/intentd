@@ -88,6 +88,7 @@ async fn open_as_process(db: &crate::harness::TestDb, tenant: &str, process: &st
 }
 
 /// The claim of a `Reserved` reservation; panics on anything else.
+#[track_caller]
 fn reserved(reservation: IdempotencyReservation) -> IdempotencyClaim {
     match reservation {
         IdempotencyReservation::Reserved(claim) => claim,
