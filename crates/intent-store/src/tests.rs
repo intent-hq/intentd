@@ -18,7 +18,6 @@ use sqlx::Row;
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 mod host_membership;
-mod embedded_migrations;
 mod human_attribution;
 mod script_initialization;
 mod script_monitors;

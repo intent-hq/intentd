@@ -6,6 +6,11 @@
 //! directory is a tracked input, and sccache keys on file contents but not
 //! file names, so a pure renumber was served the old build (intentd#3861 got
 //! a duplicate 0203 back). This test fails on such a stale build.
+//!
+//! It is an integration test on purpose: it links the `intent-store` rlib
+//! the way dependent crates do. sccache caches rlibs but never test
+//! binaries, so a unit test is always compiled fresh and cannot see a stale
+//! cached build.
 
 use std::path::{Path, PathBuf};
 
@@ -76,11 +81,11 @@ fn assert_matches_disk(migrator: &Migrator, relative_dir: &str) {
 
 #[test]
 fn embedded_sqlite_migrations_match_migration_files() {
-    assert_matches_disk(&crate::MIGRATOR, "migrations");
+    assert_matches_disk(intent_store::embedded_migrator(), "migrations");
 }
 
 #[cfg(feature = "postgres")]
 #[test]
 fn embedded_postgres_migrations_match_migration_files() {
-    assert_matches_disk(&crate::postgres::MIGRATOR, "postgres/migrations");
+    assert_matches_disk(&intent_store::postgres::MIGRATOR, "postgres/migrations");
 }

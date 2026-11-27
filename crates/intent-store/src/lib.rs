@@ -526,6 +526,15 @@ mod tests;
 /// old, duplicated embedding back).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+/// The `SQLite` migrations embedded in this build, for
+/// `tests/embedded_migrations.rs`, which checks them against the files.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[must_use]
+pub fn embedded_migrator() -> &'static sqlx::migrate::Migrator {
+    &MIGRATOR
+}
+
 /// Persistence handle: the one storage API the rest of the daemon uses.
 /// Cheaply cloneable. Every method dispatches to the backend the handle was
 /// opened with; today that is always [`SqliteStore`].
