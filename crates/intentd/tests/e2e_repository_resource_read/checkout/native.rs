@@ -552,7 +552,7 @@ async fn original_child(instance: &str, sha: &str) {
         late_client.close().await;
         response
     });
-    tokio::time::timeout(acquire(), server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.hold.wait_reached())
         .await
         .unwrap();
     // The actual public auth flow replaces A, not an injected renderer credential.
@@ -595,7 +595,7 @@ async fn original_child(instance: &str, sha: &str) {
     let refused = client.rpc("sourceControl.checkout.branches", q).await;
     assert_eq!(success(&refused)["status"], "unavailable");
     assert!(success(&refused).get("value").is_none());
-    server.state.release.notify_one();
+    server.state.hold.release();
     let late = tokio::time::timeout(acquire(), late)
         .await
         .unwrap()

@@ -1,20 +1,16 @@
 //! Personal pairing uses the actual TLS admission, router, services and `SQLite` store.
 use super::*;
 use intent_transport::{PairingSnapshot, ServerPairingInfo};
+use intentd_test_support::PausePoint;
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 
 struct PairingInfo {
     snapshot: Mutex<PairingSnapshot>,
-    barrier: Mutex<Option<SnapshotBarrier>>,
+    barrier: Mutex<Option<Arc<PausePoint>>>,
     dir: std::path::PathBuf,
     tokens: Arc<AsyncTokenStore>,
-}
-
-struct SnapshotBarrier {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ServerPairingInfo for PairingInfo {
@@ -23,8 +19,7 @@ impl ServerPairingInfo for PairingInfo {
         let barrier = self.barrier.lock().unwrap().take();
         Box::pin(async move {
             if let Some(barrier) = barrier {
-                let _ = barrier.entered.send(());
-                let _ = barrier.release.await;
+                barrier.pause().await;
             }
             snapshot
         })
@@ -130,23 +125,13 @@ async fn personal_pairing_inflight_revalidation_orders_real_revocation_and_remov
             .unwrap();
         let mut second = reconnect(&srv, &person.principal, &token).await;
         let id = person.principal.id.clone();
-        let (entered, arrived) = tokio::sync::oneshot::channel();
-        let (release, wait) = tokio::sync::oneshot::channel();
-        *info.barrier.lock().unwrap() = Some(SnapshotBarrier {
-            entered,
-            release: wait,
-        });
+        let pause = PausePoint::new("pairing snapshot");
+        *info.barrier.lock().unwrap() = Some(pause.clone());
         let pairing = tokio::spawn(async move {
             let result = person.call("pairing.getSelfInfo", json!({})).await;
             (result, person)
         });
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            arrived,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        pause.wait_reached().await;
         // The first credential check succeeded. Commit actual invalidation
         // before permitting the route/profile/final-check portion to complete.
         if remove {
@@ -158,7 +143,7 @@ async fn personal_pairing_inflight_revalidation_orders_real_revocation_and_remov
             );
             assert_closed(&mut second.ws).await;
         }
-        release.send(()).unwrap();
+        pause.release();
         let (result, mut person) = pairing.await.unwrap();
         assert_eq!(result["error"]["data"]["code"], "access-revoked");
         assert!(result.get("result").is_none());
@@ -885,8 +870,8 @@ async fn member_removal_idle_active_tunnels_and_final_control() {
 
 #[derive(Default)]
 struct RemovalAdmissionGate {
-    before: Mutex<Option<SnapshotBarrier>>,
-    after: Mutex<Option<SnapshotBarrier>>,
+    before: Mutex<Option<Arc<PausePoint>>>,
+    after: Mutex<Option<Arc<PausePoint>>>,
 }
 struct RemovalAdmissionApi {
     actual: Arc<dyn WorkspaceApi>,
@@ -906,8 +891,7 @@ impl WorkspaceApi for RemovalAdmissionApi {
             let role = self.actual.principal_host_role(id).await;
             let pause = self.gate.after.lock().unwrap().take();
             if let Some(pause) = pause {
-                let _ = pause.entered.send(());
-                let _ = pause.release.await;
+                pause.pause().await;
             }
             role
         })
@@ -919,8 +903,7 @@ impl WorkspaceApi for RemovalAdmissionApi {
         let pause = self.gate.before.lock().unwrap().take();
         Box::pin(async move {
             if let Some(pause) = pause {
-                let _ = pause.entered.send(());
-                let _ = pause.release.await;
+                pause.pause().await;
             }
             self.actual.resolve_principal_credential(hash).await
         })
@@ -957,28 +940,21 @@ async fn member_removal_connection_admission_both_linearizations_cannot_reopen_a
                 .execute(srv.store.write_pool())
                 .await
                 .unwrap();
-            let (entered, reached) = tokio::sync::oneshot::channel();
-            let (release, wait) = tokio::sync::oneshot::channel();
-            let pause = SnapshotBarrier {
-                entered,
-                release: wait,
-            };
-            if admitted_first {
-                *gate.after.lock().unwrap() = Some(pause);
+            let pause = PausePoint::new(if admitted_first {
+                "after host role"
             } else {
-                *gate.before.lock().unwrap() = Some(pause);
+                "before credential resolution"
+            });
+            if admitted_first {
+                *gate.after.lock().unwrap() = Some(pause.clone());
+            } else {
+                *gate.before.lock().unwrap() = Some(pause.clone());
             }
             let tls = tls_connect(srv.port, srv.cfg.clone()).await;
             let url = format!("wss://localhost:{}{path}?token={token}", srv.port);
             let connect =
                 tokio::spawn(async move { tokio_tungstenite::client_async(url, tls).await });
-            tokio::time::timeout(
-                intentd_test_support::test_timeout(Duration::from_secs(5)),
-                reached,
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            pause.wait_reached().await;
             assert_eq!(
                 admin
                     .call(
@@ -988,7 +964,7 @@ async fn member_removal_connection_admission_both_linearizations_cannot_reopen_a
                     .await["result"]["removed"],
                 true
             );
-            release.send(()).unwrap();
+            pause.release();
             let result = connect.await.unwrap();
             if admitted_first {
                 let (mut socket, _) = result.expect("the already admitted handshake may finish");
@@ -1036,23 +1012,13 @@ async fn member_removal_invalidates_inflight_personal_pairing_through_real_owner
         &phone.principal,
         "member",
     );
-    let (entered, reached) = tokio::sync::oneshot::channel();
-    let (release, wait) = tokio::sync::oneshot::channel();
-    *info.barrier.lock().unwrap() = Some(SnapshotBarrier {
-        entered,
-        release: wait,
-    });
+    let pause = PausePoint::new("pairing snapshot");
+    *info.barrier.lock().unwrap() = Some(pause.clone());
     let pairing = tokio::spawn(async move {
         let response = person.call("pairing.getSelfInfo", json!({})).await;
         (person, response)
     });
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        reached,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    pause.wait_reached().await;
     assert_eq!(
         admin
             .call("host.members.remove", json!({"principalId":id}))
@@ -1060,7 +1026,7 @@ async fn member_removal_invalidates_inflight_personal_pairing_through_real_owner
         true
     );
     assert_closed(&mut phone.ws).await;
-    release.send(()).unwrap();
+    pause.release();
     let (mut person, response) = pairing.await.unwrap();
     assert_eq!(response["error"]["data"]["code"], "access-revoked");
     assert!(!response.to_string().contains(token));

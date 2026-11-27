@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use intentd_test_support::GuardedChild;
+use intentd_test_support::{GuardedChild, PausePoint};
 use invitation_client::{await_workspace_updated, from_raw, wss_rpc, Ws};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -50,7 +50,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
-use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
@@ -409,14 +408,9 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
 /// The mock's scripted gists, keyed by gist id.
 type Gists = Arc<Mutex<HashMap<String, Value>>>;
 
-/// Hold one HTTP response until the test observes the competing operation.
-#[derive(Default)]
-struct ResponseGate {
-    entered: Notify,
-    release: Notify,
-}
-
-type ResponseGates = Arc<Mutex<HashMap<String, Arc<ResponseGate>>>>;
+/// Held HTTP responses, by path: each waits until the test observes the
+/// competing operation. Budgets match the live daemon's (60 s base).
+type ResponseGates = Arc<Mutex<HashMap<String, Arc<PausePoint>>>>;
 
 struct MockGithub {
     base_uri: String,
@@ -429,8 +423,12 @@ struct MockGithub {
 }
 
 impl MockGithub {
-    fn hold_response(&self, path: &str) -> Arc<ResponseGate> {
-        let gate = Arc::new(ResponseGate::default());
+    fn hold_response(&self, path: &str) -> Arc<PausePoint> {
+        let gate = Arc::new(
+            PausePoint::unshared(format!("mock GitHub {path}"))
+                .with_reach_timeout(Duration::from_secs(60))
+                .with_hold_timeout(Duration::from_secs(60)),
+        );
         self.response_gates
             .lock()
             .unwrap()
@@ -602,8 +600,7 @@ async fn serve_conn(
     let path_only = path.split('?').next().unwrap_or_default();
     let gate = response_gates.lock().unwrap().remove(path_only);
     if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
+        gate.pause().await;
     }
     let (status, payload) = if path_only == "/login/device/code" {
         let n = flows.fetch_add(1, Ordering::SeqCst);
@@ -1547,9 +1544,7 @@ async fn invite_mint_during_startup_identity_refresh_over_wss() {
         .expect("workspace id")
         .to_string();
 
-    timeout(common::daemon_startup_timeout(), profile.entered.notified())
-        .await
-        .expect("startup GET /user did not arrive");
+    profile.wait_reached().await;
     let mut observer = connect_ws(port, cfg.clone(), TOKEN).await;
     let me = wss_rpc(&mut observer, 190, "principal.me", json!({})).await;
     assert!(me.get("error").is_none(), "principal.me: {me}");
@@ -1565,15 +1560,10 @@ async fn invite_mint_during_startup_identity_refresh_over_wss() {
         json!({ "workspaceId": ws_id, "pinProvider": "github", "pinLogin": "guest" }),
     );
     let transition = async {
-        timeout(
-            common::daemon_startup_timeout(),
-            recipient.entered.notified(),
-        )
-        .await
-        .expect("invite recipient lookup did not arrive");
-        profile.release.notify_one();
+        recipient.wait_reached().await;
+        profile.release();
         await_owner_identity(&mut observer).await;
-        recipient.release.notify_one();
+        recipient.release();
     };
     let (v, ()) = tokio::join!(mint, transition);
     assert_eq!(v["error"]["code"], json!(-32603), "invite.create: {v}");

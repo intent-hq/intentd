@@ -519,8 +519,7 @@ async fn home_attachments_survive_a_machine_restart() {
 /// Home records whose calls ignore their stop and end only when released:
 /// a cleanup that does not finish.
 struct StuckRecords {
-    release: tokio::sync::watch::Sender<bool>,
-    started: Arc<std::sync::atomic::AtomicUsize>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 
 impl runner::HomeRecords for StuckRecords {
@@ -542,11 +541,9 @@ impl runner::HomeRecords for StuckRecords {
         _params: serde_json::Map<String, Value>,
         _stop: tokio::sync::watch::Receiver<bool>,
     ) -> intent_core::BoxFuture<'static, Result<Value, intent_core::node_link::HomeCallError>> {
-        let mut release = self.release.subscribe();
-        self.started
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pause = self.pause.clone();
         Box::pin(async move {
-            let _ = release.wait_for(|released| *released).await;
+            pause.pause().await;
             Ok(json!({ "late": true }))
         })
     }
@@ -558,11 +555,9 @@ impl runner::HomeRecords for StuckRecords {
 #[tokio::test]
 async fn a_cancelled_call_stays_running_until_its_cleanup_ends() {
     let dir = tempfile::tempdir().unwrap();
-    let (release, _) = tokio::sync::watch::channel(false);
-    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pause = intentd_test_support::PausePoint::new("stuck home call cleanup");
     let records: Arc<dyn runner::HomeRecords> = Arc::new(StuckRecords {
-        release: release.clone(),
-        started: started.clone(),
+        pause: pause.clone(),
     });
     let node = Running::start_with_records(
         dir.path(),
@@ -590,10 +585,7 @@ async fn a_cancelled_call_stays_running_until_its_cleanup_ends() {
     let id = stuck.request_id;
     let again = stuck.clone();
     dialed.link.send(&LinkFrame::HomeCall(stuck)).await.unwrap();
-    until("the call started", || {
-        started.load(std::sync::atomic::Ordering::SeqCst) == 1
-    })
-    .await;
+    pause.wait_reached().await;
     dialed
         .link
         .send(&LinkFrame::HomeCallCancel(HomeCallCancel {
@@ -614,11 +606,12 @@ async fn a_cancelled_call_stays_running_until_its_cleanup_ends() {
     .await;
     assert_eq!(refused.request_id, id);
     assert_eq!(err(&refused).0, -32602, "{refused:?}");
-    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(pause.arrivals(), 1);
 
-    release.send_replace(true);
+    pause.release();
     until("the cleanup ended", || runner.home_calls_for_test() == 0).await;
-    // The late result is not answered.
+    // The late result is not answered; the probe passes the pause at once.
+    pause.release();
     let probe = call_frame(&h1, "file.exists", json!({ "path": "b" }), 30_000);
     let probe_id = probe.request_id;
     dialed.link.send(&LinkFrame::HomeCall(probe)).await.unwrap();

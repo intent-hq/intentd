@@ -1,11 +1,9 @@
 //! Imported human input requires the exact current owner credential at dequeue.
 use super::*;
 use intent_core::AgentId;
+use intentd_test_support::PausePoint;
 use serde_json::json;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Condvar,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct DurableToken(std::path::PathBuf);
 impl TokenStore for DurableToken {
@@ -20,15 +18,13 @@ impl TokenStore for DurableToken {
 /// Pause the first real SQL read after dispatch, before any dequeue. The
 /// destructor always releases `SQLite`, even if the async assertion panics.
 struct ReadBarrier {
-    reached: Arc<tokio::sync::Notify>,
-    release: Arc<(Mutex<bool>, Condvar)>,
+    pause: Arc<PausePoint>,
     armed: Arc<AtomicBool>,
 }
 impl ReadBarrier {
     async fn install(store: &Store) -> Self {
         let barrier = Self {
-            reached: Arc::default(),
-            release: Arc::default(),
+            pause: PausePoint::new("imported queue SQL barrier"),
             armed: Arc::default(),
         };
         let mut connections = Vec::new();
@@ -36,30 +32,14 @@ impl ReadBarrier {
             connections.push(store.read_pool().acquire().await.unwrap());
         }
         for connection in &mut connections {
-            let (armed, reached, release) = (
-                barrier.armed.clone(),
-                barrier.reached.clone(),
-                barrier.release.clone(),
-            );
+            let (armed, pause) = (barrier.armed.clone(), barrier.pause.clone());
             connection
                 .lock_handle()
                 .await
                 .unwrap()
                 .set_progress_handler(1, move || {
                     if armed.swap(false, Ordering::SeqCst) {
-                        reached.notify_one();
-                        let (lock, cv) = &*release;
-                        let (_released, timeout) = cv
-                            .wait_timeout_while(
-                                lock.lock().unwrap(),
-                                intentd_test_support::test_timeout(Duration::from_secs(15)),
-                                |v| !*v,
-                            )
-                            .unwrap();
-                        assert!(
-                            !timeout.timed_out(),
-                            "SQL barrier must be explicitly released"
-                        );
+                        pause.pause_blocking();
                     }
                     true
                 });
@@ -68,15 +48,10 @@ impl ReadBarrier {
     }
     async fn after_pop(store: &Store) -> Self {
         let barrier = Self {
-            reached: Arc::default(),
-            release: Arc::default(),
+            pause: PausePoint::new("imported queue SQL barrier"),
             armed: Arc::default(),
         };
-        let (armed, reached, release) = (
-            barrier.armed.clone(),
-            barrier.reached.clone(),
-            barrier.release.clone(),
-        );
+        let (armed, pause) = (barrier.armed.clone(), barrier.pause.clone());
         store
             .write_pool()
             .acquire()
@@ -90,27 +65,13 @@ impl ReadBarrier {
                     && row.operation == sqlx::sqlite::SqliteOperation::Delete
                     && armed.swap(false, Ordering::SeqCst)
                 {
-                    reached.notify_one();
-                    let (lock, cv) = &*release;
-                    let (_released, timeout) = cv
-                        .wait_timeout_while(
-                            lock.lock().unwrap(),
-                            intentd_test_support::test_timeout(Duration::from_secs(15)),
-                            |v| !*v,
-                        )
-                        .unwrap();
-                    assert!(
-                        !timeout.timed_out(),
-                        "post-pop delivery barrier must release"
-                    );
+                    pause.pause_blocking();
                 }
             });
         barrier
     }
     fn release(&self) {
-        let (lock, cv) = &*self.release;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
+        self.pause.release();
     }
 }
 impl Drop for ReadBarrier {
@@ -223,12 +184,7 @@ async fn imported_owner_case(change: Change, runtime: bool) {
             json!({"workspaceId":ws,"agentId":agent,"messageId":"imported-fence"}),
         )
         .await;
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(10)),
-        barrier.reached.notified(),
-    )
-    .await
-    .unwrap();
+    barrier.pause.wait_reached().await;
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_queue WHERE id='imported-fence'")
             .fetch_one(if after_pop {
