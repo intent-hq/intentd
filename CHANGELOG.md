@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.314] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- *(providers)* Require npm 7.7+ for npx provider launches ([#3839](https://github.com/intent-hq/intentd/pull/3839))
+
+### 🔧 Refactor
+
+- *(tests)* Enforce backend-before-fake drop order in cloud e2e helpers ([#3843](https://github.com/intent-hq/intentd/pull/3843))
+
+### 🧪 Testing
+
+- Golden-check client.hello capabilities against the protocol fixture ([#3830](https://github.com/intent-hq/intentd/pull/3830))
+
+### ⚙️ Miscellaneous Tasks
+
+- Nightly smoke test of pinned npm provider packages ([#3840](https://github.com/intent-hq/intentd/pull/3840))
+
+
 ## [0.11.313] - 2026-11-27
 
 ### 🚀 Features
