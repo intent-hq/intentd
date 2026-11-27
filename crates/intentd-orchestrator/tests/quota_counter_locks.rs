@@ -130,6 +130,7 @@ async fn parked(park: &GetPrPark) {
 
 /// The one outcome of two registrations that both passed the early count:
 /// one registered, the other refused at the cap by its write.
+#[track_caller]
 fn assert_one_admitted<T: std::fmt::Debug>(
     left: intent_core::Result<T>,
     right: intent_core::Result<T>,

@@ -144,7 +144,7 @@ impl Store {
     }
 }
 
-fn db(e: sqlx::Error) -> Error {
+fn db(e: impl std::fmt::Display) -> Error {
     Error::Internal(format!("invite_nonce: {e}"))
 }
 
