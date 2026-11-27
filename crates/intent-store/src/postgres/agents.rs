@@ -802,7 +802,9 @@ impl PgStore {
         tx.commit().await.map_err(db)?;
         let mut out: HashMap<WorkspaceId, Vec<AgentSessionSummary>> = HashMap::new();
         for row in &rows {
-            let session = map_summary(row)?;
+            let mut session = map_session(row, false)?;
+            crate::agent_repo::drop_list_card_metadata_keys(&mut session.metadata);
+            let session = AgentSessionSummary::from_session(session);
             out.entry(session.workspace_id.clone())
                 .or_default()
                 .push(session);

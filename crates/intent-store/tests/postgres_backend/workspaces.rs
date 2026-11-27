@@ -565,7 +565,7 @@ parity_test!(workspace_git_roots, |store, tenant| {
         .unwrap()
         .is_empty());
     assert!(store
-        .list_workspace_git_roots_with_prs(true)
+        .list_workspace_git_roots_with_prs(std::slice::from_ref(&ws))
         .await
         .unwrap()
         .is_empty());
@@ -643,11 +643,16 @@ parity_test!(workspace_git_roots, |store, tenant| {
     assert_eq!(got.updated_at, T2);
     assert_eq!(
         store
-            .list_workspace_git_roots_with_prs(false)
+            .list_workspace_git_roots_with_prs(&[ws.clone(), wid("ws-none")])
             .await
             .unwrap(),
         std::slice::from_ref(&got)
     );
+    assert!(store
+        .list_workspace_git_roots_with_prs(&[wid("ws-none")])
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         store
             .list_workspace_git_roots_referencing_pr_url(&url.to_uppercase())

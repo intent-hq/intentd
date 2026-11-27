@@ -64,6 +64,50 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     stop_reason, stop_reason_timestamp, reasoning_effort, \
     effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy, goal, goal_set_by";
 
+/// Top-level `metadata` keys holding prompt copies: the behavior prompt, the
+/// specialist's generated prompt and the spawn message. They are most of a
+/// session row's `metadata` bytes (~7 KB per agent on a busy host), and no
+/// `workspace.list` card reads them, so the batch summary read behind the list
+/// leaves them out.
+pub(crate) const LIST_CARD_DROPPED_METADATA_KEYS: [&str; 3] = [
+    "behaviorPrompt",
+    "specialistGeneratedBehaviorPrompt",
+    "initialMessage",
+];
+
+/// [`SESSION_SUMMARY_COLUMNS`] with [`LIST_CARD_DROPPED_METADATA_KEYS`]
+/// removed from `metadata` in SQL, so the bytes are never transferred or
+/// parsed. Malformed JSON passes through unchanged and still fails the row
+/// decode.
+fn list_card_summary_columns() -> String {
+    let paths = LIST_CARD_DROPPED_METADATA_KEYS
+        .iter()
+        .map(|key| format!("'$.{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let columns = SESSION_SUMMARY_COLUMNS.replacen(
+        " metadata,",
+        &format!(
+            " CASE WHEN json_valid(metadata) THEN json_remove(metadata, {paths}) \
+             ELSE metadata END AS metadata,"
+        ),
+        1,
+    );
+    debug_assert_ne!(columns, SESSION_SUMMARY_COLUMNS);
+    columns
+}
+
+/// The Rust-side form of [`list_card_summary_columns`] for backends that
+/// decode `metadata` first.
+#[cfg(feature = "postgres")]
+pub(crate) fn drop_list_card_metadata_keys(metadata: &mut Option<serde_json::Value>) {
+    if let Some(serde_json::Value::Object(map)) = metadata {
+        for key in LIST_CARD_DROPPED_METADATA_KEYS {
+            map.remove(key);
+        }
+    }
+}
+
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
 /// (intent-hq/monorepo#3587 regression guard: this hot read must never scan
@@ -1460,7 +1504,8 @@ impl Store {
 
     /// Message-free session summaries for all requested workspaces in one
     /// statement, grouped by workspace while preserving per-workspace creation
-    /// order.
+    /// order — the `workspace.list` card read. `metadata` omits
+    /// [`LIST_CARD_DROPPED_METADATA_KEYS`]; every other key is kept.
     ///
     /// # Errors
     ///
@@ -3266,8 +3311,9 @@ impl crate::SqliteStore {
             return Ok(std::collections::HashMap::new());
         }
         let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let columns = list_card_summary_columns();
         let sql = format!(
-            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+            "SELECT {columns} FROM agent_session \
              WHERE workspace_id IN ({placeholders}) ORDER BY workspace_id, created_at"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
@@ -18472,6 +18518,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The batch summary read behind `workspace.list` pages drops the
+    /// prompt copies agents persist in `metadata` in SQL, so a page never
+    /// transfers or parses them. Every other key, non-object metadata and
+    /// NULL come back unchanged, and malformed metadata still fails the read
+    /// (the list then falls back to per-workspace reads).
+    #[tokio::test]
+    async fn batch_summaries_drop_prompt_copies_from_metadata() {
+        use serde_json::json;
+
+        let tmp = TempDb::new("batch-summary-prompts");
+        let store = Store::open(&tmp).await.unwrap();
+        let ws = WorkspaceId::from("ws-batch-prompts");
+        let ts = intent_core::now_iso();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        let kept = json!({
+            "specialistName": "Developer",
+            "lastSeenMessageId": "msg-1",
+            "pendingQuestionsMessageId": "msg-2",
+            "nested": {"behaviorPrompt": "kept below the top level"},
+        });
+        let mut heavy = kept.clone();
+        for key in [
+            "behaviorPrompt",
+            "specialistGeneratedBehaviorPrompt",
+            "initialMessage",
+        ] {
+            heavy[key] = json!("x".repeat(4096));
+        }
+        let cases = [
+            (Some(heavy), Some(kept.clone())),
+            (Some(kept.clone()), Some(kept)),
+            (Some(json!({"initialMessage": "only"})), Some(json!({}))),
+            (
+                Some(json!(["behaviorPrompt"])),
+                Some(json!(["behaviorPrompt"])),
+            ),
+            (None, None),
+        ];
+        for (index, (metadata, _)) in cases.iter().enumerate() {
+            let id = AgentId::from(format!("agent-prompts-{index}"));
+            let mut session = baseline_test_session(&id, &ws, &ts, None);
+            session.metadata.clone_from(metadata);
+            store.insert_agent_session(&session).await.unwrap();
+        }
+        let rows = store
+            .list_agent_session_summaries_by_workspace(std::slice::from_ref(&ws))
+            .await
+            .unwrap()
+            .remove(&ws)
+            .unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (index, (_, expected)) in cases.iter().enumerate() {
+            let id = format!("agent-prompts-{index}");
+            let row = rows.iter().find(|row| row.id.0 == id).unwrap();
+            assert_eq!(&row.metadata, expected, "{id}");
+        }
+        sqlx::query("UPDATE agent_session SET metadata = '{not json' WHERE id = ?")
+            .bind("agent-prompts-1")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        assert!(store
+            .list_agent_session_summaries_by_workspace(std::slice::from_ref(&ws))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

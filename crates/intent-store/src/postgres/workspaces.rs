@@ -1848,24 +1848,24 @@ impl PgStore {
 
     pub async fn list_workspace_git_roots_with_prs(
         &self,
-        include_archived: bool,
+        workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<WorkspaceGitRoot>> {
         let columns = roots::COLUMNS;
-        let sql = if include_archived {
-            format!(
-                "SELECT {columns} FROM workspace_git_root \
-                 WHERE tenant_id = $1 AND pull_requests IS NOT NULL \
-                 ORDER BY created_at COLLATE \"C\", row_seq"
-            )
-        } else {
-            format!(
-                "SELECT {columns} FROM workspace_git_root \
-                 WHERE tenant_id = $1 AND pull_requests IS NOT NULL AND workspace_id IN \
-                 (SELECT id FROM workspace WHERE tenant_id = $1 AND archived = 0) \
-                 ORDER BY created_at COLLATE \"C\", row_seq"
-            )
-        };
-        self.root_rows(&sql, &[]).await
+        let sql = format!(
+            "SELECT {columns} FROM workspace_git_root \
+             WHERE tenant_id = $1 AND pull_requests IS NOT NULL AND workspace_id = ANY($2) \
+             ORDER BY created_at COLLATE \"C\", row_seq"
+        );
+        let ids: Vec<&str> = workspace_ids.iter().map(|id| id.0.as_str()).collect();
+        let mut tx = self.begin().await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(self.tenant())
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        rows.iter().map(map_root_row).collect()
     }
 
     pub async fn list_workspace_git_roots_referencing_pr_url(

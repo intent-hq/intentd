@@ -556,18 +556,31 @@ parity_test!(
             display
         );
         let batch = store
-            .list_display_status_pr_monitors_by_workspaces(&[
+            .load_pr_monitor_reads_by_workspaces(&[
                 ws_b.clone(),
                 wid("ws-none"),
                 ws_a.clone(),
+                wid("ws-z"),
             ])
             .await
             .unwrap();
-        let mut expected = display.to_vec();
-        expected.extend(["m-c", "m-u9"]);
-        assert_eq!(ids(&batch), expected);
+        assert!(
+            !batch.contains_key(&wid("ws-none")),
+            "no monitors, no entry"
+        );
+        assert_eq!(ids(&batch[&ws_a].display_rows), display);
+        assert_eq!(ids(&batch[&ws_b].display_rows), ["m-c", "m-u9"]);
+        assert_eq!(
+            entry_keys(&batch[&ws_b].list_entries),
+            keys(&[("ws-b", 9), ("ws-b", 9)])
+        );
+        assert_eq!(
+            entry_keys(&batch[&wid("ws-z")].list_entries),
+            keys(&[("ws-z", 1)]),
+            "archived ids are served when asked"
+        );
         assert!(store
-            .list_display_status_pr_monitors_by_workspaces(&[])
+            .load_pr_monitor_reads_by_workspaces(&[])
             .await
             .unwrap()
             .is_empty());
@@ -577,32 +590,7 @@ parity_test!(
             ["m-b0", "m-c", "m-z", "m-u9", "m-a", "m-Z", "m-q", "m-lgw"]
         );
 
-        let all = store
-            .load_non_cancelled_pr_monitor_list_entries(true)
-            .await
-            .unwrap();
-        assert_eq!(
-            entry_keys(&all),
-            keys(&[
-                ("ws-a", 3),
-                ("ws-a", 4),
-                ("ws-a", 5),
-                ("ws-a", 6),
-                ("ws-b", 9),
-                ("ws-z", 1),
-                ("ws-b", 9),
-                ("ws-a", 2),
-                ("ws-a", 1),
-                ("ws-a", 7),
-                ("ws-a", 8),
-            ])
-        );
-        let live = store
-            .load_non_cancelled_pr_monitor_list_entries(false)
-            .await
-            .unwrap();
-        assert!(live.iter().all(|e| e.workspace_id != wid("ws-z")));
-        assert_eq!(live.len(), all.len() - 1);
+        let all = &batch[&ws_a].list_entries;
         let one = all
             .iter()
             .find(|e| e.pr_number == 1 && e.workspace_id == ws_a)
@@ -652,6 +640,7 @@ parity_test!(
             ])
         );
         assert_eq!(ids(&reads.display_rows), display);
+        assert_eq!(format!("{:?}", batch[&ws_a]), format!("{reads:?}"));
         let z = reads
             .display_rows
             .iter()

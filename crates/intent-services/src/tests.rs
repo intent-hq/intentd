@@ -34,6 +34,7 @@ mod workspace_create_future_size;
 mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
+mod workspace_list_latency;
 mod workspace_plain_folder;
 mod workspace_plain_folder_events;
 mod workspace_plain_folder_safety;
@@ -2121,14 +2122,16 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         "workspace.get merges the archived workspace's git-root PR"
     );
 
-    // Archived-excluding bulk reads filter archived-workspace rows in SQL.
+    // The bulk read is scoped to the requested workspaces.
     let roots = store
-        .list_workspace_git_roots_with_prs(false)
+        .list_workspace_git_roots_with_prs(&[ws1.clone(), ws2.clone()])
         .await
         .expect("roots");
     assert!(
-        roots.iter().all(|r| r.workspace_id != ws5),
-        "archived workspace's roots excluded from the non-archived read"
+        roots
+            .iter()
+            .all(|r| r.workspace_id == ws1 || r.workspace_id == ws2),
+        "only the requested workspaces' roots"
     );
 
     // Emit-path only: nothing was persisted back to workspace.pull_requests.

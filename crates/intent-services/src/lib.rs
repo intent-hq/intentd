@@ -602,6 +602,9 @@ struct WorkspaceAggregateSnapshot {
     /// once the workspace's own PR copies are at hand
     /// ([`pr_monitor::fold_monitor_pr_signals`]).
     monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>>,
+    /// Each workspace's non-cancelled monitors as PR-merge projections, from
+    /// the same read; handed to [`Services::merge_external_pull_requests`].
+    monitor_list_entries: HashMap<WorkspaceId, Vec<intent_store::PrMonitorListEntry>>,
     /// PRs persisted on each workspace's secondary git roots
     /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
     /// read, fed to the displayStatus PR rungs during enrichment and then
@@ -4177,13 +4180,11 @@ impl Services {
     }
 
     /// Load every store-backed list aggregate in a constant number of
-    /// statements, then pre-fold the PR and legacy-question projections.
-    /// `include_archived` mirrors the list call's flag so the git-root PR
-    /// bulk read never pays for archived workspaces the list won't return.
+    /// statements, each scoped to `workspace_ids` (one page), then pre-fold
+    /// the PR and legacy-question projections.
     async fn workspace_aggregate_snapshot(
         &self,
         workspace_ids: &[WorkspaceId],
-        include_archived: bool,
     ) -> WorkspaceAggregateSnapshot {
         let (max_note_updated_at, task_stats, sessions, unread) = tokio::join!(
             self.store.max_note_updated_at_by_workspace(workspace_ids),
@@ -4197,11 +4198,10 @@ impl Services {
             self.store
                 .workspaces_with_active_hooks_or_script_monitors(workspace_ids),
             self.store
-                .list_display_status_pr_monitors_by_workspaces(workspace_ids),
+                .load_pr_monitor_reads_by_workspaces(workspace_ids),
             self.store
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
-            self.store
-                .list_workspace_git_roots_with_prs(include_archived),
+            self.store.list_workspace_git_roots_with_prs(workspace_ids),
         );
 
         let task_stats = match task_stats {
@@ -4257,16 +4257,27 @@ impl Services {
         };
         let mut active_pr_monitors = HashSet::new();
         let mut monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>> = HashMap::new();
-        if let Ok(monitors) = monitors {
-            for monitor in monitors {
-                if monitor.state == intent_core::PrMonitorState::Active {
-                    active_pr_monitors.insert(monitor.workspace_id.clone());
+        let mut monitor_list_entries: HashMap<WorkspaceId, Vec<intent_store::PrMonitorListEntry>> =
+            HashMap::new();
+        match monitors {
+            Ok(monitors) => {
+                for (workspace_id, reads) in monitors {
+                    if reads
+                        .display_rows
+                        .iter()
+                        .any(|m| m.state == intent_core::PrMonitorState::Active)
+                    {
+                        active_pr_monitors.insert(workspace_id.clone());
+                    }
+                    monitor_rows.insert(workspace_id.clone(), reads.display_rows);
+                    monitor_list_entries.insert(workspace_id, reads.list_entries);
                 }
-                monitor_rows
-                    .entry(monitor.workspace_id.clone())
-                    .or_default()
-                    .push(monitor);
             }
+            // Degrades to no monitor PRs rather than failing the list.
+            Err(error) => tracing::warn!(
+                %error,
+                "workspace.list: batch pr monitor read failed; rows derive without monitors"
+            ),
         }
         // A read failure degrades to no git-root PRs (the pre-fold
         // derivation) rather than failing the list.
@@ -4348,6 +4359,7 @@ impl Services {
             },
             active_pr_monitors,
             monitor_rows,
+            monitor_list_entries,
             git_root_prs,
             legacy_question_holds,
         }
@@ -4498,26 +4510,13 @@ impl Services {
     /// A row with nothing to merge is left untouched (a `None`
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
-    /// degrades to serving the base rows. `include_archived` mirrors the
-    /// list call's flag so the monitor bulk read never pays for archived
-    /// workspaces the list won't return.
-    pub(crate) async fn merge_external_pull_requests(
-        &self,
+    /// degrades to serving the base rows. Both inputs come from the page's
+    /// aggregate snapshot, scoped to the page's workspaces: no store reads.
+    pub(crate) fn merge_external_pull_requests(
         list: &mut [Workspace],
-        include_archived: bool,
         git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
+        monitors: HashMap<WorkspaceId, Vec<intent_store::PrMonitorListEntry>>,
     ) {
-        let monitors = match self
-            .store
-            .load_non_cancelled_pr_monitor_list_entries(include_archived)
-            .await
-        {
-            Ok(monitors) => monitors,
-            Err(e) => {
-                tracing::warn!(error = %e, "workspace.list: pr monitor read failed; skipping");
-                Vec::new()
-            }
-        };
         if git_root_prs.is_empty() && monitors.is_empty() {
             return;
         }
@@ -4526,13 +4525,13 @@ impl Services {
         // priority. The snapshot never carries an empty git-root list, so no
         // entry here can flip an omitted workspace `pullRequests` into `[]`.
         let mut git_root_prs = git_root_prs;
-        let mut monitor_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
-        for monitor in &monitors {
-            monitor_prs
-                .entry(monitor.workspace_id.clone())
-                .or_default()
-                .push(pr_monitor::pr_monitor_pr_info(monitor));
-        }
+        let mut monitor_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = monitors
+            .into_iter()
+            .map(|(workspace_id, entries)| {
+                let prs = entries.iter().map(pr_monitor::pr_monitor_pr_info).collect();
+                (workspace_id, prs)
+            })
+            .collect();
         for ws in list.iter_mut() {
             let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
             let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
@@ -8599,12 +8598,8 @@ impl Services {
     pub(crate) async fn finish_workspace_list(
         &self,
         list: &mut Vec<Workspace>,
-        filter: intent_core::WorkspaceListFilter,
         full: bool,
     ) -> Result<()> {
-        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
-        // reads below must cover them whenever the list includes them.
-        let include_archived = filter.include_archived || filter.include_retired;
         // Membership filter (multiplayer w3) before any enrichment, so a
         // collaborator's rows never cost more than what it can see.
         self.retain_member_workspaces(list).await?;
@@ -8615,9 +8610,7 @@ impl Services {
         let started = std::time::Instant::now();
         let count = list.len();
         let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-        let snapshot = self
-            .workspace_aggregate_snapshot(&workspace_ids, include_archived)
-            .await;
+        let mut snapshot = self.workspace_aggregate_snapshot(&workspace_ids).await;
         for ws in list.iter_mut() {
             self.enrich_workspace_from_snapshot(ws, &snapshot, full)
                 .await;
@@ -8637,8 +8630,11 @@ impl Services {
         // merged `pullRequests`. The git-root PRs move out of the
         // snapshot — the list's one bulk git-root read serves both the
         // derivation and the wire merge.
-        self.merge_external_pull_requests(list, include_archived, snapshot.git_root_prs)
-            .await;
+        Self::merge_external_pull_requests(
+            list,
+            snapshot.git_root_prs,
+            std::mem::take(&mut snapshot.monitor_list_entries),
+        );
         // List-frame slimming (monorepo#3041): the final pass, after
         // enrichment and the PR merge, so base rows served on the panic
         // degradation path above (still carrying persisted `tokenUsage` /
@@ -22387,7 +22383,7 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         Box::pin(async move {
             let mut list = store.list_workspaces(filter).await?;
-            this.finish_workspace_list(&mut list, filter, true).await?;
+            this.finish_workspace_list(&mut list, true).await?;
             Ok(list)
         })
     }
@@ -22408,7 +22404,7 @@ impl WorkspaceApi for Services {
             // `taskStats` (counting query, no note-body hydration),
             // and `displayStatus` (same derivation as the enriched path).
             let mut list = store.list_workspaces(filter).await?;
-            this.finish_workspace_list(&mut list, filter, false).await?;
+            this.finish_workspace_list(&mut list, false).await?;
             Ok(list)
         })
     }
@@ -22452,7 +22448,7 @@ impl WorkspaceApi for Services {
             let last_scanned = list
                 .last()
                 .map(|ws| crate::pagination::encode_keyset_token(&scope, &ws.created_at, &ws.id.0));
-            this.finish_workspace_list(&mut list, filter, !lite).await?;
+            this.finish_workspace_list(&mut list, !lite).await?;
             let kept = crate::pagination::fit_rows_to_budget(
                 &list,
                 intent_core::WORKSPACE_LIST_BUDGET_BYTES,
