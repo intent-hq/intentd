@@ -119,10 +119,12 @@ fn unavailable_stubs_still_refuse() {
 /// non-Assistant bridge the `ws.app.*` management bindings, whose dispatch
 /// refuses outside the Assistant workspace (`ws.app.question` is the
 /// exception); and on the Assistant the namespaces its docs omit and the
-/// bindings `ws.rpc` replaced (stubs on its own bridge).
+/// bindings `ws.rpc` replaced (stubs on its own bridge). The Labs
+/// `ws.appLibrary.*` tools are documented only by `ws.help("appLibrary")`.
 fn listed(path: &str, is_chief: bool) -> bool {
     let namespace = path.split('.').next().unwrap_or_default();
     !UNAVAILABLE_STUBS.contains(&path)
+        && namespace != "appLibrary"
         && (is_chief || !path.starts_with("app.") || path.starts_with("app.question."))
         && !(is_chief && CHIEF_OMITTED_NAMESPACES.contains(&namespace))
         && !(is_chief
