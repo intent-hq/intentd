@@ -226,6 +226,12 @@ impl Services {
         self.with_completion_claim_park(park)
     }
 
+    /// Test seam: `with_browser_pin_park`.
+    #[must_use]
+    pub fn with_browser_pin_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.with_browser_pin_park(park)
+    }
+
     /// Test seam: `with_completion_send_park`.
     #[must_use]
     pub fn with_completion_send_park_for_test(self, park: Arc<CompletionClassifyPark>) -> Self {

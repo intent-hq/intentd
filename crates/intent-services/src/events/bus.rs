@@ -299,6 +299,44 @@ impl EventBus {
         boxed_await(|| self.publish_raw(ev)).await
     }
 
+    /// `ev` as [`Self::publish`] would persist it, for a domain write that
+    /// appends it in its own transaction and hands it back to this bus
+    /// through [`intent_store::CommittedEvents`] (the store's after-commit
+    /// hand-off) instead of publishing it: re-stamped with the bound wire
+    /// principal as `publish` does.
+    ///
+    /// # Errors
+    ///
+    /// `Error::InvalidParams` for an event `publish` treats specially, which
+    /// must keep going through it: a home record's event (never stored), a
+    /// transient `file:*` event, an `agent:tool:call` (persisted truncated),
+    /// note and task events (they update the task projection) and
+    /// `workspace:deleted` (it clears the task-event baselines).
+    pub async fn prepare_append(&self, ev: &NewEvent) -> Result<NewEvent> {
+        let special = ev.workspace_id.is_home_record()
+            || is_transient_file_event(ev)
+            || matches!(
+                ev.event_type.as_str(),
+                intent_core::events::NOTE_CREATED
+                    | intent_core::events::NOTE_UPDATED
+                    | intent_core::events::NOTE_DELETED
+                    | intent_core::events::TASK_CREATED
+                    | intent_core::events::TASK_STATUS_CHANGED
+                    | intent_core::events::WORKSPACE_DELETED
+                    | intent_core::events::AGENT_TOOL_CALL
+            );
+        if special {
+            return Err(Error::InvalidParams(format!(
+                "{} events go through EventBus::publish, not a transaction append",
+                ev.event_type
+            )));
+        }
+        Ok(self
+            .attribute_to_caller(ev)
+            .await
+            .unwrap_or_else(|| ev.clone()))
+    }
+
     async fn publish_raw(&self, ev: &NewEvent) -> Result<Event> {
         // Admission also covers the attribution lookup, which uses the store.
         // The admitted sender keeps the receiver alive through enqueue; no
@@ -512,6 +550,20 @@ impl EventBus {
             }
             Ok(())
         })
+    }
+}
+
+/// The after-commit hand-off: events a domain write appended in its own
+/// transaction go on the fabric in seq order, with no second insert. The
+/// store calls it after COMMIT while the writer still holds the tenant's
+/// slot, so this process's hand-offs keep seq order; it only places
+/// envelopes on the ring and never waits.
+impl intent_store::CommittedEvents for EventBus {
+    fn committed(&self, events: &[(Event, intent_store::EventSeq)]) {
+        for (event, _) in events {
+            self.tx
+                .publish(Arc::new(BroadcastEvent::Public(event.clone())));
+        }
     }
 }
 

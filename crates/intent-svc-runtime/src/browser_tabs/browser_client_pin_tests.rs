@@ -548,3 +548,58 @@ async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
         "the rejected set leaves the existing pin untouched"
     );
 }
+
+/// The pin's delta commits with the pin and reaches subscribers once, after
+/// the commit: a subscriber that reads the pin when the delta arrives sees
+/// it, and each set publishes exactly one delta.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_delta_arrives_once_after_its_pin_commits() {
+    let reg = FakeRegistry::new(&[
+        ("desktop-a", Some("Desktop A"), true),
+        ("desktop-b", Some("Desktop B"), true),
+    ]);
+    let (_t, _r, svc, bus, ws) = setup(reg).await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    });
+    let mut seen = Vec::new();
+    for target in [Some("desktop-b"), None] {
+        intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            svc.set_workspace_browser_client(ws.clone(), target.map(ClientId::from_string)),
+        )
+        .await
+        .expect("set");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("the delta arrives")
+        .expect("subscription open");
+        for ev in batch {
+            let ev = serde_json::to_value(ev).unwrap();
+            let delta = ev["data"]["changes"]["browserClientId"].clone();
+            let row = bus
+                .store()
+                .workspace_browser_client(&ws)
+                .await
+                .unwrap()
+                .map_or(Value::Null, |c| c.as_str().into());
+            assert_eq!(delta, row, "the delta's pin is committed when it arrives");
+            seen.push(delta);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![json!("desktop-b"), Value::Null],
+        "one delta per set"
+    );
+    let durable = bus
+        .store()
+        .events_by_type(&ws, intent_core::events::WORKSPACE_UPDATED, 10)
+        .await
+        .unwrap();
+    assert_eq!(durable.len(), 2, "each delta is stored once");
+}
