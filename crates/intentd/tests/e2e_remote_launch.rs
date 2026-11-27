@@ -373,15 +373,10 @@ async fn turn(
 }
 
 async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
-    seed_workspace_on(data_dir, repo, false).await
-}
-
-/// [`seed_workspace`]; see [`insert_workspace_on`] for `worktree`.
-async fn seed_workspace_on(data_dir: &Path, repo: &Path, worktree: bool) -> String {
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store");
-    let ws = insert_workspace_on(&store, repo, worktree).await;
+    let ws = insert_workspace_on(&store, repo, false).await;
     store.close().await;
     ws
 }

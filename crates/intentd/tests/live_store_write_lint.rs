@@ -1198,6 +1198,30 @@ async fn t(fixture: &mut Fixture) {
     assert_eq!(hits_of(src), vec![(25, "s.insert_agent".to_owned())]);
 }
 
+/// `common::seed_then_start` writes in its seed closure before the start
+/// closure spawns, and the daemon it returns is a live handle.
+#[test]
+fn seed_then_start_seeds_before_the_daemon_and_returns_a_live_one() {
+    let src = "\
+fn spawn_serve(d: &Path) -> GuardedChild {
+    let mut cmd = common::hermetic_serve_command(d);
+    GuardedChild::spawn(&mut cmd).unwrap()
+}
+async fn seed(store: &Store) { store.upsert_note(&n).await.unwrap(); }
+async fn t(d: &Path) {
+    let (child, id) = common::seed_then_start(
+        d,
+        async |store, _| seed(store).await,
+        async |id| (spawn_serve(d), id),
+    )
+    .await;
+    let store = Store::open(&db).await.unwrap();
+    store.insert_note(&n).await.unwrap();
+}
+";
+    assert_eq!(hits_of(src), vec![(14, "store.insert_note".to_owned())]);
+}
+
 #[test]
 fn follows_helpers_aliases_and_store_params() {
     let src = "\
