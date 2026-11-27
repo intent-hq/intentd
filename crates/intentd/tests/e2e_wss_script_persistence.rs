@@ -1364,3 +1364,170 @@ async fn auto_start_service_follows_local_workspace_lifecycle_over_wss() {
     drop(ws);
     stop(child);
 }
+
+/// Real authenticated WSS contract for script output cursors
+/// (`scriptOutputCursor: 1`, scripts.md "Script output cursors"): every
+/// `script:output` event of run-log output carries `runId`, `daemonBootId` and
+/// contiguous decimal-string positions, and `script.output` with
+/// `cursor: true` returns exactly those bytes and positions.
+#[tokio::test]
+async fn script_output_cursor_matches_streamed_positions_over_wss() {
+    use base64::Engine as _;
+    let data_dir_guard = scratch_dir("cursor");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_guard = create_test_repo();
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let caps = wss_rpc(&mut ws, 1, "system.capabilities", json!({})).await;
+    assert_eq!(caps["scriptOutputCursor"], json!(1), "capability: {caps}");
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "script-cursor",
+            "repositoryPath": repo_guard.path().to_string_lossy(),
+            "skipWorktree": true,
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut ws,
+        3,
+        "script.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "cursor",
+            // timing-guard: keeps the service alive after its output; stopped below
+            "command": "i=0; while [ $i -lt 200 ]; do echo cursor-line-$i; i=$((i+1)); done; echo CURSOR-DONE; exec sleep 600",
+            "mode": "service",
+            "scriptId": "cursor-1",
+        }),
+    )
+    .await;
+    let mut sub = connect_ws(port, cfg).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["script:output"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string(), "{subscribed}");
+    wss_rpc(
+        &mut ws,
+        5,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": "cursor-1" }),
+    )
+    .await;
+
+    let mut streamed = Vec::new();
+    let mut identity: Option<(String, String)> = None;
+    while !String::from_utf8_lossy(&streamed).contains("CURSOR-DONE") {
+        let next = timeout(common::rpc_read_timeout(), sub.next())
+            .await
+            .expect("script:output timed out");
+        let frame: Value = match next {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).expect("json frame"),
+            Some(Ok(Message::Ping(payload))) => {
+                let _ = sub.send(Message::Pong(payload)).await;
+                continue;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        if frame["method"] != "events.event" {
+            continue;
+        }
+        let data = &frame["params"]["event"]["data"];
+        assert_eq!(frame["params"]["event"]["type"], "script:output", "{frame}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data["chunk"].as_str().expect("chunk"))
+            .expect("base64 chunk");
+        let run = data["runId"].as_str().expect("runId").to_owned();
+        let boot = data["daemonBootId"]
+            .as_str()
+            .expect("daemonBootId")
+            .to_owned();
+        assert_eq!(
+            identity.get_or_insert_with(|| (run.clone(), boot.clone())),
+            &(run, boot),
+            "one stream: {frame}"
+        );
+        let start: u64 = data["startOffset"]
+            .as_str()
+            .expect("decimal string")
+            .parse()
+            .unwrap();
+        let end: u64 = data["endOffset"]
+            .as_str()
+            .expect("decimal string")
+            .parse()
+            .unwrap();
+        assert_eq!(start, streamed.len() as u64, "contiguous: {frame}");
+        assert_eq!(
+            end - start,
+            bytes.len() as u64,
+            "range matches chunk: {frame}"
+        );
+        streamed.extend_from_slice(&bytes);
+    }
+    let (run, boot) = identity.expect("streamed output");
+
+    let reply = wss_rpc(
+        &mut ws,
+        6,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": "cursor-1", "maxLines": 10_000, "cursor": true }),
+    )
+    .await;
+    assert_eq!(reply["runId"], run.as_str(), "{reply}");
+    assert_eq!(reply["daemonBootId"], boot.as_str(), "{reply}");
+    assert_eq!(reply["startOffset"], "0", "{reply}");
+    assert_eq!(reply["logStartOffset"], "0", "{reply}");
+    assert_eq!(reply["endOffset"], streamed.len().to_string(), "{reply}");
+    assert!(
+        reply["totalLines"].as_u64().is_some_and(|n| n > 200),
+        "{reply}"
+    );
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(reply["data"].as_str().expect("data"))
+        .expect("base64 data");
+    assert_eq!(data, streamed, "the reply holds exactly the streamed bytes");
+
+    let paged = wss_rpc_envelope(
+        &mut ws,
+        7,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": "cursor-1", "cursor": true, "paginate": true }),
+    )
+    .await;
+    assert_eq!(paged["error"]["code"], json!(-32602), "{paged}");
+    let bare = wss_rpc(
+        &mut ws,
+        8,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": "cursor-1" }),
+    )
+    .await;
+    assert!(
+        bare.is_string(),
+        "the bare string stays the default: {bare}"
+    );
+
+    wss_rpc(
+        &mut ws,
+        9,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": "cursor-1" }),
+    )
+    .await;
+    drop(sub);
+    drop(ws);
+    stop(child);
+}
