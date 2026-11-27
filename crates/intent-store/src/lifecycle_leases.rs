@@ -20,16 +20,25 @@
 //! see `postgres/lifecycle_leases.rs`). Writes of the deleting process stay
 //! under its local admission gate.
 //!
-//! Limits: the work under a lifecycle lease is not fenced by it. If renewals
-//! fail until the TTL passes (the database stopped answering), the keeper's
-//! fence fires and is logged, but the work continues; another process may
-//! then take the key. A holder that crashed blocks the key until the TTL
+//! The work under a lifecycle lease is fenced by it: the holder runs its
+//! writes inside [`LifecycleLease::guard_writes`] (`LeaseKeeper::guard_writes`),
+//! so once the lease expired by the database clock or another process took
+//! the key, each of its Postgres writes fails with `Error::LeaseLost` and
+//! changes nothing, and it stops at [`LifecycleLease::check`] once the
+//! keeper's fence fired. A retry takes the lease again before it continues.
+//! A deletion admits other processes' producers again once its lease
+//! lapsed, so its retry re-reads the workspace after the lease.
+//!
+//! Limits: a holder that crashed blocks the key until the TTL
 //! ([`LIFECYCLE_LEASE_TTL`]) passes, and so does an acquire whose caller was
-//! cancelled after the database granted it.
+//! cancelled after the database granted it. Process work that is not a
+//! store write (stopping sessions, publishing events, deleting folders) is
+//! not fenced; it stops at the next check.
 
+use std::future::Future;
 use std::time::Duration;
 
-use intent_core::Result;
+use intent_core::{Error, Result};
 
 use crate::{LeaseFence, LeaseKeeper, Store};
 
@@ -84,6 +93,46 @@ impl LifecycleLease {
     #[must_use]
     pub fn fence(&self) -> Option<LeaseFence> {
         self.held.as_ref().map(|(_, keeper)| keeper.fence())
+    }
+
+    /// Whether the fence fired: the lease was lost while held.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|(_, keeper)| keeper.is_fired())
+    }
+
+    /// `Ok` while the lease is held (always without one).
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` once the keeper's fence fired: stop the work, a
+    /// retry takes the lease again.
+    pub fn check(&self) -> Result<()> {
+        match &self.held {
+            Some((_, keeper)) if keeper.is_fired() => Err(Error::LeaseLost(format!(
+                "{} lease of {}: {}",
+                keeper.scope(),
+                keeper.key(),
+                keeper.fence().reason().unwrap_or_default()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Runs `fut` so that every Postgres write it makes guards this lease in
+    /// its own transaction ([`LeaseKeeper::guard_writes`]); without a lease
+    /// it runs `fut` as it is. The returned future does not borrow the
+    /// hold.
+    pub fn guard_writes<F: Future>(&self, fut: F) -> impl Future<Output = F::Output> {
+        let guard = self.held.as_ref().map(|(_, keeper)| keeper.write_guard());
+        async move {
+            match guard {
+                Some(guard) => crate::lease_write_guard::guard_scope(guard, fut).await,
+                None => fut.await,
+            }
+        }
     }
 
     /// Releases the lease now.

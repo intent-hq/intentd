@@ -8120,14 +8120,17 @@ impl Services {
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
             let retirement = self.agent_retirement_gates.for_agent(&agent_id);
-            let _retirement = retirement.lock().await?;
-            self.ports
-                .runtime()
-                .cancel_script_monitors(self, session_ws, Some(&agent_id), "owner-deleted")
-                .await?;
-            let deleted = self
-                .store
-                .delete_agent_session(session_ws, &agent_id)
+            let retirement = retirement.lock().await?;
+            // Fenced by the retirement lease (`lifecycle_fence`).
+            let deleted = retirement
+                .guard_writes(async {
+                    self.ports
+                        .runtime()
+                        .cancel_script_monitors(self, session_ws, Some(&agent_id), "owner-deleted")
+                        .await?;
+                    retirement.check()?;
+                    self.store.delete_agent_session(session_ws, &agent_id).await
+                })
                 .await?;
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
@@ -8376,6 +8379,7 @@ impl Services {
             }
         }
         if let Some(existing) = session.retired_at.clone() {
+            self.finish_retired_cleanup(&agent_id).await?;
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
         // Guard: an agent (`ws.agent.retire`, including from its hooks) may
@@ -8399,7 +8403,7 @@ impl Services {
             Some(intent_core::Caller::Wire { .. }) => (true, None),
             _ => (false, None),
         };
-        let _last_top_level_gate = if gated && is_active_top_level(&session) {
+        let last_top_level_gate = if gated && is_active_top_level(&session) {
             let gate = self
                 .agent_retirement_gates
                 .for_workspace(&session.workspace_id);
@@ -8434,13 +8438,37 @@ impl Services {
         } else {
             None
         };
+        // The workspace gate's lease fences the retire below too
+        // (`lifecycle_fence`): a retire that lost it writes nothing.
+        // Boxed: keeps this future (and every caller's) small.
+        let retire = Box::pin(self.agent_retire_guarded(
+            &agent_id,
+            session,
+            reason.as_deref(),
+            last_top_level_gate.as_ref(),
+        ));
+        match &last_top_level_gate {
+            Some(gate) => gate.guard_writes(retire).await,
+            None => retire.await,
+        }
+    }
+
+    /// The fenced part of [`Self::agent_retire_op`]: the descendant guard,
+    /// the retire transition and its cascade.
+    async fn agent_retire_guarded(
+        &self,
+        agent_id: &AgentId,
+        session: AgentSessionSummary,
+        reason: Option<&str>,
+        last_top_level_gate: Option<&crate::RetirementGuard>,
+    ) -> Result<Value> {
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn
         // (pending/active/Processing). NOTHING is mutated on rejection (no
         // partial cascade). Retired descendants are inert and never count;
         // idle/waiting children pass the guard and are cascade-retired
         // below.
-        let descendants = self.collect_retire_descendants(&agent_id).await?;
+        let descendants = self.collect_retire_descendants(agent_id).await?;
         let active: Vec<String> = descendants
             .iter()
             .filter(|c| c.retired_at.is_none() && c.status.is_running_turn())
@@ -8454,9 +8482,12 @@ impl Services {
                 active.join(", ")
             )));
         }
+        if let Some(gate) = last_top_level_gate {
+            gate.check()?;
+        }
         let mut session = session;
         let now = loop {
-            if let Some(now) = self.retire_one_session(&session, reason.as_deref()).await? {
+            if let Some(now) = self.retire_one_session(&session, reason).await? {
                 break now;
             }
             // Lost the CAS to a concurrent retire: re-read. While the
@@ -8464,7 +8495,7 @@ impl Services {
             // timestamp; if a concurrent restore already cleared it again,
             // retry the retire instead of fabricating a timestamp for an
             // agent that is not actually retired.
-            session = self.store.get_agent_session_summary(&agent_id).await?;
+            session = self.store.get_agent_session_summary(agent_id).await?;
             if let Some(existing) = session.retired_at.clone() {
                 return Ok(
                     json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
@@ -8541,7 +8572,26 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let gate = self.agent_retirement_gates.for_agent(&session.id);
-        let _retirement = gate.lock().await?;
+        let retirement = gate.lock().await?;
+        // Fenced by the retirement lease (`lifecycle_fence`).
+        retirement
+            .guard_writes(Box::pin(self.retire_one_session_fenced(
+                session,
+                reason,
+                &retirement,
+            )))
+            .await
+    }
+
+    /// [`Self::retire_one_session`] under the agent's retirement gate. A
+    /// lease lost after the mark committed fails it with `LeaseLost`; the
+    /// retry finishes the cleanup ([`Self::finish_retired_cleanup`]).
+    async fn retire_one_session_fenced(
+        &self,
+        session: &AgentSession,
+        reason: Option<&str>,
+        retirement: &crate::RetirementGuard,
+    ) -> Result<Option<String>> {
         let now = now_iso();
         // Unread state observed BEFORE the retire write (derived + stored
         // flag): a retired session drops out of the unread derivation, so
@@ -8559,6 +8609,12 @@ impl Services {
                 "owner-retired",
             )
             .await?;
+        crate::lifecycle_fence::park(
+            crate::lifecycle_fence::steps::RETIRE_BEFORE_MARK,
+            session.id.as_str(),
+        )
+        .await;
+        retirement.check()?;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -8647,7 +8703,21 @@ impl Services {
         // cross-workspace watches only exist for chief parents, and the
         // recompute early-returns for chief.
         self.maybe_emit_waiting_changed(&session.workspace_id).await;
+        retirement.check()?;
         Ok(Some(now))
+    }
+
+    /// Re-runs the release of a retired agent's resources (idempotent
+    /// sweeps) under its retirement gate, for an idempotent retire retry: a
+    /// retire whose lease was lost after its mark committed stopped before
+    /// its cleanup was done.
+    async fn finish_retired_cleanup(&self, agent_id: &AgentId) -> Result<()> {
+        let gate = self.agent_retirement_gates.for_agent(agent_id);
+        let retirement = gate.lock().await?;
+        retirement
+            .guard_writes(Box::pin(self.release_retired_agent(agent_id)))
+            .await;
+        retirement.check()
     }
 
     /// `agent.restore` (wire-only; PROTOCOL §5.5): clear `retired_at`,
@@ -8662,7 +8732,19 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         let gate = self.agent_retirement_gates.for_agent(&agent_id);
-        let _retirement = gate.lock().await?;
+        let retirement = gate.lock().await?;
+        // Fenced by the retirement lease (`lifecycle_fence`).
+        retirement
+            .guard_writes(Box::pin(self.agent_restore_fenced(agent_id, workspace_id)))
+            .await
+    }
+
+    /// [`Self::agent_restore_op`] under the agent's retirement gate.
+    async fn agent_restore_fenced(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
         let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {

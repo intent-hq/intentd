@@ -146,7 +146,7 @@ impl RetirementGate {
                 None => intent_store::LifecycleLease::local(),
             };
             Ok(RetirementGuard {
-                _lease: lease,
+                lease,
                 _guard: guard,
             })
         }
@@ -167,8 +167,25 @@ impl RetirementGate {
 /// A hold on a [`RetirementGate`]. Drop releases the lease (in the
 /// background), then the local gate.
 pub struct RetirementGuard {
-    _lease: intent_store::LifecycleLease,
+    lease: intent_store::LifecycleLease,
     _guard: OrderedGuard,
+}
+
+impl RetirementGuard {
+    /// Runs `fut` with its store writes fenced by this hold's lease (see
+    /// `crate::lifecycle_fence`).
+    pub fn guard_writes<F: Future>(&self, fut: F) -> impl Future<Output = F::Output> {
+        self.lease.guard_writes(fut)
+    }
+
+    /// `Ok` while the lease is held.
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` once it was lost: stop the retirement.
+    pub fn check(&self) -> intent_core::Result<()> {
+        self.lease.check()
+    }
 }
 
 /// A hold on an [`OrderedGate`]; releases it on drop.
