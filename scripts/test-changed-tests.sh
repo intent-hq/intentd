@@ -2074,6 +2074,213 @@ reset_repo
 run_script --features
 [[ "$status" -eq 2 && "$stderr" == "Usage: "*"[--features LIST]"* ]] || fail "$case_name exited $status: $stderr"
 
+# Source readers: a test that reads another crate's source must be the target
+# of a map entry, or every run (and --check-map) fails naming it.
+reader_note="reads another crate's source but no .config/e2e-test-map.txt entry targets it"
+expect_reader_error() {
+  local mode line
+  for mode in run check; do
+    if [[ "$mode" == check ]]; then
+      run_script --check-map
+    else
+      run_script
+    fi
+    [[ "$status" -eq 2 ]] || fail "$case_name ($mode) exited $status (expected 2): $stderr"
+    for line in "$@"; do
+      [[ "$stderr" == *"$line"* ]] || fail "$case_name ($mode): stderr is missing '$line':"$'\n'"$stderr"
+    done
+    [[ "$(grep -c "$reader_note\|needs a reason\|matches that path" <<<"$stderr")" -eq $# ]] || fail "$case_name ($mode): expected $# reader line(s):"$'\n'"$stderr"
+    [[ "$stderr" == *"invalid end-to-end test map"* ]] || fail "$case_name ($mode): no summary: $stderr"
+    [[ -z "$cargo_log" ]] || fail "$case_name ($mode) invoked cargo: $cargo_log"
+  done
+}
+expect_map_valid() {
+  run_script --check-map
+  expect_ok
+  [[ "$stdout" == "[check-map] .config/e2e-test-map.txt: $1 entries valid" ]] || fail "$case_name printed '$stdout'"
+}
+
+case_name="a test naming a path in another crate's src must be mapped"
+reset_repo
+write crates/gamma/tests/smoke.rs 'const ALPHA: &str = "../alpha/src/lib.rs";'
+expect_reader_error "crates/gamma/tests/smoke.rs $reader_note (gamma::smoke)"
+echo "crates/alpha/src/lib.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 5
+commit_all "map the reader"
+edit crates/alpha/src/lib.rs
+DRY_RUN=1 run_script --base HEAD
+expect_ok
+expect_plan "-p alpha --lib --bins --tests" "-p gamma --test smoke"
+
+case_name="paths into a test's own crate, outside src, or in a source lint are not readers"
+reset_repo
+write crates/alpha/tests/one.rs $'const A: &str = "alpha/src/lib.rs";\nconst B: &str = "../alpha/src/util/mod.rs";\nconst C: &str = "../beta/tests/smoke.rs";'
+write crates/gamma/tests/scan_lint.rs 'const ALPHA: &str = "crates/alpha/src/lib.rs";'
+expect_map_valid 4
+
+case_name="a crates/ directory walk in library unit tests needs an entry covering its module"
+reset_repo
+write crates/gamma/src/lib.rs $'mod scan;\nmod other {\n}'
+write crates/gamma/src/scan/mod.rs $'mod tests {\n    fn crates() -> PathBuf {\n        Path::new(env!("CARGO_MANIFEST_DIR"))\n            .parent()\n            .unwrap()\n            .to_path_buf()\n    }\n}'
+expect_reader_error "crates/gamma/src/scan/mod.rs $reader_note (gamma::lib, module scan)"
+echo "crates/alpha/src/* gamma::lib other" >>"$repo/.config/e2e-test-map.txt"
+expect_reader_error "crates/gamma/src/scan/mod.rs $reader_note (gamma::lib, module scan)"
+echo "crates/alpha/src/* gamma::lib scan::tests" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 6
+
+case_name="a suite module joining the crates/ directory is covered by an entry for it or an enclosing module"
+reset_repo
+reader_src=$'fn crates() -> PathBuf {\n    workspace_root()\n        .join("crates")\n}'
+write crates/intentd/tests/e2e_core/inner.rs "$reader_src"
+expect_map_valid 4
+write crates/intentd/tests/e2e_core.rs $'mod inner;\nmod extra;'
+write crates/intentd/tests/e2e_core/extra.rs "$reader_src"
+# The map's module-less intentd::suite_wss entry does not declare it.
+expect_reader_error "crates/intentd/tests/e2e_core/extra.rs $reader_note (any intentd test binary, module e2e_core::extra)"
+echo "crates/alpha/src/* intentd::suite_e2e e2e_core" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 5
+reset_repo
+write crates/intentd/tests/e2e_core.rs $'mod inner;\nmod extra;'
+write crates/intentd/tests/e2e_core/extra.rs "$reader_src"
+echo "crates/alpha/src/* intentd::suite_e2e" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 5
+
+# cargo discovers tests/<name>/main.rs as test target <name>: the map can name
+# it, and its modules are readers of that target.
+case_name="a tests/<name>/main.rs target is a map binary and owns its reader modules"
+reset_repo
+write crates/gamma/tests/sweep/main.rs 'mod scan;'
+write crates/gamma/tests/sweep/scan.rs 'const ALPHA: &str = "crates/alpha/src/lib.rs";'
+expect_reader_error "crates/gamma/tests/sweep/scan.rs $reader_note (gamma::sweep, module scan)"
+echo "crates/alpha/src/lib.rs gamma::sweep" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 5
+commit_all "map the reader"
+edit crates/alpha/src/lib.rs
+DRY_RUN=1 run_script --base HEAD
+expect_ok
+expect_plan "-p alpha --lib --bins --tests" "-p gamma --test sweep"
+
+# Coverage is per path, not per reader: a mapped reader that starts naming
+# another crate's src must have that path mapped too.
+case_name="a mapped reader naming a path no entry for it maps fails"
+reset_repo
+write crates/gamma/tests/smoke.rs $'const ALPHA: &str = "../alpha/src/lib.rs";\nconst DELTA: &str = "crates/delta/src/script.rs";\nconst ALL: &str = "../beta/src/";'
+echo "crates/alpha/src/lib.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+expect_reader_error "crates/gamma/tests/smoke.rs reads crates/delta/src/script.rs but no .config/e2e-test-map.txt entry for it (gamma::smoke) matches that path" \
+  "crates/gamma/tests/smoke.rs reads crates/beta/src/ but no .config/e2e-test-map.txt entry for it (gamma::smoke) matches that path"
+echo "crates/delta/src/*.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+echo "crates/beta/src/*.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 7
+
+# A path into a crate whose src change already runs every test of the reader's
+# crate needs no entry: an intent-core dependent, a feature crate or
+# intent-app reading intent-services, intent-app reading a feature crate.
+case_name="paths whose change already selects the reader's crate need no entry"
+reset_repo
+write crates/alpha/tests/one.rs 'const CORE: &str = "../intent-core/src/lib.rs";'
+write crates/intent-app/tests/smoke.rs $'const SERVICES: &str = "../intent-services/src/lib.rs";\nconst TRANSFER: &str = "intent-svc-transfer/src/lib.rs";'
+write crates/intent-svc-transfer/tests/smoke.rs 'const SERVICES: &str = "../intent-services/src/lib.rs";'
+expect_map_valid 4
+write crates/beta/tests/smoke.rs 'const CORE: &str = "../intent-core/src/lib.rs";'
+expect_reader_error "crates/beta/tests/smoke.rs $reader_note (beta::smoke)"
+
+case_name="a file that reads no other crate's source opts out with a reasoned marker"
+reset_repo
+write crates/gamma/tests/smoke.rs $'// changed-tests: not a source reader: names the path in a message only\nconst ALPHA: &str = "../alpha/src/lib.rs";'
+expect_map_valid 4
+write crates/gamma/tests/smoke.rs $'// changed-tests: not a source reader:\nconst ALPHA: &str = "../alpha/src/lib.rs";'
+expect_reader_error "crates/gamma/tests/smoke.rs: 'changed-tests: not a source reader:' needs a reason after the colon"
+
+# Prints, NUL-separated, every path under pathspecs $2... of checkout $1 that
+# differs from HEAD, staged or not (both sides of a rename), plus untracked
+# files.
+local_edits() {
+  local root=$1
+  shift
+  git -C "$root" -c core.quotePath=false diff --no-renames --name-only -z HEAD -- "$@" &&
+    git -C "$root" -c core.quotePath=false ls-files -z --others --exclude-standard -- "$@"
+}
+
+# A staged rename must list its old path too, so the copy drops it: the copy
+# starts from HEAD, and a stale reader left there fails the map check.
+case_name="the real-tree copy lists both sides of a staged rename"
+reset_repo
+g mv crates/gamma/tests/smoke.rs crates/gamma/tests/smoke_renamed.rs
+edits=$(local_edits "$repo" 'crates/*.rs' | while IFS= read -r -d '' file; do printf '%s\n' "$file"; done)
+[[ "$edits" == *"crates/gamma/tests/smoke.rs"* && "$edits" == *"crates/gamma/tests/smoke_renamed.rs"* ]] ||
+  fail "$case_name: listed"$'\n'"$edits"
+
+# The real tree: the fixtures above pin the mechanism, these cases pin the real
+# map's data (intentd#3835 changed only intent-services/src, passed
+# test-changed and was ejected from the merge queue by intent-transport's
+# event-taxonomy golden, which scans intent-services/src; CI run 45971066229).
+# The copy is a --shared clone of this checkout's HEAD (no blob is rewritten)
+# checked out sparsely: every crates/ Rust file and manifest, .config/,
+# scripts/ and each path a map glob names, with this checkout's uncommitted
+# edits there (a map entry being written) and its scripts/ helpers laid over
+# it. These cases run once, not again in the Bash 3 pass below: the fixtures
+# already cover the script under Bash 3, and the copy is the suite's slowest
+# step.
+real_tree_cases() {
+  local glob file
+  real_root=$(cd "$here/.." && pwd -P)
+  real_repo="$temp_dir/real"
+  real_specs=('crates/*.rs' 'crates/*/Cargo.toml' '.config/*')
+  real_sparse=('/crates/**/*.rs' '/crates/*/Cargo.toml' '/.config/' '/scripts/')
+  while read -r glob _; do
+    if [[ -n "$glob" && "$glob" != \#* ]]; then
+      real_specs+=("$glob")
+      real_sparse+=("/$glob")
+    fi
+  done <"$real_root/.config/e2e-test-map.txt"
+  git clone -q --shared --no-checkout "$real_root" "$real_repo" || fail "cannot clone the real tree"
+  git -C "$real_repo" sparse-checkout set --no-cone "${real_sparse[@]}" >/dev/null 2>&1 ||
+    fail "cannot set the real tree's sparse checkout"
+  git -C "$real_repo" -c advice.detachedHead=false checkout -q "$(git -C "$real_root" rev-parse HEAD)" ||
+    fail "cannot check out the real tree"
+  # Uncommitted edits, staged or not, against HEAD (which the copy checks
+  # out) and untracked files are copied; deleted ones removed.
+  local_edits "$real_root" "${real_specs[@]}" >"$temp_dir/real-files" ||
+    fail "cannot list the real tree's edits"
+  while IFS= read -r -d '' file; do
+    if [[ -f "$real_root/$file" ]]; then
+      mkdir -p "$real_repo/$(dirname "$file")"
+      cp "$real_root/$file" "$real_repo/$file"
+    else
+      rm -f "$real_repo/$file"
+    fi
+  done <"$temp_dir/real-files"
+  mkdir -p "$real_repo/scripts"
+  for helper in $helpers; do
+    cp "$here/$helper" "$real_repo/scripts/"
+  done
+  git -C "$real_repo" add -A
+  git -C "$real_repo" commit -q --allow-empty -m "real tree with local edits"
+  fixture_script=$script
+  script="$real_repo/scripts/changed-tests.sh"
+
+  real_case() {
+    git -C "$real_repo" reset -q --hard
+    git -C "$real_repo" clean -fdq
+    clear_logs
+    echo "// changed" >>"$real_repo/$1"
+    RUN_CWD="$real_repo" DRY_RUN=1 run_script --base HEAD
+    expect_ok
+  }
+
+  case_name="real map: an intent-services-only src change selects the event-taxonomy golden"
+  real_case crates/intent-services/src/lib.rs
+  [[ "$stdout" == *"[test-changed] cargo nextest run -p intent-transport --lib -E '(binary_id(=intent-transport)&test(/^(events::tests::emit_path_taxonomy)::/))'"* ]] ||
+    fail "$case_name: plan was"$'\n'"$stdout"
+
+  case_name="real map: --check-map accepts the real map"
+  git -C "$real_repo" reset -q --hard
+  RUN_CWD="$real_repo" run_script --check-map
+  expect_ok
+  script=$fixture_script
+}
+[[ -n "${CHANGED_TESTS_TEST_BASH:-}" ]] || real_tree_cases
+
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0
 

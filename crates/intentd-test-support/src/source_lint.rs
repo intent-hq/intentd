@@ -55,6 +55,9 @@
 //! and reachable only as a `[dev-dependencies]` entry, so nothing here ever
 //! ships in the daemon.
 
+// changed-tests: not a source reader: lint scaffolding; the source lints that
+// call it run on every crates/ change (scripts/changed-tests.sh).
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
