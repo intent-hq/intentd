@@ -156,7 +156,6 @@ pub struct StubForge {
     /// When set, the FIRST `get_pr` holds at the park's pause point, so a
     /// test can land a concurrent signal-bearing fold while a REST
     /// refresh's read is in flight (intent-hq/intent#5654).
-    #[cfg(test)]
     pub get_pr_park: Option<std::sync::Arc<GetPrPark>>,
     pub get_pr_error: Option<fn() -> ScError>,
     pub create_pr_error: Option<fn() -> ScError>,
@@ -165,13 +164,11 @@ pub struct StubForge {
 
 /// One-shot park for [`StubForge::get_pr`]: the first read arrives at
 /// `pause` and returns once the test releases it.
-#[cfg(test)]
 pub struct GetPrPark {
     claimed: std::sync::atomic::AtomicBool,
     pub pause: intentd_test_support::PausePoint,
 }
 
-#[cfg(test)]
 impl Default for GetPrPark {
     fn default() -> Self {
         Self {
@@ -485,7 +482,6 @@ impl SourceControl for StubForge {
             // A TCP connection that went dark: the future never resolves.
             std::future::pending::<()>().await;
         }
-        #[cfg(test)]
         if let Some(park) = &self.get_pr_park {
             if !park.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 park.pause.pause().await;
