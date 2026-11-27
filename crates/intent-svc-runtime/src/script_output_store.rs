@@ -107,6 +107,9 @@ struct RunState {
     cap: u64,
     retry: CompactionRetry,
     writers: usize,
+    /// Bumped by every writer open: only the newest writer of a run logs, so
+    /// a straggling earlier process cannot write into its positions.
+    epoch: u64,
 }
 
 impl RunState {
@@ -119,6 +122,7 @@ impl RunState {
             cap,
             retry: CompactionRetry::default(),
             writers: 0,
+            epoch: 0,
         }
     }
 }
@@ -130,7 +134,8 @@ type Runs = Arc<Mutex<HashMap<BlobKey, Arc<Mutex<RunState>>>>>;
 
 /// An open run log, the stream position of its first byte, and the log
 /// range `[from, len)` to read: the bytes contiguous with the run's end.
-type PositionedRead = (Box<dyn BlobFile>, u64, u64, u64);
+/// The file is `None` when a run that has positions never got a log.
+type PositionedRead = (Option<Box<dyn BlobFile>>, u64, u64, u64);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -280,6 +285,7 @@ impl ScriptOutputStore {
                     path: PathBuf::new(),
                     state: Arc::new(Mutex::new(state)),
                     runs: Arc::clone(&self.runs),
+                    epoch: 0,
                 };
             }
         };
@@ -290,9 +296,10 @@ impl ScriptOutputStore {
             runs.entry(key.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(RunState::new(self.max_bytes_per_run)))),
         );
-        {
+        let epoch = {
             let mut s = lock(&state);
             s.writers += 1;
+            s.epoch += 1;
             s.cap = self.max_bytes_per_run;
             if s.file.is_none() {
                 match open_append(&*self.storage, &key, &path, s.cap) {
@@ -321,7 +328,8 @@ impl ScriptOutputStore {
                     }
                 }
             }
-        }
+            s.epoch
+        };
         drop(runs);
         RunOutputWriter {
             storage: Arc::clone(&self.storage),
@@ -329,6 +337,7 @@ impl ScriptOutputStore {
             path,
             state,
             runs: Arc::clone(&self.runs),
+            epoch,
         }
     }
 
@@ -400,8 +409,17 @@ impl ScriptOutputStore {
     ) -> Result<Option<CursorTail>> {
         let key = Self::run_key(workspace_id, script_id, run_id)?;
         let err = |e: io::Error| self.key_err(&key, &e);
-        let Some((mut file, base, from, len)) = self.positioned_read(&key).map_err(err)? else {
+        let Some((file, base, from, len)) = self.positioned_read(&key).map_err(err)? else {
             return Ok(None);
+        };
+        let Some(mut file) = file else {
+            return Ok(Some(CursorTail {
+                bytes: Vec::new(),
+                start: base,
+                end: base,
+                log_start: base,
+                total_lines: 0,
+            }));
         };
         let file = &mut *file;
         let cut = tail_cut(file, len, max_lines.max(1))
@@ -439,15 +457,16 @@ impl ScriptOutputStore {
                 return Ok(None);
             };
             let len = file.len()?;
-            return Ok(Some((file, 0, 0, len)));
+            return Ok(Some((Some(file), 0, 0, len)));
         };
         let s = lock(state);
         let Some(file) = self.storage.open_read(key)? else {
-            return Ok(None);
+            // The run never got a log: it still has an end position.
+            return Ok(Some((None, s.base + s.len, 0, 0)));
         };
         let len = s.len.min(file.len()?);
         Ok(Some((
-            file,
+            Some(file),
             s.base + s.len - len,
             s.contiguous.min(len),
             len,
@@ -670,6 +689,8 @@ pub(crate) struct RunOutputWriter {
     path: PathBuf,
     state: Arc<Mutex<RunState>>,
     runs: Runs,
+    /// The run's [`RunState::epoch`] when this writer opened.
+    epoch: u64,
 }
 
 /// Backoff state after a failed compaction (see [`write_capped`]).
@@ -725,6 +746,9 @@ impl RunOutputWriter {
         }
         let mut guard = lock(&self.state);
         let s = &mut *guard;
+        if s.epoch != self.epoch {
+            return;
+        }
         let end = s.base + s.len + chunk.len() as u64;
         let written = match (s.file.as_mut(), self.key.as_ref()) {
             (Some(file), Some(key)) => {

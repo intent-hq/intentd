@@ -1115,21 +1115,36 @@ fn reopening_under_a_smaller_cap_keeps_positions() {
     assert_cursor_slice(&tail, &stream);
 }
 
+/// Regression (cursor review): a straggling earlier process of the run must
+/// not write into the positions a newer writer of the same run hands out.
 #[test]
-fn writers_of_one_run_share_its_positions() {
+fn a_newer_writer_supersedes_an_older_one() {
     let (_dir, store) = store(1000);
-    let stream = numbered_stream(80);
-    let mut a = store.open_writer("ws", "s", "r");
-    let mut b = store.open_writer("ws", "s", "r");
-    for (i, line) in stream.chunks(40).enumerate() {
-        if i % 2 == 0 {
-            a.append(line);
-        } else {
-            b.append(line);
-        }
-    }
-    assert_eq!((a.end(), b.end()), (3200, 3200));
-    assert_cursor_slice(&cursor(&store, 10_000), &stream);
+    let stream = numbered_stream(4);
+    let mut old = store.open_writer("ws", "s", "r");
+    old.append(&stream[..40]);
+    let mut new = store.open_writer("ws", "s", "r");
+    assert_eq!(new.end(), 40);
+    old.append(b"straggler output\n");
+    new.append(&stream[40..160]);
+    assert_eq!(new.end(), 160);
+    let tail = cursor(&store, 10_000);
+    assert_eq!((tail.start, tail.end), (0, 160));
+    assert_cursor_slice(&tail, &stream);
+}
+
+/// Regression (cursor review): a run whose log never opened still answers
+/// at its end position, never at 0.
+#[test]
+fn a_run_without_a_log_reads_at_its_end() {
+    let (dir, store) = store(1024);
+    fs::create_dir_all(dir.path().join("script-output")).unwrap();
+    fs::write(dir.path().join("script-output").join("ws"), b"not a dir").unwrap();
+    let mut w = store.open_writer("ws", "s", "r");
+    w.append(b"streamed but not saved");
+    let tail = cursor(&store, 10);
+    assert_eq!((tail.start, tail.end, tail.log_start), (22, 22, 22));
+    assert!(tail.bytes.is_empty());
 }
 
 #[test]
