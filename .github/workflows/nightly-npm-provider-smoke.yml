@@ -93,6 +93,7 @@ jobs:
       # Package output reaches the log: stop-commands keeps it from issuing
       # workflow commands.
       - name: Smoke on npm latest
+        id: latest
         shell: bash
         run: |
           token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
@@ -102,6 +103,7 @@ jobs:
           echo "::$token::"
           exit "$status"
       - name: Smoke on the oldest supported npm
+        id: oldest
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
@@ -111,22 +113,33 @@ jobs:
           scripts/npm-provider-smoke.sh oldest "$RUNNER_TEMP/npm-provider-smoke" || status=$?
           echo "::$token::"
           exit "$status"
+      # One annotation per failed launch; a failed step that reported no
+      # launch (npm install, a test precondition) gets one of its own.
       - name: Report launch results
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
+        env:
+          LATEST_OUTCOME: ${{ steps.latest.outcome }}
+          OLDEST_OUTCOME: ${{ steps.oldest.outcome }}
         run: |
-          shopt -s nullglob
-          for log in "$RUNNER_TEMP"/npm-provider-smoke/*.log; do
+          for spec in latest oldest; do
+            log="$RUNNER_TEMP/npm-provider-smoke/npm-$spec.log"
+            if [ "$spec" = latest ]; then outcome=$LATEST_OUTCOME; else outcome=$OLDEST_OUTCOME; fi
+            touch "$log"
             {
-              echo "### $(head -n 1 "$log")"
+              echo "### npm $spec: $(head -n 1 "$log")"
               echo '```'
               grep -E '^(ok   |FAIL )' "$log" || echo 'No launch results: see the smoke step log.'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            grep '^FAIL ' "$log" | while IFS= read -r line; do
-              line=${line//%/%25}
-              echo "::error title=npm provider smoke::${line#FAIL }"
-            done || true
+            if grep -q '^FAIL ' "$log"; then
+              grep '^FAIL ' "$log" | while IFS= read -r line; do
+                line=${line//%/%25}
+                echo "::error title=npm provider smoke::${line#FAIL }"
+              done
+            elif [ "$outcome" = failure ]; then
+              echo "::error title=npm provider smoke::npm $spec failed before reporting a launch: see its smoke step log"
+            fi
           done
       - name: Upload smoke logs
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

@@ -10,10 +10,19 @@
 # installed into a temp folder with the host's npm and node; the host's own
 # npm cache is never read. Writes OUT_DIR/npm-<spec>.log (default
 # target/npm-provider-smoke) and exits non-zero when any launch fails.
-# Run nightly by .github/workflows/nightly-npm-provider-smoke.yml.
+# Inherited npm_config_* settings and the user npmrc are ignored. Run
+# nightly by .github/workflows/nightly-npm-provider-smoke.yml.
 # Bash 3.2 compatible.
 
 set -euo pipefail
+
+# A shell started by npx (an Intent agent, an npm script) carries its
+# npm_config_* settings, and a user npmrc can skip scripts: neither may
+# change what Intent's own launches would do on a clean host.
+for name in $(compgen -e); do
+  case $name in npm_config_* | NPM_CONFIG_*) unset "$name" ;; esac
+done
+export npm_config_userconfig=/dev/null
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 spec=${1:?usage: scripts/npm-provider-smoke.sh <latest|oldest|VERSION> [OUT_DIR]}
