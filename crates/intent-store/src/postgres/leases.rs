@@ -12,6 +12,9 @@
 //! release take the tenant writer lock without its owner check
 //! (`Fence::LeaseOnly`), so they order with the tenant's other writes and pass
 //! the writer-lock lint; a process that lost the tenant keeps its leases.
+//! An acquire or renewal needs the tenant open (`tenant_state`), like every
+//! write; a release (`Fence::LeaseRelease`) does not, so work that stops
+//! while its tenant closes gives its keys back at once.
 //!
 //! The unleased first open (`clear_foreign_claims_once`) leaves leases
 //! alone: they lapse by their TTL, and clearing them would let two unleased
@@ -110,7 +113,7 @@ impl PgStore {
     }
 
     pub async fn lease_release(&self, lease: &Lease) -> Result<()> {
-        let mut tx: WriteTx = self.begin_write_as(Fence::LeaseOnly).await?;
+        let mut tx: WriteTx = self.begin_write_as(Fence::LeaseRelease).await?;
         sqlx::query(RELEASE_SQL)
             .bind(self.tenant())
             .bind(lease.scope())

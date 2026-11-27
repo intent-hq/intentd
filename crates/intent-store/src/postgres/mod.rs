@@ -1252,6 +1252,10 @@ pub struct WriterRow {
     pub epoch: i64,
     /// The writer transaction's isolation level (`read committed`).
     pub isolation: String,
+    /// The tenant state on the locked `tenant_writer` row: writes run only
+    /// while it is open (see `tenant_state`).
+    #[sqlx(try_from = "String")]
+    pub state: crate::TenantState,
 }
 
 /// Seeds the tenant's `tenant_writer` row ($1). On a conflict with a
@@ -1269,11 +1273,18 @@ const WRITER_SEED_SQL: &str =
 /// at READ COMMITTED (a REPEATABLE READ snapshot is taken before the lock
 /// wait and would show the old lease), so [`PgStore::begin_write`] refuses
 /// any other level.
-const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true) AS reset, \
+///
+/// And it reads the tenant state from the `tenant_writer` row the lock
+/// holds (no other transaction can move it until this one ends), so the
+/// state check adds no statement to a write.
+#[doc(hidden)]
+pub const WRITER_RESET_SQL: &str = "SELECT set_config('lock_timeout', $1, true) AS reset, \
      current_setting('transaction_isolation') AS isolation, \
-     l.lease_id, l.holder AS owner_instance, COALESCE(l.token, 0) AS epoch \
-     FROM (SELECT 1 AS one) AS once \
-     LEFT JOIN lease AS l ON l.tenant_id = $2 AND l.scope = 'tenant' AND l.lease_key = ''";
+     l.lease_id, l.holder AS owner_instance, COALESCE(l.token, 0) AS epoch, \
+     tw.state \
+     FROM tenant_writer AS tw \
+     LEFT JOIN lease AS l ON l.tenant_id = $2 AND l.scope = 'tenant' AND l.lease_key = '' \
+     WHERE tw.tenant_id = $2";
 
 /// Neki's default, cross-shard mode, for [`migrate`]'s connection (a
 /// session setting: Neki refuses it inside a transaction); see
@@ -1339,18 +1350,32 @@ fn writer_busy(tenant: &str, waited: Duration) -> Error {
     ))
 }
 
-/// Whether [`PgStore::begin_write_as`] checks the tenant's fence.
+/// Whether [`PgStore::begin_write_as`] checks the tenant's fence (its
+/// lease) and its state (`tenant_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fence {
-    /// Every write: the locked row must name this process's claim.
+    /// Every write: the locked row must name this process's claim, and the
+    /// tenant must be open.
     Check,
-    /// A claim, which changes the fence under the same lock.
+    /// A claim or a tenant state move, which change the fence or the state
+    /// under the same lock: neither check (`lease.rs`).
     Skip,
     /// A store lease write (`leases.rs`): it takes the writer lock for its
     /// ordering but not the owner check, because a lease is fenced by its
     /// own token and must not depend on the tenant owner or epoch. It never
-    /// touches the tenant fence.
+    /// touches the tenant fence. The tenant must be open.
     LeaseOnly,
+    /// A store lease release (`leases.rs`): as [`Self::LeaseOnly`], but
+    /// also while the tenant is closing or closed. A release only gives the
+    /// work up; refusing it would leave the key held until its TTL.
+    LeaseRelease,
+}
+
+impl Fence {
+    /// Whether a write under this fence needs the tenant open.
+    fn needs_open(self) -> bool {
+        matches!(self, Self::Check | Self::LeaseOnly)
+    }
 }
 
 #[derive(Clone)]
@@ -1485,6 +1510,12 @@ impl PgStore {
     /// back and the call fails with [`Error::NotOwner`], having written
     /// nothing. The lease is read after the lock is granted, at READ
     /// COMMITTED, so a writer that waited behind a takeover sees it.
+    ///
+    /// **State.** In the same statement it reads the tenant state
+    /// (`tenant_state`); unless the tenant is open the transaction rolls
+    /// back and the call fails with [`Error::TenantClosed`], whoever holds
+    /// the lease. A state move takes the same row lock, so a write already
+    /// holding it commits first and every later one sees the move.
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         self.begin_write_as(Fence::Check).await
     }
@@ -1550,6 +1581,12 @@ impl PgStore {
                             let _ = tx.rollback().await;
                             return Err(e);
                         }
+                    }
+                    // After the owner check, so a takeover still fires this
+                    // process's fence.
+                    if fence.needs_open() && writer.state != crate::TenantState::Open {
+                        let _ = tx.rollback().await;
+                        return Err(lease::closed_error(self.tenant(), writer.state));
                     }
                     let mut tx = WriteTx {
                         tx,
@@ -1650,14 +1687,28 @@ impl crate::Store {
         // its build refuses before it writes anything (no seed rows, and no
         // later startup step such as a lease).
         check_schema(&store.pool).await?;
-        store.provision().await?;
+        // A closed tenant opens for reads: its writes, these two included,
+        // are refused until it is open again (`tenant_state`).
+        let open = |r: Result<()>| match r {
+            Err(Error::TenantClosed(_)) => Ok(()),
+            r => r,
+        };
+        open(store.provision().await)?;
         // Unleased opens only (one process per tenant by design); see
         // `clear_foreign_claims_once`. The leased open does not call it.
-        store.clear_foreign_claims_once().await?;
+        open(store.clear_foreign_claims_once().await)?;
         Ok(Self {
             backend: crate::Backend::Postgres(store),
         })
     }
+}
+
+/// A store of `tenant` on `pool` for a tenant state move without an open
+/// (no schema gate, no provisioning): it shares this process's gates for
+/// the tenant, its claim included.
+pub(crate) fn state_mover(pool: PgPool, tenant: TenantId) -> PgStore {
+    let key = tenant_registry::tenant_key(&pool, &tenant);
+    PgStore::for_key(pool, tenant, PostgresOptions::default(), key)
 }
 
 impl PgStore {

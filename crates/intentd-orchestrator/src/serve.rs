@@ -20,7 +20,7 @@ use intent_store::postgres::{
     LeaseHeld, PgPool, PostgresOptions, SecretKeyring, TenantId, TenantLeaseKeeper,
     LEASE_FENCE_MARGIN, LEASE_TTL,
 };
-use intent_store::{OrchestratorOnly, Store};
+use intent_store::{OrchestratorOnly, Store, TenantState, TenantStateMove};
 use intent_transport::PrimaryReverseRegistry;
 
 /// How a tenant's lease is held: claimed and renewed for `ttl`, with the
@@ -750,6 +750,50 @@ impl ServedTenant {
             services.shutdown_store_writers().await;
             tracing::info!(tenant, closed, "drained the tenant's work");
         }
+    }
+
+    /// Close the tenant for a graceful stop (`TenantState::Closing`), after
+    /// [`Self::drain`] and before firing the fence: a write in flight
+    /// commits, and every later write of any process is refused
+    /// (`Error::TenantClosed`) while its work stops. It does nothing once
+    /// the fence fired (the lease may be another process's by then). A
+    /// failure is logged: the fence still refuses this process's writes.
+    pub fn close(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let tenant = self.tenant.clone();
+        let fence = self.fence.clone();
+        let store = self.services.store().clone();
+        async move {
+            if fence.is_fenced() {
+                return;
+            }
+            match store.move_tenant_state(TenantState::Closing).await {
+                Ok(moved) if moved.reached(TenantState::Closing) => tracing::info!(
+                    tenant,
+                    last_row_seq = moved.last_row_seq,
+                    "the tenant is closing"
+                ),
+                Ok(moved) => tracing::warn!(
+                    tenant,
+                    state = %moved.state,
+                    "the tenant was already closed; it stays closed"
+                ),
+                Err(error) => tracing::warn!(tenant, %error, "could not close the tenant"),
+            }
+        }
+    }
+
+    /// Mark the tenant closed (`TenantState::Closed`) once its work
+    /// stopped ([`Self::stopped`]), before its lease is released. Only from
+    /// `closing`: a tenant reopened meanwhile stays open.
+    ///
+    /// # Errors
+    /// `Error::NotOwner` once another process claimed the tenant; as
+    /// [`Store::move_tenant_state`].
+    pub async fn mark_closed(&self) -> Result<TenantStateMove> {
+        self.services
+            .store()
+            .move_tenant_state(TenantState::Closed)
+            .await
     }
 
     /// Wait until the tenant's fence fired and its work stopped. Once

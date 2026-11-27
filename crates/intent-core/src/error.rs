@@ -356,6 +356,14 @@ pub enum Error {
     #[error("not the tenant owner: {0}")]
     NotOwner(String),
 
+    /// The Postgres tenant is closing or closed (its `tenant_writer` state
+    /// is not `open`): it is being stopped, retired or migrated, so every
+    /// write is refused, whichever process holds its lease. The write was
+    /// rolled back and changed nothing; it may succeed once the tenant is
+    /// open again. Surfaces as `-32603`.
+    #[error("tenant closed: {0}")]
+    TenantClosed(String),
+
     /// A write guarded by a store lease (`Store::acquire_lease`) found the
     /// lease no longer held: it expired by the database clock, another
     /// holder took it, or it was released. The write was rolled back; the
@@ -866,6 +874,7 @@ impl Error {
             | Error::StoreBusy(_)
             | Error::SchemaMismatch(_)
             | Error::NotOwner(_)
+            | Error::TenantClosed(_)
             | Error::LeaseLost(_)
             | Error::ProviderRequest(_)
             | Error::IdentityProof(_)

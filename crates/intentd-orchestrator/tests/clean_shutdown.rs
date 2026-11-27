@@ -103,6 +103,13 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
     // Released: free and expired now, long before the 30 s TTL, keeping its
     // token so the next claim's epoch is higher.
     assert_eq!(lease(&pool, &tenant).await, Some((None, epoch, true)));
+    // Closed before the release: it refuses every write until a start.
+    let state: String = sqlx::query_scalar("SELECT state FROM tenant_writer WHERE tenant_id = $1")
+        .bind(&tenant)
+        .fetch_one(&pool)
+        .await
+        .expect("read the tenant state");
+    assert_eq!(state, "closed", "a clean stop leaves the tenant closed");
     let (standby, next) = Store::open_postgres_owned(
         pool.clone(),
         TenantId::new(&tenant).unwrap(),
@@ -114,6 +121,11 @@ async fn sigterm_releases_the_lease_so_a_standby_claims_at_once() {
     .await
     .expect("the standby claims the released tenant at once");
     assert_eq!(next.epoch, epoch + 1);
+    assert_eq!(
+        standby.tenant_state().await.unwrap(),
+        intent_store::TenantState::Open,
+        "the standby's start opens the tenant"
+    );
     standby
         .set_setting("userRules", "\"standby\"")
         .await

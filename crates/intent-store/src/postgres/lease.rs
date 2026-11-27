@@ -41,6 +41,14 @@
 //! renewal of the claim in this process (`NotOwner`) before it touches the
 //! database; the process's consumers stop serving the tenant on it.
 //!
+//! **State** ([`Store::move_tenant_state`](crate::Store::move_tenant_state),
+//! `tenant_state`): the `tenant_writer` row also says whether the tenant
+//! takes writes at all (`open`, `closing`, `closed`). Every write reads it
+//! with the lease, under the writer lock; a move takes the same lock without
+//! the fence or state check (`Fence::Skip`) and, from a process that
+//! claimed the tenant, only while the lease still names that claim. A claim
+//! by the startup open moves the tenant back to `open`.
+//!
 //! `SQLite` has no tenant lease: one daemon owns a database file
 //! (`intentd.lock` and the database flock), so the methods refuse there.
 
@@ -54,7 +62,7 @@ use tokio::time::Instant;
 use super::{db, Fence, PgPool, PgStore, PostgresOptions, TenantId, WriteTx, WriterRow};
 use crate::lease_keeper::{LeaseFence, LeaseKeeper, Renew, Renewal};
 use crate::lease_repo::{ttl_millis, TENANT_SCOPE};
-use crate::{Lease, TenantFence};
+use crate::{Lease, TenantFence, TenantState, TenantStateMove};
 
 /// How long a claim or renewal holds the tenant. A takeover waits this long
 /// after the owner's last renewal. Far below Neki's router idle limits
@@ -199,6 +207,21 @@ impl ClaimSlot {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// For a tenant state move: no claim passes (a tool that never claimed
+    /// moves the state whoever owns the tenant); a claim passes while the
+    /// tenant lease, read under the writer lock, still names it, even after
+    /// its fence fired for a clean stop. A mismatch fires the claim's fence.
+    pub(crate) fn check_current(&self, tenant: &str, row: &WriterRow) -> Result<()> {
+        let Some(claim) = self.get() else {
+            return Ok(());
+        };
+        let checked = fence(tenant, Some(&claim), row);
+        if let Err(e) = &checked {
+            claim.fence.fire_lost(e.to_string());
+        }
+        checked
+    }
+
     /// The fence: may a store of this process write, given the tenant lease
     /// it read under the writer lock?
     ///
@@ -286,6 +309,23 @@ const TENANT_RELEASE_SQL: &str = "UPDATE lease \
      WHERE tenant_id = $1 AND scope = 'tenant' AND lease_key = '' \
      AND lease_id = $2 AND token = $3";
 
+/// Sets the tenant ($1) state to $2 on its `tenant_writer` row, which the
+/// mover holds locked; returns the tenant's row counter. The mover decided
+/// from the state it read under the lock whether the move is allowed ($2 is
+/// that state again when it is not).
+const TENANT_STATE_SQL: &str = "UPDATE tenant_writer SET state = $2 WHERE tenant_id = $1 \
+     RETURNING last_row_seq";
+
+/// The tenant's ($1) state, without the writer lock.
+const TENANT_STATE_READ_SQL: &str = "SELECT state FROM tenant_writer WHERE tenant_id = $1";
+
+/// The refusal of a write to a tenant that is not open.
+pub(crate) fn closed_error(tenant: &str, state: TenantState) -> Error {
+    Error::TenantClosed(format!(
+        "tenant {tenant} is {state}, so it takes no writes; nothing was written"
+    ))
+}
+
 fn timestamp(ms: i64) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
         .map_err(|e| Error::Internal(format!("postgres: lease expiry out of range: {e}")))
@@ -354,6 +394,61 @@ impl PgStore {
             expires_at: timestamp(expires_ms)?,
             lease: lease.acquired(u64::try_from(epoch).unwrap_or_default()),
         }))
+    }
+
+    /// See [`Store::move_tenant_state`](crate::Store::move_tenant_state).
+    /// Under the writer lock without the fence or state check
+    /// (`Fence::Skip`: the move is how the state changes), so it waits for
+    /// the write in flight, and the next writer reads the new state. A
+    /// reopen also provisions the tenant's seed rows, in the same
+    /// transaction, for a tenant closed before it ever wrote.
+    pub(crate) async fn move_state(&self, to: TenantState) -> Result<TenantStateMove> {
+        let mut tx: WriteTx = self.begin_write_as(Fence::Skip).await?;
+        if let Err(e) = self.claim.check_current(self.tenant(), tx.writer()) {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+        let from = tx.writer().state;
+        let state = if to.moves_from().contains(&from) {
+            to
+        } else {
+            from
+        };
+        let last_row_seq: i64 = sqlx::query_scalar(TENANT_STATE_SQL)
+            .bind(self.tenant())
+            .bind(state.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        if state == TenantState::Open && from != TenantState::Open {
+            sqlx::query("SELECT intent_provision_tenant($1)")
+                .bind(self.tenant())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        if state != from {
+            tracing::info!(tenant = self.tenant(), %from, %state, last_row_seq, "tenant state moved");
+        }
+        Ok(TenantStateMove {
+            from,
+            state,
+            last_row_seq,
+        })
+    }
+
+    /// See [`Store::tenant_state`](crate::Store::tenant_state). No row: the
+    /// tenant never wrote, so it is open.
+    pub(crate) async fn read_state(&self) -> Result<TenantState> {
+        let mut tx = self.begin().await?;
+        let state: Option<String> = sqlx::query_scalar(TENANT_STATE_READ_SQL)
+            .bind(self.tenant())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        state.map_or(Ok(TenantState::Open), TenantState::try_from)
     }
 
     /// See [`Store::postgres_lease_expires_in`](crate::Store::postgres_lease_expires_in).
@@ -586,7 +681,9 @@ impl crate::Store {
     /// The orchestrator's startup open: [`Self::open_postgres`] that claims
     /// the tenant for this process as `instance` (for `ttl`) after the
     /// schema gate and before anything else writes (provisioning, then every
-    /// startup sweep the caller runs on the returned store).
+    /// startup sweep the caller runs on the returned store). Once claimed it
+    /// opens the tenant (`TenantState::Open`): starting a tenant undoes the
+    /// close of the stop before it, finished or not.
     ///
     /// # Errors
     /// `Error::NotOwner` naming the owner and its lease expiry when another
@@ -669,6 +766,9 @@ impl crate::Store {
                 }));
             }
         };
+        // Starting the tenant opens it: a stop that closed it (or crashed
+        // while closing it) left it refusing every write.
+        store.move_state(TenantState::Open).await?;
         store.provision().await?;
         Ok(Ok((
             Self {
@@ -870,6 +970,7 @@ mod tests {
             owner_instance: lease.map(|_| "a".to_owned()),
             epoch,
             isolation: "read committed".to_owned(),
+            state: crate::TenantState::Open,
         }
     }
 
