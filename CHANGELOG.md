@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.312] - 2026-11-27
+
+### 🚀 Features
+
+- *(store)* Add a tenant state to the tenant_writer row ([#3836](https://github.com/intent-hq/intentd/pull/3836))
+
+### 🐛 Bug Fixes
+
+- *(store)* Fence lifecycle work with its lease ([#3835](https://github.com/intent-hq/intentd/pull/3835))
+
+
 ## [0.11.311] - 2026-11-27
 
 ### 🐛 Bug Fixes
