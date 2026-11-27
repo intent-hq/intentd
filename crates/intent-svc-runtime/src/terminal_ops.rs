@@ -55,6 +55,10 @@ const EXIT_POLL: Duration = Duration::from_millis(25);
 /// so the bound keeps `terminal:exit` from waiting on it (same as scripts).
 const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
 
+/// Cap on chunks flushed after the EOF wait, so a grandchild that keeps
+/// writing cannot hold back `terminal:exit` (same cap as scripts).
+const EXIT_DRAIN_MAX_CHUNKS: usize = 4096;
+
 /// Delay after output before re-reading the foreground program. A program
 /// start or exit almost always prints (the echoed Enter, a new prompt), so
 /// output drives the check; the delay lets the new program take the
@@ -708,7 +712,8 @@ pub(crate) fn spawn_output_stream(
 /// Emit live output until the reader reaches EOF (bounded by
 /// [`OUTPUT_EOF_WAIT`]), then flush what is left on the channel. The child can
 /// be reaped before the reader has published its final chunks; stopping at the
-/// reap dropped them from the live stream.
+/// reap dropped them from the live stream. Unix only: a `ConPTY` reader reaches
+/// EOF only at teardown, so on Windows the wait would always time out.
 async fn stream_until_output_eof(
     live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
     pty: &PtyHost,
@@ -717,17 +722,28 @@ async fn stream_until_output_eof(
     workspace_id: &WorkspaceId,
     terminal_id: &str,
 ) {
-    let eof = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id));
-    tokio::pin!(eof);
-    loop {
-        tokio::select! {
-            biased;
-            recv = live.recv() => match recv {
-                Ok(chunk) => emit_data(bus, workspace_id, terminal_id, pty.daemon_boot_id(), &chunk),
-                Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return,
-            },
-            _ = &mut eof => break,
+    if cfg!(unix) {
+        // Checked after each chunk too: a channel that never empties keeps
+        // `recv` ready, and the coop budget can then starve the timer.
+        let deadline = tokio::time::Instant::now() + OUTPUT_EOF_WAIT;
+        let eof = pty.wait_output_eof(pty_id);
+        tokio::pin!(eof);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut eof => break,
+                () = tokio::time::sleep_until(deadline) => break,
+                recv = live.recv() => match recv {
+                    Ok(chunk) => {
+                        emit_data(bus, workspace_id, terminal_id, pty.daemon_boot_id(), &chunk);
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+            }
         }
     }
     drain_pending(live, bus, workspace_id, terminal_id, pty.daemon_boot_id());
@@ -742,7 +758,7 @@ fn drain_pending(
     terminal_id: &str,
     daemon_boot_id: &str,
 ) {
-    loop {
+    for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, daemon_boot_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
