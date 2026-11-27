@@ -757,7 +757,7 @@ async fn bundle_limits_hold_inside_a_package() {
         "intent-app.json",
         &vec![b' '; 64 * 1024 + 1],
     )]);
-    assert_eq!(f.refusal(&huge_manifest).await, "invalid-bundle");
+    assert_eq!(f.refusal(&huge_manifest).await, "invalid-manifest");
 
     // At the limits: 2000 files, a 16 MiB file, accepted.
     let mut at_limit: Vec<RawEntry> = (0..1997)

@@ -255,10 +255,13 @@ pub(crate) fn unpack_package(package: &Path, dest: &Path) -> Result<(), Error> {
             ));
         }
         if path == MANIFEST_FILE && entry.size > MAX_MANIFEST_BYTES {
-            return Err(invalid_bundle(
-                "intent-app.json is larger than 64 KiB",
-                Some(MANIFEST_FILE),
-            ));
+            // The same refusal as a directory bundle (`parse_manifest`).
+            return Err(AppError::params(
+                "invalid-manifest",
+                "invalid manifest: intent-app.json is larger than 64 KiB",
+                json!({ "detail": "intent-app.json is larger than 64 KiB", "field": "" }),
+            )
+            .into_error());
         }
         if entry.size > MAX_FILE_BYTES {
             return Err(invalid_bundle("a file is larger than 16 MiB", Some(path)));
