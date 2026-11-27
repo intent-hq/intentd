@@ -361,7 +361,8 @@ fn retained_dir_report(test: &str, original: &Path, retained: &Path) -> String {
 ///
 /// `Services::new_isolated(...)` already roots workspaces in its own scratch
 /// dir; chain `.with_workspaces_root(root.path().to_path_buf())` when a test
-/// needs to know the root or share it with a spawned daemon. The returned `TempDir` guard must be held for the full test lifetime: it
+/// needs to know the root or share it with a spawned daemon. The returned
+/// `TempDir` guard must be held for the full test lifetime: it
 /// removes the tree on drop (including on panic), so dropping it early would
 /// let the services layer recreate — and leak — the root. Set
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir for debugging.

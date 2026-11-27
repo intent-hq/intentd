@@ -992,8 +992,10 @@ pub struct Services {
     /// Root directory `workspace.create` provisions worktrees under
     /// (`<root>/<workspaceId>/<repo-slug>`). `None` resolves the default at
     /// call time: `$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces` (the
-    /// FE's `WorkspaceConfig.WORKSPACES_BASE`). Every test constructor sets
-    /// it to its owned scratch dir, so only production constructors are `None`.
+    /// FE's `WorkspaceConfig.WORKSPACES_BASE`). The test constructors
+    /// (`new_isolated`, `new_with_file_secrets`, `new_repository_fixture`)
+    /// set it to their owned scratch dir; `new` / `new_with_secret_file`
+    /// leave it `None`.
     workspaces_root: Option<PathBuf>,
     /// Wall-clock bound for the `workspace.create` base-refresh fetch.
     /// `None` keeps the production default (100 s); tests inject a short
