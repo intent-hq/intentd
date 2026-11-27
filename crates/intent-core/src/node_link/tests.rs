@@ -2940,3 +2940,25 @@ fn a_capacity_report_refuses_only_when_the_machine_would() {
         })
     );
 }
+
+/// `reasoningEffort` rides the launch in camelCase, is omitted when unset,
+/// and a launch from a backend that never sends it still decodes.
+#[test]
+fn launch_reasoning_effort_is_optional_on_the_wire() {
+    let mut command = labelled_launch(LaunchLabels::default());
+    let plain = serde_json::to_value(&command).unwrap();
+    assert!(plain.get("reasoningEffort").is_none(), "{plain}");
+    assert_eq!(
+        serde_json::from_value::<LaunchCommand>(plain)
+            .unwrap()
+            .reasoning_effort,
+        None
+    );
+    command.reasoning_effort = Some("high".into());
+    let sent = serde_json::to_value(&command).unwrap();
+    assert_eq!(sent["reasoningEffort"], "high");
+    assert_eq!(
+        serde_json::from_value::<LaunchCommand>(sent).unwrap(),
+        command
+    );
+}

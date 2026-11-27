@@ -1537,6 +1537,95 @@ async fn node_runner_applies_the_launch_effort_to_the_provider_session() {
     );
     assert_eq!(applied("e2"), vec![option("model", "opus")]);
     assert_eq!(applied("e3"), vec![option("model", "opus")]);
+
+    // An adapter that acks the model with `{}` keeps the opening options:
+    // the effort still goes out.
+    let Some(h) = tuned_harness(
+        &["--thought-level", "medium", "--bare-model-ack"],
+        |config| {
+            config.supports_config_option_model = true;
+        },
+    ) else {
+        return;
+    };
+    h.runner.launch(with_effort("b1", "high")).await;
+    wait_for(&h.runner, "start", started("b1")).await;
+    let path = h
+        .storage
+        .agent_dir(&AgentId::from("b1"))
+        .unwrap()
+        .join("session-model.jsonl");
+    let sent: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        vec![option("model", "opus"), option("effort", "high")]
+    );
+}
+
+/// A cleared effort restores the provider's default on a loaded session,
+/// not the level the session last ran: run at high, clear, resume from disk.
+#[tokio::test]
+async fn node_runner_restores_the_default_effort_when_a_cleared_session_loads() {
+    let sessions = tempfile::tempdir().unwrap();
+    let dir = sessions.path().to_str().unwrap().to_owned();
+    let Some(h) = tuned_harness(&["--sessions", &dir, "--thought-level", "medium"], |_| {}) else {
+        return;
+    };
+    let efforts = || -> Vec<String> {
+        let path = h
+            .storage
+            .agent_dir(&AgentId::from("r1"))
+            .unwrap()
+            .join("session-model.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|sent| sent["configId"] == "effort")
+            .map(|sent| sent["value"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    h.runner
+        .launch(LaunchCommand {
+            reasoning_effort: Some("high".into()),
+            ..launch("r1")
+        })
+        .await;
+    wait_for(&h.runner, "start", started("r1")).await;
+    assert_eq!(efforts(), ["high"]);
+
+    h.runner.stop(&AgentId::from("r1"));
+    wait_for(&h.runner, "exit", exited("r1")).await;
+    let before = records(&h.runner)
+        .await
+        .into_iter()
+        .filter(started("r1"))
+        .count();
+    h.runner
+        .launch(LaunchCommand {
+            resumed_from_disk: true,
+            ..launch("r1")
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .into_iter()
+        .filter(started("r1"))
+        .count()
+        == before
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "r1 never started again"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(efforts(), ["high", "medium"]);
 }
 
 /// A provider whose model selection must succeed (codex, cursor,
@@ -1946,7 +2035,7 @@ fn the_redactor_masks_tool_payloads_but_keeps_schema_identifiers() {
         );
         let redactor = Redactor::new(Some(&profile));
         let mut params = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call-1",
@@ -2008,7 +2097,7 @@ fn the_redactor_keeps_resource_and_location_keys() {
         );
         let redactor = Redactor::new(Some(&profile));
         let mut resource = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
@@ -2029,7 +2118,7 @@ fn the_redactor_keeps_resource_and_location_keys() {
         );
         assert!(embedded.get("uri").is_some(), "{secret}: {resource}");
         let mut tool = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-1",
@@ -2187,7 +2276,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         });
 
         let mut chunk = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
@@ -2215,7 +2304,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         assert!(parses(&chunk), "{secret}: unparseable {chunk}");
 
         let mut tool = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-1",
@@ -2245,7 +2334,7 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         assert!(parses(&tool), "{secret}: unparseable {tool}");
 
         let mut config = json!({
-            "sessionId": "node-test-session",
+            "sessionId": "s1",
             "update": {
                 "sessionUpdate": "config_option_update",
                 "configOptions": [{
@@ -2278,7 +2367,7 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
     );
     let redactor = Redactor::new(Some(&profile));
     let mut chunk = json!({
-        "sessionId": "node-test-session",
+        "sessionId": "s1",
         "update": {
             "sessionUpdate": "agent_message_chunk",
             "content": {
@@ -2294,7 +2383,7 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
         json!(["user", "[redacted]"])
     );
     let mut config = json!({
-        "sessionId": "node-test-session",
+        "sessionId": "s1",
         "update": {
             "sessionUpdate": "config_option_update",
             "configOptions": [{ "id": "model", "name": "Model", "type": secret, "currentValue": "x" }],

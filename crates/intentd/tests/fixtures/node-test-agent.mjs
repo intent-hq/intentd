@@ -27,6 +27,8 @@
 //   --thought-level <value> advertise a reasoning-effort select (`effort`,
 //                           category thought_level, low/medium/high) at
 //                           <value> on session/new
+//   --bare-model-ack        acknowledge session/set_config_option with `{}`,
+//                           as older adapters do
 //
 // session/set_config_option and session/set_model append their params as a
 // JSON line to `session-model.jsonl` in its working directory.
@@ -97,6 +99,13 @@ const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
 const detachedHelper = argv.includes('--detached-helper');
 const authRequiredSetup = argv.includes('--auth-required-setup');
 const thoughtLevelAt = argv.indexOf('--thought-level');
+// With sessions, the level a session was set to survives a restart, and
+// session/load reports it as the current value.
+const effortFile = (id) => `${sessionsDir}/${id}.effort`;
+const currentEffort = () =>
+  (currentSession && fs.existsSync(effortFile(currentSession))
+    ? fs.readFileSync(effortFile(currentSession), 'utf8')
+    : undefined) ?? argv[thoughtLevelAt + 1];
 const thoughtLevel = () =>
   thoughtLevelAt < 0
     ? {}
@@ -107,7 +116,7 @@ const thoughtLevel = () =>
             name: 'Effort',
             category: 'thought_level',
             type: 'select',
-            currentValue: argv[thoughtLevelAt + 1],
+            currentValue: currentEffort(),
             options: ['low', 'medium', 'high'].map((value) => ({ value, name: value })),
           },
         ],
@@ -284,7 +293,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       currentSession = `s-${crypto.randomUUID()}`;
       fs.mkdirSync(sessionsDir, { recursive: true });
       fs.writeFileSync(sessionFile(currentSession), '[]');
-      return send({ id: msg.id, result: { sessionId: currentSession } });
+      return send({ id: msg.id, result: { sessionId: currentSession, ...thoughtLevel() } });
     case 'session/load': {
       if (argv.includes('--crash-on-load')) {
         spawn('sleep', ['3'], { stdio: ['ignore', 'inherit', 'ignore'] });
@@ -305,7 +314,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           },
         });
       stored.forEach(replay);
-      send({ id: msg.id, result: {} });
+      send({ id: msg.id, result: { ...thoughtLevel() } });
       // A provider may flush the last of its replay just after the answer.
       if (stored.length) setTimeout(() => replay(stored[stored.length - 1]), 10);
       return;
@@ -313,12 +322,18 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     case 'session/set_config_option':
     case 'session/set_model':
       fs.appendFileSync('session-model.jsonl', `${JSON.stringify({ method: msg.method, ...msg.params })}\n`);
+      if (msg.params?.configId === 'effort' && currentSession && sessionsDir) {
+        fs.writeFileSync(effortFile(currentSession), msg.params.value);
+      }
       if (argv.includes('--reject-model')) {
         return send({ id: msg.id, error: { code: -32602, message: 'unknown model' } });
       }
       return send({
         id: msg.id,
-        result: msg.method === 'session/set_model' ? {} : { configOptions: thoughtLevel().configOptions ?? [] },
+        result:
+          msg.method === 'session/set_model' || argv.includes('--bare-model-ack')
+            ? {}
+            : { configOptions: thoughtLevel().configOptions ?? [] },
       });
     case 'session/prompt': {
       const text = promptText(msg.params);

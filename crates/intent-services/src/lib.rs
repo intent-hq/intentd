@@ -398,8 +398,8 @@ pub mod auggie_discovery {
 pub use agent_manager::{
     apply_session_effort, apply_session_model, compute_process_cap, default_process_cap,
     recommended_memory_budget_bytes, resolve_provider_launch, AgentManager, AgentMemorySnapshot,
-    BusEventSink, ProcessRegistry, ProcessSample, ProviderLaunchSpec, RemoteAgentMemory,
-    RemoteAgentRoot, RemoteOwner, TreeMemoryProbe, TreeSample,
+    BusEventSink, EffortBaseline, ProcessRegistry, ProcessSample, ProviderLaunchSpec,
+    RemoteAgentMemory, RemoteAgentRoot, RemoteOwner, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via

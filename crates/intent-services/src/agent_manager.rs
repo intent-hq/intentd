@@ -3795,61 +3795,99 @@ async fn apply_cursor_session_model(
     }
 }
 
+/// Where a session's default reasoning effort comes from for
+/// [`apply_session_effort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortBaseline<'a> {
+    /// A new session: the level it opened on (after the model) is the
+    /// provider's default.
+    Opening,
+    /// A loaded session: its current level may be an earlier override, so
+    /// only the default recorded when the session was new counts, if known.
+    Recorded(Option<&'a str>),
+}
+
 /// Apply a reasoning effort to a session opened outside an agent handle (a
-/// machine launch), through the `thought_level` option in `config_options`
-/// (a `session/new` list, or a `session/set_config_option` response after a
-/// model change, whose options follow the selected model). Mirrors the
-/// local first application: no-op without an effort or such an option, or
-/// when the provider is already on it; a level the option does not offer is
-/// skipped. Failures are logged; the provider keeps its current effort.
+/// machine launch), through its `thought_level` option, with the local
+/// path's rules: the options are a valid `configOptions` list in the model
+/// change's `model_response` (an explicit list without the option clears
+/// it), else the `opening` ones from `session/new` / `session/load`. An
+/// explicit effort is matched case-insensitively and sent in the adapter's
+/// spelling; a level the option does not offer is skipped. Without an effort
+/// the default is restored: the adapter's own `default` value when offered,
+/// else the `baseline` (never a loaded session's current level). Nothing is
+/// sent when the provider is already on the target. Failures are logged; the
+/// provider keeps its current effort.
+///
+/// Returns the session's default level, for the caller to record as the
+/// baseline of a later load; `None` without a `thought_level` option or a
+/// known default.
 pub async fn apply_session_effort(
     conn: &Connection,
     acp_session_id: &str,
-    config_options: Option<&Value>,
+    opening: Option<&Value>,
+    model_response: Option<&Value>,
     effort: Option<&str>,
-) {
-    let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
-        return;
+    baseline: EffortBaseline<'_>,
+) -> Option<String> {
+    let parse = |options: &Value| {
+        serde_json::from_value::<Vec<SessionConfigOption>>(
+            options.get("configOptions").unwrap_or(options).clone(),
+        )
+        .ok()
     };
-    let Some(selector) = config_options
-        .map(|options| options.get("configOptions").unwrap_or(options))
-        .and_then(|options| {
-            serde_json::from_value::<Vec<SessionConfigOption>>(options.clone()).ok()
-        })
-        .and_then(|options| discover_thought_level(Some(&options)))
-    else {
-        return;
+    let options = model_response
+        .and_then(|response| response.get("configOptions"))
+        .and_then(parse)
+        .or_else(|| opening.and_then(parse));
+    let selector = discover_thought_level(options.as_deref())?;
+    let offered = |level: &str| {
+        selector
+            .values
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(level))
+            .cloned()
+            .or_else(|| selector.values.is_empty().then(|| level.to_string()))
     };
-    let value = match selector
+    let default = selector
         .values
         .iter()
-        .find(|v| v.eq_ignore_ascii_case(effort))
-    {
-        Some(value) => value.clone(),
-        None if selector.values.is_empty() => effort.to_string(),
-        None => {
-            tracing::warn!(
-                session_id = acp_session_id,
-                effort,
-                "the provider does not offer this reasoning effort; it keeps its current one"
-            );
-            return;
+        .find(|v| v.eq_ignore_ascii_case("default"))
+        .cloned()
+        .or_else(|| match baseline {
+            EffortBaseline::Opening => Some(selector.current_value.clone()),
+            EffortBaseline::Recorded(level) => level.and_then(offered),
+        })
+        .filter(|level| !level.is_empty());
+    let requested = effort.map(str::trim).filter(|e| !e.is_empty());
+    let target = match requested {
+        Some(effort) => {
+            let Some(value) = offered(effort) else {
+                tracing::warn!(
+                    session_id = acp_session_id,
+                    effort,
+                    "the provider does not offer this reasoning effort; it keeps its current one"
+                );
+                return default;
+            };
+            value
         }
+        None => default.clone()?,
     };
-    if selector.current_value.eq_ignore_ascii_case(&value) {
-        return;
+    if !selector.current_value.eq_ignore_ascii_case(&target) {
+        if let Err(e) = intent_acp::session::set_session_config_option_response(
+            conn,
+            acp_session_id,
+            &selector.config_id,
+            &target,
+        )
+        .await
+        {
+            tracing::warn!(session_id = acp_session_id, error = %e, effort = %target,
+                "session/set_config_option failed; provider keeps its current reasoning effort");
+        }
     }
-    if let Err(e) = intent_acp::session::set_session_config_option_response(
-        conn,
-        acp_session_id,
-        &selector.config_id,
-        &value,
-    )
-    .await
-    {
-        tracing::warn!(session_id = acp_session_id, error = %e, effort = %value,
-            "session/set_config_option failed; provider keeps its current reasoning effort");
-    }
+    default
 }
 
 impl AgentManager {

@@ -2868,7 +2868,9 @@ impl Runner {
             {
                 match load_recorded(agent, connection, cwd, mcp.clone(), &recorded.session_id).await
                 {
-                    Ok(options) => return Ok((recorded.session_id, options)),
+                    Ok(options) => {
+                        return Ok((recorded.session_id, options, Some(recorded.effort_default)))
+                    }
                     Err(error) => {
                         tracing::warn!(agent = %agent.id, %error, "node: could not load the agent's provider session; starting a new one");
                     }
@@ -2884,9 +2886,10 @@ impl Runner {
             let options = session
                 .config_options
                 .map(|options| serde_json::json!(options));
-            Ok::<_, intent_acp::AcpError>((session.session_id.to_string(), options))
+            Ok::<_, intent_acp::AcpError>((session.session_id.to_string(), options, None))
         };
-        let (session, options) = tokio::select! {
+        // `loaded` holds a loaded session's recorded default effort.
+        let (session, options, loaded) = tokio::select! {
             result = setup => match result {
                 Ok(opened) => opened,
                 Err(error) => {
@@ -2934,24 +2937,32 @@ impl Runner {
                 agent.model.as_deref(),
                 agent.reasoning_effort.as_deref(),
             );
-            intent_services::apply_session_effort(
-                connection,
-                &session,
-                response.as_ref().or(options.as_ref()),
-                effort.as_deref(),
+            let baseline = match &loaded {
+                None => intent_services::EffortBaseline::Opening,
+                Some(recorded) => intent_services::EffortBaseline::Recorded(recorded.as_deref()),
+            };
+            Ok::<_, intent_core::Error>(
+                intent_services::apply_session_effort(
+                    connection,
+                    &session,
+                    options.as_ref(),
+                    response.as_ref(),
+                    effort.as_deref(),
+                    baseline,
+                )
+                .await,
             )
-            .await;
-            Ok::<_, intent_core::Error>(())
         };
-        tokio::select! {
-            result = applied => if let Err(error) = result {
-                return Outcome::StartFailed(error.to_string(), false);
+        let effort_default = tokio::select! {
+            result = applied => match result {
+                Ok(default) => default,
+                Err(error) => return Outcome::StartFailed(error.to_string(), false),
             },
             status = child.wait() => {
                 return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()), None);
             }
             _ = &mut *stop => return Outcome::Stopped,
-        }
+        };
         // Record what the provider started during setup before any prompt
         // can make it exit: once it has exited, helpers in their own process
         // groups are no longer its descendants.
@@ -2967,6 +2978,7 @@ impl Runner {
             session_id: session.clone(),
             provider: agent.provider.clone(),
             model: agent.model.clone(),
+            effort_default,
         };
         if let Err(error) = self
             .inner
