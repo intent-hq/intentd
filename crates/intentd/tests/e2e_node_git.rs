@@ -727,6 +727,16 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     use std::io::{Read as _, Write as _};
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
+    /// Kills the helper when a failed assertion ends the test early.
+    struct KillOnDrop(u32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .status();
+        }
+    }
+
     let dir = test_tempdir_in("/tmp", "itd-helper-");
     let helper_dir = dir.path().join("bin");
     NodeGit::install_helper(&helper_dir, Path::new(env!("CARGO_BIN_EXE_intentd"))).unwrap();
@@ -754,6 +764,7 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    let reaper = KillOnDrop(helper.id());
     // As git does: ask for the service, then keep stdin open while it
     // waits for the answer.
     let mut stdin = helper.stdin.take().unwrap();
@@ -772,7 +783,6 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     let request = tokio::time::timeout(wait(), node).await.unwrap().unwrap();
     assert!(request.starts_with("git-receive-pack "), "{request}");
     let mut stdout = helper.stdout.take().unwrap();
-    let pid = helper.id();
     let exited = tokio::task::spawn_blocking(move || {
         let mut output = Vec::new();
         let _ = stdout.read_to_end(&mut output);
@@ -785,8 +795,10 @@ async fn the_helper_exits_when_its_session_ends_while_git_still_writes() {
     .await;
     drop(stdin);
     let Ok(status) = status else {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        drop(reaper);
         panic!("the helper did not exit when its session ended, with git's stdin still open");
     };
+    // Exited and reaped: its pid may name another process now.
+    std::mem::forget(reaper);
     assert!(status.unwrap().code().is_some());
 }

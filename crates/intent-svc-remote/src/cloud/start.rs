@@ -1195,7 +1195,9 @@ async fn link(
 }
 
 /// Bind the first link to a new sandbox: a connect that finds it
-/// unreachable dials again, until `budget` is spent.
+/// unreachable dials again, until `budget` is spent. No dial starts after
+/// `budget`; the last one may end up to one connect's budget later. The
+/// delay between dials grows to an eighth of `budget`, at most 4 s.
 ///
 /// # Errors
 ///
@@ -1203,7 +1205,8 @@ async fn link(
 /// any other at once.
 pub(crate) async fn first_bind(node: &crate::Node, budget: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + budget;
-    let mut delay = Duration::from_millis(250);
+    let longest = (budget / 8).min(Duration::from_secs(4));
+    let mut delay = Duration::from_millis(250).min(longest);
     loop {
         let error = match node.connect().await {
             Ok(()) => return Ok(()),
@@ -1216,7 +1219,7 @@ pub(crate) async fn first_bind(node: &crate::Node, budget: Duration) -> Result<(
         }
         tracing::info!(machine = %node.machine_id(), %error, "cloud machine: the new sandbox did not answer its first dial; dialing again");
         tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(4));
+        delay = (delay * 2).min(longest);
     }
 }
 
