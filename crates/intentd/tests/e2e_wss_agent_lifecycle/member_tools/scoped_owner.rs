@@ -207,6 +207,7 @@ async fn permission_recovery(routed: bool) {
     .await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
 
+    // live-store-write: allow — flips a connected guest's role to and from Owner, which no RPC can do; set_workspace_member_role retries busy upgrades
     store
         .set_workspace_member_role(&ws, &person, WorkspaceRole::Collaborator)
         .await
@@ -230,6 +231,7 @@ async fn permission_recovery(routed: bool) {
     )
     .await;
     assert_eq!(history["items"], json!([]), "demoted guest loses history");
+    // live-store-write: allow — flips a connected guest's role to and from Owner, which no RPC can do; set_workspace_member_role retries busy upgrades
     store
         .set_workspace_member_role(&ws, &person, WorkspaceRole::Owner)
         .await

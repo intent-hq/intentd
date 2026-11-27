@@ -105,6 +105,9 @@ name = "e2e_wss_agent_lifecycle"
 name = "caller_binding_lint"
 
 [[test]]
+name = "live_store_write_lint"
+
+[[test]]
 name = "repo_cache_path_lint"
 
 [[test]]

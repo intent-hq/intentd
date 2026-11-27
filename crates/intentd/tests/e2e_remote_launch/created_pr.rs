@@ -10,7 +10,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::forge_token::backend_with_repo;
+use super::forge_token::backend_with_repo_seeded;
 use super::secrets::{agent_turn, create_agent};
 use super::*;
 
@@ -164,7 +164,39 @@ async fn a_pr_a_remote_agent_opens_from_a_submodule_branch_is_listed_on_its_root
 
     let stub = StubGithub::start().await;
     let api = format!("http://127.0.0.1:{}", stub.port);
-    let (_head, port, cfg, ws_id, backend_id) = backend_with_repo(
+    let repo = scratch.path().join("repo");
+    // The submodule's root, as the submodule sweep records it, seeded before
+    // the backend starts: a second writer racing the live daemon fails at
+    // random with "database is locked".
+    let seed_root = async |ws_id: &str| {
+        let lib = std::fs::canonicalize(repo.join("lib")).unwrap();
+        let pin = git(&lib, &["rev-parse", "HEAD"]);
+        let store = intent_store::Store::open(&scratch.path().join("head").join("intentd.db"))
+            .await
+            .unwrap();
+        let now = intent_core::now_iso();
+        store
+            .upsert_workspace_git_root(&intent_core::WorkspaceGitRoot {
+                id: intent_core::WorkspaceGitRootId::new(),
+                workspace_id: intent_core::WorkspaceId::from(ws_id),
+                path: lib.to_string_lossy().into_owned(),
+                source: intent_core::WorkspaceGitRootSource::Auto,
+                repo_owner: Some("acme".into()),
+                repo_name: Some("lib".into()),
+                registered_by_agent_ids: vec![],
+                registered_commit_sha: Some(pin),
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        store.close().await;
+    };
+    let (_head, port, cfg, ws_id, backend_id) = backend_with_repo_seeded(
         scratch.path(),
         None,
         &[("INTENTD_GITHUB_API_BASE_URI", &api)],
@@ -192,37 +224,11 @@ async fn a_pr_a_remote_agent_opens_from_a_submodule_branch_is_listed_on_its_root
                 ],
             );
         },
+        seed_root,
     )
     .await;
-    let repo = scratch.path().join("repo");
     let lib = std::fs::canonicalize(repo.join("lib")).unwrap();
     let pin = git(&lib, &["rev-parse", "HEAD"]);
-
-    // The submodule's root, as the submodule sweep records it.
-    let store = intent_store::Store::open(&scratch.path().join("head").join("intentd.db"))
-        .await
-        .unwrap();
-    let now = intent_core::now_iso();
-    store
-        .upsert_workspace_git_root(&intent_core::WorkspaceGitRoot {
-            id: intent_core::WorkspaceGitRootId::new(),
-            workspace_id: intent_core::WorkspaceId::from(ws_id.as_str()),
-            path: lib.to_string_lossy().into_owned(),
-            source: intent_core::WorkspaceGitRootSource::Auto,
-            repo_owner: Some("acme".into()),
-            repo_name: Some("lib".into()),
-            registered_by_agent_ids: vec![],
-            registered_commit_sha: Some(pin.clone()),
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            pull_requests: None,
-            created_at: now.clone(),
-            updated_at: now,
-        })
-        .await
-        .unwrap();
-    drop(store);
 
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let mut events = connect(port, cfg.clone()).await;

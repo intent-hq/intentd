@@ -298,17 +298,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
 
-    // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
-    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
-    let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let daemon1 = Daemon {
-        child: child1,
-        data_dir: data_dir.clone(),
-    };
-    let socket = data_dir.join("intentd.sock");
-    assert!(await_uds(&socket).await, "daemon1 did not start");
-
-    // Seed workspace and create an agent session
+    // Seed the workspace before daemon1 starts: a second writer racing a
+    // live daemon fails at random with "database is locked".
     let ws_id = {
         use intent_core::WorkspaceId;
         use intent_store::Store;
@@ -321,6 +312,16 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
             .expect("insert ws");
         ws.0
     };
+
+    // Phase 1: Boot daemon1, create an agent, then interrupt it
+    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
+    let child1 = spawn_serve(&data_dir, "both", &env, false);
+    let daemon1 = Daemon {
+        child: child1,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon1 did not start");
 
     // Create the agent via RPC
     let create_result = uds_rpc(
@@ -355,7 +356,12 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     // Give it a moment to start processing
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    eprintln!("Killing daemon1 to simulate interruption");
+    drop(daemon1); // Kill daemon1
+
     // Manually insert an interrupted_agent row (simulating daemon crash)
+    // now that daemon1 is dead: a second writer racing a live daemon fails
+    // at random with "database is locked".
     {
         use intent_core::{now_iso, AgentId, WorkspaceId};
         use intent_store::Store;
@@ -371,9 +377,6 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
             .await
             .expect("insert interrupted agent");
     }
-
-    eprintln!("Killing daemon1 to simulate interruption");
-    drop(daemon1); // Kill daemon1
 
     // Phase 2: Boot daemon2 with --resume-all and subscribe to agent events
     eprintln!("Phase 2: Boot daemon2 with --resume-all");
@@ -480,16 +483,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
 
-    // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
-    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
-    let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let daemon1 = Daemon {
-        child: child1,
-        data_dir: data_dir.clone(),
-    };
-    let socket = data_dir.join("intentd.sock");
-    assert!(await_uds(&socket).await, "daemon1 did not start");
-
+    // Seed the workspace before daemon1 starts: a second writer racing a
+    // live daemon fails at random with "database is locked".
     let ws_id = {
         use intent_core::WorkspaceId;
         use intent_store::Store;
@@ -502,6 +497,16 @@ async fn setting_on_resumes_without_resume_all_flag() {
             .expect("insert ws");
         ws.0
     };
+
+    // Phase 1: Boot daemon1, create an agent, then interrupt it
+    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
+    let child1 = spawn_serve(&data_dir, "both", &env, false);
+    let daemon1 = Daemon {
+        child: child1,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon1 did not start");
 
     let create_result = uds_rpc(
         &socket,
@@ -561,7 +566,11 @@ async fn setting_on_resumes_without_resume_all_flag() {
         assert_eq!(applied[0]["value"], json!("on"));
     }
 
+    eprintln!("Killing daemon1 to simulate interruption");
+    drop(daemon1);
     // Manually insert an interrupted_agent row (simulating daemon crash)
+    // now that daemon1 is dead: a second writer racing a live daemon fails
+    // at random with "database is locked".
     {
         use intent_core::{now_iso, AgentId, WorkspaceId};
         use intent_store::Store;
@@ -577,9 +586,6 @@ async fn setting_on_resumes_without_resume_all_flag() {
             .await
             .expect("insert interrupted agent");
     }
-
-    eprintln!("Killing daemon1 to simulate interruption");
-    drop(daemon1);
 
     // Phase 2: Boot daemon2 WITHOUT --resume-all. DISPLAY is set so
     // `detect_has_display()` is true: `auto` would skip the sweep, proving a
@@ -678,11 +684,8 @@ impl RecoveryFixture {
             ("INTENTD_AUTH_TOKEN", TOKEN),
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ];
-        let daemon = Daemon {
-            child: spawn_serve(data_dir, "both", &env, false),
-            data_dir: data_dir.to_owned(),
-        };
-        assert!(await_uds(&socket).await);
+        // Seed before the daemon starts: a second writer racing a live
+        // daemon fails at random with "database is locked".
         let store = intent_store::Store::open(&data_dir.join("intentd.db"))
             .await
             .unwrap();
@@ -691,6 +694,11 @@ impl RecoveryFixture {
             .insert_workspace(&workspace_seed(&workspace))
             .await
             .unwrap();
+        let daemon = Daemon {
+            child: spawn_serve(data_dir, "both", &env, false),
+            data_dir: data_dir.to_owned(),
+        };
+        assert!(await_uds(&socket).await);
         let mut agents = Vec::new();
         for name in ["First", "Second"] {
             let created = uds_rpc(&socket, 1, "agent.create", json!({"workspaceId": workspace, "name": name, "provider": "mock", "model": "default"})).await;

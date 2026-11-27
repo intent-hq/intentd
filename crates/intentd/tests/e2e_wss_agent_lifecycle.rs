@@ -2226,6 +2226,9 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    // Seeded with an old activity timestamp so the preference writes below
+    // cannot pass just because they land in the same clock tick as creation.
+    let backdated = seed_backdated_agent(&data_dir, &ws_id, "WSS-Muted-Backdated").await;
     let behavior = json!({ "response": "muted turn ok" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -2316,19 +2319,8 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         "agent.getSession serves notificationsMuted=false explicitly: {fresh_session}"
     );
 
-    // Seed an old activity timestamp so this regression cannot pass just
-    // because the preference write happens in the same clock tick as creation.
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .unwrap();
-    let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
-    let old = "2020-01-01T00:00:00.000Z";
-    seeded.updated_at = old.to_string();
-    store
-        .update_agent_session(&seeded.workspace_id, &seeded)
-        .await
-        .unwrap();
+    // Preference-only edits keep the backdated agent's activity stamp.
+    let old = OLD_ACTIVITY;
     for (index, changes) in [
         json!({ "notificationsMuted": true }),
         json!({ "notificationsMuted": true }),
@@ -2343,7 +2335,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
             &mut rpc,
             30,
             "agent.update",
-            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": changes }),
+            json!({ "workspaceId": ws_id, "agentId": backdated, "changes": changes }),
         )
         .await;
         assert_eq!(response["jsonrpc"], "2.0");
@@ -2364,7 +2356,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         for _ in 0..40 {
             let frame = wss_event(&mut sub, 30).await;
             let ev = &frame["params"]["event"];
-            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == backdated {
                 assert_eq!(
                     ev["data"]["notificationsMuted"],
                     changes["notificationsMuted"]
@@ -2379,7 +2371,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
             &mut rpc,
             31,
             "agent.get",
-            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            json!({ "workspaceId": ws_id, "agentId": backdated }),
         )
         .await;
         assert_eq!(refreshed["agent"]["updatedAt"], agent["updatedAt"]);
@@ -2537,6 +2529,7 @@ async fn agent_pinned_round_trip_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
+    let backdated = seed_backdated_agent(&data_dir, &ws_id, "WSS-Pinned-Backdated").await;
     let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -2609,17 +2602,10 @@ async fn agent_pinned_round_trip_over_wss() {
         "non-boolean pinned is -32602: {rejected}"
     );
 
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .unwrap();
-    let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
-    let old = "2020-01-01T00:00:00.000Z";
-    seeded.updated_at = old.to_string();
-    store
-        .update_agent_session(&seeded.workspace_id, &seeded)
-        .await
-        .unwrap();
+    // Pin edits run on an agent seeded before startup with an old activity
+    // stamp, so a pin landing in the creation tick cannot pass by accident.
+    let agent_id = backdated;
+    let old = OLD_ACTIVITY;
 
     for (rpc_id, pinned) in [(20, true), (21, true), (22, false), (23, true)] {
         let response = wss_rpc_envelope(
@@ -7202,6 +7188,36 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     (ws.0, note.id.0)
 }
 
+/// An `updatedAt` older than any activity a test drives.
+const OLD_ACTIVITY: &str = "2020-01-01T00:00:00.000Z";
+
+/// Seed an idle mock agent last active at [`OLD_ACTIVITY`], before the
+/// daemon starts: a second writer racing a live daemon fails at random with
+/// "database is locked", so an agent a test backdates is seeded, not edited.
+async fn seed_backdated_agent(data_dir: &Path, ws_id: &str, name: &str) -> String {
+    use intent_core::{AgentId, AgentSession, AgentStatus, WorkspaceId};
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let id = AgentId::new();
+    store
+        .insert_agent_session(&AgentSession {
+            id: id.clone(),
+            workspace_id: WorkspaceId::from(ws_id),
+            name: name.to_owned(),
+            status: AgentStatus::Idle,
+            provider: Some("mock".to_owned()),
+            model: Some("default".to_owned()),
+            created_at: OLD_ACTIVITY.to_owned(),
+            updated_at: OLD_ACTIVITY.to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("insert backdated agent");
+    store.close().await;
+    id.0
+}
+
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::WorkspaceId;
     use intent_store::Store;
@@ -10293,20 +10309,9 @@ async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
-    let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon { child };
-    let socket = data_dir.join("intentd.sock");
-    assert!(await_uds(&socket).await, "daemon did not start");
-    let status = common::await_wss_status(&socket).await;
-    let port =
-        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
-    let fingerprint = status["result"]["fingerprint"]
-        .as_str()
-        .expect("fingerprint")
-        .to_string();
-    let cfg = client_config(&fingerprint);
-
-    // A collaborator with its own credential, seeded into the daemon's store.
+    // A collaborator with its own credential, seeded into the store before
+    // the daemon starts: a second writer racing a live daemon fails at
+    // random with "database is locked".
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
@@ -10340,6 +10345,19 @@ async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
             .await
             .expect("guest credential");
     }
+
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
 
     // SUBSCRIBER conn (owner) — unfiltered `agent:*`, so a kickoff agent
     // spawned behind a leaked create would show up here.

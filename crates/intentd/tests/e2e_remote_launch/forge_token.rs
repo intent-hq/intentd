@@ -46,6 +46,18 @@ pub(super) async fn backend_with_repo(
     env: &[(&str, &str)],
     prepare: impl FnOnce(&Path),
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
+    backend_with_repo_seeded(scratch, origin, env, prepare, async |_: &str| {}).await
+}
+
+/// [`backend_with_repo`], with `seed` run on the seeded workspace's id before
+/// the backend starts (see [`start_backend_seeded`]).
+pub(super) async fn backend_with_repo_seeded(
+    scratch: &Path,
+    origin: Option<&str>,
+    env: &[(&str, &str)],
+    prepare: impl FnOnce(&Path),
+    seed: impl AsyncFnOnce(&str),
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     // The workspace branch follows the checkout's branch.
@@ -63,7 +75,7 @@ pub(super) async fn backend_with_repo(
         .store(TOKEN_ACCOUNT, TOKEN)
         .unwrap();
     // A closed loopback port: a GitHub origin must not reach github.com.
-    let (head, port, cfg, ws_id) = start_backend_with(
+    let (head, port, cfg, ws_id) = start_backend_seeded(
         &head_dir,
         &repo,
         &[
@@ -71,6 +83,7 @@ pub(super) async fn backend_with_repo(
             env,
         ]
         .concat(),
+        seed,
     )
     .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;

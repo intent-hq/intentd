@@ -2251,6 +2251,7 @@ async fn explicit_batch_over_wss(fail_second_append: bool) {
         1,
         "rejections never preempt"
     );
+    // live-store-write: allow — the test injects faults (a quarantine status, a failing trigger) into the live daemon on purpose; each is one autocommit statement
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();

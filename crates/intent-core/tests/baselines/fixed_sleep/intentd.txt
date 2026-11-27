@@ -96,7 +96,7 @@ crates/intentd/tests/e2e_wss_subscribe_snapshot_warn.rs 3
 crates/intentd/tests/e2e_wss_system_prompt_fallback.rs 1
 crates/intentd/tests/e2e_wss_tcp_origin_guard.rs 1
 crates/intentd/tests/e2e_wss_tilde_paths.rs 1
-crates/intentd/tests/e2e_wss_tool_payload_retention.rs 5
+crates/intentd/tests/e2e_wss_tool_payload_retention.rs 3
 crates/intentd/tests/e2e_wss_truncation_redrive.rs 1
 crates/intentd/tests/e2e_wss_tunnel.rs 3
 crates/intentd/tests/e2e_wss_unblocked_hints.rs 1

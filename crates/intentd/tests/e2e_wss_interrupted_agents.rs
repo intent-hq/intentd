@@ -345,6 +345,10 @@ async fn interrupted_agents_persisted_across_restart() {
         panic!("daemon did not start");
     }
 
+    // Kill daemon to simulate restart.
+    guard1.kill_tree().expect("kill daemon");
+    drop(guard1);
+
     let ws_id = "ws-interrupted-test";
     let agent_id = format!("agent-{}", Uuid::new_v4().simple());
 
@@ -352,7 +356,9 @@ async fn interrupted_agents_persisted_across_restart() {
         .await
         .expect("open store");
 
-    // Seed workspace + agent session with Active status (stale in-flight).
+    // Seed workspace + agent session with Active status (stale in-flight)
+    // while no daemon is running: a second writer racing a live daemon fails
+    // at random with "database is locked".
     {
         use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
         let ts = now_iso();
@@ -376,10 +382,7 @@ async fn interrupted_agents_persisted_across_restart() {
             .await
             .expect("insert agent");
     }
-
-    // Kill daemon to simulate restart.
-    guard1.kill_tree().expect("kill daemon");
-    drop(guard1);
+    store.close().await;
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
     if listen != "uds" {

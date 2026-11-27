@@ -237,6 +237,7 @@ async fn a_moved_home_pushes_its_leftover_work_to_orphaned_refs_when_its_machine
 
     // The move's switch, recorded while the orchestrator is down: a new
     // home on the same machine, and a stop of the old one.
+    // live-store-write: allow — the orchestrator owning this store is stopped; only the machine daemon, on its own data dir, runs
     let store = intent_store::Store::open(&head_dir.join("intentd.db"))
         .await
         .unwrap();

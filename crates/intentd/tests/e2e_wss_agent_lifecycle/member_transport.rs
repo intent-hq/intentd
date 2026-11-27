@@ -94,11 +94,18 @@ async fn create_as_member(existing: bool, retained: bool) {
         .await;
         let id = intent_core::WorkspaceId::from(row["workspace"]["id"].as_str().unwrap());
         assert_eq!(row["workspace"]["ownerPrincipalId"], owner_id);
-        store
-            .add_workspace_member(&id, &guest_id, WorkspaceRole::Collaborator)
-            .await
-            .unwrap();
+        // The owner adds the guest through the daemon: a second writer racing
+        // the live daemon fails at random with "database is locked".
+        let add = wss_rpc(
+            &mut owner,
+            3,
+            "workspace.members.add",
+            json!({"workspaceId":id,"principalId":guest_id}),
+        )
+        .await;
+        assert_eq!(add["added"], true, "{add}");
         if retained {
+            // live-store-write: allow — members.add treats a host member as already present, so only the store can give one a direct row; add_workspace_member retries busy upgrades
             store
                 .add_workspace_member(&id, &member_id, WorkspaceRole::Collaborator)
                 .await

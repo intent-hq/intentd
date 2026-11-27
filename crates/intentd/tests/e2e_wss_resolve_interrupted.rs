@@ -195,22 +195,9 @@ async fn resolve_interrupted_resume_and_abandon() {
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
-    // Phase 1: Boot daemon, create workspace, seed two interrupted agent rows.
-    if listen != "uds" {
-        common::enable_ws_api(&data_dir);
-    }
-    let mut cmd = common::hermetic_serve_command(&data_dir);
-    cmd.env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
-        ));
-    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
-    let mut guard = DaemonGuard::process_only(child);
-    assert!(await_uds(&socket).await, "daemon did not start");
-
+    // Seed the workspace and two interrupted agent rows before the daemon
+    // starts: a second writer racing a live daemon fails at random with
+    // "database is locked".
     let ws_id = "ws-resolve-test";
     let agent_resume = format!("agent-{}", Uuid::new_v4().simple());
     let agent_abandon = format!("agent-{}", Uuid::new_v4().simple());
@@ -277,6 +264,22 @@ async fn resolve_interrupted_resume_and_abandon() {
             .await
             .expect("insert interrupted 2");
     }
+
+    // Phase 1: Boot the daemon on the seeded store.
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
+    let mut cmd = common::hermetic_serve_command(&data_dir);
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
+        ));
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
+    let mut guard = DaemonGuard::process_only(child);
+    assert!(await_uds(&socket).await, "daemon did not start");
 
     // Fetch fingerprint and port
     let status = common::await_wss_status(&socket).await;

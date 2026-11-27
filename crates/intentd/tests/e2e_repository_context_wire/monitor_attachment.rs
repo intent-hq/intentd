@@ -180,9 +180,20 @@ async fn unresolved_monitor(store: &Store, workspace: &WorkspaceId) -> intent_co
 }
 
 async fn check_native_unresolved_delivery(wss: bool, support: bool) {
-    let h = Harness::boot_with_monitor_support(None, support).await;
+    let mut row = None;
+    let h = Harness::boot_seeded(
+        None,
+        support,
+        None,
+        false,
+        false,
+        async |store, workspace| {
+            row = Some(unresolved_monitor(store, workspace).await);
+        },
+    )
+    .await;
+    let row = row.expect("seeded monitor");
     let store = Store::open(&h.dir.path().join("intentd.db")).await.unwrap();
-    let row = unresolved_monitor(&store, &h.workspace).await;
     let mut ordinary = connect(&h, wss).await;
     let hello = ordinary
         .rpc("client.hello", json!({"clientId":"monitor-events-desktop"}))
