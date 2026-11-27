@@ -103,7 +103,7 @@ async fn observed_timeout_keeps_original_writer_and_lease_until_actual_completio
     let weak = Arc::downgrade(&lease);
     let output = store.clone();
     let completion = observer.clone();
-    let mut work = tokio::spawn(async move {
+    let work = tokio::spawn(async move {
         run_blocking_observed(
             move || output.store(SECRET_ACCOUNT, "after-timeout"),
             "persist",
@@ -113,11 +113,10 @@ async fn observed_timeout_keeps_original_writer_and_lease_until_actual_completio
         )
         .await
     });
-    let timed_out = match pause.reached(&mut work).await {
-        Some(out) => out,
-        None => work.await,
-    };
-    assert!(timed_out.unwrap().is_err());
+    // The 20 ms budget may expire before the blocking write reaches the
+    // observer, so the caller can finish before or after the pause point.
+    pause.wait_reached().await;
+    assert!(work.await.unwrap().is_err());
     assert!(observer.outcomes.lock().unwrap().is_empty());
     assert!(weak.upgrade().is_some());
     assert_eq!(store.load(SECRET_ACCOUNT).unwrap(), None);
