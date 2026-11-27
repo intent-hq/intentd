@@ -8,8 +8,8 @@
 //! "database is locked" (`SQLite` codes 5 / 517). One such seed failed a full
 //! local gate on intent-hq/intentd#3792 and 4 of 40 runs under
 //! `make test-stress LOAD=1` until intentd#3799 moved it before startup.
-//! Seed before the spawn, or stop the daemon first; reads while it runs are
-//! fine.
+//! Seed before the spawn with `common::seed_then_start`, or stop the daemon
+//! first; reads while it runs are fine.
 //!
 //! The heuristic, per function in `crates/intentd/tests/**` (each top-level
 //! test module — `X.rs` plus `X/` — is analysed together with `common/`):
@@ -1074,8 +1074,10 @@ fn tests_do_not_write_the_store_of_a_live_daemon() {
         offenders.is_empty(),
         "\nstore writes while a spawned daemon is still running ({} site{}):\n  {}\n\n\
          A second writer racing the live daemon fails at random with \"database is locked\" \
-         (SQLite 5/517; intentd#3799). Seed the store before spawning the daemon, or stop it \
-         first; reads are fine. If the write cannot race, put \
+         (SQLite 5/517; intentd#3799). Seed the store before the daemon starts with \
+         `common::seed_then_start(data_dir, seed, start)` (tests/common/mod.rs) instead of a \
+         per-file seed hook; for state only a daemon can make, stop it, then seed and restart \
+         through the same helper. Reads are fine. If the write cannot race, put \
          `// {TAG}: allow — <reason>` on the line above it.\n",
         offenders.len(),
         if offenders.len() == 1 { "" } else { "s" },
@@ -1194,6 +1196,30 @@ async fn t(fixture: &mut Fixture) {
 }
 ";
     assert_eq!(hits_of(src), vec![(25, "s.insert_agent".to_owned())]);
+}
+
+/// `common::seed_then_start` writes in its seed closure before the start
+/// closure spawns, and the daemon it returns is a live handle.
+#[test]
+fn seed_then_start_seeds_before_the_daemon_and_returns_a_live_one() {
+    let src = "\
+fn spawn_serve(d: &Path) -> GuardedChild {
+    let mut cmd = common::hermetic_serve_command(d);
+    GuardedChild::spawn(&mut cmd).unwrap()
+}
+async fn seed(store: &Store) { store.upsert_note(&n).await.unwrap(); }
+async fn t(d: &Path) {
+    let (child, id) = common::seed_then_start(
+        d,
+        async |store, _| seed(store).await,
+        async |id| (spawn_serve(d), id),
+    )
+    .await;
+    let store = Store::open(&db).await.unwrap();
+    store.insert_note(&n).await.unwrap();
+}
+";
+    assert_eq!(hits_of(src), vec![(14, "store.insert_note".to_owned())]);
 }
 
 #[test]

@@ -373,16 +373,18 @@ async fn turn(
 }
 
 async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
-    seed_workspace_on(data_dir, repo, false).await
-}
-
-/// [`seed_workspace`]; with `worktree`, `repo` is the workspace's own
-/// worktree (so its setup script applies) instead of a shared checkout.
-async fn seed_workspace_on(data_dir: &Path, repo: &Path, worktree: bool) -> String {
-    use intent_core::{now_iso, Workspace, WorkspaceId};
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store");
+    let ws = insert_workspace_on(&store, repo, false).await;
+    store.close().await;
+    ws
+}
+
+/// Insert a workspace on `repo`; with `worktree`, `repo` is the workspace's
+/// own worktree (so its setup script applies) instead of a shared checkout.
+async fn insert_workspace_on(store: &intent_store::Store, repo: &Path, worktree: bool) -> String {
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     let ws = WorkspaceId::new();
     let ts = now_iso();
     store
@@ -1630,34 +1632,39 @@ async fn start_backend_with(
     start_backend_on(data_dir, repo, env, false).await
 }
 
-/// [`start_backend_with`]; see [`seed_workspace_on`] for `worktree`.
+/// [`start_backend_with`]; see [`insert_workspace_on`] for `worktree`.
 async fn start_backend_on(
     data_dir: &Path,
     repo: &Path,
     env: &[(&str, &str)],
     worktree: bool,
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
-    std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
-    let ws_id = seed_workspace_on(data_dir, repo, worktree).await;
-    let (guard, port, cfg) = serve_backend(data_dir, env).await;
-    (guard, port, cfg, ws_id)
+    start_backend_seeded(data_dir, repo, env, worktree, async |_, _| {}).await
 }
 
-/// [`start_backend_with`], running `seed` with the seeded workspace's id
-/// before the backend starts: a test's own store writes land there, since a
-/// second writer racing the live daemon fails at random with "database is
-/// locked".
+/// [`start_backend_on`], running `seed` on the store with the seeded
+/// workspace's id before the backend starts ([`common::seed_then_start`]).
 async fn start_backend_seeded(
     data_dir: &Path,
     repo: &Path,
     env: &[(&str, &str)],
-    seed: impl AsyncFnOnce(&str),
+    worktree: bool,
+    seed: impl AsyncFnOnce(&intent_store::Store, &str),
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
-    let ws_id = seed_workspace_on(data_dir, repo, false).await;
-    seed(&ws_id).await;
-    let (guard, port, cfg) = serve_backend(data_dir, env).await;
-    (guard, port, cfg, ws_id)
+    common::seed_then_start(
+        data_dir,
+        async |store, _| {
+            let ws_id = insert_workspace_on(store, repo, worktree).await;
+            seed(store, &ws_id).await;
+            ws_id
+        },
+        async |ws_id| {
+            let (guard, port, cfg) = serve_backend(data_dir, env).await;
+            (guard, port, cfg, ws_id)
+        },
+    )
+    .await
 }
 
 /// Start the backend's `intentd serve` on `data_dir` (seeded or from an
@@ -2585,8 +2592,8 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
         c_url.clone(),
     ];
     let (_head, port, cfg, ws_id) =
-        start_backend_seeded(&head_dir, &repo, &[], async |ws_id: &str| {
-            seed_git_roots(&head_dir, ws_id, &roots).await;
+        start_backend_seeded(&head_dir, &repo, &[], false, async |store, ws_id| {
+            seed_git_roots(store, ws_id, &roots).await;
         })
         .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
@@ -2722,11 +2729,8 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
 }
 
 /// Register `paths` as `ws_id`'s secondary git roots in the backend's store.
-async fn seed_git_roots(data_dir: &Path, ws_id: &str, paths: &[std::path::PathBuf]) {
+async fn seed_git_roots(store: &intent_store::Store, ws_id: &str, paths: &[std::path::PathBuf]) {
     use intent_core::{now_iso, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource};
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
     let ts = now_iso();
     for path in paths {
         store

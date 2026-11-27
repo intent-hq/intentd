@@ -168,12 +168,9 @@ async fn a_pr_a_remote_agent_opens_from_a_submodule_branch_is_listed_on_its_root
     // The submodule's root, as the submodule sweep records it, seeded before
     // the backend starts: a second writer racing the live daemon fails at
     // random with "database is locked".
-    let seed_root = async |ws_id: &str| {
+    let seed_root = async |store: &intent_store::Store, ws_id: &str| {
         let lib = std::fs::canonicalize(repo.join("lib")).unwrap();
         let pin = git(&lib, &["rev-parse", "HEAD"]);
-        let store = intent_store::Store::open(&scratch.path().join("head").join("intentd.db"))
-            .await
-            .unwrap();
         let now = intent_core::now_iso();
         store
             .upsert_workspace_git_root(&intent_core::WorkspaceGitRoot {
@@ -194,7 +191,6 @@ async fn a_pr_a_remote_agent_opens_from_a_submodule_branch_is_listed_on_its_root
             })
             .await
             .unwrap();
-        store.close().await;
     };
     let (_head, port, cfg, ws_id, backend_id) = backend_with_repo_seeded(
         scratch.path(),
