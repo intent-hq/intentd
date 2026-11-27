@@ -469,6 +469,18 @@ pub struct CompletionClassifyPark {
     pub release: tokio::sync::Notify,
 }
 
+/// Test seams inside the identity transition: each parks the step right
+/// before its store write, after the service's own checks, so a test can
+/// commit another process's change in that window. Unset in production.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub(crate) struct IdentityParks {
+    /// An invite mint, before its insert.
+    pub(crate) mint: OnceLock<Arc<intentd_test_support::PausePoint>>,
+    /// A primary identity apply, before its principal write.
+    pub(crate) write: OnceLock<Arc<intentd_test_support::PausePoint>>,
+}
+
 /// Shared state of lease-guarded delivery (`Services::delivery_guards`).
 #[derive(Default)]
 pub(crate) struct DeliveryGuards {
@@ -1406,6 +1418,9 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
+    /// Test seams inside the identity transition (see [`IdentityParks`]).
+    #[cfg(any(test, feature = "test-hooks"))]
+    identity_parks: Arc<IdentityParks>,
     /// Bumped by every `identity.provider` write; an in-flight re-key
     /// commits only when it still holds the current generation (see
     /// [`principal_ops::IdentityRekeyGeneration`]). Shared across clones.
@@ -2071,6 +2086,8 @@ impl Services {
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(test, feature = "test-hooks"))]
+            identity_parks: Arc::default(),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
             discussion_control_gates: Arc::default(),
@@ -3368,6 +3385,23 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_watch_registration_park(self, park: Arc<CompletionClassifyPark>) -> Self {
         let _ = self.delivery_guards.registration_park.set(park);
+        self
+    }
+
+    /// Test seam: park an invite mint right before its insert.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_invite_mint_park(self, park: Arc<intentd_test_support::PausePoint>) -> Self {
+        let _ = self.identity_parks.mint.set(park);
+        self
+    }
+
+    /// Test seam: park a primary identity apply right before its write.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_identity_write_park(
+        self,
+        park: Arc<intentd_test_support::PausePoint>,
+    ) -> Self {
+        let _ = self.identity_parks.write.set(park);
         self
     }
 

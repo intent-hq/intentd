@@ -135,6 +135,7 @@ mod executor_repo;
 mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
+mod identity_transition_repo;
 pub use idempotency_repo::{IdempotencyClaim, IdempotencyReservation, IDEMPOTENCY_CLAIM_TTL};
 mod known_repo_repo;
 mod mcp_oauth_repo;
@@ -249,6 +250,7 @@ pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,
 };
+pub use identity_transition_repo::IdentityWriteCheck;
 pub use invite_nonce_repo::{InviteNonce, InviteNonceCaps};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use node_invite_repo::{NodeInvite, NodeInviteRefusal, NodeInviteRevocation};

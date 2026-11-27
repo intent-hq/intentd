@@ -611,10 +611,22 @@ impl Services {
             }
             // Direct grants and joins use this same database write boundary;
             // the identity lock alone does not serialize their seat checks.
+            // The insert re-checks the creator's identity in its own write
+            // transaction: the lock above orders this process only, and
+            // another process may re-key the identity before the insert.
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(park) = self.identity_parks.mint.get() {
+                park.pause().await;
+            }
             match self
                 .store
-                .insert_workspace_invite_within_cap(&invite, max_guests)
-                .await?
+                .insert_workspace_invite_within_cap_as(
+                    &invite,
+                    max_guests,
+                    creator.identity_key().as_ref(),
+                )
+                .await
+                .map_err(inviting_identity_changed)?
             {
                 InviteInsertOutcome::Inserted => {}
                 InviteInsertOutcome::WorkspaceArchived => {
@@ -1376,3 +1388,15 @@ mod removal_tests;
 
 #[cfg(test)]
 mod forge_required_tests;
+
+/// A minting insert that lost to an identity change committed by another
+/// process (the store's [`Error::Conflict`]) is the same retryable refusal
+/// as one this process saw under its identity lock.
+pub(crate) fn inviting_identity_changed(error: Error) -> Error {
+    match error {
+        Error::Conflict { .. } => {
+            Error::Internal("the inviting identity changed while minting; retry".to_string())
+        }
+        other => other,
+    }
+}

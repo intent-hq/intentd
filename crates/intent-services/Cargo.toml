@@ -14,12 +14,15 @@ repository-test-fixtures = []
 # "test-hooks"))]` items) for the tests of feature crates. Enable it only from
 # a dev-dependency: scripts/check-test-hooks-feature.sh fails CI when the
 # production feature graph of intentd turns it on. `async-trait` lets
-# test_support's stub forge implement `SourceControl` in that build.
-test-hooks = ["dep:async-trait"]
+# test_support's stub forge implement `SourceControl` in that build;
+# `intentd-test-support` gives its test seams the bounded `PausePoint`.
+test-hooks = ["dep:async-trait", "dep:intentd-test-support"]
 
 [dependencies]
 # Only for test-hooks (see [features]); a dev-dependency below as well.
 async-trait = { version = "0.1", optional = true }
+# Only for test-hooks (see [features]); a dev-dependency below as well.
+intentd-test-support = { path = "../intentd-test-support", optional = true }
 intent-core = { workspace = true }
 intent-store = { workspace = true }
 intent-git = { workspace = true }

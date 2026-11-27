@@ -23,13 +23,14 @@ use super::{db, PgStore, WriteTx};
 use crate::host_membership_repo::{
     HostInviteJoinOutcome, HostMemberRemoval, HostMembersSnapshot, OwnerQueuePermit,
 };
+use crate::identity_transition_repo::{identity_conflict, identity_locked};
 use crate::principal_repo::{
     map_owner_violation, principal_identity_columns, ArchivedGuestSweep, CollaboratorAddOutcome,
     EffectiveWorkspaceMember, InviteInsertOutcome, InviteJoinOutcome, WorkspaceAuthorFallback,
     WorkspaceGuestCount, CREDENTIAL_COLUMNS, INVITE_COLUMNS, MEMBER_COLUMNS, PRINCIPAL_COLUMNS,
     PRINCIPAL_UPSERT_SET,
 };
-use crate::{enum_from_db, enum_to_db, HostJoinCredential};
+use crate::{enum_from_db, enum_to_db, HostJoinCredential, IdentityWriteCheck};
 
 /// [`PRINCIPAL_COLUMNS`] qualified by the alias `p`.
 const P_COLUMNS: &str = "p.id, p.github_user_id, p.login, p.display_name, p.avatar_url, \
@@ -645,6 +646,28 @@ impl PgStore {
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
         let mut tx = self.begin_write().await?;
         write_principal(&mut tx, self.tenant(), p, true).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// See [`crate::Store::upsert_principal_checked`]: the checks run in the
+    /// write transaction, after locking the principal row.
+    pub async fn upsert_principal_checked(
+        &self,
+        p: &Principal,
+        check: &IdentityWriteCheck,
+    ) -> Result<()> {
+        let tenant = self.tenant();
+        let mut tx = self.begin_write().await?;
+        let current = locked_identity(&mut tx, tenant, &p.id)
+            .await?
+            .and_then(|row| row.identity_key());
+        if current != check.expected {
+            return Err(identity_conflict(&p.id, current.as_ref()));
+        }
+        if check.refuse_if_locked && primary_identity_locked(&mut tx, tenant).await? {
+            return Err(identity_locked());
+        }
+        write_principal(&mut tx, tenant, p, true).await?;
         tx.commit().await.map_err(db)
     }
 
@@ -1309,7 +1332,8 @@ impl PgStore {
         &self,
         invite: &WorkspaceInvite,
     ) -> Result<InviteInsertOutcome> {
-        self.insert_workspace_invite_with_limit(invite, None).await
+        self.insert_workspace_invite_with_limit(invite, None, IssuerCheck::Unchecked)
+            .await
     }
 
     pub async fn insert_workspace_invite_within_cap(
@@ -1317,17 +1341,39 @@ impl PgStore {
         invite: &WorkspaceInvite,
         max_guests: u32,
     ) -> Result<InviteInsertOutcome> {
-        self.insert_workspace_invite_with_limit(invite, Some(max_guests))
+        self.insert_workspace_invite_with_limit(invite, Some(max_guests), IssuerCheck::Unchecked)
             .await
     }
 
+    /// See [`crate::Store::insert_workspace_invite_within_cap_as`].
+    pub async fn insert_workspace_invite_within_cap_as(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: u32,
+        issuer_identity: Option<&PrincipalIdentity>,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(
+            invite,
+            Some(max_guests),
+            IssuerCheck::Expect(issuer_identity),
+        )
+        .await
+    }
+
+    /// `issuer`: whether to check, and the identity the issuer must still have
+    /// (checked after locking its row).
     async fn insert_workspace_invite_with_limit(
         &self,
         invite: &WorkspaceInvite,
         max_guests: Option<u32>,
+        issuer: IssuerCheck<'_>,
     ) -> Result<InviteInsertOutcome> {
         let tenant = self.tenant();
         let mut tx = self.begin_write().await?;
+        if let IssuerCheck::Expect(expected) = issuer {
+            check_issuer_identity(&mut tx, tenant, &invite.created_by_principal_id, expected)
+                .await?;
+        }
         if workspace_archived(&mut tx, tenant, &invite.workspace_id).await? == Some(true) {
             return Ok(InviteInsertOutcome::WorkspaceArchived);
         }
@@ -1878,9 +1924,32 @@ impl PgStore {
     }
 
     pub async fn insert_host_invite(&self, invite: &HostInvite) -> Result<()> {
+        self.insert_host_invite_checked(invite, IssuerCheck::Unchecked)
+            .await
+    }
+
+    /// See [`crate::Store::insert_host_invite_as`].
+    pub async fn insert_host_invite_as(
+        &self,
+        invite: &HostInvite,
+        issuer_identity: Option<&PrincipalIdentity>,
+    ) -> Result<()> {
+        self.insert_host_invite_checked(invite, IssuerCheck::Expect(issuer_identity))
+            .await
+    }
+
+    async fn insert_host_invite_checked(
+        &self,
+        invite: &HostInvite,
+        issuer: IssuerCheck<'_>,
+    ) -> Result<()> {
         invite.validate_new()?;
         let tenant = self.tenant();
         let mut tx = self.begin_write().await?;
+        if let IssuerCheck::Expect(expected) = issuer {
+            check_issuer_identity(&mut tx, tenant, &invite.created_by_principal_id, expected)
+                .await?;
+        }
         if !is_primary(&mut tx, tenant, &invite.created_by_principal_id).await? {
             return Err(Error::InvalidInput(
                 "only the host owner may issue host invitations".into(),
@@ -2222,6 +2291,68 @@ impl PgStore {
             .await?;
         Ok(result)
     }
+}
+
+/// Locks `principal_id`'s row for the rest of `tx` and returns it (`None`:
+/// no row). Identity writes and invite inserts lock the row they
+/// check, so a check made here holds until `tx` commits.
+async fn locked_identity(
+    tx: &mut WriteTx,
+    tenant: &str,
+    principal_id: &PrincipalId,
+) -> Result<Option<Principal>> {
+    let sql = format!(
+        "SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE tenant_id = $1 AND id = $2 FOR UPDATE"
+    );
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(tenant)
+        .bind(&principal_id.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+    row.as_ref().map(principal).transpose()
+}
+
+/// Whether an invite insert checks its issuer's identity, and against what.
+#[derive(Clone, Copy)]
+enum IssuerCheck<'a> {
+    Unchecked,
+    /// The identity the issuer must still have (`None`: unlinked).
+    Expect(Option<&'a PrincipalIdentity>),
+}
+
+/// Fails with [`Error::Conflict`] unless `issuer` still has `expected`.
+async fn check_issuer_identity(
+    tx: &mut WriteTx,
+    tenant: &str,
+    issuer: &PrincipalId,
+    expected: Option<&PrincipalIdentity>,
+) -> Result<()> {
+    let current = locked_identity(tx, tenant, issuer)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("principal {issuer}")))?
+        .identity_key();
+    if current.as_ref() != expected {
+        return Err(identity_conflict(issuer, current.as_ref()));
+    }
+    Ok(())
+}
+
+/// Whether the primary identity is load-bearing (another principal exists or
+/// a workspace invite is open), read in `tx` (the service's
+/// `primary_identity_locked`).
+async fn primary_identity_locked(tx: &mut WriteTx, tenant: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT (SELECT COUNT(*) FROM principal WHERE tenant_id = $1) > 1 \
+         OR EXISTS (SELECT 1 FROM workspace_invite i WHERE i.tenant_id = $1 AND {})",
+        invite_open(2)
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(tenant)
+        .bind(now_iso())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db)
 }
 
 async fn revoke_credentials_of(
