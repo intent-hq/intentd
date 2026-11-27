@@ -18,22 +18,6 @@ SPEC = importlib.util.spec_from_file_location("new_harness_version", SCRIPT)
 bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 
-DOCS = """### 5.5 Session
-
-#### Prompt breakdown
-
-*(Additive; recorded for harness 3.10, 3.12, 3.13, 3.14 and 3.15.)* `agent.getSession` adds a
-top-level `promptBreakdown` field.
-
-   1. `harness-predates-breakdown`: the daemon admits versions by name: 3.10 (eval-only), 3.12,
-      which releases the breakdown, and 3.13, 3.14 and
-      3.15, which keep it. Released 3.11 only corrects visual guidance.
-
-#### Next section
-
-Harness 3.14 and 3.15 are unrelated here.
-"""
-
 
 def current_version():
     text = (REPO / bump.MODEL).read_text()
@@ -55,8 +39,6 @@ class RealTree(unittest.TestCase):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(REPO / relative, target)
-        self.docs = Path(temp.name) / "agents.md"
-        self.docs.write_text(DOCS.replace("3.15", self.old))
 
     def run_script(self, *args):
         return subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "--root", str(self.root), *args],
@@ -108,24 +90,8 @@ class RealTree(unittest.TestCase):
         self.assertIn("assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);", created)
         self.assertTrue(all(len(line) <= bump.MAX_WIDTH for line in created.split("\n")))
 
-    def test_bumps_the_protocol_docs_lists(self):
-        result = self.run_script("--from", self.old, "--to", self.new, "--docs", str(self.docs))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        docs = self.docs.read_text()
-        self.assertIn(f"recorded for harness 3.10, 3.12, 3.13, 3.14, {self.old} and {self.new}.)", docs)
-        self.assertIn(f"and 3.13, 3.14, {self.old} and\n      {self.new}, which keep it.", docs)
-        self.assertIn(f"Harness 3.14 and {self.old} are unrelated here.", docs)
-
     def test_writes_nothing_when_an_anchor_is_missing(self):
         before = self.snapshot()
-        docs_before = self.docs.read_text()
-        self.docs.write_text("# no prompt breakdown section\n")
-        result = self.run_script("--from", self.old, "--to", self.new, "--docs", str(self.docs))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("Nothing was written", result.stderr)
-        self.assertEqual(self.snapshot(), before)
-        self.docs.write_text(docs_before)
-
         stale = bump.next_minor(self.new)
         result = self.run_script("--from", self.new, "--to", stale)
         self.assertEqual(result.returncode, 1)
@@ -196,10 +162,6 @@ class Layout(unittest.TestCase):
         self.assertIn("pub(crate) mod v3_9;\npub(crate) mod v4_0;\n", out)
         with self.assertRaises(bump.Mismatch):
             bump.edit_harness_mod(text, "3.9", "3.16")
-
-    def test_docs_match_whole_versions_only(self):
-        with self.assertRaises(bump.Mismatch):
-            bump.edit_docs(DOCS, "3.1", "3.2")
 
 
 if __name__ == "__main__":

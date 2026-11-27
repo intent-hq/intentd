@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn older_harnesses_have_no_goal_surface_and_3_17_is_current() {
+    fn older_harnesses_have_no_goal_surface() {
         assert_eq!(
             super::super::v3_16::ENTRY
                 .harness
@@ -496,8 +496,6 @@ mod tests {
             None
         );
         let current = &ENTRY;
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
-        assert!(std::ptr::eq(crate::harness::latest_entry(), current));
+        assert_eq!(current.version, "3.17");
     }
 }

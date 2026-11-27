@@ -295,6 +295,23 @@ pub(crate) const EMBEDDED_BUNDLED_V3_15: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v3.18 embedded specialist bundle: the v3.15 set with a Developer that
+/// writes every unit of work as a task block, also when it does the work
+/// itself.
+pub(crate) const EMBEDDED_BUNDLED_V3_18: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_15[0],
+    (
+        "developer",
+        include_str!("../resources/specialists/v3.18/developer.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_15[2],
+    EMBEDDED_BUNDLED_V3_15[3],
+    EMBEDDED_BUNDLED_V3_15[4],
+    EMBEDDED_BUNDLED_V3_15[5],
+    EMBEDDED_BUNDLED_V3_15[6],
+    EMBEDDED_BUNDLED_V3_15[7],
+];
+
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.
 const EMPTY_BUNDLE: &[(&str, &str)] = &[];
@@ -2006,8 +2023,9 @@ impl SpecialistsService {
         self.resolve_prompt_injection_in(id, workspace_path, false)
     }
 
-    /// Apply plain-folder doctrine only to the shipped v3.8 prompts. File
-    /// overrides and older session-pinned bundles retain their authored text.
+    /// Apply plain-folder doctrine only to the shipped v3.8 prompts and the
+    /// v3.18 Developer. File overrides and older session-pinned bundles retain
+    /// their authored text.
     pub(crate) fn resolve_prompt_injection_in(
         &self,
         id: &str,
@@ -2016,7 +2034,10 @@ impl SpecialistsService {
     ) -> Option<(Option<String>, String, Option<String>)> {
         let mut def = self.resolve(id, workspace_path)?;
         if plain_folder && !self.base_replaced && def["source"] == "bundled" {
-            for (candidate, source) in EMBEDDED_BUNDLED_V3_8 {
+            for (candidate, source) in EMBEDDED_BUNDLED_V3_8
+                .iter()
+                .chain(&EMBEDDED_BUNDLED_V3_18[1..2])
+            {
                 if !matches!(*candidate, "developer" | "pr-reviewer") {
                     continue;
                 }
@@ -3020,7 +3041,9 @@ mod tests {
                 original,
                 svc.resolve_prompt_injection_in(id, None, true).unwrap()
             );
-            let source = EMBEDDED_BUNDLED_V3_8
+            let source = crate::harness::latest_entry()
+                .doctrine
+                .specialists
                 .iter()
                 .find(|(name, _)| *name == id)
                 .unwrap()

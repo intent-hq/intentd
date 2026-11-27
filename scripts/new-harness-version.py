@@ -14,9 +14,6 @@ feature defaults) in the new module:
 4. intent-services harness/mod.rs: the module line and the REGISTRY row.
 5. harness/v<FROM>.rs: its test no longer pins FROM as the current version.
 6. harness/v<TO>.rs (new): reuses every FROM surface; its test pins TO as current.
-7. With --docs (the make target passes it inside the monorepo): both version
-   lists in the Prompt breakdown section of docs/protocol/methods/agents.md.
-   That docs change is a separate monorepo PR that must merge first.
 
 The admissions in 1 and 2 keep FROM's: FROM must already be admitted. A
 version that should drop repository guidance or the prompt breakdown is not a
@@ -27,7 +24,7 @@ tree does not match (a missing anchor, an unexpected current version), 2 on a
 usage error.
 
 Usage (from packages/intentd): make new-harness-version FROM=3.15 TO=3.16
-   or: python3 -I -B scripts/new-harness-version.py --from 3.15 --to 3.16 [--docs PATH] [--dry-run]
+   or: python3 -I -B scripts/new-harness-version.py --from 3.15 --to 3.16 [--dry-run]
 """
 import argparse
 import os
@@ -240,24 +237,7 @@ mod tests {{
 '''
 
 
-def edit_docs(text, old, new):
-    """Extend the two English version lists ("3.13, 3.14 and 3.15") in the
-    Prompt breakdown section."""
-    start = text.find("#### Prompt breakdown\n")
-    if start < 0:
-        raise Mismatch("agents.md: no '#### Prompt breakdown' section")
-    end = text.find("\n#", start + 1)
-    end = len(text) if end < 0 else end
-    section = text[start:end]
-    version = r"\d+\.\d+"
-    pattern = re.compile(rf"((?<![\d.]){version}(?:,\s+{version})*)(\s+)and(\s+){re.escape(old)}(?![\d]|\.\d)")
-    section, count = pattern.subn(lambda m: f"{m.group(1)},{m.group(2)}{old} and{m.group(3)}{new}", section)
-    if count != 2:
-        raise Mismatch(f"agents.md: expected 2 version lists ending in {old} in Prompt breakdown, found {count}")
-    return text[:start] + section + text[end:]
-
-
-def plan(root, old, new, docs):
+def plan(root, old, new):
     """Map path -> new content for every edit, or raise Mismatch."""
     def read(relative):
         path = root / relative
@@ -277,10 +257,6 @@ def plan(root, old, new, docs):
         root / previous: edit_previous_module(read(previous), old),
         new_path: new_module(old, new, read(previous)),
     }
-    if docs is not None:
-        if not docs.is_file():
-            raise Mismatch(f"{docs}: not found")
-        changes[docs] = edit_docs(docs.read_text(), old, new)
     return changes
 
 
@@ -289,7 +265,6 @@ def main(argv=None):
     parser.add_argument("--from", dest="old", required=True, help="the current harness version, e.g. 3.15")
     parser.add_argument("--to", dest="new", required=True, help="the new harness version, e.g. 3.16")
     parser.add_argument("--root", type=Path, default=ROOT, help="the intentd checkout (default: this one)")
-    parser.add_argument("--docs", type=Path, help="the monorepo's docs/protocol/methods/agents.md")
     parser.add_argument("--dry-run", action="store_true", help="list the files without writing them")
     args = parser.parse_args(argv)
     try:
@@ -299,7 +274,7 @@ def main(argv=None):
         parser.error(str(error))
 
     try:
-        changes = plan(args.root, args.old, args.new, args.docs)
+        changes = plan(args.root, args.old, args.new)
     except Mismatch as error:
         print(f"new-harness-version: {error}. Nothing was written.", file=sys.stderr)
         return 1
@@ -311,12 +286,7 @@ def main(argv=None):
     print(f"\nHarness {args.new} is registered as a copy of {args.old}. Next:")
     print(f"  1. Make the change in {HARNESS_DIR}/{module(args.new)}.rs (new resource sets go in")
     print("     resources/agent-instructions/ or resources/specialists/), and pin it in its test.")
-    if args.docs is None:
-        print("  2. Add the version to both lists in the Prompt breakdown section of the monorepo's")
-        print("     docs/protocol/methods/agents.md (not found here; pass --docs).")
-    else:
-        print(f"  2. Open the monorepo PR for {args.docs.name} first; it must merge before this one.")
-    print("  3. Run: make check && make test-select E='test(harness)'")
+    print("  2. Run: make check && make test-select E='test(harness)'")
     return 0
 
 

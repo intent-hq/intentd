@@ -41,7 +41,7 @@ help:
 	@echo "  lint-workflows — run the pinned actionlint with shellcheck over .github/workflows,"
 	@echo "    as ci.yml's release-scripts job does (needs actionlint + shellcheck)."
 	@echo "  new-harness-version FROM=3.15 TO=3.16 [DRY_RUN=1] — register harness TO as a copy of"
-	@echo "    the current FROM (every routine bump edit, plus the monorepo protocol docs when present)."
+	@echo "    the current FROM (every routine bump edit)."
 
 test-release-scripts:
 	python3 scripts/release-scripts-local.py
@@ -51,7 +51,7 @@ lint-workflows:
 
 new-harness-version:
 	@if [ -z "$(FROM)" ] || [ -z "$(TO)" ]; then echo "usage: make new-harness-version FROM=3.15 TO=3.16 [DRY_RUN=1]" >&2; exit 2; fi
-	@python3 -I -B scripts/new-harness-version.py --from "$(FROM)" --to "$(TO)" $(if $(MONOREPO_PRESENT),--docs "$(MONOREPO_ROOT)/docs/protocol/methods/agents.md") $(if $(DRY_RUN),--dry-run)
+	@python3 -I -B scripts/new-harness-version.py --from "$(FROM)" --to "$(TO)" $(if $(DRY_RUN),--dry-run)
 
 ifneq ($(MONOREPO_PRESENT),)
 # One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,
