@@ -1551,6 +1551,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     workspace_id: record.workspace_id,
                     provider: intent_providers::base_provider_id(&provider).to_owned(),
                     model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort.clone(),
                     base_commit: view.base_commit,
                     repo_key,
                     profile_env,
@@ -1561,7 +1562,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                     compact_tool_descriptions,
                     checkout_of: home
                         .map(intent_core::node_link::CheckoutOf::Home)
-                        .or_else(|| checkout_of.map(Into::into)),
+                        .or_else(|| checkout_of.map(Into::into))
+                        .map(Box::new),
                     forge,
                     forge_fetch,
                     forge_fetch_modules,

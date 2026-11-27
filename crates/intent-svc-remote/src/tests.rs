@@ -1991,6 +1991,7 @@ mod stop_acks {
             workspace_id: workspace(),
             provider: "codex".into(),
             model: None,
+            reasoning_effort: None,
             base_commit: "0".repeat(40),
             repo_key: "repo".into(),
             agent_features: serde_json::json!({}),

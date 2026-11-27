@@ -3795,6 +3795,63 @@ async fn apply_cursor_session_model(
     }
 }
 
+/// Apply a reasoning effort to a session opened outside an agent handle (a
+/// machine launch), through the `thought_level` option in `config_options`
+/// (a `session/new` list, or a `session/set_config_option` response after a
+/// model change, whose options follow the selected model). Mirrors the
+/// local first application: no-op without an effort or such an option, or
+/// when the provider is already on it; a level the option does not offer is
+/// skipped. Failures are logged; the provider keeps its current effort.
+pub async fn apply_session_effort(
+    conn: &Connection,
+    acp_session_id: &str,
+    config_options: Option<&Value>,
+    effort: Option<&str>,
+) {
+    let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
+        return;
+    };
+    let Some(selector) = config_options
+        .map(|options| options.get("configOptions").unwrap_or(options))
+        .and_then(|options| {
+            serde_json::from_value::<Vec<SessionConfigOption>>(options.clone()).ok()
+        })
+        .and_then(|options| discover_thought_level(Some(&options)))
+    else {
+        return;
+    };
+    let value = match selector
+        .values
+        .iter()
+        .find(|v| v.eq_ignore_ascii_case(effort))
+    {
+        Some(value) => value.clone(),
+        None if selector.values.is_empty() => effort.to_string(),
+        None => {
+            tracing::warn!(
+                session_id = acp_session_id,
+                effort,
+                "the provider does not offer this reasoning effort; it keeps its current one"
+            );
+            return;
+        }
+    };
+    if selector.current_value.eq_ignore_ascii_case(&value) {
+        return;
+    }
+    if let Err(e) = intent_acp::session::set_session_config_option_response(
+        conn,
+        acp_session_id,
+        &selector.config_id,
+        &value,
+    )
+    .await
+    {
+        tracing::warn!(session_id = acp_session_id, error = %e, effort = %value,
+            "session/set_config_option failed; provider keeps its current reasoning effort");
+    }
+}
+
 impl AgentManager {
     /// Wire a manager over the services surface and a concrete event sink, with
     /// a global concurrency `cap`.

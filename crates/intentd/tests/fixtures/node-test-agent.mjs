@@ -24,6 +24,9 @@
 //                           answers, so its exit is seen first)
 //   --reject-model          refuse session/set_config_option and
 //                           session/set_model with ACP's invalid-params error
+//   --thought-level <value> advertise a reasoning-effort select (`effort`,
+//                           category thought_level, low/medium/high) at
+//                           <value> on session/new
 //
 // session/set_config_option and session/set_model append their params as a
 // JSON line to `session-model.jsonl` in its working directory.
@@ -93,6 +96,22 @@ const failSetupAt = argv.indexOf('--fail-setup-echo');
 const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
 const detachedHelper = argv.includes('--detached-helper');
 const authRequiredSetup = argv.includes('--auth-required-setup');
+const thoughtLevelAt = argv.indexOf('--thought-level');
+const thoughtLevel = () =>
+  thoughtLevelAt < 0
+    ? {}
+    : {
+        configOptions: [
+          {
+            id: 'effort',
+            name: 'Effort',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: argv[thoughtLevelAt + 1],
+            options: ['low', 'medium', 'high'].map((value) => ({ value, name: value })),
+          },
+        ],
+      };
 const sessionsAt = argv.indexOf('--sessions');
 const sessionsDir = sessionsAt >= 0 ? argv[sessionsAt + 1] : process.env.NODE_TEST_AGENT_SESSIONS;
 const sessionFile = (id) => `${sessionsDir}/${id}.json`;
@@ -261,7 +280,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } },
         });
       }
-      if (!sessionsDir) return send({ id: msg.id, result: { sessionId: SESSION } });
+      if (!sessionsDir) return send({ id: msg.id, result: { sessionId: SESSION, ...thoughtLevel() } });
       currentSession = `s-${crypto.randomUUID()}`;
       fs.mkdirSync(sessionsDir, { recursive: true });
       fs.writeFileSync(sessionFile(currentSession), '[]');
@@ -297,7 +316,10 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       if (argv.includes('--reject-model')) {
         return send({ id: msg.id, error: { code: -32602, message: 'unknown model' } });
       }
-      return send({ id: msg.id, result: msg.method === 'session/set_model' ? {} : { configOptions: [] } });
+      return send({
+        id: msg.id,
+        result: msg.method === 'session/set_model' ? {} : { configOptions: thoughtLevel().configOptions ?? [] },
+      });
     case 'session/prompt': {
       const text = promptText(msg.params);
       // A specialist's role reminder leads its prompts: echo-raw,

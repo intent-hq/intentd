@@ -489,6 +489,7 @@ fn every_frame() -> Vec<LinkFrame> {
             workspace_id: WorkspaceId::new(),
             provider: "claude".into(),
             model: Some("opus".into()),
+            reasoning_effort: None,
             base_commit: "base".into(),
             repo_key: "repo".into(),
             profile_env: Some(LaunchProfileEnv(json!({
@@ -1345,6 +1346,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),
@@ -1385,6 +1387,7 @@ fn launch_without_a_profile_omits_profile_env() {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),
@@ -1822,6 +1825,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             workspace_id: WorkspaceId::from("ws-1"),
             provider: "codex".into(),
             model: None,
+            reasoning_effort: None,
             base_commit: "base".into(),
             repo_key: "repo".into(),
             agent_features: json!({}),
@@ -1860,6 +1864,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             workspace_id: WorkspaceId::from("ws-1"),
             provider: "codex".into(),
             model: None,
+            reasoning_effort: None,
             base_commit: "base".into(),
             repo_key: "repo".into(),
             agent_features: json!({}),
@@ -1919,6 +1924,7 @@ fn a_launch_carries_the_harness_version_on_any_protocol() {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),
@@ -1962,13 +1968,14 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),
         is_sub_agent: true,
         profile_env: None,
         checkout: None,
-        checkout_of: Some(AgentId::from("parent").into()),
+        checkout_of: Some(Box::new(AgentId::from("parent").into())),
         forge: None,
         forge_fetch: None,
         forge_fetch_modules: Vec::new(),
@@ -2320,7 +2327,7 @@ fn launch_forge_fetch_needs_protocol_17_and_is_closed() {
     let LinkFrame::Launch(mut sharing) = frame.clone() else {
         unreachable!()
     };
-    sharing.checkout_of = Some(AgentId::from("agent-owner").into());
+    sharing.checkout_of = Some(Box::new(AgentId::from("agent-owner").into()));
     assert_eq!(
         LinkFrame::Launch(sharing).min_protocol(),
         FORGE_FETCH_PROTOCOL
@@ -2419,6 +2426,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),
@@ -2494,6 +2502,7 @@ fn labelled_launch(labels: LaunchLabels) -> LaunchCommand {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: json!({}),

@@ -121,7 +121,7 @@ fn tuned_harness(args: &[&str], tune: impl FnOnce(&mut ProviderConfig)) -> Optio
         eprintln!("skipping node runner test: node not on PATH");
         return None;
     };
-    Some(harness_tuned(node, 2, args, tune))
+    Some(harness_tuned(node, 4, args, tune))
 }
 
 /// [`harness`] with the fixture provider run by `node`. Tests that never
@@ -197,6 +197,7 @@ fn launch(id: &str) -> LaunchCommand {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: PROVIDER.into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: serde_json::json!({}),
@@ -1489,6 +1490,53 @@ async fn node_runner_applies_the_launch_model_to_the_provider_session() {
             json!({ "method": "session/set_model", "sessionId": "node-test-session", "modelId": "grok-5" })
         ]
     );
+}
+
+/// The launch's reasoning effort reaches the provider's `thought_level`
+/// option after the model, as a local session's does; a level the provider
+/// is already on, or does not offer, sends nothing.
+#[tokio::test]
+async fn node_runner_applies_the_launch_effort_to_the_provider_session() {
+    let Some(h) = tuned_harness(&["--thought-level", "medium"], |config| {
+        config.supports_config_option_model = true;
+    }) else {
+        return;
+    };
+    let applied = |id: &str| -> Vec<Value> {
+        let path = h
+            .storage
+            .agent_dir(&AgentId::from(id))
+            .unwrap()
+            .join("session-model.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let with_effort = |id: &str, effort: &str| LaunchCommand {
+        model: Some("opus".into()),
+        reasoning_effort: Some(effort.into()),
+        ..launch(id)
+    };
+    let option = |config: &str, value: &str| {
+        json!({
+            "method": "session/set_config_option",
+            "sessionId": "node-test-session",
+            "configId": config,
+            "value": value,
+        })
+    };
+    for (id, effort) in [("e1", "HIGH"), ("e2", "medium"), ("e3", "ultra")] {
+        h.runner.launch(with_effort(id, effort)).await;
+        wait_for(&h.runner, "start", started(id)).await;
+    }
+    assert_eq!(
+        applied("e1"),
+        vec![option("model", "opus"), option("effort", "high")]
+    );
+    assert_eq!(applied("e2"), vec![option("model", "opus")]);
+    assert_eq!(applied("e3"), vec![option("model", "opus")]);
 }
 
 /// A provider whose model selection must succeed (codex, cursor,

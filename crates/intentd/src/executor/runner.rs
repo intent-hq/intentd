@@ -605,6 +605,8 @@ struct Agent {
     /// The launch's provider id and model, for the memory report.
     provider: String,
     model: Option<String>,
+    /// The launch's reasoning effort, applied after the model.
+    reasoning_effort: Option<String>,
     /// The launch's display labels, for the memory report only.
     labels: intent_core::node_link::LaunchLabels,
     /// The provider process's pid while it runs, for the memory sampler.
@@ -1586,6 +1588,7 @@ impl Runner {
             workspace_id,
             provider,
             model,
+            reasoning_effort,
             base_commit,
             repo_key,
             profile_env,
@@ -1645,7 +1648,7 @@ impl Runner {
         }
         // An agent sharing the workspace's home checkout (nodeProtocol 19)
         // has no checkout owner agent: it works in the home's.
-        let (checkout_of, home) = match checkout_of {
+        let (checkout_of, home) = match checkout_of.map(|of| *of) {
             None => (None, None),
             Some(CheckoutOf::Agent(owner)) => (Some(owner), None),
             Some(CheckoutOf::Home(home)) if home.workspace_id == workspace_id => (None, Some(home)),
@@ -1731,6 +1734,7 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             provider: provider.clone(),
             model: model.clone(),
+            reasoning_effort,
             labels: *labels,
             root_pid: Mutex::new(None),
             base_commit,
@@ -2915,14 +2919,30 @@ impl Runner {
             _ = &mut *stop => return Outcome::Stopped,
         };
         // A provider without a CLI model flag takes the model on its session,
-        // as a local spawn's does (intent-hq/intent#10197).
-        let applied = intent_services::apply_session_model(
-            connection,
-            &launch.config,
-            &session,
-            agent.model.as_deref(),
-            options.as_ref(),
-        );
+        // then the effort, as a local spawn's does (intent-hq/intent#10197).
+        let applied = async {
+            let response = intent_services::apply_session_model(
+                connection,
+                &launch.config,
+                &session,
+                agent.model.as_deref(),
+                options.as_ref(),
+            )
+            .await?;
+            let effort = intent_services::AgentManager::session_model_effort(
+                &launch.config,
+                agent.model.as_deref(),
+                agent.reasoning_effort.as_deref(),
+            );
+            intent_services::apply_session_effort(
+                connection,
+                &session,
+                response.as_ref().or(options.as_ref()),
+                effort.as_deref(),
+            )
+            .await;
+            Ok::<_, intent_core::Error>(())
+        };
         tokio::select! {
             result = applied => if let Err(error) = result {
                 return Outcome::StartFailed(error.to_string(), false);

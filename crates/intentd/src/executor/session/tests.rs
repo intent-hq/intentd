@@ -93,6 +93,7 @@ fn launch(id: &str) -> LinkFrame {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        reasoning_effort: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
         profile_env: None,
