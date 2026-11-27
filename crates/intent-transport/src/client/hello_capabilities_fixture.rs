@@ -114,7 +114,20 @@ fn generated() -> String {
 /// Per-profile capability differences, `-` for the fixture and `+` for the code.
 fn differences(fixture: &Value, code: &Value) -> Vec<String> {
     let mut lines = Vec::new();
+    for field in ["fixtureFormatVersion", "description"] {
+        if fixture[field] != code[field] {
+            lines.push(format!("{field} {} -> {}", fixture[field], code[field]));
+        }
+    }
     let profiles = |doc: &Value| doc["profiles"].as_array().cloned().unwrap_or_default();
+    for theirs in profiles(fixture) {
+        if !profiles(code).iter().any(|p| p["id"] == theirs["id"]) {
+            lines.push(format!(
+                "{}: profile the code no longer builds",
+                theirs["id"]
+            ));
+        }
+    }
     for ours in profiles(code) {
         let id = ours["id"].as_str().unwrap_or_default().to_owned();
         let Some(theirs) = profiles(fixture)
@@ -167,6 +180,10 @@ fn hello_capabilities_match_the_protocol_fixture() {
         std::fs::create_dir_all(canonical.parent().expect("fixture directory"))
             .expect("create fixture directory");
         std::fs::write(&canonical, &generated).expect("write canonical fixture");
+        eprintln!(
+            "wrote {}; land it, then re-export the component copies",
+            canonical.display()
+        );
         return;
     }
     let fixture: Value = serde_json::from_str(COPY).expect("fixture json");
