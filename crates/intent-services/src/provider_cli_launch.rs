@@ -63,12 +63,7 @@ impl ProviderCli {
     pub(crate) fn program(&self) -> (&Path, Vec<String>) {
         match self {
             Self::Installed(bin) => (bin, Vec::new()),
-            Self::Npx { npx, package } => {
-                let mut args = vec![intent_acp::spawn::NPX_NO_WORKSPACES_ARG.to_owned()];
-                args.extend(intent_providers::npx_install_args(package));
-                args.extend(["-y".to_owned(), package.clone()]);
-                (npx, args)
-            }
+            Self::Npx { npx, package } => (npx, intent_acp::spawn::npx_run_args(package)),
         }
     }
 
@@ -350,8 +345,8 @@ mod tests {
         assert_eq!(
             argv(&cli).await,
             format!(
-                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0} models",
-                intent_providers::OPENCODE_NPX_PACKAGE
+                "{} models",
+                intent_acp::spawn::npx_run_args(intent_providers::OPENCODE_NPX_PACKAGE).join(" ")
             )
         );
         // fixed-deadline: allow — an input to the timeout choice, not a wait

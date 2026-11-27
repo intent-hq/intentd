@@ -33,10 +33,10 @@ pub fn in_subprocess(test_name: &str) -> bool {
         ("node", "#!/bin/sh\nexec \"$MOCK_CLAUDE_NODE\" \"$@\"\n".to_owned()),
         (
             "npx",
-            format!(
-                "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then echo 10.9.2; exit 0; fi\n[ \"$#\" = 6 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = --ignore-scripts=false ] && [ \"$3\" = --include=optional ] && [ \"$4\" = --allow-scripts='{0}' ] && [ \"$5\" = -y ] && [ \"$6\" = '{0}' ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = \"$MOCK_CLAUDE_ROOT/bin/claude\" ] || exit 93\nprintf '%s\\n' \"$CLAUDE_CODE_EXECUTABLE\" >> \"$MOCK_CLAUDE_ROOT/adapter-calls\"\nIFS= read -r adapter < \"$MOCK_CLAUDE_ROOT/adapter-path\"\nexec \"$adapter\" \"$@\"\n",
-                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
-            ),
+            intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+                .version("10.9.2")
+                .then("[ \"$CLAUDE_CODE_EXECUTABLE\" = \"$MOCK_CLAUDE_ROOT/bin/claude\" ] || exit 93\nprintf '%s\\n' \"$CLAUDE_CODE_EXECUTABLE\" >> \"$MOCK_CLAUDE_ROOT/adapter-calls\"\nIFS= read -r adapter < \"$MOCK_CLAUDE_ROOT/adapter-path\"\nexec \"$adapter\" \"$@\"")
+                .script(),
         ),
         (
             "legacy-adapter",

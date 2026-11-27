@@ -331,10 +331,11 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-/// The fake `npx` body; `__REPORT__`, `__NODE__` and `__SCRIPT__` are
-/// substituted. `npx --version` (the daemon's spawn-time stale-npx probe,
-/// intent-hq/intent#5725) prints an npm ≥ 7 version and exits without
-/// recording anything, like the real npx. A launch appends its cwd to
+/// The fake `npx` body after the shared argv check
+/// ([`intent_acp::fake_npx::FakeNpx`]); `__REPORT__`, `__NODE__` and
+/// `__SCRIPT__` are substituted. `npx --version` (the daemon's spawn-time
+/// stale-npx probe, intent-hq/intent#5725) prints an npm ≥ 7 version and exits
+/// without recording anything, like the real npx. A launch appends its cwd to
 /// `<report>.cwd` and its argv to `<report>.args`, then picks npm's project
 /// root the way `@npmcli/config` `loadLocalPrefix` does: the nearest
 /// `package.json` above its cwd, unless an ancestor further up declares
@@ -343,13 +344,11 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 /// `--no-workspaces` is absent from the argv. It fails like npm when that
 /// root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc`
 /// names a `script-shell` that does not exist (`ENOENT`, exit 254), and
-/// otherwise execs the mock fixture under `node`.
-const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
-if [ "$1" = --version ]; then
-  echo '10.9.2'
-  exit 0
-fi
-printf '%s\n' "$PWD" >> '__REPORT__.cwd'
+/// otherwise execs the mock fixture under `node`. The shared argv check
+/// already rejects a launch without `--workspaces=false`, so the walk always
+/// sees the switch; it stays to prove the launch dir's sentinel manifest is
+/// the root npm picks.
+const FAKE_NPX_SCRIPT: &str = r#"printf '%s\n' "$PWD" >> '__REPORT__.cwd'
 printf '%s\n' "$*" >> '__REPORT__.args'
 printf '%s\n' "$CLAUDE_CODE_EXECUTABLE" >> '__REPORT__.runtime'
 no_ws=0
@@ -422,15 +421,16 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755))
         .expect("chmod node");
     let npx = bin_dir.join("npx");
-    std::fs::write(
-        &npx,
-        FAKE_NPX_SCRIPT
-            .replace("__REPORT__", &report.display().to_string())
-            .replace("__NODE__", &node.display().to_string())
-            .replace("__SCRIPT__", script),
-    )
-    .expect("write fake npx");
-    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).expect("chmod npx");
+    intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+        .version("10.9.2")
+        .then(
+            &FAKE_NPX_SCRIPT
+                .replace("__REPORT__", &report.display().to_string())
+                .replace("__NODE__", &node.display().to_string())
+                .replace("__SCRIPT__", script),
+        )
+        .write(&npx)
+        .expect("write fake npx");
     npx
 }
 
@@ -640,13 +640,8 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     );
     assert_eq!(
         first_args,
-        format!(
-            "{} {} -y {}",
-            intent_acp::spawn::NPX_NO_WORKSPACES_ARG,
-            intent_providers::npx_install_args(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
-                .join(" "),
-            intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
-        ),
+        intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+            .command_line(),
         "claude-code npx argv is the pinned package with ancestor workspaces disabled"
     );
     let cwds = std::fs::read_to_string(format!("{}.cwd", report.display()))

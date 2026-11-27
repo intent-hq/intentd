@@ -1873,17 +1873,9 @@ rl.on('line', (line) => {
                 let observed: Value = serde_json::from_str(&reply).unwrap();
                 assert_eq!(
                     observed["argv"],
-                    json!([
-                        "--workspaces=false",
-                        "--ignore-scripts=false",
-                        "--include=optional",
-                        format!(
-                            "--allow-scripts={}",
-                            intent_providers::config::CODEX_ACP_NPX_PACKAGE
-                        ),
-                        "-y",
+                    json!(intent_acp::spawn::npx_run_args(
                         intent_providers::config::CODEX_ACP_NPX_PACKAGE
-                    ])
+                    ))
                 );
                 assert_eq!(observed["hasCodexPath"], true);
                 assert_eq!(

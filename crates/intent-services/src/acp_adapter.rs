@@ -28,7 +28,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use intent_acp::spawn::{npm_workspace_selector_env_keys, NPX_NO_WORKSPACES_ARG};
+use intent_acp::spawn::npm_workspace_selector_env_keys;
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
 use intent_acp::{
@@ -438,10 +438,7 @@ impl AcpAdapterCommand {
             installed: None,
             profile: None,
             program: npx,
-            args: std::iter::once(NPX_NO_WORKSPACES_ARG.to_owned())
-                .chain(intent_providers::npx_install_args(package))
-                .chain(["-y".to_owned(), package.to_owned()])
-                .collect(),
+            args: intent_acp::spawn::npx_run_args(package),
             envs: Vec::new(),
             envs_removed: Vec::new(),
             cwd: None,
@@ -1661,19 +1658,9 @@ exit 0
     fn npx_command_disables_workspace_root_adoption_ahead_of_the_package() {
         let cmd = AcpAdapterCommand::npx(PathBuf::from("/usr/bin/npx"), "codex-acp@1.2.3")
             .args(["--model".to_string(), "gpt".to_string()]);
-        assert_eq!(
-            cmd.args,
-            [
-                NPX_NO_WORKSPACES_ARG,
-                "--ignore-scripts=false",
-                "--include=optional",
-                "--allow-scripts=codex-acp@1.2.3",
-                "-y",
-                "codex-acp@1.2.3",
-                "--model",
-                "gpt"
-            ]
-        );
+        let mut expected = intent_acp::spawn::npx_run_args("codex-acp@1.2.3");
+        expected.extend(["--model".to_owned(), "gpt".to_owned()]);
+        assert_eq!(cmd.args, expected);
         assert!(cmd.via_npx);
         let bin = AcpAdapterCommand::binary(PathBuf::from("/opt/codex-acp"), vec!["a".into()]);
         assert_eq!(bin.args, ["a"], "direct binaries take no npx switches");

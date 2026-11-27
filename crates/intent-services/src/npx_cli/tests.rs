@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use intent_acp::fake_npx::FakeNpx;
 use intent_core::WorkspaceApi;
 use intent_store::Store;
 use intentd_test_support::GuardedChild;
@@ -39,16 +40,18 @@ rl.on('line', (line) => {
 });
 ";
 
-const NPX: &str = r#"#!/bin/sh
-if [ "$1" = --version ]; then
-  printf 'probe\n' >> "$INTENT_TEST_NPX_ROOT/probes"
-  if [ "$INTENT_TEST_NPX_VERSION" = failed ]; then exit 9; fi
-  printf '%s\n' "$INTENT_TEST_NPX_VERSION"
-  exit 0
-fi
-printf '%s\n' "$*" >> "$INTENT_TEST_NPX_ROOT/packages"
-exec "$INTENT_TEST_REAL_NODE" "$INTENT_TEST_NPX_ROOT/adapter.mjs" "$@"
-"#;
+fn npx() -> FakeNpx {
+    FakeNpx::new(intent_providers::CODEX_ACP_NPX_PACKAGE)
+        .on_version(
+            r#"printf 'probe\n' >> "$INTENT_TEST_NPX_ROOT/probes"
+if [ "$INTENT_TEST_NPX_VERSION" = failed ]; then exit 9; fi
+printf '%s\n' "$INTENT_TEST_NPX_VERSION""#,
+        )
+        .then(
+            r#"printf '%s\n' "$*" >> "$INTENT_TEST_NPX_ROOT/packages"
+exec "$INTENT_TEST_REAL_NODE" "$INTENT_TEST_NPX_ROOT/adapter.mjs" "$@""#,
+        )
+}
 
 fn executable(path: &Path, script: &str) {
     std::fs::write(path, script).unwrap();
@@ -73,7 +76,7 @@ fn in_subprocess(test: &str, version: &str) -> bool {
         &bin.join("node"),
         "#!/bin/sh\nexec \"$INTENT_TEST_REAL_NODE\" \"$@\"\n",
     );
-    executable(&bin.join("npx"), NPX);
+    npx().write(&bin.join("npx")).unwrap();
     // Public Codex launches now require a canonical installed CLI even when
     // the pinned adapter itself is mocked. It may only be version-probed.
     executable(
@@ -320,16 +323,7 @@ async fn assert_public_launches_succeed() {
         1,
         "all entrypoints share the cached verdict"
     );
-    assert_eq!(
-        lines("packages"),
-        vec![
-            format!(
-                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0}",
-                intent_providers::CODEX_ACP_NPX_PACKAGE
-            );
-            4
-        ]
-    );
+    assert_eq!(lines("packages"), vec![npx().command_line(); 4]);
     assert!(lines("native").is_empty());
 }
 

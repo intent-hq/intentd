@@ -172,7 +172,7 @@ intent-nodes = { path = "../intent-nodes", features = ["northflank-fake", "agent
 sqlx = { workspace = true }
 uuid = { workspace = true }
 intent-services = { workspace = true, features = ["repository-test-fixtures", "test-hooks"] }
-intent-acp = { workspace = true }
+intent-acp = { workspace = true, features = ["test-hooks"] }
 intent-providers = { workspace = true, features = ["test-support"] }
 intent-core = { workspace = true }
 # Tests seed and inspect SQLite through the test-only raw pools.

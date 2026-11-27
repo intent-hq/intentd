@@ -239,6 +239,18 @@ pub const NPX_LAUNCH_SENTINEL_MANIFEST: &str =
 /// npx passes everything after it to the adapter.
 pub const NPX_NO_WORKSPACES_ARG: &str = "--workspaces=false";
 
+/// The npx argv that runs the pinned `package`: [`NPX_NO_WORKSPACES_ARG`],
+/// [`intent_providers::npx_install_args`], then `-y <package>`. The package's
+/// own arguments follow it. Every npx package launch builds its argv here, and
+/// the shared test fake npx accepts exactly this argv.
+#[must_use]
+pub fn npx_run_args(package: &str) -> Vec<String> {
+    let mut args = vec![NPX_NO_WORKSPACES_ARG.to_owned()];
+    args.extend(intent_providers::npx_install_args(package));
+    args.extend(["-y".to_owned(), package.to_owned()]);
+    args
+}
+
 /// Whether `key` is an npm environment config selecting workspaces. npm reads
 /// every `npm_config_<key>` variable case-insensitively and normalises
 /// `<key>` like `@npmcli/config` `loadEnv` (`_` → `-`, lowercased), so
@@ -344,9 +356,8 @@ impl std::fmt::Display for LaunchMode {
 
 /// Assemble provider launch arguments. Codex model and effort are applied
 /// through ACP config options; its selected adapter ignores CLI config flags.
-/// When spawning via npx, prepends [`NPX_NO_WORKSPACES_ARG`],
-/// [`intent_providers::npx_install_args`] and `-y <package>` before the
-/// provider's args.
+/// When spawning via npx, prepends [`npx_run_args`] before the provider's
+/// args.
 #[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
@@ -355,10 +366,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     // prepend the npx-specific args before the provider's args
     if opts.via_npx() {
         if let Some(pkg) = opts.npx_fallback_package {
-            args.push(NPX_NO_WORKSPACES_ARG.to_string());
-            args.extend(intent_providers::npx_install_args(pkg));
-            args.push("-y".to_string());
-            args.push(pkg.to_string());
+            args = npx_run_args(pkg);
         }
     }
 
@@ -1227,17 +1235,7 @@ mod build_args_tests {
                 opts.reasoning_effort = effort;
                 assert_eq!(
                     build_args(&opts),
-                    [
-                        NPX_NO_WORKSPACES_ARG,
-                        "--ignore-scripts=false",
-                        "--include=optional",
-                        &format!(
-                            "--allow-scripts={}",
-                            intent_providers::CODEX_ACP_NPX_PACKAGE
-                        ),
-                        "-y",
-                        intent_providers::CODEX_ACP_NPX_PACKAGE
-                    ],
+                    npx_run_args(intent_providers::CODEX_ACP_NPX_PACKAGE),
                     "model={model:?}, effort={effort:?}"
                 );
             }
@@ -1555,9 +1553,8 @@ mod build_command_tests {
 
     #[test]
     fn claude_code_npx_spawn_argv_is_pinned() {
-        // The exact spawn argv for claude-code: `<npx> --workspaces=false
-        // <npx_install_args> -y <pinned package>` — no other args
-        // (claude-code has no base args).
+        // The exact spawn argv for claude-code: `<npx> <npx_run_args>` — no
+        // other args (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1567,17 +1564,7 @@ mod build_command_tests {
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
         // The package itself is the registry golden's fact.
-        assert_eq!(
-            args,
-            vec![
-                "--workspaces=false".to_string(),
-                "--ignore-scripts=false".to_string(),
-                "--include=optional".to_string(),
-                format!("--allow-scripts={}", provider.npx_only_package.unwrap()),
-                "-y".to_string(),
-                provider.npx_only_package.unwrap().to_string(),
-            ]
-        );
+        assert_eq!(args, npx_run_args(provider.npx_only_package.unwrap()));
     }
 
     #[test]

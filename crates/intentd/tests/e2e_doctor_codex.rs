@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use intent_acp::fake_npx::{sh_quote, FakeNpx};
 use intent_core::settings_file::SettingsFile;
 use intent_providers::discover::ProviderLaunch;
 use intent_services::codex_diagnostics::CodexLaunch;
@@ -109,14 +110,23 @@ impl Fixture {
             )
             .unwrap();
         }
-        executable(
-            &bin.join("npx"),
-            &format!(
-                "#!/usr/bin/env node\nconst fixture={};\n{}",
+        let npx_fixture = root.path().join("npx.cjs");
+        fs::write(
+            &npx_fixture,
+            format!(
+                "const fixture={};\n{}",
                 json!(root.path()),
                 include_str!("fixtures/codex-doctor-npx.cjs")
             ),
-        );
+        )
+        .unwrap();
+        FakeNpx::new(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+            .then(&format!(
+                "shift \"$npx_prefix_len\"\nexec node {} \"$@\"",
+                sh_quote(npx_fixture.to_str().unwrap())
+            ))
+            .write(&bin.join("npx"))
+            .unwrap();
         // Canonical CLI is independent of the package dependency. The latter
         // remains present but must never be executed as a fallback.
         #[cfg(target_os = "linux")]

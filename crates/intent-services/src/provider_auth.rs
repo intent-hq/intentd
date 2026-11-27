@@ -2048,22 +2048,16 @@ esac
             ),
             (
                 "npx",
-                format!(
-                    r#"#!/bin/sh
-if [ "$#" = 1 ] && [ "$1" = --version ]; then
-  printf '11.0.0\n'
-  exit 0
-fi
-[ "$#" = 6 ] && [ "$1" = --workspaces=false ] && [ "$2" = --ignore-scripts=false ] && [ "$3" = --include=optional ] && [ "$4" = --allow-scripts='{0}' ] && [ "$5" = -y ] && [ "$6" = '{0}' ] || exit 93
-[ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
+                intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+                    .then(
+                        r#"[ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
 printf '%s\n' "$*" >> "$HOME/packages"
 IFS= read -r request
 printf '%s\n' "$request" >> "$HOME/requests"
-printf '%s\n' '{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"Authentication required"}}}}'
-while IFS= read -r unexpected; do exit 95; done
-"#,
-                    intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
-                ),
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required"}}'
+while IFS= read -r unexpected; do exit 95; done"#,
+                    )
+                    .script(),
             ),
         ];
         for (name, script) in scripts {
@@ -2148,8 +2142,9 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(
             std::fs::read_to_string(root.join("packages")).unwrap(),
             format!(
-                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0}\n",
-                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
+                "{}\n",
+                intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+                    .command_line()
             )
         );
         let requests = std::fs::read_to_string(root.join("requests")).unwrap();
