@@ -2225,17 +2225,16 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     };
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let ws_id = seed_workspace_only(&data_dir).await;
-    // Seeded with an old activity timestamp so the preference writes below
-    // cannot pass just because they land in the same clock tick as creation.
-    let backdated = seed_backdated_agent(&data_dir, &ws_id, "WSS-Muted-Backdated").await;
     let behavior = json!({ "response": "muted turn ok" }).to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
-    let child = spawn_serve(&data_dir, "both", &env);
+    // Seeded with an old activity timestamp so the preference writes below
+    // cannot pass just because they land in the same clock tick as creation.
+    let (child, (ws_id, backdated)) =
+        boot_with_backdated_agent(&data_dir, &env, "WSS-Muted-Backdated").await;
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -2528,13 +2527,12 @@ async fn agent_pinned_round_trip_over_wss() {
     };
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let ws_id = seed_workspace_only(&data_dir).await;
-    let backdated = seed_backdated_agent(&data_dir, &ws_id, "WSS-Pinned-Backdated").await;
     let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
     ];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let (child, (ws_id, backdated)) =
+        boot_with_backdated_agent(&data_dir, &env, "WSS-Pinned-Backdated").await;
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -7191,14 +7189,29 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
 /// An `updatedAt` older than any activity a test drives.
 const OLD_ACTIVITY: &str = "2020-01-01T00:00:00.000Z";
 
-/// Seed an idle mock agent last active at [`OLD_ACTIVITY`], before the
-/// daemon starts: a second writer racing a live daemon fails at random with
-/// "database is locked", so an agent a test backdates is seeded, not edited.
-async fn seed_backdated_agent(data_dir: &Path, ws_id: &str, name: &str) -> String {
+/// Spawn `serve` on `data_dir` with a workspace and an idle mock agent named
+/// `name` last active at [`OLD_ACTIVITY`], seeded first
+/// ([`common::seed_then_start`]): a backdated agent cannot be edited behind
+/// a live daemon. Returns the child and `(workspace id, agent id)`.
+async fn boot_with_backdated_agent(
+    data_dir: &Path,
+    env: &[(&str, &str)],
+    name: &str,
+) -> (GuardedChild, (String, String)) {
+    common::seed_then_start(
+        data_dir,
+        async |store, _| {
+            let ws_id = insert_workspace_only(store).await;
+            let agent_id = insert_backdated_agent(store, &ws_id, name).await;
+            (ws_id, agent_id)
+        },
+        async |ids| (spawn_serve(data_dir, "both", env), ids),
+    )
+    .await
+}
+
+async fn insert_backdated_agent(store: &intent_store::Store, ws_id: &str, name: &str) -> String {
     use intent_core::{AgentId, AgentSession, AgentStatus, WorkspaceId};
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open store");
     let id = AgentId::new();
     store
         .insert_agent_session(&AgentSession {
@@ -7214,16 +7227,20 @@ async fn seed_backdated_agent(data_dir: &Path, ws_id: &str, name: &str) -> Strin
         })
         .await
         .expect("insert backdated agent");
-    store.close().await;
     id.0
 }
 
 async fn seed_workspace_only(data_dir: &Path) -> String {
-    use intent_core::WorkspaceId;
-    use intent_store::Store;
-    let db_path = data_dir.join("intentd.db");
-    let store = Store::open(&db_path).await.expect("open store");
-    let ws = WorkspaceId::new();
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ws = insert_workspace_only(&store).await;
+    store.close().await;
+    ws
+}
+
+async fn insert_workspace_only(store: &intent_store::Store) -> String {
+    let ws = intent_core::WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
         .await

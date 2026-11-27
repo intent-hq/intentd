@@ -397,12 +397,9 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// Seed one workspace + one task note (via `mark_as_task`), returning
 /// `(workspace_id, task_note_id)`. Runs BEFORE the daemon boots so the daemon
 /// picks up the seeded rows on start.
-async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, String) {
+async fn seed_workspace_and_task(store: &intent_store::Store, title: &str) -> (String, String) {
     use intent_core::{NoteCreate, WorkspaceApi, WorkspaceId};
     use intent_services::Services;
-    use intent_store::Store;
-    let db_path = data_dir.join("intentd.db");
-    let store = Store::open(&db_path).await.expect("open store");
     let ws_root = common::hermetic_workspaces_root();
     let services =
         Services::new_isolated(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
@@ -455,22 +452,28 @@ async fn boot_daemon_with_task_env(
     boot_daemon_with_task_env_seeded(title, extra_env, async |_, _| {}).await
 }
 
-/// [`boot_daemon_with_task_env`], running `seed` on the data dir and the
-/// seeded workspace's id before the daemon starts: a test's own store writes
-/// land there, since a second writer racing the live daemon fails at random
-/// with "database is locked".
+/// [`boot_daemon_with_task_env`], running `seed` on the store and the
+/// seeded workspace's id before the daemon starts
+/// ([`common::seed_then_start`]).
 async fn boot_daemon_with_task_env_seeded(
     title: &str,
     extra_env: &[(&str, &str)],
-    seed: impl AsyncFnOnce(&Path, &str),
+    seed: impl AsyncFnOnce(&intent_store::Store, &str),
 ) -> (Daemon, String, String, u16, String) {
     let data_dir_guard: daemon_exit::FixtureDir = temp_data_dir().into();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
-    seed(&data_dir, &ws_id).await;
     let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(extra_env);
-    let child = spawn_serve(&data_dir, "both", &env);
+    let (child, (ws_id, note_id)) = common::seed_then_start(
+        &data_dir,
+        async |store, _| {
+            let ids = seed_workspace_and_task(store, title).await;
+            seed(store, &ids.0).await;
+            ids
+        },
+        async |ids| (spawn_serve(&data_dir, "both", &env), ids),
+    )
+    .await;
     let daemon = Daemon {
         child,
         data_dir: data_dir_guard,
@@ -1445,10 +1448,7 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
             ("MOCK_AGENT_SCRIPT_PATH", &script),
             ("MOCK_AGENT_BEHAVIOR", &behavior),
         ],
-        async |data_dir: &Path, ws_id: &str| {
-            let store = Store::open(&data_dir.join("intentd.db"))
-                .await
-                .expect("open store");
+        async |store: &Store, ws_id: &str| {
             store
                 .upsert_principal(&guest)
                 .await
@@ -1473,7 +1473,6 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
                 )
                 .await
                 .expect("guest membership");
-            store.close().await;
         },
     )
     .await;

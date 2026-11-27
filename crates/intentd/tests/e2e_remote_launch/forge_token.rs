@@ -46,17 +46,17 @@ pub(super) async fn backend_with_repo(
     env: &[(&str, &str)],
     prepare: impl FnOnce(&Path),
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
-    backend_with_repo_seeded(scratch, origin, env, prepare, async |_: &str| {}).await
+    backend_with_repo_seeded(scratch, origin, env, prepare, async |_, _| {}).await
 }
 
-/// [`backend_with_repo`], with `seed` run on the seeded workspace's id before
-/// the backend starts (see [`start_backend_seeded`]).
+/// [`backend_with_repo`], with `seed` run on the store and the seeded
+/// workspace's id before the backend starts (see [`start_backend_seeded`]).
 pub(super) async fn backend_with_repo_seeded(
     scratch: &Path,
     origin: Option<&str>,
     env: &[(&str, &str)],
     prepare: impl FnOnce(&Path),
-    seed: impl AsyncFnOnce(&str),
+    seed: impl AsyncFnOnce(&intent_store::Store, &str),
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -83,6 +83,7 @@ pub(super) async fn backend_with_repo_seeded(
             env,
         ]
         .concat(),
+        false,
         seed,
     )
     .await;

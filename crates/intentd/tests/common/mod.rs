@@ -881,6 +881,41 @@ pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::write(&path, text).expect("seed config.toml with model.defaultProvider");
 }
 
+/// Seed the store under `data_dir`, then start a daemon on it: the one way
+/// for a test to put rows in `intentd.db` before its daemon runs.
+///
+/// Opens `data_dir/intentd.db`, runs `seed` with the store and `data_dir`,
+/// closes the store, and only then calls `start` with what `seed` returned
+/// (a workspace id, say). A test that writes the store while a daemon it
+/// spawned is running races that daemon and fails at random with "database
+/// is locked" (`SQLite` 5/517; intentd#3799), which `live_store_write_lint`
+/// rejects. Seed here instead of adding a per-file `*_seeded` hook:
+///
+/// ```ignore
+/// let (daemon, ws_id) = common::seed_then_start(
+///     &data_dir,
+///     async |store, _| insert_workspace(store).await,
+///     async |ws_id| (spawn_daemon(&data_dir), ws_id),
+/// )
+/// .await;
+/// ```
+///
+/// For state that only a daemon can make, stop it, seed, and restart it
+/// here.
+pub async fn seed_then_start<S, T>(
+    data_dir: &Path,
+    seed: impl AsyncFnOnce(&intent_store::Store, &Path) -> S,
+    start: impl AsyncFnOnce(S) -> T,
+) -> T {
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store to seed");
+    let seeded = seed(&store, data_dir).await;
+    store.close().await;
+    start(seeded).await
+}
+
 /// Daemon env seam (defined in `intent_core`, read in `intentd` `main.rs`;
 /// an invalid value fails daemon startup) that resolves an
 /// `agents.resumeInterruptedOnStart` of `auto` — the schema default, also
