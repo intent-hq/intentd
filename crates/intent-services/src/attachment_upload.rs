@@ -208,6 +208,16 @@ pub(crate) struct KeyedPlacement {
     pub(crate) sha256: Option<String>,
 }
 
+/// The method a keyed placement's store reservation names.
+const ATTACHMENT_PLACE_METHOD: &str = "file.placeAttachment";
+
+/// The store reservation key of a keyed placement: its own namespace in the
+/// `with_idempotency` key space of the workspace, so a client that reuses an
+/// attachment key on another keyed method does not meet this reservation.
+pub(crate) fn attachment_reservation_key(key: &str) -> String {
+    format!("attachment-placement:{key}")
+}
+
 /// Per-`(workspace, idempotencyKey)` in-flight locks for keyed placements
 /// (see `Services::attachment_idempotency_inflight`).
 pub(crate) type IdempotencyInflight =
@@ -355,8 +365,28 @@ impl Services {
         self.sweep_expired_attachment_idempotency_keys_before(&cutoff)
             .await;
         let lock = self.idempotency_inflight_lock(&workspace_id, &keyed.key);
-        let result = {
+        let result = async {
             let _guard = lock.lock().await;
+            // Across processes (Postgres) the key is reserved in the store
+            // for the lookup, placement and bind, so a same-key caller in
+            // another process waits and then replays the binding instead of
+            // placing a second copy. Never completed: the binding is the
+            // stored result, and the reservation is released on every exit.
+            let _reservation = match crate::reserve_idempotency_key(
+                &self.store,
+                &workspace_id.0,
+                &attachment_reservation_key(&keyed.key),
+                ATTACHMENT_PLACE_METHOD,
+            )
+            .await?
+            {
+                crate::KeyReservation::Held(held) => Some(held),
+                // Only a `with_idempotency` call could have stored a result
+                // under this namespaced key; the binding lookup decides.
+                crate::KeyReservation::Done(_) => None,
+            };
+            crate::dedupe_keys::park(crate::dedupe_keys::steps::ATTACHMENT_RESERVED, &keyed.key)
+                .await;
             let bound = match &keyed.lookup_fingerprint {
                 Some(_) => {
                     self.store
@@ -385,7 +415,8 @@ impl Services {
                     .await
                 }
             }
-        };
+        }
+        .await;
         self.release_idempotency_inflight_lock(&workspace_id, &keyed.key, &lock);
         result
     }

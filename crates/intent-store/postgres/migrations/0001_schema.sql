@@ -249,6 +249,18 @@ CREATE TABLE IF NOT EXISTS agent_browser_sender (
     PRIMARY KEY (tenant_id, agent_id, submission_id)
 );
 
+-- sqlite: 0203_agent_dismissal_notice.sql
+-- One row per questions-dismissed notice an agent was sent: the insert
+-- (ON CONFLICT DO NOTHING) is the claim, so any number of processes
+-- dismissing one message id deliver one notice.
+CREATE TABLE IF NOT EXISTS agent_dismissal_notice (
+    tenant_id text NOT NULL,
+    agent_id text NOT NULL,
+    message_id text NOT NULL,
+    created_at text NOT NULL,
+    PRIMARY KEY (tenant_id, agent_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_flipped_completion (
     tenant_id text NOT NULL,
     agent_id text NOT NULL,
@@ -994,19 +1006,23 @@ CREATE TABLE IF NOT EXISTS idempotency_key (
     result_json text,
     created_at text NOT NULL,
     row_seq bigint NOT NULL,
-    -- Postgres only (orchestrator mode): the reservation names the tenant's
-    -- epoch (the tenant lease token, read under the writer lock) and the
-    -- reserving process (a token per process). It is stale only when a
-    -- newer epoch exists (a takeover), never by elapsed time (the ~hourly
-    -- reaper still drops any row older than its retention, pending or not).
+    -- Postgres only (orchestrator mode): the reservation names the
+    -- reserving process (a token per process) and an expiry set and
+    -- compared by the database clock. The holder renews it while the
+    -- operation runs; another process may take it over only once it
+    -- expired (a holder that died), never because of a tenant takeover:
+    -- request replicas keep their reservations across one. The ~hourly
+    -- reaper still drops any row older than its retention, pending or not.
     -- A process's first unleased open of the tenant drops other processes'
     -- pending rows (an unleased tenant has one process by design).
-    claim_epoch bigint,
     claim_token text,
+    claim_expires_at timestamptz,
     PRIMARY KEY (tenant_id, workspace_id, idempotency_key),
     -- A pending row names its reservation; a completed one names none.
     CONSTRAINT idempotency_key_pending_check
-        CHECK ((result_json IS NULL) = (claim_token IS NOT NULL))
+        CHECK ((result_json IS NULL) = (claim_token IS NOT NULL)),
+    CONSTRAINT idempotency_key_expiry_check
+        CHECK ((claim_token IS NULL) = (claim_expires_at IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS interrupted_agent (
@@ -1994,6 +2010,7 @@ ALTER TABLE advisory_wake_delivery DROP CONSTRAINT IF EXISTS advisory_wake_deliv
 ALTER TABLE advisory_wake_delivery DROP CONSTRAINT IF EXISTS advisory_wake_delivery_parent_agent_id_fkey, ADD CONSTRAINT advisory_wake_delivery_parent_agent_id_fkey FOREIGN KEY (tenant_id, parent_agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_browser_sender DROP CONSTRAINT IF EXISTS agent_browser_sender_tenant_id_agent_id_fkey, ADD CONSTRAINT agent_browser_sender_tenant_id_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_browser_sender DROP CONSTRAINT IF EXISTS agent_browser_sender_tenant_id_client_id_fkey, ADD CONSTRAINT agent_browser_sender_tenant_id_client_id_fkey FOREIGN KEY (tenant_id, client_id) REFERENCES client (tenant_id, id) ON DELETE SET NULL (client_id);
+ALTER TABLE agent_dismissal_notice DROP CONSTRAINT IF EXISTS agent_dismissal_notice_tenant_id_agent_id_fkey, ADD CONSTRAINT agent_dismissal_notice_tenant_id_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_flipped_completion DROP CONSTRAINT IF EXISTS agent_flipped_completion_agent_id_fkey, ADD CONSTRAINT agent_flipped_completion_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_message DROP CONSTRAINT IF EXISTS agent_message_agent_id_fkey, ADD CONSTRAINT agent_message_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_message_payload DROP CONSTRAINT IF EXISTS agent_message_payload_agent_id_fkey, ADD CONSTRAINT agent_message_payload_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;

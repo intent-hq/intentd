@@ -489,10 +489,6 @@ impl Services {
             // Pending-question registries (monorepo#3179). In-flight marker
             // mutations keep their own Arc of the mutex.
             self.pending_question_mutation_locks.remove(agent_id);
-            self.dismissal_notices_sent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(agent_id);
         }
     }
 }

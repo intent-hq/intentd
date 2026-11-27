@@ -18,18 +18,25 @@ pub enum IdempotencyReservation {
     Reserved,
     /// The operation already ran: replay its stored `result_json`.
     Done(String),
-    /// Another process reserved the key in the tenant's current epoch and
-    /// is still running the operation (Postgres only): wait and look again.
+    /// Another process holds a live reservation of the key and is still
+    /// running the operation (Postgres only): wait and look again.
     InProgress,
 }
+
+/// How long a Postgres reservation stays live without a renewal
+/// ([`Store::renew_idempotent`]). A holder renews well within it while its
+/// operation runs; a holder that died frees the key for a retry in another
+/// process within this time.
+pub const IDEMPOTENCY_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl Store {
     /// Reserve `(workspace_id, key)` before running a keyed operation, so a
     /// retry in another process cannot run it a second time (batch G 2b).
-    /// On Postgres a reservation is a `pending` row naming the tenant's
-    /// epoch and this process; it is stale only when a newer epoch exists
-    /// (a takeover), never by elapsed time. `SQLite` (one process) reports
-    /// the stored result or `Reserved`.
+    /// On Postgres a reservation is a `pending` row naming this process and
+    /// an expiry by the database clock ([`IDEMPOTENCY_CLAIM_TTL`]); another
+    /// process may take it over only once it expired, also across a tenant
+    /// takeover. `SQLite` (one process) reports the stored result or
+    /// `Reserved`.
     ///
     /// # Errors
     ///
@@ -58,6 +65,19 @@ impl Store {
         result_json: &str,
     ) -> Result<()> {
         dispatch!(self, backend => backend.complete_idempotent(workspace_id, key, method, result_json).await)
+    }
+
+    /// Restart the expiry of this process's reservation while its operation
+    /// runs. `false` when the reservation is gone: another process took it
+    /// over after it expired, so this run's result will not be stored.
+    /// Always `true` on `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotOwner` when this process lost the tenant, and
+    /// `Error::Internal` if the database operation fails.
+    pub async fn renew_idempotent(&self, workspace_id: &str, key: &str) -> Result<bool> {
+        dispatch!(self, backend => backend.renew_idempotent(workspace_id, key).await)
     }
 
     /// Drop this process's reservation after the operation failed, so a
@@ -135,6 +155,11 @@ impl crate::SqliteStore {
         self.put_idempotent(workspace_id, key, method, result_json)
             .await
             .map(|_| ())
+    }
+
+    #[expect(clippy::unused_async, reason = "mirrors the Postgres reservation")]
+    pub async fn renew_idempotent(&self, _workspace_id: &str, _key: &str) -> Result<bool> {
+        Ok(true)
     }
 
     #[expect(clippy::unused_async, reason = "mirrors the Postgres reservation")]

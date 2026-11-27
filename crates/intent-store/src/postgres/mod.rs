@@ -75,6 +75,7 @@ mod completion_watches;
 mod delete_grace;
 mod desktop;
 mod discussions;
+mod dismissal_notice;
 mod events;
 #[cfg(test)]
 mod future_size_tests;

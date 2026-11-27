@@ -50,6 +50,8 @@ mod delete_grace;
 mod desktop;
 #[path = "postgres_backend/discussions.rs"]
 mod discussions;
+#[path = "postgres_backend/dismissal_notices.rs"]
+mod dismissal_notices;
 #[path = "postgres_backend/events.rs"]
 mod events;
 #[path = "postgres_backend/harness.rs"]

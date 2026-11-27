@@ -12178,24 +12178,19 @@ impl Services {
         }
         // Idempotency for the notice below: a repeat dismissal of the same
         // messageId re-persists the marker (harmless) but must NOT deliver a
-        // duplicate dismissal notice. The claim is atomic — a check-and-insert
-        // into the per-agent notice registry under one lock acquisition — so
-        // concurrent dismissals of the same id race to a single winner, and
-        // the registry remembers OLDER ids the single-slot persisted marker
-        // has since been overwritten by (A -> B -> A). The persisted marker
-        // still short-circuits ids dismissed before a daemon restart.
-        let already_dismissed = {
-            let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
-            let mut guard = self
-                .dismissal_notices_sent
-                .lock()
-                .expect("dismissal notice registry poisoned");
-            let claimed = !guard
-                .entry(agent_id.clone())
-                .or_default()
-                .insert(message_id.clone());
-            persisted || claimed
-        };
+        // duplicate dismissal notice. The claim is a unique key in the store
+        // (`claim_dismissal_notice`, insert-or-ignore on (agent, messageId)),
+        // so concurrent dismissals of the same id race to a single winner in
+        // any number of processes, and an OLDER id the single-slot persisted
+        // marker has since been overwritten by (A -> B -> A) stays claimed,
+        // also across a restart. The persisted marker still short-circuits
+        // ids dismissed before the claims existed.
+        let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
+        let already_dismissed = persisted
+            || !self
+                .store
+                .claim_dismissal_notice(&agent_id, &message_id)
+                .await?;
         // Atomic single-key write (store-side `json_set`): sibling metadata
         // keys — e.g. a concurrently-advanced `lastSeenMessageId`
         // (`agent.markSeen`) — are preserved rather than clobbered by a
@@ -12220,12 +12215,16 @@ impl Services {
             // Release the notice claim so a retried dismissal (after this
             // store failure) still delivers the notice.
             if !already_dismissed {
-                let mut guard = self
-                    .dismissal_notices_sent
-                    .lock()
-                    .expect("dismissal notice registry poisoned");
-                if let Some(sent) = guard.get_mut(&agent_id) {
-                    sent.remove(&message_id);
+                if let Err(release) = self
+                    .store
+                    .release_dismissal_notice(&agent_id, &message_id)
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %release,
+                        "failed to release the dismissal notice claim; a retry will not notify"
+                    );
                 }
             }
             return Err(e);

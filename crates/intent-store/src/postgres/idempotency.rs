@@ -2,7 +2,7 @@
 
 use intent_core::{now_iso, Result};
 
-use crate::idempotency_repo::IdempotencyReservation;
+use crate::idempotency_repo::{IdempotencyReservation, IDEMPOTENCY_CLAIM_TTL};
 
 use super::{db, PgStore};
 
@@ -12,35 +12,42 @@ const REAP_IDEMPOTENT_SQL: &str = "DELETE FROM idempotency_key WHERE tenant_id =
        FROM idempotency_key k WHERE k.tenant_id = $1 AND k.created_at < $2 COLLATE \"C\" \
        LIMIT $3)";
 
+/// [`IDEMPOTENCY_CLAIM_TTL`] in milliseconds, for the expiry arithmetic.
+fn claim_ttl_millis() -> Result<i64> {
+    crate::lease_repo::ttl_millis(IDEMPOTENCY_CLAIM_TTL)
+}
+
 impl PgStore {
     /// Inserts a `pending` row for the key, or takes over one that is this
-    /// process's or from an older epoch, under the writer lock; else reports
-    /// the row that is there.
+    /// process's or whose expiry passed by the database clock, under the
+    /// writer lock; else reports the row that is there. The tenant epoch
+    /// plays no part: a takeover leaves live reservations alone.
     pub async fn reserve_idempotent(
         &self,
         workspace_id: &str,
         key: &str,
         method: &str,
     ) -> Result<IdempotencyReservation> {
+        let ttl = claim_ttl_millis()?;
         let mut tx = self.begin_write().await?;
-        let epoch = tx.writer().epoch;
         let reserved = sqlx::query(
             "INSERT INTO idempotency_key (tenant_id, workspace_id, idempotency_key, method, \
-             result_json, claim_epoch, claim_token, created_at) \
-             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7) \
+             result_json, claim_token, claim_expires_at, created_at) \
+             VALUES ($1, $2, $3, $4, NULL, $5, \
+             clock_timestamp() + $6::bigint * interval '1 millisecond', $7) \
              ON CONFLICT (tenant_id, workspace_id, idempotency_key) DO UPDATE SET \
-             method = excluded.method, claim_epoch = excluded.claim_epoch, \
-             claim_token = excluded.claim_token \
+             method = excluded.method, claim_token = excluded.claim_token, \
+             claim_expires_at = excluded.claim_expires_at \
              WHERE idempotency_key.result_json IS NULL \
              AND (idempotency_key.claim_token = excluded.claim_token \
-               OR idempotency_key.claim_epoch < excluded.claim_epoch)",
+               OR idempotency_key.claim_expires_at <= clock_timestamp())",
         )
         .bind(self.tenant())
         .bind(workspace_id)
         .bind(key)
         .bind(method)
-        .bind(epoch)
         .bind(self.process_token())
+        .bind(ttl)
         .bind(now_iso())
         .execute(&mut *tx)
         .await
@@ -82,7 +89,7 @@ impl PgStore {
         let mut tx = self.begin_write().await?;
         let done = sqlx::query(
             "UPDATE idempotency_key SET result_json = $4, \
-             claim_epoch = NULL, claim_token = NULL \
+             claim_token = NULL, claim_expires_at = NULL \
              WHERE tenant_id = $1 AND workspace_id = $2 AND idempotency_key = $3 \
              AND result_json IS NULL AND claim_token = $5",
         )
@@ -112,6 +119,31 @@ impl PgStore {
             .map_err(db)?;
         }
         tx.commit().await.map_err(db)
+    }
+
+    /// Restarts the expiry of this process's `pending` reservation, also
+    /// after it passed while nobody took the key over.
+    pub async fn renew_idempotent(&self, workspace_id: &str, key: &str) -> Result<bool> {
+        let ttl = claim_ttl_millis()?;
+        let mut tx = self.begin_write().await?;
+        let renewed = sqlx::query(
+            "UPDATE idempotency_key \
+             SET claim_expires_at = clock_timestamp() + $5::bigint * interval '1 millisecond' \
+             WHERE tenant_id = $1 AND workspace_id = $2 AND idempotency_key = $3 \
+             AND result_json IS NULL AND claim_token = $4",
+        )
+        .bind(self.tenant())
+        .bind(workspace_id)
+        .bind(key)
+        .bind(self.process_token())
+        .bind(ttl)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected()
+            > 0;
+        tx.commit().await.map_err(db)?;
+        Ok(renewed)
     }
 
     /// Deletes this process's `pending` reservation; another's stays.

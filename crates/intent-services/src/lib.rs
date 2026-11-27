@@ -242,6 +242,7 @@ mod agent_list_cache;
 mod automatic_pr_refresh;
 pub mod checkpoint;
 pub mod cursor_cli;
+pub mod dedupe_keys;
 mod direct_secret_ops;
 pub mod dsh_cli;
 mod fast_mode;
@@ -932,16 +933,6 @@ pub struct Services {
     /// start). In-memory only: after a restart only the persisted marker
     /// guards, so the accepted one-duplicate residual window remains.
     advisory_wake_periods: Arc<Mutex<HashSet<(AgentId, AgentId)>>>,
-    /// Message ids whose questions-dismissed notice has already been claimed
-    /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
-    /// dismissal marker is single-slot (most recent id only), so this set is
-    /// what makes the no-duplicate-notice guarantee hold across concurrent
-    /// dismissals of the same id (both read the marker before either writes)
-    /// and interleaved dismissals (A → B → A). In-memory only: after a
-    /// daemon restart only the single-slot marker guards, so a re-dismissal
-    /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
-    /// notice at worst.
-    dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
     /// Agent-owned secrets and pending secret requests (PROTOCOL §5.56).
     /// Memory only: never persisted, so a restart drops every value.
     secret_vault: Arc<secret_requests::SecretVault>,
@@ -1950,7 +1941,6 @@ impl Services {
             stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
-            dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             secret_vault: Arc::new(secret_requests::SecretVault::default()),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -16605,10 +16595,11 @@ pub(crate) type IdempotencyInflight = KeyedInflight<IdempotencyIdent>;
 /// caller's lookup sees the first's stored result and replays it rather than
 /// running `op` again. A failed `op` releases the key without storing, so the
 /// next same-key caller runs `op` itself (a panic or cancellation releases it
-/// too, see [`ReservationGuard`]). Across daemons (Postgres) the key is
-/// reserved in the store before `op` runs ([`Store::reserve_idempotent`]): a
-/// caller that finds it reserved elsewhere waits up to
-/// [`IDEMPOTENCY_IN_PROGRESS_WAIT`] for the result, then fails `StoreBusy`.
+/// too, see [`HeldReservation`]). Across daemons (Postgres) the key is
+/// reserved in the store before `op` runs ([`reserve_idempotency_key`]) and
+/// renewed while it runs: a caller that finds it reserved elsewhere waits
+/// up to [`IDEMPOTENCY_IN_PROGRESS_WAIT`] for the result, taking the key
+/// over if its holder stopped renewing it, then fails `StoreBusy`.
 ///
 /// `workspace_id` is the `""` sentinel for global methods that carry no
 /// workspaceId (e.g. `workspace.create`).
@@ -16637,15 +16628,65 @@ where
     // Batch G 2b: reserve the key in the store before `op` runs, so a retry
     // that reaches another process meanwhile waits for this result instead
     // of running `op` a second time.
+    let mut reservation = match reserve_idempotency_key(store, workspace_id, &key, method).await? {
+        KeyReservation::Held(reservation) => reservation,
+        KeyReservation::Done(stored) => {
+            return serde_json::from_str(&stored)
+                .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")));
+        }
+    };
+    // Nothing is stored for an `op` that fails, panics or is cancelled, or
+    // whose result cannot be stored: the reservation releases itself on
+    // every such exit so another daemon's retry may run it, instead of
+    // waiting for its expiry.
+    let result = op().await?;
+    let result_json = serde_json::to_string(&result)
+        .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
+    store
+        .complete_idempotent(workspace_id, &key, method, &result_json)
+        .await?;
+    reservation.disarm();
+    Ok(result)
+}
+
+/// What [`reserve_idempotency_key`] got for a key.
+pub(crate) enum KeyReservation {
+    /// This process holds the key until the reservation drops.
+    Held(HeldReservation),
+    /// The keyed operation already ran: its stored result.
+    Done(String),
+}
+
+/// Reserve `(workspace_id, key)` in the store, waiting while another process
+/// holds a live reservation of it: up to [`IDEMPOTENCY_IN_PROGRESS_WAIT`],
+/// which is longer than [`intent_store::IDEMPOTENCY_CLAIM_TTL`], so a holder
+/// that died is taken over within the wait.
+///
+/// # Errors
+///
+/// `Error::StoreBusy` when another process still holds the key after the
+/// wait (retryable with the same key), or the store error.
+pub(crate) async fn reserve_idempotency_key(
+    store: &Store,
+    workspace_id: &str,
+    key: &str,
+    method: &str,
+) -> Result<KeyReservation> {
     let waited_since = tokio::time::Instant::now();
     loop {
-        match store.reserve_idempotent(workspace_id, &key, method).await? {
-            IdempotencyReservation::Reserved => break,
-            IdempotencyReservation::Done(stored) => {
-                return serde_json::from_str(&stored)
-                    .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")));
+        match store.reserve_idempotent(workspace_id, key, method).await? {
+            IdempotencyReservation::Reserved => {
+                return Ok(KeyReservation::Held(HeldReservation::hold(
+                    store,
+                    workspace_id,
+                    key,
+                    method,
+                )));
             }
+            IdempotencyReservation::Done(stored) => return Ok(KeyReservation::Done(stored)),
             IdempotencyReservation::InProgress => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::dedupe_keys::count_wait(workspace_id, key);
                 if waited_since.elapsed() >= IDEMPOTENCY_IN_PROGRESS_WAIT {
                     return Err(Error::StoreBusy(format!(
                         "{method} with this idempotency key is still running in another \
@@ -16656,42 +16697,75 @@ where
             }
         }
     }
-    // Nothing is stored for an `op` that fails, panics or is cancelled, or
-    // whose result cannot be stored: the guard releases the reservation on
-    // every such exit so another daemon's retry may run it, instead of
-    // waiting for a restart or takeover of this live process.
-    let mut reservation = ReservationGuard {
-        store: store.clone(),
-        workspace_id: workspace_id.to_string(),
-        key: key.clone(),
-        method: method.to_string(),
-        armed: true,
-    };
-    let result = op().await?;
-    let result_json = serde_json::to_string(&result)
-        .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
-    store
-        .complete_idempotent(workspace_id, &key, method, &result_json)
-        .await?;
-    reservation.armed = false;
-    Ok(result)
 }
 
-/// Releases a [`with_idempotency`] reservation when it is dropped armed: the
-/// keyed call ended without storing a result (an `op` error, a panic, a
-/// cancelled future, or a failed encode or store). Release is best-effort and
-/// runs on a spawned task, since `Drop` cannot await; a failed release is
-/// freed by the next process that opens the tenant or a takeover.
-struct ReservationGuard {
+/// A held idempotency reservation. While it lives a background task renews
+/// it every [`IDEMPOTENCY_RENEW_EVERY`], so a long operation keeps the key
+/// (Postgres; a no-op on `SQLite`). Dropped armed — the keyed call ended
+/// without storing a result (an `op` error, a panic, a cancelled future, a
+/// failed encode or store, or a caller that only needed the key held) — it
+/// releases the reservation. Release is best-effort and runs on a spawned
+/// task, since `Drop` cannot await; a failed release lapses at the
+/// reservation's expiry.
+pub(crate) struct HeldReservation {
     store: Store,
     workspace_id: String,
     key: String,
     method: String,
     armed: bool,
+    renewer: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for ReservationGuard {
+impl HeldReservation {
+    fn hold(store: &Store, workspace_id: &str, key: &str, method: &str) -> Self {
+        let renewer = tokio::runtime::Handle::try_current().ok().map(|runtime| {
+            let (store, workspace_id, key, method) = (
+                store.clone(),
+                workspace_id.to_string(),
+                key.to_string(),
+                method.to_string(),
+            );
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(IDEMPOTENCY_RENEW_EVERY).await;
+                    match store.renew_idempotent(&workspace_id, &key).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                method,
+                                "idempotency reservation was taken over after it expired; \
+                                 this run's result will not be replayed"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(method, error = %e, "idempotency reservation renewal failed");
+                        }
+                    }
+                }
+            })
+        });
+        Self {
+            store: store.clone(),
+            workspace_id: workspace_id.to_string(),
+            key: key.to_string(),
+            method: method.to_string(),
+            armed: true,
+            renewer,
+        }
+    }
+
+    /// The result is stored: keep the row, release nothing.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HeldReservation {
     fn drop(&mut self) {
+        if let Some(renewer) = self.renewer.take() {
+            renewer.abort();
+        }
         if !self.armed {
             return;
         }
@@ -16711,6 +16785,12 @@ impl Drop for ReservationGuard {
         });
     }
 }
+
+/// How often a held reservation renews its expiry: a quarter of
+/// [`intent_store::IDEMPOTENCY_CLAIM_TTL`], so a missed renewal or two does
+/// not lose it.
+const IDEMPOTENCY_RENEW_EVERY: std::time::Duration =
+    std::time::Duration::from_secs(intent_store::IDEMPOTENCY_CLAIM_TTL.as_secs() / 4);
 
 /// How long a keyed call waits for another daemon that reserved the same key
 /// to finish before it fails with a retryable `StoreBusy` (Postgres only;
