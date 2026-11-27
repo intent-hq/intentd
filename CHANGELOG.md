@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.316] - 2026-11-27
+
+### 🚀 Features
+
+- *(store)* Convert dedupe and idempotency gates to unique keys ([#3865](https://github.com/intent-hq/intentd/pull/3865))
+- *(acp)* Ws.appLibrary tools so agents install the Intent apps they build ([#3862](https://github.com/intent-hq/intentd/pull/3862))
+
+### 🐛 Bug Fixes
+
+- *(services)* Give test-built Services a scratch workspaces root ([#3864](https://github.com/intent-hq/intentd/pull/3864))
+
+
 ## [0.11.315] - 2026-11-27
 
 ### 🚀 Features
