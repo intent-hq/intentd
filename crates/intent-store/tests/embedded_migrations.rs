@@ -5,7 +5,8 @@
 //! or edit still embeds the old set: cargo misses an added file unless the
 //! directory is a tracked input, and sccache keys on file contents but not
 //! file names, so a pure renumber was served the old build (intentd#3861 got
-//! a duplicate 0203 back). This test fails on such a stale build.
+//! a duplicate 0203 back). `build.rs` closes both gaps; this test fails on
+//! such a stale build.
 //!
 //! It is an integration test on purpose: it links the `intent-store` rlib
 //! the way dependent crates do. sccache caches rlibs but never test
@@ -47,7 +48,13 @@ fn on_disk(dir: &Path) -> Vec<(i64, String, String)> {
 fn embedded(migrator: &Migrator) -> Vec<(i64, String, String)> {
     let mut migrations: Vec<(i64, String, String)> = migrator
         .iter()
-        .map(|m| (m.version, m.description.to_string(), m.sql.as_str().to_owned()))
+        .map(|m| {
+            (
+                m.version,
+                m.description.to_string(),
+                m.sql.as_str().to_owned(),
+            )
+        })
         .collect();
     migrations.sort();
     migrations
@@ -64,10 +71,19 @@ fn assert_matches_disk(migrator: &Migrator, relative_dir: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_dir);
     let embedded = embedded(migrator);
     let on_disk = on_disk(&dir);
-    assert_eq!(
-        names(&embedded),
-        names(&on_disk),
-        "the migrations embedded in this build differ from {}: the build is stale",
+    let (embedded_names, disk_names) = (names(&embedded), names(&on_disk));
+    let only_embedded: Vec<_> = embedded_names
+        .iter()
+        .filter(|n| !disk_names.contains(n))
+        .collect();
+    let only_on_disk: Vec<_> = disk_names
+        .iter()
+        .filter(|n| !embedded_names.contains(n))
+        .collect();
+    assert!(
+        embedded_names == disk_names,
+        "the migrations embedded in this build differ from {}: the build is stale\n  \
+         embedded only: {only_embedded:?}\n  on disk only: {only_on_disk:?}",
         dir.display()
     );
     for ((version, description, sql), (_, _, file_sql)) in embedded.iter().zip(&on_disk) {
