@@ -139,60 +139,128 @@ impl CommittedEvents for NoHandOff {
 
 /// A `SQLite` write transaction (`BEGIN IMMEDIATE` on the sole write
 /// connection) that can append events, the `SQLite` twin of the Postgres
-/// `WriteTx` append. Finish it with [`Self::finish`] on every path: it
-/// commits or rolls back, and only a commit hands the appended events off.
+/// `WriteTx` append. Finish it with [`Self::finish`]: it commits or rolls
+/// back, and only a commit hands the appended events off.
+///
+/// Cancellation: the caller's future may be dropped at any await.
+/// - Before `finish` (during `BEGIN` or the body), the guard owns the
+///   connection from the moment it is taken: dropped unfinished, it
+///   detaches and closes it instead of returning it to the pool with a
+///   transaction open. Closing rolls the transaction back, and the pool
+///   opens a fresh write connection on demand.
+/// - In `finish`, COMMIT (or ROLLBACK) and the hand-off run in their own
+///   task, which owns the connection: once the commit is under way, a
+///   cancelled caller cannot make it durable without handing it off.
 pub(crate) struct SqliteEventTx {
-    conn: sqlx::pool::PoolConnection<Sqlite>,
+    conn: Option<sqlx::pool::PoolConnection<Sqlite>>,
     appended: Vec<(Event, EventSeq)>,
+    #[cfg(test)]
+    pauses: TxPauses,
+}
+
+/// Test pause points of a [`SqliteEventTx`], for the cancellation tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TxPauses {
+    /// Held once `BEGIN` succeeded, before `begin` returns.
+    pub(crate) after_begin: Option<std::sync::Arc<intentd_test_support::PausePoint>>,
+    /// Held in the commit task once COMMIT succeeded, before the hand-off.
+    pub(crate) after_commit: Option<std::sync::Arc<intentd_test_support::PausePoint>>,
 }
 
 impl SqliteEventTx {
     /// Take the write connection and open the transaction.
     pub(crate) async fn begin(store: &crate::SqliteStore) -> Result<Self> {
-        let mut conn = store
+        let conn = store
             .write_pool()
             .acquire()
             .await
             .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        let mut tx = Self {
+            conn: Some(conn),
+            appended: Vec::new(),
+            #[cfg(test)]
+            pauses: TxPauses::default(),
+        };
         sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await
             .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
-        Ok(Self {
-            conn,
-            appended: Vec::new(),
-        })
+        Ok(tx)
+    }
+
+    /// [`Self::begin`] with test pause points.
+    #[cfg(test)]
+    pub(crate) async fn begin_paused(store: &crate::SqliteStore, pauses: TxPauses) -> Result<Self> {
+        let mut tx = Self::begin(store).await?;
+        if let Some(pause) = &pauses.after_begin {
+            pause.pause().await;
+        }
+        tx.pauses = pauses;
+        Ok(tx)
     }
 
     /// The transaction's connection, for the domain statements.
     pub(crate) fn conn(&mut self) -> &mut sqlx::SqliteConnection {
-        &mut self.conn
+        self.conn.as_mut().expect("an unfinished SqliteEventTx")
     }
 
     /// Insert `ev` in this transaction and return its seq. It is handed off
     /// only if the transaction commits.
     pub(crate) async fn append_event(&mut self, ev: &NewEvent) -> Result<EventSeq> {
-        let (event, seq) = insert_event_with(&mut *self.conn, ev).await?;
+        let (event, seq) = insert_event_with(self.conn(), ev).await?;
         self.appended.push((event, seq));
         Ok(seq)
     }
 
     /// Commit when `body` is `Ok` and hand the appended events to
     /// `after_commit` while the write connection is still held; roll back
-    /// otherwise. Returns the body's value and the appended events.
+    /// otherwise. Both run in their own task (see the type's docs). Returns
+    /// the body's value and the appended events.
     pub(crate) async fn finish<T>(
-        self,
+        mut self,
         body: Result<T>,
-        after_commit: &dyn CommittedEvents,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
     ) -> Result<(T, Vec<(Event, EventSeq)>)> {
-        let Self { conn, appended } = self;
-        let (value, conn) =
-            crate::commit_with_rollback_guard_holding(conn, body, "commit failed").await?;
-        if !appended.is_empty() {
-            after_commit.committed(&appended);
-        }
-        drop(conn);
+        let conn = self.conn.take().expect("an unfinished SqliteEventTx");
+        let appended = std::mem::take(&mut self.appended);
+        let value = match body {
+            Ok(value) => value,
+            Err(e) => {
+                intent_core::spawn_daemon(crate::rollback_or_poison(conn))
+                    .await
+                    .map_err(|join| Error::Internal(format!("rollback task failed: {join}")))?;
+                return Err(e);
+            }
+        };
+        #[cfg(test)]
+        let pause = self.pauses.after_commit.take();
+        let completion = intent_core::spawn_daemon(async move {
+            let ((), conn) =
+                crate::commit_with_rollback_guard_holding(conn, Ok(()), "commit failed").await?;
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+            if !appended.is_empty() {
+                after_commit.committed(&appended);
+            }
+            drop(conn);
+            Ok::<_, Error>(appended)
+        });
+        let appended = completion
+            .await
+            .map_err(|join| Error::Internal(format!("commit task failed: {join}")))??;
         Ok((value, appended))
+    }
+}
+
+impl Drop for SqliteEventTx {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            tracing::warn!("SqliteEventTx dropped unfinished; closing its write connection");
+            drop(conn.detach());
+        }
     }
 }
 

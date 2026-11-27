@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{ClientId, Error, Event, EventActor, Workspace, WorkspaceId};
+use intent_store::postgres::{PostgresOptions, TenantId, WriterLimits};
 use intent_store::{CommittedEvents, EventSeq, NewEvent, Store};
 use intentd_test_support::{test_timeout, PausePoint};
 use serde_json::json;
@@ -120,14 +121,14 @@ async fn install_fault(store: &Store, db: Option<&TestDb>) {
 
 parity_test!(a_committed_append_hands_off_once_in_seq_order, |store| {
     seed_workspace(&store).await;
-    let recorder = Recorder::default();
+    let recorder = Arc::new(Recorder::default());
 
     let (first, first_seq) = store
         .set_workspace_browser_client_with_event(
             &ws(),
             Some(&client("desktop-a")),
             &delta("workspace:updated", "desktop-a"),
-            &recorder,
+            recorder.clone(),
         )
         .await
         .expect("pin A");
@@ -136,7 +137,7 @@ parity_test!(a_committed_append_hands_off_once_in_seq_order, |store| {
             &ws(),
             Some(&client("desktop-b")),
             &delta("workspace:updated", "desktop-b"),
-            &recorder,
+            recorder.clone(),
         )
         .await
         .expect("pin B");
@@ -165,13 +166,13 @@ parity_test!(
     a_rolled_back_append_hands_off_nothing,
     |store, _tenant, db| {
         seed_workspace(&store).await;
-        let recorder = Recorder::default();
+        let recorder = Arc::new(Recorder::default());
         store
             .set_workspace_browser_client_with_event(
                 &ws(),
                 Some(&client("desktop-a")),
                 &delta("workspace:updated", "desktop-a"),
-                &recorder,
+                recorder.clone(),
             )
             .await
             .expect("pin A");
@@ -182,7 +183,7 @@ parity_test!(
                 &WorkspaceId("ws-missing".into()),
                 None,
                 &delta("workspace:updated", "none"),
-                &recorder,
+                recorder.clone(),
             )
             .await;
         assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
@@ -194,7 +195,7 @@ parity_test!(
                 &ws(),
                 Some(&client("desktop-b")),
                 &delta(FAULT, "desktop-b"),
-                &recorder,
+                recorder.clone(),
             )
             .await;
         assert!(failed.is_err(), "the append failed: {failed:?}");
@@ -247,7 +248,7 @@ async fn the_next_writer_of_the_process_waits_for_a_hand_off() {
                 &ws(),
                 Some(&client("desktop-a")),
                 &delta("workspace:updated", "desktop-a"),
-                hand_off.as_ref(),
+                hand_off.clone(),
             )
             .await
         }
@@ -264,7 +265,7 @@ async fn the_next_writer_of_the_process_waits_for_a_hand_off() {
                 &ws(),
                 Some(&client("desktop-b")),
                 &delta("workspace:updated", "desktop-b"),
-                hand_off.as_ref(),
+                hand_off.clone(),
             )
             .await
         }
@@ -295,4 +296,117 @@ async fn the_next_writer_of_the_process_waits_for_a_hand_off() {
         .collect();
     assert_eq!(handed, vec![seq_a, seq_b]);
     assert!(seq_a < seq_b);
+}
+
+/// Event type whose COMMIT waits on [`COMMIT_LOCK`] (a deferred constraint
+/// trigger runs at COMMIT).
+const SLOW_COMMIT: &str = "test:slow-commit";
+
+/// Advisory lock key the slow-commit trigger takes.
+const COMMIT_LOCK: i64 = 0x5717_c0de;
+
+/// A caller cancelled while its COMMIT is in flight does not lose the
+/// hand-off: the commit task owns the transaction and the writer slot,
+/// finishes the commit and hands the event off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_cancelled_during_commit_still_hands_off() {
+    let Some(db) = test_db(false).await else {
+        return;
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.event_type = '{SLOW_COMMIT}' THEN \
+         PERFORM pg_advisory_xact_lock({COMMIT_LOCK}); END IF; RETURN NULL; END $$; \
+         CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON event \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit();"
+    )))
+    .execute(&db.admin)
+    .await
+    .expect("install the slow-commit trigger");
+    // The commit lock wait runs under the writer's `lock_timeout`: long
+    // enough that only the test's release ends it.
+    let long = Duration::from_secs(600);
+    let store = Store::open_postgres(
+        db.app.clone(),
+        TenantId::new("tenant").unwrap(),
+        PostgresOptions {
+            writer: WriterLimits {
+                lock_attempt: long,
+                statement_timeout: long,
+                idle_in_transaction_timeout: long,
+                ..WriterLimits::default()
+            },
+            ..PostgresOptions::default()
+        },
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("open tenant store");
+    seed_workspace(&store).await;
+
+    let mut holder = db.admin.acquire().await.expect("lock holder connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(COMMIT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the commit lock");
+
+    let recorder = Arc::new(Recorder::default());
+    let caller = tokio::spawn({
+        let (store, recorder) = (store.clone(), recorder.clone());
+        async move {
+            store
+                .set_workspace_browser_client_with_event(
+                    &ws(),
+                    Some(&client("desktop-a")),
+                    &delta(SLOW_COMMIT, "desktop-a"),
+                    recorder,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                 AND wait_event = 'advisory'",
+            )
+            .fetch_one(&db.admin)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the COMMIT waits on the commit lock");
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(
+        recorder.calls().is_empty(),
+        "nothing handed off before COMMIT"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(COMMIT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("release the commit lock");
+    tokio::time::timeout(test_timeout(Duration::from_secs(30)), async {
+        while recorder.calls().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the commit task hands the event off");
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(logged(&store, &calls[0][0].0.id).await, 1);
+    assert_eq!(
+        store.workspace_browser_client(&ws()).await.unwrap(),
+        Some(client("desktop-a"))
+    );
 }

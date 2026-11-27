@@ -1170,9 +1170,13 @@ impl WriteTx {
     /// while this transaction still holds the writer slot, so the next
     /// writer of this process commits (and hands off) after them. Returns
     /// the appended events. Nothing is handed off when the commit fails.
+    ///
+    /// COMMIT and the hand-off run in their own task, which owns the
+    /// transaction and the slot: a caller cancelled while COMMIT is in
+    /// flight cannot leave the events durable but never handed off.
     pub(crate) async fn commit_handing_off(
         self,
-        after_commit: &dyn CommittedEvents,
+        after_commit: Arc<dyn CommittedEvents>,
     ) -> Result<Vec<(intent_core::Event, EventSeq)>> {
         let Self {
             tx,
@@ -1180,12 +1184,16 @@ impl WriteTx {
             appended,
             ..
         } = self;
-        tx.commit().await.map_err(db)?;
-        if !appended.is_empty() {
-            after_commit.committed(&appended);
-        }
-        drop(slot);
-        Ok(appended)
+        intent_core::spawn_daemon(async move {
+            tx.commit().await.map_err(db)?;
+            if !appended.is_empty() {
+                after_commit.committed(&appended);
+            }
+            drop(slot);
+            Ok(appended)
+        })
+        .await
+        .map_err(|join| Error::Internal(format!("commit task failed: {join}")))?
     }
 
     /// Commit, keeping the writer slot: the caller finishes what must happen
@@ -1194,6 +1202,10 @@ impl WriteTx {
     pub(crate) async fn commit_holding_slot(
         self,
     ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, sqlx::Error> {
+        debug_assert!(
+            self.appended.is_empty(),
+            "a WriteTx that appended events must commit with commit_handing_off"
+        );
         let Self {
             tx, _slot: slot, ..
         } = self;

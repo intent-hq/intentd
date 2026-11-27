@@ -1205,7 +1205,7 @@ impl PgStore {
         id: &WorkspaceId,
         client_id: Option<&ClientId>,
         event: &NewEvent,
-        after_commit: &dyn CommittedEvents,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
     ) -> Result<(Event, EventSeq)> {
         let mut tx = self.begin_write().await?;
         let updated = sqlx::query(
@@ -1219,7 +1219,9 @@ impl PgStore {
         .map_err(db)?
         .rows_affected();
         if updated == 0 {
-            tx.rollback().await.map_err(db)?;
+            // NotFound either way; a failed rollback only ends the
+            // transaction when the connection drops.
+            let _ = tx.rollback().await;
             return Err(not_found(id));
         }
         tx.append_event(event).await?;

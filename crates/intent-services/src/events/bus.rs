@@ -281,14 +281,7 @@ impl EventBus {
         if ev.workspace_id.is_home_record() {
             return Ok(self.tap_home_record(ev));
         }
-        if matches!(
-            ev.event_type.as_str(),
-            intent_core::events::NOTE_CREATED
-                | intent_core::events::NOTE_UPDATED
-                | intent_core::events::NOTE_DELETED
-                | intent_core::events::TASK_CREATED
-                | intent_core::events::TASK_STATUS_CHANGED
-        ) {
+        if TASK_PROJECTION_EVENT_TYPES.contains(&ev.event_type.as_str()) {
             // Keep projection futures off the deeply nested agent delivery
             // and `workspace.create` stacks (see `crate::stack_frame`).
             return boxed_await(|| self.publish_note_and_task_changes(ev)).await;
@@ -307,29 +300,23 @@ impl EventBus {
     ///
     /// # Errors
     ///
-    /// `Error::InvalidParams` for an event `publish` treats specially, which
-    /// must keep going through it: a home record's event (never stored), a
-    /// transient `file:*` event, an `agent:tool:call` (persisted truncated),
-    /// note and task events (they update the task projection) and
-    /// `workspace:deleted` (it clears the task-event baselines).
+    /// `Error::InvalidParams` for an event `publish` routes specially
+    /// ([`publish_routes_specially`]), which must keep going through it;
+    /// `Error::Internal` after [`Self::shutdown`], as `publish`.
+    ///
+    /// # Panics
+    /// Panics if the writer admission mutex is poisoned.
     pub async fn prepare_append(&self, ev: &NewEvent) -> Result<NewEvent> {
-        let special = ev.workspace_id.is_home_record()
-            || is_transient_file_event(ev)
-            || matches!(
-                ev.event_type.as_str(),
-                intent_core::events::NOTE_CREATED
-                    | intent_core::events::NOTE_UPDATED
-                    | intent_core::events::NOTE_DELETED
-                    | intent_core::events::TASK_CREATED
-                    | intent_core::events::TASK_STATUS_CHANGED
-                    | intent_core::events::WORKSPACE_DELETED
-                    | intent_core::events::AGENT_TOOL_CALL
-            );
-        if special {
+        if publish_routes_specially(ev) {
             return Err(Error::InvalidParams(format!(
                 "{} events go through EventBus::publish, not a transaction append",
                 ev.event_type
             )));
+        }
+        // The same admission as `publish`: after `shutdown` no new durable
+        // publication is admitted.
+        if self.writer_tx.lock().unwrap().is_none() {
+            return Err(Error::Internal("event writer task closed".to_string()));
         }
         Ok(self
             .attribute_to_caller(ev)
@@ -551,6 +538,31 @@ impl EventBus {
             Ok(())
         })
     }
+}
+
+/// Note and task events: [`EventBus::publish`] also updates the task
+/// projection for them.
+const TASK_PROJECTION_EVENT_TYPES: &[&str] = &[
+    intent_core::events::NOTE_CREATED,
+    intent_core::events::NOTE_UPDATED,
+    intent_core::events::NOTE_DELETED,
+    intent_core::events::TASK_CREATED,
+    intent_core::events::TASK_STATUS_CHANGED,
+];
+
+/// Whether [`EventBus::publish`] does more for `ev` than persist and
+/// broadcast it, so it cannot be appended in a domain transaction
+/// ([`EventBus::prepare_append`]): a home record's event (never stored), a
+/// transient `file:*` event (never stored), an `agent:tool:call` (persisted
+/// truncated), note and task events (task projection) and
+/// `workspace:deleted` (clears the task-event baselines). A new special
+/// route in `publish` belongs here too.
+fn publish_routes_specially(ev: &NewEvent) -> bool {
+    ev.workspace_id.is_home_record()
+        || is_transient_file_event(ev)
+        || TASK_PROJECTION_EVENT_TYPES.contains(&ev.event_type.as_str())
+        || ev.event_type == intent_core::events::WORKSPACE_DELETED
+        || ev.event_type == intent_core::events::AGENT_TOOL_CALL
 }
 
 /// The after-commit hand-off: events a domain write appended in its own

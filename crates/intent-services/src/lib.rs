@@ -16212,6 +16212,22 @@ fn search_done_event(
     }
 }
 
+/// The after-commit hand-off of `workspace.setBrowserClient`: bumps the
+/// workspace's desktop assignment generation, then puts the pin's delta on
+/// the bus, so a subscriber reacting to the delta reads the new assignment.
+struct PinHandOff {
+    bus: EventBus,
+    desktop: Arc<desktop::Runtime>,
+    workspace: WorkspaceId,
+}
+
+impl intent_store::CommittedEvents for PinHandOff {
+    fn committed(&self, events: &[(Event, intent_store::EventSeq)]) {
+        self.desktop.assignment_changed(&self.workspace);
+        intent_store::CommittedEvents::committed(&self.bus, events);
+    }
+}
+
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
 ///
@@ -25925,27 +25941,36 @@ impl WorkspaceApi for Services {
                 .map_or(serde_json::Value::Null, |c| c.as_str().into());
             let delta =
                 workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change }));
-            if let Some(bus) = bus.as_ref() {
+            if let Some(bus) = bus.as_ref().filter(|_| !id.is_home_record()) {
                 let delta = bus.prepare_append(&delta).await?;
-                store
-                    .set_workspace_browser_client_with_event(&id, client_id.as_ref(), &delta, bus)
-                    .await?;
-            } else {
+                let hand_off = Arc::new(PinHandOff {
+                    bus: bus.clone(),
+                    desktop: self.desktop.clone(),
+                    workspace: id.clone(),
+                });
                 store
                     .set_workspace_browser_client_with_event(
                         &id,
                         client_id.as_ref(),
                         &delta,
-                        &intent_store::NoHandOff,
+                        hand_off,
                     )
                     .await?;
+            } else {
+                // No bus to hand off to, or a machine's home record, whose
+                // events are never stored: write the pin alone and publish
+                // as before.
+                store
+                    .set_workspace_browser_client(&id, client_id.as_ref())
+                    .await?;
+                self.desktop.assignment_changed(&id);
+                publish_event(bus.as_ref(), delta).await;
             }
             #[cfg(any(test, feature = "test-hooks"))]
             if let Some(park) = &self.browser_pin_park {
                 park.entered.notify_one();
                 park.release.notified().await;
             }
-            self.desktop.assignment_changed(&id);
             // Migrate to the pin in effect now: another process's setter may
             // have replaced this one since it committed.
             let committed = store.workspace_browser_client(&id).await?;

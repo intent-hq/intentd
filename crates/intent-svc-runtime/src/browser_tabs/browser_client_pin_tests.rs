@@ -550,8 +550,9 @@ async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
 }
 
 /// The pin's delta commits with the pin and reaches subscribers once, after
-/// the commit: a subscriber that reads the pin when the delta arrives sees
-/// it, and each set publishes exactly one delta.
+/// the commit: while the setter is still held right after its write, the
+/// delta has already arrived and a subscriber reading the pin then sees it.
+/// Each set publishes exactly one delta, stored once.
 #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pin_delta_arrives_once_after_its_pin_commits() {
     let reg = FakeRegistry::new(&[
@@ -559,47 +560,61 @@ async fn a_pin_delta_arrives_once_after_its_pin_commits() {
         ("desktop-b", Some("Desktop B"), true),
     ]);
     let (_t, _r, svc, bus, ws) = setup(reg).await;
+    let park = Arc::new(intent_services::CompletionClassifyPark::default());
+    let svc = svc.with_browser_pin_park_for_test(park.clone());
     let mut sub = bus.subscribe(SubscriptionFilter {
         workspace_id: Some(ws.0.clone()),
         ..Default::default()
     });
-    let mut seen = Vec::new();
-    for target in [Some("desktop-b"), None] {
-        intent_core::with_caller(
-            intent_core::Caller::Daemon,
-            svc.set_workspace_browser_client(ws.clone(), target.map(ClientId::from_string)),
-        )
-        .await
-        .expect("set");
-        let batch = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            sub.recv(),
-        )
-        .await
-        .expect("the delta arrives")
-        .expect("subscription open");
-        for ev in batch {
-            let ev = serde_json::to_value(ev).unwrap();
-            let delta = ev["data"]["changes"]["browserClientId"].clone();
-            let row = bus
-                .store()
-                .workspace_browser_client(&ws)
+    let wait = || intentd_test_support::test_timeout(Duration::from_secs(5));
+
+    let mut setter = tokio::spawn(intent_core::with_caller(intent_core::Caller::Daemon, {
+        let (svc, ws) = (svc.clone(), ws.clone());
+        async move {
+            svc.set_workspace_browser_client(ws, Some(ClientId::from_string("desktop-b")))
                 .await
-                .unwrap()
-                .map_or(Value::Null, |c| c.as_str().into());
-            assert_eq!(delta, row, "the delta's pin is committed when it arrives");
-            seen.push(delta);
         }
+    }));
+    tokio::time::timeout(wait(), async {
+        tokio::select! {
+            () = park.entered.notified() => {}
+            done = &mut setter => panic!("the setter ended before its pin was written: {done:?}"),
+        }
+    })
+    .await
+    .expect("the setter writes its pin");
+    let batch = tokio::time::timeout(wait(), sub.recv())
+        .await
+        .expect("the delta arrives while the setter is held after its commit")
+        .expect("subscription open");
+    let delta =
+        serde_json::to_value(&batch[0]).unwrap()["data"]["changes"]["browserClientId"].clone();
+    assert_eq!(delta, "desktop-b");
+    assert_eq!(
+        bus.store().workspace_browser_client(&ws).await.unwrap(),
+        Some(ClientId::from_string("desktop-b")),
+        "the delta's pin is committed when it arrives"
+    );
+    park.release.notify_one();
+    tokio::time::timeout(wait(), setter)
+        .await
+        .expect("the setter finishes once released")
+        .unwrap()
+        .expect("set");
+
+    let mut seen = vec![delta];
+    for ev in &batch[1..] {
+        seen.push(serde_json::to_value(ev).unwrap()["data"]["changes"]["browserClientId"].clone());
     }
     assert_eq!(
         seen,
-        vec![json!("desktop-b"), Value::Null],
-        "one delta per set"
+        vec![json!("desktop-b")],
+        "one delta per set: {seen:?}"
     );
     let durable = bus
         .store()
         .events_by_type(&ws, intent_core::events::WORKSPACE_UPDATED, 10)
         .await
         .unwrap();
-    assert_eq!(durable.len(), 2, "each delta is stored once");
+    assert_eq!(durable.len(), 1, "the delta is stored once");
 }

@@ -671,7 +671,7 @@ impl Store {
         id: &WorkspaceId,
         client_id: Option<&ClientId>,
         event: &NewEvent,
-        after_commit: &dyn CommittedEvents,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
     ) -> Result<(Event, EventSeq)> {
         dispatch!(self, backend => backend
             .set_workspace_browser_client_with_event(id, client_id, event, after_commit)
@@ -2056,7 +2056,7 @@ impl crate::SqliteStore {
         id: &WorkspaceId,
         client_id: Option<&ClientId>,
         event: &NewEvent,
-        after_commit: &dyn CommittedEvents,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
     ) -> Result<(Event, EventSeq)> {
         let mut tx = SqliteEventTx::begin(self).await?;
         let body = async {

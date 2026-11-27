@@ -5987,6 +5987,182 @@ async fn client_upsert_sets_first_seen_once_and_touches_last_seen() {
     assert_eq!(kept, again, "an already-stamped row keeps its own stamp");
 }
 
+/// A `SqliteEventTx` dropped mid-transaction (its caller's future was
+/// cancelled) must not hand the sole write connection back with the
+/// transaction open: its append is gone, nothing was handed off, and the
+/// next writer commits normally.
+#[tokio::test]
+async fn an_unfinished_event_tx_rolls_back_and_frees_the_write_connection() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "Pinned", false))
+        .await
+        .expect("insert");
+    let event = |pin: &str| crate::NewEvent {
+        workspace_id: ws_id.clone(),
+        timestamp: "2026-11-27T00:00:00Z".into(),
+        event_type: "workspace:updated".into(),
+        actor: intent_core::EventActor::default(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "pin": pin }),
+    };
+
+    let mut tx = crate::event_repo::SqliteEventTx::begin(store.sqlite())
+        .await
+        .expect("begin");
+    tx.append_event(&event("dropped")).await.expect("append");
+    drop(tx);
+
+    let (_, seq) = store
+        .set_workspace_browser_client_with_event(
+            &ws_id,
+            Some(&ClientId::from_string("desktop-a")),
+            &event("kept"),
+            std::sync::Arc::new(crate::NoHandOff),
+        )
+        .await
+        .expect("the next writer gets a clean write connection");
+    let logged: Vec<_> = store
+        .events_after(0, -1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(e, s)| (e.data["pin"].clone(), s))
+        .collect();
+    assert_eq!(logged, vec![(serde_json::json!("kept"), seq)]);
+}
+
+/// Records every hand-off of an event transaction.
+#[derive(Default)]
+struct HandOffs(std::sync::Mutex<Vec<Vec<crate::EventSeq>>>);
+
+impl crate::CommittedEvents for HandOffs {
+    fn committed(&self, events: &[(intent_core::Event, crate::EventSeq)]) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(events.iter().map(|(_, seq)| *seq).collect());
+    }
+}
+
+fn tx_event(ws: &WorkspaceId, pin: &str) -> crate::NewEvent {
+    crate::NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: "2026-11-27T00:00:00Z".into(),
+        event_type: "workspace:updated".into(),
+        actor: intent_core::EventActor::default(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "pin": pin }),
+    }
+}
+
+/// An event transaction cancelled right after `BEGIN` succeeded (its
+/// caller's future dropped there) closes its write connection: the next
+/// writer gets a clean one and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_tx_cancelled_after_begin_frees_the_write_connection() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "Pinned", false))
+        .await
+        .expect("insert");
+    let pause = intentd_test_support::PausePoint::new("after BEGIN");
+    let mut caller = tokio::spawn({
+        let (store, pause) = (store.clone(), pause.clone());
+        async move {
+            let pauses = crate::event_repo::TxPauses {
+                after_begin: Some(pause),
+                ..Default::default()
+            };
+            crate::event_repo::SqliteEventTx::begin_paused(store.sqlite(), pauses)
+                .await
+                .map(drop)
+        }
+    });
+    assert!(pause.reached(&mut caller).await.is_none());
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    store
+        .set_workspace_browser_client_with_event(
+            &ws_id,
+            Some(&ClientId::from_string("desktop-a")),
+            &tx_event(&ws_id, "kept"),
+            std::sync::Arc::new(crate::NoHandOff),
+        )
+        .await
+        .expect("the next writer gets a clean write connection");
+    assert_eq!(
+        store.workspace_browser_client(&ws_id).await.unwrap(),
+        Some(ClientId::from_string("desktop-a"))
+    );
+}
+
+/// A caller cancelled once its COMMIT is under way does not lose the
+/// hand-off: the commit task finishes the commit and hands the event off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_tx_cancelled_at_commit_still_hands_off() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "Pinned", false))
+        .await
+        .expect("insert");
+    let pause = intentd_test_support::PausePoint::new("after COMMIT");
+    let hand_offs = std::sync::Arc::new(HandOffs::default());
+    let mut caller = tokio::spawn({
+        let (store, pause, hand_offs, ws_id) = (
+            store.clone(),
+            pause.clone(),
+            hand_offs.clone(),
+            ws_id.clone(),
+        );
+        async move {
+            let pauses = crate::event_repo::TxPauses {
+                after_commit: Some(pause),
+                ..Default::default()
+            };
+            let mut tx = crate::event_repo::SqliteEventTx::begin_paused(store.sqlite(), pauses)
+                .await
+                .expect("begin");
+            tx.append_event(&tx_event(&ws_id, "committed"))
+                .await
+                .expect("append");
+            tx.finish(Ok(()), hand_offs).await.map(drop)
+        }
+    });
+    assert!(pause.reached(&mut caller).await.is_none());
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(hand_offs.0.lock().unwrap().is_empty());
+    pause.release();
+
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        async {
+            while hand_offs.0.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("the commit task hands the event off");
+    let logged = store.events_after(0, -1).await.unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(*hand_offs.0.lock().unwrap(), vec![vec![logged[0].1]]);
+}
+
 /// REV-2 per-workspace browser-client pin: NULL (unpinned) by default, a
 /// scoped set/clear round-trips, the column rides `Workspace` reads, and an
 /// unknown workspace is `NotFound`. The scoped setter is the column's only
