@@ -409,7 +409,8 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
 type Gists = Arc<Mutex<HashMap<String, Value>>>;
 
 /// Held HTTP responses, by path: each waits until the test observes the
-/// competing operation. Budgets match the live daemon's (60 s base).
+/// competing operation. Reaching one gets the live daemon's 60 s base
+/// budget; the hold keeps the default so it fires before nextest's kill.
 type ResponseGates = Arc<Mutex<HashMap<String, Arc<PausePoint>>>>;
 
 struct MockGithub {
@@ -426,8 +427,7 @@ impl MockGithub {
     fn hold_response(&self, path: &str) -> Arc<PausePoint> {
         let gate = Arc::new(
             PausePoint::unshared(format!("mock GitHub {path}"))
-                .with_reach_timeout(Duration::from_secs(60))
-                .with_hold_timeout(Duration::from_secs(60)),
+                .with_reach_timeout(Duration::from_secs(60)),
         );
         self.response_gates
             .lock()
