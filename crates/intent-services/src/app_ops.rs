@@ -359,18 +359,6 @@ fn upload_invalid(detail: &str) -> Error {
     .into_error()
 }
 
-/// Ends an `app.install` claim on an `app-package` upload when dropped.
-struct UploadClaimRelease<'a> {
-    svc: &'a Services,
-    upload_id: &'a str,
-}
-
-impl Drop for UploadClaimRelease<'_> {
-    fn drop(&mut self) {
-        self.svc.app_package_upload_release(self.upload_id);
-    }
-}
-
 /// A read bundle with its parsed manifest and signature.
 type ValidatedBundle = (bundle::Bundle, Manifest, Option<Signature>);
 
@@ -668,27 +656,30 @@ impl Services {
             .app_package_upload_claim(upload_id)
             .await
             .map_err(|detail| upload_invalid(&detail))?;
-        // Releases the claim on every path, a dropped request included, so
-        // the upload never stays busy; after a finish it is a no-op.
-        let _release = UploadClaimRelease {
-            svc: self,
-            upload_id,
-        };
-        let package_path = claim.package;
-        let read = tokio::task::spawn_blocking(move || -> Result<ValidatedBundle> {
-            // `tempdir` is created 0700 and deleted on drop, on every path.
-            let scratch = tempfile::Builder::new()
-                .prefix("intent-app-package-")
-                .tempdir()
-                .map_err(|e| Error::Internal(format!("app package scratch dir failed: {e}")))?;
-            package::unpack_package(&package_path, scratch.path())?;
-            read_validated_bundle(scratch.path())
+        let crate::attachment_upload::AppPackageClaim {
+            package: package_path,
+            claim,
+        } = claim;
+        // The claim rides the unpack worker and comes back with its result,
+        // so a cancelled request releases it only when the worker ends.
+        let unpacked = tokio::task::spawn_blocking(move || {
+            let read = (|| -> Result<ValidatedBundle> {
+                // `tempdir` is created 0700 and deleted on drop, on every path.
+                let scratch = tempfile::Builder::new()
+                    .prefix("intent-app-package-")
+                    .tempdir()
+                    .map_err(|e| Error::Internal(format!("app package scratch dir failed: {e}")))?;
+                package::unpack_package(&package_path, scratch.path())?;
+                read_validated_bundle(scratch.path())
+            })();
+            (claim, read)
         })
         .await
-        .map_err(|e| Error::Internal(format!("app package task failed: {e}")));
+        .map_err(|e| Error::Internal(format!("app package task failed: {e}")))?;
+        let (_claim, read) = unpacked;
         let result = match read {
-            Ok(Ok(read)) => self.install_bundle(read, None, replace, dry_run).await,
-            Ok(Err(e)) | Err(e) => Err(e),
+            Ok(read) => self.install_bundle(read, None, replace, dry_run).await,
+            Err(e) => Err(e),
         };
         if result.is_ok() && !dry_run {
             self.app_package_upload_finish(upload_id).await;

@@ -94,6 +94,11 @@ pub(crate) struct AttachmentUploadSession {
     /// Client-minted idempotency key from `begin` (intent-hq/intent#4691),
     /// bound at commit like a keyed `file.placeAttachment`.
     pub idempotency_key: Option<String>,
+    /// Chunk writes reserved but not yet on disk. A chunk counts from its
+    /// reservation until its blocking write ends, a cancelled call
+    /// included, so an `app.install` claim never assembles around a write
+    /// that is still running.
+    pub writes_in_flight: u32,
 }
 
 impl AttachmentUploadSession {
@@ -675,6 +680,7 @@ impl Services {
                     committing: false,
                     last_activity: Instant::now(),
                     idempotency_key,
+                    writes_in_flight: 0,
                 };
                 uploads.insert(upload_id.clone(), session);
                 Ok(None)
@@ -929,10 +935,30 @@ impl Services {
                 )));
             }
             session.chunk_sizes.insert(seq, bytes.len() as u64);
+            session.writes_in_flight += 1;
             (session.staging_dir.clone(), prior_this_seq, new_total)
         };
         let path = staging_dir.join(chunk_file_name(seq));
-        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+        // The write owns its in-flight mark: the blocking worker drops it
+        // when the bytes are on disk, even if this call was cancelled.
+        let in_flight = ChunkWriteInFlight {
+            uploads: std::sync::Arc::clone(&self.attachment_uploads),
+            upload_id: upload_id.clone(),
+        };
+        #[cfg(test)]
+        let pause = test_pause(&CHUNK_WRITE_PAUSES, &upload_id);
+        let written = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.pause_blocking();
+            }
+            let written = std::fs::write(&path, &bytes);
+            drop(in_flight);
+            written
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("attachment chunk write task failed: {e}")))?;
+        if let Err(e) = written {
             // Roll the reservation back so a retry accounts correctly.
             let mut uploads = self
                 .attachment_uploads
@@ -1187,6 +1213,90 @@ pub(crate) fn app_package_caller_ok() -> bool {
 /// package file, while the session is flagged `committing`.
 pub(crate) struct AppPackageClaim {
     pub(crate) package: PathBuf,
+    /// Holds the session's `committing` flag; see [`UploadClaim`].
+    pub(crate) claim: UploadClaim,
+}
+
+type UploadRegistry = std::sync::Arc<std::sync::Mutex<HashMap<String, AttachmentUploadSession>>>;
+
+/// Owns an `app.install` claim on an `app-package` upload. Dropping it
+/// clears `committing` and restarts the idle clock, so the upload can be
+/// installed again, aborted or expire. It moves into each blocking worker
+/// that reads the staged files and comes back with its result, so a
+/// cancelled request releases the claim only when that worker has ended.
+/// After [`Services::app_package_upload_finish`] removed the session, the
+/// drop does nothing.
+pub(crate) struct UploadClaim {
+    uploads: UploadRegistry,
+    upload_id: String,
+}
+
+impl Drop for UploadClaim {
+    fn drop(&mut self) {
+        if let Some(session) = self
+            .uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.upload_id)
+        {
+            session.committing = false;
+            session.last_activity = Instant::now();
+        }
+    }
+}
+
+/// One reserved chunk write; dropping it ends the write's in-flight mark.
+struct ChunkWriteInFlight {
+    uploads: UploadRegistry,
+    upload_id: String,
+}
+
+impl Drop for ChunkWriteInFlight {
+    fn drop(&mut self) {
+        if let Some(session) = self
+            .uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.upload_id)
+        {
+            session.writes_in_flight = session.writes_in_flight.saturating_sub(1);
+        }
+    }
+}
+
+/// Test seams keyed by upload id: a chunk write and a package assembly
+/// pause on a registered [`intentd_test_support::PausePoint`].
+#[cfg(test)]
+pub(crate) static CHUNK_WRITE_PAUSES: TestPauses = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static PACKAGE_ASSEMBLY_PAUSES: TestPauses = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) type TestPauses =
+    std::sync::Mutex<Option<HashMap<String, std::sync::Arc<intentd_test_support::PausePoint>>>>;
+
+#[cfg(test)]
+fn test_pause(
+    pauses: &TestPauses,
+    upload_id: &str,
+) -> Option<std::sync::Arc<intentd_test_support::PausePoint>> {
+    pauses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|m| m.remove(upload_id))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_pause(
+    pauses: &TestPauses,
+    upload_id: &str,
+    pause: std::sync::Arc<intentd_test_support::PausePoint>,
+) {
+    pauses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(upload_id.to_owned(), pause);
 }
 
 impl Services {
@@ -1261,6 +1371,7 @@ impl Services {
                         committing: false,
                         last_activity: Instant::now(),
                         idempotency_key: None,
+                        writes_in_flight: 0,
                     },
                 );
                 Ok(())
@@ -1316,6 +1427,11 @@ impl Services {
                     "upload {upload_id} is busy with another install — retry when it returns"
                 ));
             }
+            if session.writes_in_flight > 0 {
+                return Err(format!(
+                    "upload {upload_id} is busy with a chunk write — retry when the chunk call returns"
+                ));
+            }
             session.last_activity = Instant::now();
             let received = session.received_bytes();
             if received != session.declared_size {
@@ -1339,35 +1455,41 @@ impl Services {
                 seqs,
             )
         };
+        let claim = UploadClaim {
+            uploads: std::sync::Arc::clone(&self.attachment_uploads),
+            upload_id: upload_id.to_owned(),
+        };
         let package = staging_dir.join("assembled");
         let assembled = package.clone();
-        let verified = tokio::task::spawn_blocking(move || {
-            assemble_and_verify(
+        #[cfg(test)]
+        let pause = test_pause(&PACKAGE_ASSEMBLY_PAUSES, upload_id);
+        // The claim rides the worker: a cancelled caller leaves it there
+        // and the worker drops it when the assembly has ended.
+        let (claim, verified) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.pause_blocking();
+            }
+            let verified = assemble_and_verify(
                 &staging_dir,
                 &seqs,
                 declared_size,
                 &declared_sha,
                 &assembled,
-            )
+            );
+            (claim, verified)
         })
         .await
-        .map_err(|e| format!("app package assembly task failed: {e}"))
-        .and_then(|r| r.map_err(|e| e.to_string()));
-        if let Err(detail) = verified {
-            self.release_failed_commit_claim(upload_id);
-            return Err(detail);
+        .map_err(|e| format!("app package assembly task failed: {e}"))?;
+        match verified {
+            Ok(()) => Ok(AppPackageClaim { package, claim }),
+            // Dropping `claim` keeps the upload for a retry or an abort.
+            Err(e) => Err(e.to_string()),
         }
-        Ok(AppPackageClaim { package })
     }
 
-    /// End a claim and keep the upload (a `dryRun` or a failed install), so
-    /// the client can install again or abort.
-    pub(crate) fn app_package_upload_release(&self, upload_id: &str) {
-        self.release_failed_commit_claim(upload_id);
-    }
-
-    /// End a claim and the upload (a successful install): the session is
-    /// removed and its staging deleted.
+    /// End the upload after a successful install: the session is removed
+    /// and its staging deleted, so the claim's drop does nothing.
     pub(crate) async fn app_package_upload_finish(&self, upload_id: &str) {
         let session = self
             .attachment_uploads
@@ -2522,6 +2644,7 @@ mod tests {
                 committing: false,
                 last_activity: tokio::time::Instant::now(),
                 idempotency_key: None,
+                writes_in_flight: 0,
             },
         );
 

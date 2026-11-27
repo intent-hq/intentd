@@ -788,3 +788,129 @@ fn unpack_writes_only_inside_the_destination() {
     assert_eq!(std::fs::read(dest.join("a/b/c.js")).unwrap(), b"c");
     assert!(!dest.join("top").exists(), "the top folder is removed");
 }
+
+// ---------------------------------------------------------------------------
+// Claim lifecycle under cancellation and concurrent chunk writes
+// ---------------------------------------------------------------------------
+
+fn session_committing(f: &Fx, upload_id: &str) -> Option<bool> {
+    f.svc
+        .attachment_uploads
+        .lock()
+        .unwrap()
+        .get(upload_id)
+        .map(|s| s.committing)
+}
+
+/// An install dropped during assembly keeps the upload busy until the
+/// worker ends, then the upload can be installed or aborted again and the
+/// package-upload capacity recovers.
+#[intent_test_macros::daemon_test]
+async fn a_cancelled_install_releases_the_upload_when_assembly_ends() {
+    let f = fx().await;
+    let upload_id = f.upload(&package("cancel-app", &[])).await;
+    let pause = intentd_test_support::PausePoint::new("package assembly");
+    crate::attachment_upload::set_test_pause(
+        &crate::attachment_upload::PACKAGE_ASSEMBLY_PAUSES,
+        &upload_id,
+        pause.clone(),
+    );
+    let mut install = Box::pin(f.install_upload(&upload_id, false, false));
+    assert!(pause.reached(&mut install).await.is_none());
+    drop(install);
+
+    // The worker still holds the claim: no second install, no abort.
+    let busy = f
+        .install_upload(&upload_id, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&busy), "upload-invalid");
+    let abort = with_caller(
+        owner(),
+        f.svc.file_attachment_upload_abort(upload_id.clone()),
+    )
+    .await;
+    assert!(abort.is_err(), "abort waits for the claim: {abort:?}");
+    assert_eq!(session_committing(&f, &upload_id), Some(true));
+
+    pause.release();
+    for _ in 0..1000 {
+        if session_committing(&f, &upload_id) == Some(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        session_committing(&f, &upload_id),
+        Some(false),
+        "the worker releases the claim when it ends"
+    );
+
+    let installed = f.install_upload(&upload_id, false, false).await.unwrap();
+    assert_eq!(installed["app"]["id"], json!("cancel-app"));
+    assert!(!f.upload_live(&upload_id));
+    // Both package-upload slots are free again.
+    let a = f.upload(&package("cap-a", &[])).await;
+    let b = f.upload(&package("cap-b", &[])).await;
+    for id in [a, b] {
+        with_caller(owner(), f.svc.file_attachment_upload_abort(id))
+            .await
+            .unwrap();
+    }
+}
+
+/// A chunk whose bytes are reserved but not yet written fences the
+/// install: it is refused as busy and succeeds once the write ends.
+#[intent_test_macros::daemon_test]
+async fn an_install_is_refused_while_a_chunk_write_is_in_flight() {
+    let f = fx().await;
+    let big = RawEntry {
+        method: 0,
+        ..RawEntry::file("big.bin", &vec![7u8; 64 * 1024])
+    };
+    let bytes = package("chunk-app", &[big]);
+    let (head, tail) = bytes.split_at(bytes.len() / 2);
+    let sha = crate::app_ops::bundle::hex(&sha2::Sha256::digest(&bytes));
+    let begun = with_caller(
+        owner(),
+        f.svc
+            .file_app_package_upload_begin("c.zip".into(), bytes.len() as u64, sha),
+    )
+    .await
+    .unwrap();
+    let upload_id = begun["uploadId"].as_str().unwrap().to_owned();
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    with_caller(
+        owner(),
+        f.svc
+            .file_attachment_upload_chunk(upload_id.clone(), 0, b64(head)),
+    )
+    .await
+    .unwrap();
+
+    let pause = intentd_test_support::PausePoint::new("chunk write");
+    crate::attachment_upload::set_test_pause(
+        &crate::attachment_upload::CHUNK_WRITE_PAUSES,
+        &upload_id,
+        pause.clone(),
+    );
+    let mut chunk = Box::pin(with_caller(
+        owner(),
+        f.svc
+            .file_attachment_upload_chunk(upload_id.clone(), 1, b64(tail)),
+    ));
+    assert!(pause.reached(&mut chunk).await.is_none());
+
+    // All bytes are reserved, but the last write is still running.
+    let busy = f
+        .install_upload(&upload_id, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&busy), "upload-invalid");
+    assert!(busy.to_string().contains("chunk write"), "{busy}");
+
+    pause.release();
+    chunk.await.unwrap();
+    let installed = f.install_upload(&upload_id, false, false).await.unwrap();
+    assert_eq!(installed["app"]["id"], json!("chunk-app"));
+}
