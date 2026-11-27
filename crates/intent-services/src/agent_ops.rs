@@ -12178,23 +12178,21 @@ impl Services {
         }
         // Idempotency for the notice below: a repeat dismissal of the same
         // messageId re-persists the marker (harmless) but must NOT deliver a
-        // duplicate dismissal notice. The claim is atomic — a check-and-insert
-        // into the per-agent notice registry under one lock acquisition — so
-        // concurrent dismissals of the same id race to a single winner, and
-        // the registry remembers OLDER ids the single-slot persisted marker
-        // has since been overwritten by (A -> B -> A). The persisted marker
-        // still short-circuits ids dismissed before a daemon restart.
-        let already_dismissed = {
-            let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
-            let mut guard = self
-                .dismissal_notices_sent
-                .lock()
-                .expect("dismissal notice registry poisoned");
-            let claimed = !guard
-                .entry(agent_id.clone())
-                .or_default()
-                .insert(message_id.clone());
-            persisted || claimed
+        // duplicate dismissal notice. The claim is a unique key in the store
+        // (`claim_dismissal_notice`, insert-or-ignore on (agent, messageId)),
+        // so concurrent dismissals of the same id race to a single winner in
+        // any number of processes, and an OLDER id the single-slot persisted
+        // marker has since been overwritten by (A -> B -> A) stays claimed,
+        // also across a restart. The persisted marker still short-circuits
+        // ids dismissed before the claims existed.
+        // The claim is held by a guard until the notice is delivered: an
+        // error, a failed delivery or a cancelled call releases it, so a
+        // retried dismissal still notifies.
+        let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
+        let mut claim = if persisted {
+            None
+        } else {
+            DismissalNoticeClaim::claim(&self.store, &agent_id, &message_id).await?
         };
         // Atomic single-key write (store-side `json_set`): sibling metadata
         // keys — e.g. a concurrently-advanced `lastSeenMessageId`
@@ -12219,14 +12217,8 @@ impl Services {
         {
             // Release the notice claim so a retried dismissal (after this
             // store failure) still delivers the notice.
-            if !already_dismissed {
-                let mut guard = self
-                    .dismissal_notices_sent
-                    .lock()
-                    .expect("dismissal notice registry poisoned");
-                if let Some(sent) = guard.get_mut(&agent_id) {
-                    sent.remove(&message_id);
-                }
+            if let Some(claim) = claim.take() {
+                claim.release().await;
             }
             return Err(e);
         }
@@ -12284,9 +12276,15 @@ impl Services {
         // or lost are skipped, so a repeat dismissal sends no duplicate notices.
         self.decline_secret_requests_on_message(&workspace_id, &agent_id, &message_id)
             .await;
-        if !already_dismissed {
-            self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
-                .await;
+        if let Some(claim) = claim.take() {
+            if self
+                .notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
+                .await
+            {
+                claim.keep();
+            } else {
+                claim.release().await;
+            }
         }
         // Kick the drain so entries parked for other reasons (busy race,
         // notice enqueued above) resume without waiting for the next
@@ -12480,12 +12478,13 @@ impl Services {
     /// is already gone. Fail-soft: delivery problems are logged, never
     /// surfaced to the RPC — the durable dismissal marker is the source of
     /// truth.
+    /// `false` when the notice could not be delivered.
     async fn notify_questions_dismissed(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         dismissed_message_id: &str,
-    ) {
+    ) -> bool {
         let count = self
             .dismissed_question_count(agent_id, dismissed_message_id)
             .await;
@@ -12507,6 +12506,7 @@ impl Services {
                         }
                     }
                 }
+                true
             }
             Err(e) => {
                 tracing::warn!(
@@ -12514,6 +12514,7 @@ impl Services {
                     error = %e,
                     "questions-dismissed notice delivery failed"
                 );
+                false
             }
         }
     }
@@ -23221,6 +23222,77 @@ fn legacy_auggie_shape(mut out: Value) -> Value {
         }
     }
     out
+}
+
+/// A won questions-dismissed notice claim (`Store::claim_dismissal_notice`).
+/// [`Self::keep`] once the notice is delivered; [`Self::release`] or a drop
+/// (a cancelled dismissal) gives it back, so a retried dismissal notifies.
+struct DismissalNoticeClaim {
+    store: intent_store::Store,
+    agent_id: AgentId,
+    message_id: String,
+    armed: bool,
+}
+
+impl DismissalNoticeClaim {
+    /// `None` when the notice was already claimed.
+    async fn claim(
+        store: &intent_store::Store,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<Self>> {
+        Ok(store
+            .claim_dismissal_notice(agent_id, message_id)
+            .await?
+            .then(|| Self {
+                store: store.clone(),
+                agent_id: agent_id.clone(),
+                message_id: message_id.to_owned(),
+                armed: true,
+            }))
+    }
+
+    fn keep(mut self) {
+        self.armed = false;
+    }
+
+    async fn release(mut self) {
+        self.armed = false;
+        release_dismissal_notice(&self.store, &self.agent_id, &self.message_id).await;
+    }
+}
+
+impl Drop for DismissalNoticeClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (store, agent_id, message_id) = (
+            self.store.clone(),
+            self.agent_id.clone(),
+            std::mem::take(&mut self.message_id),
+        );
+        runtime.spawn(async move {
+            release_dismissal_notice(&store, &agent_id, &message_id).await;
+        });
+    }
+}
+
+async fn release_dismissal_notice(
+    store: &intent_store::Store,
+    agent_id: &AgentId,
+    message_id: &str,
+) {
+    if let Err(e) = store.release_dismissal_notice(agent_id, message_id).await {
+        tracing::warn!(
+            agent = %agent_id,
+            error = %e,
+            "failed to release the dismissal notice claim; a retry will not notify"
+        );
+    }
 }
 
 #[cfg(test)]

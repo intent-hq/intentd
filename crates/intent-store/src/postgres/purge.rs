@@ -44,7 +44,7 @@ pub(super) const REAP_BATCH_ROWS: i64 = 1000;
 /// message the agent was sent). `$1` tenant, `$2` agent, `$3` batch size.
 /// Left to the final transaction: at most a few rows per agent
 /// (`agent_usage_cell` per model, `interrupted_agent`,
-/// `agent_stop_redelivery`, `remote_agent`, `review_context_enrollment`,
+/// `agent_stop_redelivery`, `agent_dismissal_notice` per dismissal, `remote_agent`, `review_context_enrollment`,
 /// `discussion_agent_grant` per conversation, `agent_flipped_completion` per
 /// task); `pr_monitor_message_provenance` goes with its message, batch by
 /// batch.

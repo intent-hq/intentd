@@ -104,6 +104,7 @@ mod completion_watch_repo;
 mod daemon_ownership;
 mod delegation_group_repo;
 mod derived_index;
+mod dismissal_notice_repo;
 pub use derived_index::{
     check_integrity, repair_derived_indexes, DerivedIndex, IntegrityProblem, IntegrityReport,
     RepairAction, RepairReport,
@@ -134,7 +135,7 @@ mod executor_repo;
 mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
-pub use idempotency_repo::IdempotencyReservation;
+pub use idempotency_repo::{IdempotencyClaim, IdempotencyReservation, IDEMPOTENCY_CLAIM_TTL};
 mod known_repo_repo;
 mod mcp_oauth_repo;
 mod message_payload;

@@ -42624,10 +42624,10 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
     );
 }
 
-/// Registry hygiene (monorepo#3179): deleting an agent evicts its entries
-/// from the pending-question mutation-lock map AND the dismissal-notice
-/// registry, so neither in-memory map grows unboundedly as agents churn on a
-/// long-lived daemon.
+/// Registry hygiene (monorepo#3179): deleting an agent evicts its entry
+/// from the pending-question mutation-lock map, so it does not grow
+/// unboundedly as agents churn on a long-lived daemon. The dismissal-notice
+/// claims are store rows and go with the agent's session row.
 #[tokio::test]
 async fn agent_delete_evicts_pending_question_registries() {
     let (_t, svc, ws) = setup().await;
@@ -42638,8 +42638,8 @@ async fn agent_delete_evicts_pending_question_registries() {
         .await
         .expect("append question");
 
-    // Populate both registries: the marker write takes the mutation lock,
-    // the dismissal records a notice-dedup entry.
+    // Populate the registry and a claim: the marker write takes the
+    // mutation lock, the dismissal claims its notice.
     assert!(
         svc.record_pending_questions_marker(&ws, &id, &asked.id)
             .await
@@ -42648,11 +42648,13 @@ async fn agent_delete_evicts_pending_question_registries() {
         .await
         .expect("dismiss");
     assert!(svc.pending_question_mutation_locks.contains(&id));
-    assert!(svc
-        .dismissal_notices_sent
-        .lock()
-        .expect("dismissal notice registry poisoned")
-        .contains_key(&id));
+    assert!(
+        !svc.store()
+            .claim_dismissal_notice(&id, &asked.id)
+            .await
+            .expect("claim"),
+        "the dismissal claimed its notice"
+    );
 
     svc.agent_delete_op(id.clone(), Some(ws.clone()))
         .await
@@ -42662,12 +42664,56 @@ async fn agent_delete_evicts_pending_question_registries() {
         !svc.pending_question_mutation_locks.contains(&id),
         "delete must evict the agent's mutation-lock entry"
     );
-    assert!(
-        !svc.dismissal_notices_sent
-            .lock()
-            .expect("dismissal notice registry poisoned")
-            .contains_key(&id),
-        "delete must evict the agent's dismissal-notice entries"
+}
+
+/// The questions-dismissed notice goes out once per dismissed message id,
+/// also when an older id is dismissed again after a newer one (A -> B -> A)
+/// and when the dismissals come from two `Services` on one store (the
+/// claim is a store row, not process memory).
+#[tokio::test]
+async fn interleaved_dismissals_notify_once_per_message_id() {
+    let (_t, svc, ws) = setup().await;
+    let other = Services::new_isolated(svc.store().clone());
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let mut asked = Vec::new();
+    for _ in 0..2 {
+        asked.push(
+            svc.store()
+                .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+                .await
+                .expect("append question")
+                .id,
+        );
+    }
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked[0].clone())
+        .await
+        .expect("dismiss A");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked[1].clone())
+        .await
+        .expect("dismiss B");
+    other
+        .agent_dismiss_questions_op(ws.clone(), id.clone(), asked[0].clone())
+        .await
+        .expect("dismiss A again, from another Services");
+
+    let notices: Vec<_> = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages")
+        .into_iter()
+        .filter_map(|m| {
+            m.metadata
+                .filter(|meta| {
+                    meta["type"] == json!(crate::agent_ops::QUESTIONS_DISMISSED_METADATA_TYPE)
+                })
+                .map(|meta| meta["dismissedQuestionsMessageId"].clone())
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec![json!(asked[0]), json!(asked[1])],
+        "one notice per dismissed message id"
     );
 }
 
