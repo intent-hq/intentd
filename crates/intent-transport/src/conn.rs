@@ -3435,8 +3435,7 @@ mod tests {
 
         struct HeldWriter {
             store: intent_store::Store,
-            entered: tokio::sync::Notify,
-            release: tokio::sync::Notify,
+            pause: Arc<intentd_test_support::PausePoint>,
             calls: AtomicUsize,
         }
         impl WorkspaceApi for HeldWriter {
@@ -3447,8 +3446,7 @@ mod tests {
             {
                 Box::pin(async {
                     self.calls.fetch_add(1, Ordering::SeqCst);
-                    self.entered.notify_one();
-                    self.release.notified().await;
+                    self.pause.pause().await;
                     self.store.set_setting("test.admitted", "durable").await?;
                     Ok(Vec::new())
                 })
@@ -3460,8 +3458,7 @@ mod tests {
             .unwrap();
         let writer = Arc::new(HeldWriter {
             store: store.clone(),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            pause: intentd_test_support::PausePoint::new("workspace.list persistence"),
             calls: AtomicUsize::new(0),
         });
         let api: Arc<dyn WorkspaceApi> = writer.clone();
@@ -3491,12 +3488,7 @@ mod tests {
             )
             .await
         );
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(10)),
-            writer.entered.notified(),
-        )
-        .await
-        .unwrap();
+        writer.pause.wait_reached().await;
         limiter.begin_shutdown();
         assert!(
             !process_frame(
@@ -3522,7 +3514,7 @@ mod tests {
             () = &mut drained => panic!("admitted writer escaped request drain"),
             () = std::future::ready(()) => {}
         }
-        writer.release.notify_one();
+        writer.pause.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             drained,

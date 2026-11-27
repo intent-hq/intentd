@@ -10,7 +10,7 @@ use intent_core::repository_request::{
     RepositoryWireEntry,
 };
 use intent_core::{BoxFuture, Caller, Error, HostRole, PrincipalId};
-use tokio::sync::Notify;
+use intentd_test_support::PausePoint;
 
 use super::*;
 use crate::context::{with_credential_context, ReadConnectionGuard};
@@ -21,19 +21,6 @@ mod monitor_hello_tests;
 
 tokio::task_local! {
     static FIXTURE_SCOPE: Arc<FixtureScope>;
-}
-
-#[derive(Default)]
-pub(crate) struct Gate {
-    pub(crate) entered: Notify,
-    pub(crate) release: Notify,
-}
-
-impl Gate {
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
 }
 
 #[derive(Default)]
@@ -67,7 +54,7 @@ pub(crate) struct FixtureScope {
     state: Arc<Mutex<ScopeState>>,
     caller: Option<Caller>,
     credential: Option<WireCredential>,
-    delivery: Option<Arc<Gate>>,
+    delivery: Option<Arc<PausePoint>>,
     fault: DeliveryFault,
 }
 
@@ -156,7 +143,7 @@ impl RepositoryReadRequestScope for FixtureScope {
                 return Ok(());
             }
             if let Some(gate) = &self.delivery {
-                gate.wait().await;
+                gate.pause().await;
             }
             let mut state = self.state.lock().unwrap();
             state.kinds.push(kind);
@@ -196,7 +183,7 @@ pub(crate) struct FixtureConnection {
     selection_frames: Mutex<Vec<intent_core::repository_request::RepositorySelectionFrame>>,
     cohort: Mutex<Cohort>,
     scopes: Mutex<Vec<Arc<FixtureScope>>>,
-    delivery: Option<Arc<Gate>>,
+    delivery: Option<Arc<PausePoint>>,
     fault: DeliveryFault,
 }
 
@@ -293,26 +280,26 @@ pub(crate) struct FixtureApi {
     selection_effects: std::sync::atomic::AtomicUsize,
     pub(crate) connections: Mutex<Vec<Arc<FixtureConnection>>>,
     pub(crate) entries: Mutex<Vec<RepositoryWireEntry>>,
-    pub(crate) permission: Option<Arc<Gate>>,
-    pub(crate) handler: Option<Arc<Gate>>,
-    pub(crate) delivery: Option<Arc<Gate>>,
+    pub(crate) permission: Option<Arc<PausePoint>>,
+    pub(crate) handler: Option<Arc<PausePoint>>,
+    pub(crate) delivery: Option<Arc<PausePoint>>,
     pub(crate) principal: PrincipalId,
-    primary: Option<Arc<Gate>>,
+    primary: Option<Arc<PausePoint>>,
     member_token_hash: Option<String>,
     revocations: Option<tokio::sync::broadcast::Sender<intent_core::PrincipalRevocation>>,
-    revoke_reply: Option<Arc<Gate>>,
+    revoke_reply: Option<Arc<PausePoint>>,
     fault: DeliveryFault,
 }
 
 impl FixtureApi {
-    pub(crate) fn holding_handler(gate: Arc<Gate>) -> Self {
+    pub(crate) fn holding_handler(gate: Arc<PausePoint>) -> Self {
         Self {
             handler: Some(gate),
             ..Self::default()
         }
     }
 
-    pub(crate) fn holding_primary(gate: Arc<Gate>) -> Self {
+    pub(crate) fn holding_primary(gate: Arc<PausePoint>) -> Self {
         Self {
             primary: Some(gate),
             ..Self::default()
@@ -475,7 +462,7 @@ impl WorkspaceApi for FixtureApi {
     fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
         Box::pin(async {
             if let Some(gate) = &self.primary {
-                gate.wait().await;
+                gate.pause().await;
             }
             Ok(self.principal.clone())
         })
@@ -487,7 +474,7 @@ impl WorkspaceApi for FixtureApi {
     ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
         Box::pin(async {
             if let Some(gate) = &self.permission {
-                gate.wait().await;
+                gate.pause().await;
             }
             Ok(HostRole::Member)
         })
@@ -519,7 +506,7 @@ impl WorkspaceApi for FixtureApi {
                 .send(self.principal.clone().into())
                 .unwrap();
             if let Some(gate) = &self.revoke_reply {
-                gate.wait().await;
+                gate.pause().await;
             }
             Ok(json!({"revoked":true}))
         })
@@ -556,7 +543,7 @@ impl WorkspaceApi for FixtureApi {
                 state.public_service_error = path == "provider-error";
             }
             if let Some(gate) = &self.handler {
-                gate.wait().await;
+                gate.pause().await;
             }
             match path.as_str() {
                 "private-error" => Err(Error::Internal("private service error".into())),
@@ -679,7 +666,7 @@ fn request(path: &str) -> String {
 
 #[tokio::test]
 async fn original_capture_precedes_the_first_permission_await() {
-    let permission = Arc::new(Gate::default());
+    let permission = PausePoint::new("permission");
     let h = Harness::new(
         FixtureApi {
             permission: Some(permission.clone()),
@@ -693,7 +680,7 @@ async fn original_capture_precedes_the_first_permission_await() {
     tokio::pin!(call);
     tokio::select! {
         result = &mut call => panic!("permission did not wait: {result}"),
-        () = permission.entered.notified() => {}
+        () = permission.wait_reached() => {}
     }
     assert_eq!(
         h.original().scopes.lock().unwrap().len(),
@@ -704,7 +691,7 @@ async fn original_capture_precedes_the_first_permission_await() {
 
 #[tokio::test]
 async fn original_retirement_prevents_the_prepared_private_response() {
-    let handler = Arc::new(Gate::default());
+    let handler = PausePoint::new("handler");
     let mut h = Harness::new(
         FixtureApi {
             handler: Some(handler.clone()),
@@ -714,9 +701,9 @@ async fn original_retirement_prevents_the_prepared_private_response() {
     )
     .await;
     assert!(h.dispatch(&request("private")).await);
-    handler.entered.notified().await;
+    handler.wait_reached().await;
     h.connection.retire();
-    handler.release.notify_one();
+    handler.release();
     let reply = h.response().await;
     assert!(
         reply.get("result").is_none(),
@@ -801,7 +788,7 @@ async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scop
     )
     .await;
 
-    let gate = Arc::new(Gate::default());
+    let gate = PausePoint::new("gate");
     let h = Harness::new(
         FixtureApi {
             permission: Some(gate.clone()),
@@ -811,7 +798,7 @@ async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scop
     )
     .await;
     let task = tokio::spawn(h.dispatch(&request("private")));
-    gate.entered.notified().await;
+    gate.wait_reached().await;
     let escaped = h.original().scopes.lock().unwrap()[0].clone();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -822,7 +809,7 @@ async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scop
 #[tokio::test]
 async fn final_delivery_wait_is_handler_work_and_retirement_has_both_orders() {
     for retire_first in [true, false] {
-        let gate = Arc::new(Gate::default());
+        let gate = PausePoint::new("gate");
         let mut h = Harness::new(
             FixtureApi {
                 delivery: Some(gate.clone()),
@@ -832,13 +819,13 @@ async fn final_delivery_wait_is_handler_work_and_retirement_has_both_orders() {
         )
         .await;
         assert!(h.dispatch(&request("private")).await);
-        gate.entered.notified().await;
+        gate.wait_reached().await;
         assert_eq!(h.limiter.available_permits(), Some(0));
         assert!(h.rx.priority.try_recv().is_err());
         if retire_first {
             h.connection.retire();
         }
-        gate.release.notify_one();
+        gate.release();
         until(|| h.limiter.available_permits() == Some(1)).await;
         if !retire_first {
             h.connection.retire();
@@ -853,7 +840,7 @@ async fn final_delivery_wait_is_handler_work_and_retirement_has_both_orders() {
 
 #[tokio::test]
 async fn final_future_abort_releases_original_packet_permit_and_request() {
-    let gate = Arc::new(Gate::default());
+    let gate = PausePoint::new("gate");
     let h = Harness::new(
         FixtureApi {
             delivery: Some(gate.clone()),
@@ -885,7 +872,7 @@ async fn final_future_abort_releases_original_packet_permit_and_request() {
             ))
             .await;
     });
-    gate.entered.notified().await;
+    gate.wait_reached().await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert!(scope.state.lock().unwrap().retired);
@@ -903,7 +890,7 @@ async fn typed_service_failures_and_public_transport_errors_keep_distinct_polici
         "panic",
         "ordinary",
     ] {
-        let gate = Arc::new(Gate::default());
+        let gate = PausePoint::new("gate");
         let mut h = Harness::new(
             FixtureApi {
                 handler: Some(gate.clone()),
@@ -913,9 +900,9 @@ async fn typed_service_failures_and_public_transport_errors_keep_distinct_polici
         )
         .await;
         assert!(h.dispatch(&request(path)).await);
-        gate.entered.notified().await;
+        gate.wait_reached().await;
         h.connection.retire();
-        gate.release.notify_one();
+        gate.release();
         let reply = h.response().await;
         assert_eq!(reply["id"], 7);
         match path {
@@ -973,7 +960,7 @@ async fn independent_completion_and_equal_public_ids_never_rebind_scopes() {
 
 #[tokio::test]
 async fn notifications_overload_and_invalid_frames_keep_existing_queue_policy() {
-    let gate = Arc::new(Gate::default());
+    let gate = PausePoint::new("gate");
     let mut h = Harness::new(
         FixtureApi {
             handler: Some(gate.clone()),
@@ -985,13 +972,13 @@ async fn notifications_overload_and_invalid_frames_keep_existing_queue_policy() 
     let raw =
         json!({"jsonrpc":"2.0","method":"settings.get","params":{"path":"private"}}).to_string();
     assert!(h.dispatch(&raw).await);
-    gate.entered.notified().await;
+    gate.wait_reached().await;
     assert_eq!(h.limiter.available_permits(), Some(0));
     assert!(h.dispatch(&request("private")).await);
     assert_eq!(h.response().await["error"]["code"], -32011);
     assert!(h.dispatch("not json").await);
     assert_eq!(h.response().await["error"]["code"], -32700);
-    gate.release.notify_one();
+    gate.release();
     until(|| h.limiter.available_permits() == Some(1)).await;
     assert!(h.rx.priority.try_recv().is_err());
     assert!(h.tx.priority_idle());
@@ -1270,7 +1257,7 @@ async fn actual_wss_close_rotation_shutdown_and_heartbeat_retire_held_requests()
                 .await
                 .unwrap(),
         );
-        let handler = Arc::new(Gate::default());
+        let handler = PausePoint::new("handler");
         let api = Arc::new(FixtureApi {
             handler: Some(handler.clone()),
             ..FixtureApi::default()
@@ -1303,7 +1290,7 @@ async fn actual_wss_close_rotation_shutdown_and_heartbeat_retire_held_requests()
             .send(Message::Text(request("private").into()))
             .await
             .unwrap();
-        handler.entered.notified().await;
+        handler.wait_reached().await;
         let original = api.connections.lock().unwrap()[0].clone();
         let scope = original.scopes.lock().unwrap()[0].clone();
         let shutdown = if mode == "shutdown" {
@@ -1328,7 +1315,7 @@ async fn actual_wss_close_rotation_shutdown_and_heartbeat_retire_held_requests()
         }
         until(|| original.cohort.lock().unwrap().closed).await;
         assert!(scope.state.lock().unwrap().retired, "{mode}");
-        handler.release.notify_one();
+        handler.release();
         if mode == "rotation" {
             let reply = ws_response(&mut socket).await;
             assert!(reply.get("result").is_none());
@@ -1359,8 +1346,8 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
             .await
             .unwrap(),
     );
-    let handler = Arc::new(Gate::default());
-    let revoke_reply = Arc::new(Gate::default());
+    let handler = PausePoint::new("handler");
+    let revoke_reply = PausePoint::new("revoke_reply");
     let (revocations, _) = tokio::sync::broadcast::channel(8);
     let token = "e".repeat(64);
     let token_hash = crate::auth::hash_token(&token);
@@ -1398,7 +1385,7 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         .unwrap();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        handler.entered.notified(),
+        handler.wait_reached(),
     )
     .await
     .unwrap();
@@ -1430,14 +1417,14 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         .unwrap();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        revoke_reply.entered.notified(),
+        revoke_reply.wait_reached(),
     )
     .await
     .unwrap();
     until(|| original.is_closed()).await;
     assert!(scope.state.lock().unwrap().retired);
-    revoke_reply.release.notify_one();
-    handler.release.notify_one();
+    revoke_reply.release();
+    handler.release();
     let mut replies = [
         ws_response(&mut socket).await,
         ws_response(&mut socket).await,
@@ -1495,7 +1482,7 @@ async fn selection_frame_preserves_command_before_original_full_queue() {
 #[tokio::test]
 async fn selection_original_receipt_has_one_slot_with_both_retirement_orders() {
     for retire_first in [true, false] {
-        let gate = Arc::new(Gate::default());
+        let gate = PausePoint::new("gate");
         let mut h = Harness::new(
             FixtureApi {
                 delivery: Some(gate.clone()),
@@ -1505,7 +1492,7 @@ async fn selection_original_receipt_has_one_slot_with_both_retirement_orders() {
         )
         .await;
         assert!(h.dispatch_selection(&selection_request()).await);
-        gate.entered.notified().await;
+        gate.wait_reached().await;
         assert_eq!(
             h.api
                 .selection_effects
@@ -1516,7 +1503,7 @@ async fn selection_original_receipt_has_one_slot_with_both_retirement_orders() {
         if retire_first {
             h.connection.retire();
         }
-        gate.release.notify_one();
+        gate.release();
         until(|| h.limiter.available_permits() == Some(1)).await;
         if !retire_first {
             h.connection.retire();
@@ -1591,7 +1578,7 @@ async fn native_review_frame_precedes_actual_full_writer_queue() {
 #[tokio::test]
 async fn native_review_actual_slot_both_retirement_orders_retain_effect() {
     for retire_first in [true, false] {
-        let gate = Arc::new(Gate::default());
+        let gate = PausePoint::new("gate");
         let mut h = Harness::new(
             FixtureApi {
                 delivery: Some(gate.clone()),
@@ -1601,7 +1588,7 @@ async fn native_review_actual_slot_both_retirement_orders_retain_effect() {
         )
         .await;
         assert!(h.dispatch_selection(&native_review_request()).await);
-        gate.entered.notified().await;
+        gate.wait_reached().await;
         assert_eq!(
             h.api
                 .review_effects
@@ -1612,7 +1599,7 @@ async fn native_review_actual_slot_both_retirement_orders_retain_effect() {
         if retire_first {
             h.connection.retire();
         }
-        gate.release.notify_one();
+        gate.release();
         until(|| h.limiter.available_permits() == Some(1)).await;
         if !retire_first {
             h.connection.retire();
@@ -1793,7 +1780,7 @@ async fn checkout_config_typed_frame_precedes_writer_queue() {
 #[tokio::test]
 async fn checkout_config_private_reply_obeys_final_delivery_retirement() {
     for retire_first in [true, false] {
-        let gate = Arc::new(Gate::default());
+        let gate = PausePoint::new("gate");
         let mut h = Harness::new(
             FixtureApi {
                 delivery: Some(gate.clone()),
@@ -1803,12 +1790,12 @@ async fn checkout_config_private_reply_obeys_final_delivery_retirement() {
         )
         .await;
         assert!(h.dispatch_selection(&checkout_config_request()).await);
-        gate.entered.notified().await;
+        gate.wait_reached().await;
         assert!(h.rx.priority.try_recv().is_err());
         if retire_first {
             h.connection.retire();
         }
-        gate.release.notify_one();
+        gate.release();
         until(|| h.limiter.available_permits() == Some(1)).await;
         if !retire_first {
             h.connection.retire();

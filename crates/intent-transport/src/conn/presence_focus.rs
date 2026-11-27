@@ -140,13 +140,13 @@ async fn forward(
 mod tests {
     use super::*;
     use intent_core::{Error, EventActor};
+    use intentd_test_support::PausePoint;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::{mpsc, Notify};
+    use tokio::sync::mpsc;
 
     struct DelayedFocus {
         calls: AtomicUsize,
-        entered: Notify,
-        release: Notify,
+        pause: Arc<PausePoint>,
     }
     impl WorkspaceApi for DelayedFocus {
         fn presence_focus_snapshot(
@@ -156,8 +156,7 @@ mod tests {
         ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
             Box::pin(async move {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    self.entered.notify_one();
-                    self.release.notified().await;
+                    self.pause.pause().await;
                     Ok(
                         json!({"workspaceId":workspace,"principalId":person,"target":{"workspaceId":"secret-old"}}),
                     )
@@ -181,12 +180,11 @@ mod tests {
         });
         let api = Arc::new(DelayedFocus {
             calls: AtomicUsize::new(0),
-            entered: Notify::new(),
-            release: Notify::new(),
+            pause: PausePoint::new("first presence focus snapshot"),
         });
         let (priority, _priority_rx) = mpsc::channel(1);
         let (bulk, mut rx) = mpsc::channel(1);
-        let task = tokio::spawn(forward(
+        let mut task = tokio::spawn(forward(
             api.clone(),
             WorkspaceId::from("source"),
             PrincipalId::from("person"),
@@ -199,12 +197,7 @@ mod tests {
                 recovery: crate::conn::recovery::Output::default(),
             },
         ));
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-            api.entered.notified(),
-        )
-        .await
-        .unwrap();
+        api.pause.reached(&mut task).await;
         let _ = bus.publish_transient(&intent_store::NewEvent {
             workspace_id: WorkspaceId::from("secret-old"),
             timestamp: intent_core::now_iso(),

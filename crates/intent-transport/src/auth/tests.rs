@@ -680,24 +680,14 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
     use intent_core::caller::LegacyCredentialAuthority;
     struct PausedWrite {
         token: Mutex<Option<String>>,
-        entered: tokio::sync::Notify,
-        release: (Mutex<bool>, std::sync::Condvar),
+        pause: Arc<intentd_test_support::PausePoint>,
     }
     impl TokenStore for PausedWrite {
         fn load_token(&self) -> Option<String> {
             self.token.lock().unwrap().clone()
         }
         fn store_token(&self, token: &str) -> Result<()> {
-            self.entered.notify_one();
-            let (lock, cv) = &self.release;
-            let (_released, timeout) = cv
-                .wait_timeout_while(
-                    lock.lock().unwrap(),
-                    intentd_test_support::test_timeout(Duration::from_secs(10)),
-                    |v| !*v,
-                )
-                .unwrap();
-            assert!(!timeout.timed_out());
+            self.pause.pause_blocking();
             *self.token.lock().unwrap() = Some(token.to_owned());
             Ok(())
         }
@@ -707,8 +697,7 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
         let new = "cd".repeat(32);
         let backing = Arc::new(PausedWrite {
             token: Mutex::new(Some(old.clone())),
-            entered: tokio::sync::Notify::new(),
-            release: (Mutex::new(false), std::sync::Condvar::new()),
+            pause: intentd_test_support::PausePoint::new("durable token write"),
         });
         let store = AsyncTokenStore::with_timings(
             backing.clone(),
@@ -722,21 +711,19 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             Duration::from_secs(60),
         );
         assert_eq!(store.load_token().await, Some(old.clone()));
-        let writer = tokio::spawn({
+        let mut writer = tokio::spawn({
             let store = store.clone();
             let new = new.clone();
             async move { store.store_token(&new).await }
         });
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            backing.entered.notified(),
-        )
-        .await
-        .unwrap();
         if cancel {
+            // The 10 s write budget outlasts the pause: the writer is held.
+            assert!(backing.pause.reached(&mut writer).await.is_none());
             writer.abort();
             assert!(writer.await.unwrap_err().is_cancelled());
         } else {
+            // The 20 ms budget may expire before the blocking write arrives.
+            backing.pause.wait_reached().await;
             assert!(writer.await.unwrap().is_err());
         }
         let authority = LegacyAdmission {
@@ -748,11 +735,7 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             (&mut admission).now_or_never().is_none(),
             "unfinished durable write retains exclusion after caller exits"
         );
-        {
-            let (lock, cv) = &backing.release;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
+        backing.pause.release();
         assert!(
             admission.await.is_err(),
             "late write publishes the new credential before releasing the fence"
