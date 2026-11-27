@@ -486,12 +486,13 @@ async fn seed_people(head_dir: &Path) -> String {
 }
 
 /// An orchestrator serving homes, with only a cloud entry on its machine
-/// list, against a fake E2B; a host member and a guest are known. Fields
-/// drop in order: the connection and the backend go before the fake, which
-/// owns the scratch dir.
+/// list, against a fake E2B; a host member and a guest are known. Its
+/// `Drop` stops the backend before any field drops, so the backend is gone
+/// before the fake (which owns the scratch dir); no field can be moved out
+/// (E0509).
 struct CloudHomes {
     rpc_ws: common::TlsWs,
-    _head: common::DaemonGuard,
+    head: common::DaemonGuard,
     port: u16,
     cfg: Arc<ClientConfig>,
     repo: PathBuf,
@@ -502,6 +503,12 @@ struct CloudHomes {
     entry: String,
     id: i64,
     fake: Arc<FakeE2b>,
+}
+
+impl Drop for CloudHomes {
+    fn drop(&mut self) {
+        let _ = self.head.kill_tree();
+    }
 }
 
 impl CloudHomes {
@@ -573,7 +580,7 @@ impl CloudHomes {
         let entry = configured["provider"]["id"].as_str().unwrap().to_owned();
         Some(Self {
             rpc_ws,
-            _head: head,
+            head,
             port,
             cfg,
             repo,

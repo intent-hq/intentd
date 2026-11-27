@@ -283,18 +283,28 @@ async fn refused(rpc_ws: &mut common::TlsWs, id: i64, method: &str, params: Valu
 }
 
 /// A backend against a fake Agent37, with one settings minute of 100 ms,
-/// and an API-key profile. `None` (the test skips) without node or git.
-async fn backend(
-    prefix: &str,
-) -> Option<(
-    FakeAgent37,
-    common::DaemonGuard,
-    u16,
-    Arc<ClientConfig>,
-    String,
-    String,
-    common::TlsWs,
-)> {
+/// an API-key profile (`keyed_ref`) and one connection for calls.
+///
+/// Its `Drop` stops the backend before any field drops, so the backend is
+/// gone before the fake (which owns the scratch dir holding the backend's
+/// data dir). A test borrows its fields: moving one out is a compile error
+/// (E0509), so none can drop early or late.
+struct Agent37Backend {
+    head: common::DaemonGuard,
+    ws_id: String,
+    keyed_ref: String,
+    rpc_ws: common::TlsWs,
+    fake: FakeAgent37,
+}
+
+impl Drop for Agent37Backend {
+    fn drop(&mut self) {
+        let _ = self.head.kill_tree();
+    }
+}
+
+/// `None` (the test skips) without node or git on PATH.
+async fn backend(prefix: &str) -> Option<Agent37Backend> {
     if intent_providers::resolve_on_path("node").is_none()
         || intent_providers::resolve_on_path("git").is_none()
     {
@@ -345,22 +355,35 @@ async fn backend(
     )
     .await;
     let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
-    Some((fake, head, port, cfg, ws_id, keyed_ref, rpc_ws))
+    Some(Agent37Backend {
+        head,
+        ws_id,
+        keyed_ref,
+        rpc_ws,
+        fake,
+    })
 }
 
 /// The life of one agent on an Agent37 instance of `instance_type` in
 /// `region`.
 async fn life(instance_type: &str, region: &str, prefix: &str) {
-    let Some((fake, _head, port, cfg, ws_id, keyed_ref, mut rpc_ws)) = backend(prefix).await else {
+    let Some(mut backend) = backend(prefix).await else {
         return;
     };
+    let Agent37Backend {
+        ws_id,
+        keyed_ref,
+        rpc_ws,
+        fake,
+        ..
+    } = &mut backend;
     let head_dir = fake.scratch.path().join("head");
     let version = env!("CARGO_PKG_VERSION");
     let template = intent_nodes::agent37::template_name(&format!("{IMAGE_REPO}:{version}"));
 
     // Refusals before any save.
     let rejected = refused(
-        &mut rpc_ws,
+        rpc_ws,
         10,
         "cloudMachines.configure",
         agent37_params(&json!({ "apiKey": "wrong-agent37-key" })),
@@ -381,7 +404,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     .enumerate()
     {
         let invalid = refused(
-            &mut rpc_ws,
+            rpc_ws,
             11 + i64::try_from(n).unwrap(),
             "cloudMachines.configure",
             agent37_params(&extra),
@@ -390,7 +413,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         assert_eq!(invalid["code"], -32602, "{extra}: {invalid}");
     }
     let eu_default = refused(
-        &mut rpc_ws,
+        rpc_ws,
         20,
         "cloudMachines.configure",
         agent37_params(&json!({ "region": "eu" })),
@@ -404,7 +427,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         "{eu_default}"
     );
     let checked = ok(
-        &mut rpc_ws,
+        rpc_ws,
         21,
         "cloudMachines.configure",
         agent37_params(
@@ -417,7 +440,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         fake.api().templates.contains_key(&template),
         "validateOnly imported the template"
     );
-    let listed = ok(&mut rpc_ws, 22, "cloudMachines.list", json!({})).await;
+    let listed = ok(rpc_ws, 22, "cloudMachines.list", json!({})).await;
     assert_eq!(
         listed["providers"],
         json!([]),
@@ -430,7 +453,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     assert_eq!(listed["diskSettings"], disk_settings(), "{listed}");
 
     let saved = ok(
-        &mut rpc_ws,
+        rpc_ws,
         23,
         "cloudMachines.configure",
         agent37_params(&json!({
@@ -464,7 +487,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         .no_capacity
         .push((instance_type.to_owned(), region.to_owned()));
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         30,
         "agent.create",
         json!({
@@ -479,7 +502,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         created["agent"]["placement"]["cloudMachineId"],
         entry.as_str()
     );
-    let failed = agent_until(&mut rpc_ws, (ws_id.as_str(), sleepy.as_str()), 31, |a| {
+    let failed = agent_until(rpc_ws, (ws_id.as_str(), sleepy.as_str()), 31, |a| {
         a.get("placementError").is_some()
     })
     .await;
@@ -499,7 +522,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
 
     // With room again, an agent starts on a new instance of the entry.
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         38,
         "agent.create",
         json!({
@@ -510,10 +533,10 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
-    let first = echoed(&mut rpc_ws, agent, "first turn", 40).await;
+    let first = echoed(rpc_ws, agent, "first turn", 40).await;
     assert!(!first.contains(DISK_NOTICE), "{first}");
     let id = fake.only_instance().unwrap();
-    let machine = machine_until(&mut rpc_ws, 50, &id, |m| m.is_some())
+    let machine = machine_until(rpc_ws, 50, &id, |m| m.is_some())
         .await
         .unwrap();
     let machine_id = machine["id"].as_str().unwrap().to_owned();
@@ -539,7 +562,7 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     // While it runs, an exec renews activity (every 10 minutes = 1 s).
     timeout(common::test_timeout(Duration::from_secs(30)), async {
         while !fake.execs_of(&id).iter().any(|c| c.ends_with("true")) {
-            keep_alive(&mut rpc_ws).await;
+            keep_alive(rpc_ws).await;
             // timing-guard: poll interval for the renewal (every 10 minutes = 1 s)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -549,25 +572,25 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
 
     // Idle: it sleeps; a message wakes it, memory kept, no notice.
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         60,
         "cloudMachines.configure",
         json!({ "cloudMachineId": entry, "idlePauseMinutes": 1 }),
     )
     .await;
-    machine_until(&mut rpc_ws, 61, &id, |m| {
+    machine_until(rpc_ws, 61, &id, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })
     .await;
     assert_eq!(fake.api().instance(&id).unwrap().status, "sleeping");
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         70,
         "cloudMachines.configure",
         json!({ "cloudMachineId": entry, "idlePauseMinutes": 1440 }),
     )
     .await;
-    let woke = echoed(&mut rpc_ws, agent, "after the sleep", 71).await;
+    let woke = echoed(rpc_ws, agent, "after the sleep", 71).await;
     assert!(
         !woke.contains(DISK_NOTICE),
         "a memory restore needs no notice: {woke}"
@@ -576,28 +599,28 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
         .server
         .lines()
         .contains(&format!("POST /instances/{id}/start")));
-    let recalled = echoed(&mut rpc_ws, agent, "recall first turn", 75).await;
+    let recalled = echoed(rpc_ws, agent, "recall first turn", 75).await;
     assert!(recalled.contains("recall first turn: yes"), "{recalled}");
 
     // A wake that boots fresh: intentd starts again from the disk, the
     // machine keeps its identity, and the agent is told once.
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         80,
         "cloudMachines.pause",
         json!({ "machineId": machine_id }),
     )
     .await;
     fake.api().instance_mut(&id).unwrap().wake_fresh = true;
-    let fresh = echoed(&mut rpc_ws, agent, "after a fresh boot", 81).await;
+    let fresh = echoed(rpc_ws, agent, "after a fresh boot", 81).await;
     assert!(fresh.contains(DISK_NOTICE), "{fresh}");
     assert_eq!(fresh.matches("Note from Intent").count(), 1, "{fresh}");
-    let recalled = echoed(&mut rpc_ws, agent, "recall after a fresh boot", 85).await;
+    let recalled = echoed(rpc_ws, agent, "recall after a fresh boot", 85).await;
     assert!(
         recalled.contains("recall after a fresh boot: yes"),
         "{recalled}"
     );
-    let same = machine_until(&mut rpc_ws, 90, &id, |m| m.is_some())
+    let same = machine_until(rpc_ws, 90, &id, |m| m.is_some())
         .await
         .unwrap();
     assert_eq!(
@@ -608,14 +631,14 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
 
     // Removing the entry with its agents deletes the instance.
     let removed = ok(
-        &mut rpc_ws,
+        rpc_ws,
         100,
         "cloudMachines.remove",
         json!({ "cloudMachineId": entry, "stopAgents": true }),
     )
     .await;
     assert_eq!(removed["ok"], true, "{removed}");
-    machine_until(&mut rpc_ws, 101, &id, |m| m.is_none()).await;
+    machine_until(rpc_ws, 101, &id, |m| m.is_none()).await;
     assert!(fake.api().instances.is_empty());
     assert!(fake
         .server
@@ -643,8 +666,6 @@ async fn life(instance_type: &str, region: &str, prefix: &str) {
     for secret in &secrets {
         assert!(!log.contains(secret.as_str()), "a secret reached the log");
     }
-    let _ = port;
-    let _ = cfg;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -662,15 +683,14 @@ async fn an_agent_on_an_agent37_vm_in_eu_sleeps_wakes_and_is_removed() {
 /// backend's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reaper_deletes_this_backends_leftover_agent37_instances() {
-    let Some((fake, _head, _port, _cfg, _ws_id, _keyed, mut rpc_ws)) =
-        backend("itd-a37-reap-").await
-    else {
+    let Some(mut backend) = backend("itd-a37-reap-").await else {
         return;
     };
-    let backend_info = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
+    let Agent37Backend { rpc_ws, fake, .. } = &mut backend;
+    let backend_info = ok(rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend_info["backendId"].as_str().unwrap().to_owned();
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         4,
         "cloudMachines.configure",
         agent37_params(&json!({ "size": "2x4" })),
@@ -703,7 +723,7 @@ async fn the_reaper_deletes_this_backends_leftover_agent37_instances() {
     let theirs = seed("another-backend");
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         while fake.api().instance(&mine).is_some() {
-            keep_alive(&mut rpc_ws).await;
+            keep_alive(rpc_ws).await;
             // timing-guard: poll interval for the reaper (every 10 minutes = 1 s)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
