@@ -618,7 +618,7 @@ pub(super) fn configure_native_daemon(root: &Path, command: &mut std::process::C
     let native = root.join("native-runtime");
     std::fs::create_dir(&native).unwrap();
     let peer = native.join("adapter.mjs");
-    let diagnostic = r#"import cp from 'node:child_process';
+    let diagnostic = r"import cp from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
 import {appendFileSync,writeFileSync as writeDiagnostic} from 'node:fs';
 const originalSpawn=cp.spawn;
@@ -634,7 +634,7 @@ cp.spawn=function(...args){
  return child;
 };
 syncBuiltinESMExports();
-"#;
+";
     std::fs::write(
         &peer,
         format!("{diagnostic}{}", include_str!("native_daemon_peer.mjs")),
@@ -676,49 +676,49 @@ syncBuiltinESMExports();
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_original_startup_and_callback() {
-    native_daemon_case(false, false, false, false, false, false, None).await;
+    native_daemon_case(NativeCase::Startup).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_model_registers_original_monitor() {
-    native_daemon_case(true, false, false, false, false, false, None).await;
+    native_daemon_case(NativeCase::Register).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_scheduler_delivers_original_monitor() {
-    native_daemon_case(true, true, false, false, false, false, None).await;
+    native_daemon_case(NativeCase::Deliver).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_account_replacement_joins_original_allocation() {
-    native_daemon_case(true, true, true, false, false, false, None).await;
+    native_daemon_case(NativeCase::Retire).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_restart_replays_original_history() {
-    native_daemon_case(true, true, false, true, false, false, None).await;
+    native_daemon_case(NativeCase::Restart(Stop::Graceful, AfterRestart::Replay)).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_restart_refuses_replacement_and_recovers_original() {
-    native_daemon_case(true, true, false, true, true, false, None).await;
+    native_daemon_case(NativeCase::Restart(Stop::Graceful, AfterRestart::Recover)).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_abrupt_restart_replays_original_history() {
-    native_daemon_case(true, true, false, true, false, true, None).await;
+    native_daemon_case(NativeCase::Restart(Stop::Abrupt, AfterRestart::Replay)).await;
 }
 
 #[tokio::test]
 #[ignore = "requires explicit verified installed native bundle and admitted database fixture"]
 async fn monitor_native_daemon_abrupt_restart_refuses_replacement_and_recovers_original() {
-    native_daemon_case(true, true, false, true, true, true, None).await;
+    native_daemon_case(NativeCase::Restart(Stop::Abrupt, AfterRestart::Recover)).await;
 }
 
 async fn restart_native_daemon(h: &mut Harness, endpoint: &str) {
@@ -907,15 +907,48 @@ async fn restart_native_daemon_mode(h: &mut Harness, endpoint: &str, abrupt: boo
     .unwrap();
 }
 
-async fn native_daemon_case(
-    register_monitor: bool,
-    deliver_monitor: bool,
-    retire_monitor: bool,
-    restart: bool,
-    recovery: bool,
-    abrupt: bool,
-    live_hold: Option<(bool, bool, bool)>,
-) {
+/// What a native daemon case drives after startup. Each of `Register`,
+/// `Deliver` and `Retire` includes the steps before it; `Restart` and
+/// `LiveHold` deliver first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeCase {
+    Startup,
+    Register,
+    Deliver,
+    Retire,
+    Restart(Stop, AfterRestart),
+    LiveHold(live_hold::Held),
+}
+
+/// How a restart case stops the first daemon.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Graceful,
+    Abrupt,
+}
+
+/// What a restart case checks once the daemon is back: the original history
+/// replays, or a replacement account is refused and the original recovers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterRestart {
+    Replay,
+    Recover,
+}
+
+async fn native_daemon_case(case: NativeCase) {
+    let register_monitor = case != NativeCase::Startup;
+    let deliver_monitor = !matches!(case, NativeCase::Startup | NativeCase::Register);
+    let retire_monitor = case == NativeCase::Retire;
+    let (restart, abrupt, recovery) = match case {
+        NativeCase::Restart(stop, after) => {
+            (true, stop == Stop::Abrupt, after == AfterRestart::Recover)
+        }
+        _ => (false, false, false),
+    };
+    let live_hold = match case {
+        NativeCase::LiveHold(held) => Some(held),
+        _ => None,
+    };
     let input = PathBuf::from(std::env::var_os("INTENT_MONITOR_HISTORY_DATABASE_FIXTURE").unwrap());
     let account = OriginalAccount::new().await;
     let mut h = Harness::boot_case(
@@ -952,13 +985,12 @@ async fn native_daemon_case(
                 if model.exists() && session.status == intent_core::AgentStatus::RuntimeIdle {
                     break;
                 }
-                if session.status == intent_core::AgentStatus::Error {
-                    panic!(
-                        "native daemon startup failed: {:?}\n{}",
-                        session.status,
-                        std::fs::read_to_string(h.dir.path().join("daemon.log")).unwrap()
-                    );
-                }
+                assert_ne!(
+                    session.status,
+                    intent_core::AgentStatus::Error,
+                    "native daemon startup failed:\n{}",
+                    std::fs::read_to_string(h.dir.path().join("daemon.log")).unwrap()
+                );
                 // timing-guard: wait for actual daemon provider turn completion
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1017,7 +1049,7 @@ async fn native_daemon_case(
             let hello = client
                 .rpc("client.hello", json!({"clientId":"native-live-chat"}))
                 .await;
-            let mut capable = connect(&h, live_hold.map(|case| case.0).unwrap_or(true)).await;
+            let mut capable = connect(&h, live_hold.is_none_or(|held| held.wss)).await;
             success(&capable.rpc("client.hello", json!({"clientId":success(&hello)["clientId"],"connectionRole":"review-monitor","capabilities":{"reviewMonitoring":1}})).await);
             let subscribed = capable
                 .rpc(
@@ -1071,9 +1103,9 @@ async fn native_daemon_case(
             )
             .await
             .expect("original scheduled monitor did not reach native model");
-            if let Some(case) = live_hold {
+            if let Some(held) = live_hold {
                 let (capable, id) = live_chat.as_mut().unwrap();
-                live_hold::exercise(&h, &store, &agent, &mut client, (capable, id), case).await;
+                live_hold::exercise(&h, &store, &agent, &mut client, (capable, id), held).await;
                 return;
             }
             if let Some((capable, id)) = live_chat.as_mut() {

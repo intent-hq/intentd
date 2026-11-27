@@ -1,15 +1,35 @@
 //! Live internal history notification through the actual private socket writer.
 use super::*;
 
+/// A live-hold case: the transport of the held connection and what changes
+/// while the private write is held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Held {
+    pub(super) wss: bool,
+    pub(super) change: Change,
+}
+
+/// What changes while the private write is held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Change {
+    /// The original account is replaced.
+    Account,
+    /// The review source is replaced.
+    Source,
+    Unchanged,
+}
+
 pub(super) async fn exercise(
     h: &Harness,
     store: &Store,
     agent: &intent_core::AgentId,
     control: &mut Client,
     live: (&mut Client, &Value),
-    case: (bool, bool, bool),
+    held: Held,
 ) {
-    let (wss, replace_source, unchanged) = case;
+    let Held { wss, change } = held;
+    let replace_source = change == Change::Source;
+    let unchanged = change == Change::Unchanged;
     let (doc, subscription_id) = live;
     let barrier = h.dir.path().join("private-write-hold");
     wait_marker(&barrier.join("entered")).await;
@@ -84,7 +104,7 @@ pub(super) async fn exercise(
                         while let Some(frame) = socket.next().await {
                             match frame {
                                 Ok(Message::Text(text)) => {
-                                    received.extend_from_slice(text.as_bytes())
+                                    received.extend_from_slice(text.as_bytes());
                                 }
                                 Ok(Message::Close(_)) | Err(_) => break,
                                 _ => {}
@@ -148,84 +168,54 @@ pub(super) async fn exercise(
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_uds_held_account() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((false, false, false)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: false,
+        change: Change::Account,
+    }))
     .await;
 }
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_wss_held_account() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((true, false, false)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: true,
+        change: Change::Account,
+    }))
     .await;
 }
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_uds_held_source() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((false, true, false)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: false,
+        change: Change::Source,
+    }))
     .await;
 }
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_wss_held_source() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((true, true, false)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: true,
+        change: Change::Source,
+    }))
     .await;
 }
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_uds_held_unchanged() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((false, false, true)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: false,
+        change: Change::Unchanged,
+    }))
     .await;
 }
 #[tokio::test]
 #[ignore = "requires verified installed native runtime and actual ACP database"]
 async fn native_live_wss_held_unchanged() {
-    native_daemon_case(
-        true,
-        true,
-        false,
-        false,
-        false,
-        false,
-        Some((true, false, true)),
-    )
+    native_daemon_case(NativeCase::LiveHold(Held {
+        wss: true,
+        change: Change::Unchanged,
+    }))
     .await;
 }
