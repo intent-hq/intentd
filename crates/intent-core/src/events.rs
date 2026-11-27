@@ -567,6 +567,15 @@ pub const APP_UI_NAVIGATE: &str = "app:ui-navigate";
 pub const APP_UI_HIGHLIGHT: &str = "app:ui-highlight";
 pub const APP_WORKSPACE_OPEN: &str = "app:workspace-open";
 
+// App library events (PROTOCOL §5.60, Labs). Daemon-global, persisted,
+// administrator connections only; unrelated to the `app:ui-*` events above.
+// `app:installed` → `{ appId, version, bundleHash, replaced }`,
+// `app:removed` → `{ appId }`, `app:approval-changed` → `{ appId,
+// bundleHash, status, level, features }`.
+pub const APP_INSTALLED: &str = "app:installed";
+pub const APP_REMOVED: &str = "app:removed";
+pub const APP_APPROVAL_CHANGED: &str = "app:approval-changed";
+
 // Skills events (new in intentd; PROTOCOL §5.33/§6.5). Emitted when the
 // discovered skill set changes for a workspace (file-watch on skill roots).
 // Payload: `{ workspaceId }`.
@@ -792,6 +801,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
+    APP_INSTALLED,
+    APP_REMOVED,
+    APP_APPROVAL_CHANGED,
     SKILLS_CHANGED,
     SPECIALISTS_CHANGED,
     BROWSER_TAB_OPENED,

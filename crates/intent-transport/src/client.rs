@@ -119,6 +119,9 @@ pub(crate) fn server_json(
     let mut capabilities = capabilities;
     capabilities["remoteAgentSkills"] = json!(1);
     capabilities["agentPlugins"] = json!(1);
+    // Intent apps (§5.60, Labs): the app library, approval per bundle hash
+    // and app principals. Grants nothing; clients hide the library without it.
+    capabilities["intentApps"] = json!(1);
     // agent.importableSessions.list / agent.importSession (§5.5).
     capabilities["sessionImport"] = json!(1);
     // Conversation goal (§5.5): the `goal` session field, `agent.setGoal`,

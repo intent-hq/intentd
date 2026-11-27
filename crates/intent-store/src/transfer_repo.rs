@@ -156,6 +156,14 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "per-daemon OAuth secrets; credentials never leave the source machine",
     ),
     (
+        "intent_app",
+        "daemon-global app library (PROTOCOL §5.60), not workspace-scoped",
+    ),
+    (
+        "intent_app_storage",
+        "daemon-global per-app storage (PROTOCOL §5.60), not workspace-scoped",
+    ),
+    (
         "known_repo",
         "daemon-global repository registry; the target daemon discovers repos itself",
     ),

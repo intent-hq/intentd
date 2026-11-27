@@ -65,6 +65,7 @@ pub use tenant_config::{ConfigWrite, StoredConfig, TenantConfigStore};
 
 mod agent_messages;
 mod agents;
+mod apps;
 mod attachments;
 mod browser_sender;
 mod browser_tabs;

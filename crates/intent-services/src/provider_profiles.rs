@@ -2019,7 +2019,7 @@ impl Services {
                 self.store.get_host_role(&principal_id).await,
                 Ok(intent_core::HostRole::Owner | intent_core::HostRole::Member)
             ),
-            Some(intent_core::Caller::Executor { .. }) => true,
+            Some(intent_core::Caller::Executor { .. } | intent_core::Caller::App(_)) => true,
             Some(intent_core::Caller::Agent { .. } | intent_core::Caller::Daemon) | None => false,
         };
         let shared = self

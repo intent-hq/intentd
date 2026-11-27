@@ -549,7 +549,9 @@ pub(super) async fn internal(caller: Caller) -> OriginalRepositoryCaller {
     let entry = match caller {
         Caller::Agent { .. } => RepositoryEntry::AgentCallback,
         Caller::Daemon => RepositoryEntry::DaemonTask,
-        Caller::Wire { .. } | Caller::Executor { .. } => panic!("internal fixture"),
+        Caller::Wire { .. } | Caller::Executor { .. } | Caller::App(_) => {
+            panic!("internal fixture")
+        }
     };
     with_caller(
         caller,

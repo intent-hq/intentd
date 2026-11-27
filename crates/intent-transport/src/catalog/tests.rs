@@ -88,6 +88,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("presence.rs", "note.presence."),
         ("agent_workers.rs", "agent.workers."),
         ("backends.rs", "backends."),
+        ("app_conn.rs", "app.session."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -689,6 +690,23 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.workers.list",
     "agent.workers.stop",
     "agent.workers.subscribe",
+    "app.approve",
+    "app.complete",
+    "app.get",
+    "app.install",
+    "app.list",
+    "app.models.list",
+    "app.notify",
+    "app.readBundle",
+    "app.revoke",
+    "app.session.attach",
+    "app.session.close",
+    "app.session.open",
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "app.uninstall",
     "backends.report",
     "browser.closeTab",
     "browser.exec",
@@ -1354,7 +1372,7 @@ fn extract_subscription_channel_methods() -> HashSet<String> {
 
 /// Every method a client can put on the wire: router arms, fast paths, and
 /// the subscription channels.
-pub(super) fn client_callable_universe() -> BTreeSet<String> {
+pub(crate) fn client_callable_universe() -> BTreeSet<String> {
     ROUTER_METHODS
         .iter()
         .chain(FASTPATH_METHODS.iter())
@@ -1383,7 +1401,8 @@ pub(super) fn client_callable_universe() -> BTreeSet<String> {
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
 /// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
-/// the primary user; refused as a family pending a per-method decision).
+/// the primary user; refused as a family pending a per-method decision),
+/// and every `app.*` method (the Intent apps library is owner-only, §5.60).
 const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.addRemote",
     "accept-changes.execute",
@@ -1408,6 +1427,23 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.retrySetup",
     "agent.rpcMethods",
     "agent.wakeOrCreate",
+    "app.approve",
+    "app.complete",
+    "app.get",
+    "app.install",
+    "app.list",
+    "app.models.list",
+    "app.notify",
+    "app.readBundle",
+    "app.revoke",
+    "app.session.attach",
+    "app.session.close",
+    "app.session.open",
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "app.uninstall",
     "backends.report",
     "browser.closeTab",
     "browser.exec",
@@ -1872,6 +1908,23 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "agent.resolveRpcProposal",
         "agent.retrySetup",
         "agent.rpcMethods",
+        "app.approve",
+        "app.complete",
+        "app.get",
+        "app.install",
+        "app.list",
+        "app.models.list",
+        "app.notify",
+        "app.readBundle",
+        "app.revoke",
+        "app.session.attach",
+        "app.session.close",
+        "app.session.open",
+        "app.storage.delete",
+        "app.storage.get",
+        "app.storage.list",
+        "app.storage.set",
+        "app.uninstall",
         "backends.report",
         "cloudMachines.configure",
         "cloudMachines.remove",
@@ -2182,6 +2235,7 @@ fn bulk_transfer_caps_match_handlers() {
     let expected: BTreeSet<(&str, Option<&str>, usize)> = [
         ("file.readChunk", Some("length"), chunk),
         ("git.showFileChunk", Some("length"), chunk),
+        ("app.readBundle", None, 16 * 1024 * 1024),
         ("note.readAssetChunk", Some("length"), chunk),
         ("workspace.export.read", None, chunk),
     ]
@@ -2276,5 +2330,108 @@ fn snapshot_channels_are_sorted_unique_and_explained() {
                 "{method} sends a seq-0 snapshot, so its PAYLOAD_CLASSES row must be Subscription"
             );
         }
+    }
+}
+
+/// Intent apps (§5.60) golden: the exact app allowlists. A change here is a
+/// change of what an app can reach and must be mirrored in
+/// `docs/protocol/methods/apps.md` first.
+const APP_LEVEL1_GOLDEN: &[&str] = &[
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "principal.me",
+];
+const APP_LEVEL2_GOLDEN: &[&str] = &[
+    "app.complete",
+    "app.models.list",
+    "app.notify",
+    "app.storage.delete",
+    "app.storage.get",
+    "app.storage.list",
+    "app.storage.set",
+    "principal.me",
+];
+
+#[test]
+fn app_allowlists_are_frozen() {
+    use super::{APP_LEVEL1_METHODS, APP_LEVEL2_METHODS, APP_LEVEL3_METHODS};
+    assert_eq!(APP_LEVEL1_METHODS, APP_LEVEL1_GOLDEN);
+    assert_eq!(APP_LEVEL2_METHODS, APP_LEVEL2_GOLDEN);
+    // M1: level 3 is exactly level 2 (it cannot be approved yet).
+    assert_eq!(APP_LEVEL3_METHODS, APP_LEVEL2_GOLDEN);
+    for list in [APP_LEVEL1_METHODS, APP_LEVEL2_METHODS] {
+        let mut sorted = list.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, list, "app allowlists are sorted and unique");
+        for m in list {
+            assert!(
+                ROUTER_METHODS.contains(m),
+                "{m} is on an app allowlist but is not a router method"
+            );
+            assert!(
+                !m.starts_with("app.session."),
+                "{m}: no session method is app-callable"
+            );
+        }
+    }
+    assert!(APP_LEVEL1_METHODS
+        .iter()
+        .all(|m| APP_LEVEL2_METHODS.contains(m)));
+}
+
+/// Security sweep: at every level, every client-callable method outside
+/// the level's list is refused, and so are unknown and look-alike names.
+#[test]
+fn app_allowlist_refuses_everything_else() {
+    use super::{app_may_call, APP_LEVEL1_METHODS, APP_LEVEL2_METHODS, APP_LEVEL3_METHODS};
+    let universe = client_callable_universe();
+    for (level, list) in [
+        (1u8, APP_LEVEL1_METHODS),
+        (2, APP_LEVEL2_METHODS),
+        (3, APP_LEVEL3_METHODS),
+    ] {
+        for method in &universe {
+            assert_eq!(
+                app_may_call(level, method),
+                list.contains(&method.as_str()),
+                "level {level}: {method}"
+            );
+        }
+        for probe in [
+            "",
+            "app.session.attach",
+            "app.session.open",
+            "app.approve",
+            "App.storage.get",
+            "app.storage.get ",
+            "app.storage.get\u{0}",
+            "principal.me.x",
+            "agent.completeOnce",
+            "models.list",
+            "events.subscribe",
+            "client.hello",
+            "host.exec",
+            "no.such.method",
+        ] {
+            assert!(
+                !list.contains(&probe) || app_may_call(level, probe),
+                "level {level}: {probe:?}"
+            );
+            if !list.contains(&probe) {
+                assert!(
+                    !app_may_call(level, probe),
+                    "level {level}: {probe:?} must be refused"
+                );
+            }
+        }
+    }
+    for level in [0u8, 4, 255] {
+        assert!(
+            !app_may_call(level, "principal.me"),
+            "level {level} has no list"
+        );
     }
 }

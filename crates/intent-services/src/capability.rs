@@ -84,7 +84,9 @@ pub fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
         }) => Ok(Some(principal_id)),
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
         // Never ungated: an executor credential has no method authority.
-        Some(Caller::Executor { .. }) => Err(crate::principal_ops::executor_forbidden()),
+        Some(Caller::Executor { .. } | Caller::App(_)) => {
+            Err(crate::principal_ops::executor_forbidden())
+        }
         None => {
             static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
             let first = WARNED

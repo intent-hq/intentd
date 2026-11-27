@@ -381,6 +381,12 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A typed Intent apps refusal (PROTOCOL §5.60 "Errors"): the code,
+    /// message and `error.data` travel as given. Boxed to keep [`Error`]
+    /// small.
+    #[error("{0}")]
+    App(Box<crate::apps::AppError>),
+
     /// A workspace-invite operation was refused for a reason the client must
     /// key off machine-readably (multiplayer w4): the invite is unknown /
     /// expired / revoked / already redeemed, the pinned GitHub login does not
@@ -868,6 +874,7 @@ impl Error {
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
             Error::Forbidden(_) | Error::NodeMode(_) | Error::OrchestratorMode(_) => -32003,
+            Error::App(e) => e.rpc_code,
             Error::Invite(kind) => kind.code(),
         }
     }

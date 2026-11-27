@@ -199,7 +199,7 @@ pub(crate) fn executor_forbidden() -> Error {
 pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<PrincipalId>> {
     match current_caller() {
         // An executor credential is not a person and acts for no principal.
-        None | Some(Caller::Executor { .. }) => Ok(None),
+        None | Some(Caller::Executor { .. } | Caller::App(_)) => Ok(None),
         Some(Caller::Wire { principal_id, .. }) => Ok(Some(principal_id)),
         Some(Caller::Agent { .. } | Caller::Daemon) => {
             Ok(Some(store.get_primary_principal().await?.id))
@@ -213,7 +213,8 @@ pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<Principa
 fn stamping_principal_id() -> Option<PrincipalId> {
     match current_caller() {
         Some(Caller::Wire { principal_id, .. }) => Some(principal_id),
-        Some(Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. }) | None => None,
+        Some(Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. } | Caller::App(_))
+        | None => None,
     }
 }
 
@@ -846,6 +847,9 @@ impl Services {
             Caller::Wire { principal_id, .. } => self.store.get_principal(principal_id).await?,
             Caller::Agent { .. } | Caller::Daemon => self.store.get_primary_principal().await?,
             Caller::Executor { .. } => return Err(executor_forbidden()),
+            // An attached app connection (PROTOCOL §5.60): its own app
+            // shape, never a person record.
+            Caller::App(app) => return Ok(crate::app_ops::app_principal_me(app)),
         };
         if principal.is_primary {
             self.spawn_primary_identity_refresh(principal.clone()).await;
@@ -858,7 +862,13 @@ impl Services {
             let role = self.store.get_host_role(&principal.id).await?;
             let after = self.store.host_membership_state().await?;
             if before.revision == after.revision {
-                return Ok(principal_to_wire(&principal, role, after.revision));
+                // Additive `kind` (PROTOCOL §5.60): a missing `kind` means
+                // "person" on daemons without Intent apps.
+                let mut me = principal_to_wire(&principal, role, after.revision);
+                if let Some(obj) = me.as_object_mut() {
+                    obj.insert("kind".into(), json!("person"));
+                }
+                return Ok(me);
             }
         }
         Err(Error::Forbidden(
@@ -918,7 +928,7 @@ impl Services {
         let caller_is_primary = match current_caller() {
             Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
             Some(Caller::Agent { .. } | Caller::Daemon) => true,
-            Some(Caller::Executor { .. }) | None => false,
+            Some(Caller::Executor { .. } | Caller::App(_)) | None => false,
         };
         if caller_is_primary {
             self.spawn_primary_identity_refresh(primary.clone()).await;

@@ -592,6 +592,7 @@ fn tenant_services(
             .with_chief_cwd_root(chief_cwd_root(dir))
             .with_models_cache_dir(dir)
             .with_provider_profiles_dir(dir)
+            .with_apps_dir(dir)
             .with_script_output_dir(dir)
             .with_orchestrator_mode(true),
     );

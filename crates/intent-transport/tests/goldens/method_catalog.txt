@@ -2,6 +2,7 @@
 # Generated from crates/intent-transport/src/catalog.rs; do not hand-edit. Regenerate:
 #   INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-transport --lib catalog::tests::method_catalog_matches_golden
 fastpath agent.workers.subscribe
+fastpath app.session.attach
 fastpath backends.report
 fastpath browser.closeTab
 fastpath browser.exec
@@ -134,6 +135,22 @@ router agent.update
 router agent.wakeOrCreate
 router agent.workers.list
 router agent.workers.stop
+router app.approve
+router app.complete
+router app.get
+router app.install
+router app.list
+router app.models.list
+router app.notify
+router app.readBundle
+router app.revoke
+router app.session.close
+router app.session.open
+router app.storage.delete
+router app.storage.get
+router app.storage.list
+router app.storage.set
+router app.uninstall
 router client.list
 router cloudMachines.configure
 router cloudMachines.kill

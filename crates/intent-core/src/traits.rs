@@ -5876,6 +5876,45 @@ pub trait WorkspaceApi: Send + Sync {
     /// fields are the cached GitHub identity (served offline); a wire caller
     /// resolves to its bound principal, agent and daemon callers to the
     /// primary principal. Fails when no caller is bound (fail-closed).
+    /// Intent apps (PROTOCOL §5.60, Labs): one entry point for every
+    /// router `app.*` method (library, approval, sessions and the
+    /// app-principal methods). The method name is the full wire name. The
+    /// implementation checks the caller per method; the transport has
+    /// already applied its connection-level allowlists.
+    fn app_call(
+        &self,
+        method: String,
+        params: serde_json::Map<String, serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (method, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_call not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `app.session.attach` (PROTOCOL §5.60): resolve a session token to
+    /// its app principal. The transport binds the connection on success.
+    fn app_session_attach(
+        &self,
+        token: String,
+    ) -> BoxFuture<'_, Result<crate::apps::AppAttachment>> {
+        let _ = token;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_session_attach not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// End the app sessions an administrator connection opened, when that
+    /// connection closes (PROTOCOL §5.60 "Session end").
+    fn app_sessions_end(&self, session_ids: Vec<String>) -> BoxFuture<'_, ()> {
+        let _ = session_ids;
+        Box::pin(async {})
+    }
+
     fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

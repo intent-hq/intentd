@@ -26,6 +26,7 @@ mod e2e_wss_host;
 mod e2e_wss_host_credential_env;
 mod e2e_wss_input_autocomplete;
 mod e2e_wss_installed_cli;
+mod e2e_wss_intent_apps;
 mod e2e_wss_interrupted_agents;
 mod e2e_wss_invite_join;
 mod e2e_wss_invite_join_gitlab;

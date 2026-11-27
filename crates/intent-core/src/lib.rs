@@ -22,6 +22,7 @@ pub mod agent_rpc;
 pub mod agent_runtime;
 pub mod agent_tmp;
 pub mod ansi;
+pub mod apps;
 pub mod blob;
 pub mod browser_message;
 pub mod caller;

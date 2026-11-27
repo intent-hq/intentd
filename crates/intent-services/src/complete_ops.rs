@@ -382,6 +382,14 @@ pub(crate) fn config_option_model<'m>(
     Some(model)
 }
 
+/// The working directory of a one-shot completion.
+pub(crate) enum CompleteOnceCwd {
+    /// `agent.completeOnce`: the optional workspace root (no cwd without one).
+    Workspace(Option<WorkspaceId>),
+    /// `app.complete`: a private temporary directory the caller owns.
+    Private(PathBuf),
+}
+
 impl Services {
     /// `agent.completeOnce` (PROTOCOL §5.32): stateless one-shot completion.
     /// Composes an optional `system_prompt` with `prompt` in the same shape as
@@ -449,6 +457,41 @@ impl Services {
             },
         };
 
+        self.complete_once_on_route(
+            &settings,
+            effective_provider.as_deref(),
+            run_provider,
+            model,
+            quick_action_type.as_deref(),
+            reasoning_effort.as_deref(),
+            prompt,
+            system_prompt,
+            CompleteOnceCwd::Workspace(workspace_id),
+            timeout_ms,
+            MAX_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    /// The half of `agent.completeOnce` after the route is chosen: the
+    /// provider gates, effort resolution, orchestrator hand-off, cwd and the
+    /// auggie / ACP runners. `app.complete` (PROTOCOL §5.60) enters here with
+    /// the app's explicit provider and model and a private temporary cwd.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn complete_once_on_route(
+        &self,
+        settings: &intent_core::settings_file::SettingsFile,
+        effective_provider: Option<&str>,
+        run_provider: String,
+        model: Option<String>,
+        quick_action_type: Option<&str>,
+        reasoning_effort: Option<&str>,
+        prompt: String,
+        system_prompt: Option<String>,
+        cwd: CompleteOnceCwd,
+        timeout_ms: Option<u64>,
+        max_timeout_ms: u64,
+    ) -> Result<Value> {
         // Keep named-profile replacement errors intact; a bare selection uses
         // the existing one-shot unavailable result. Check the resolved route,
         // since a legacy quick-action override can name a different provider.
@@ -462,11 +505,11 @@ impl Services {
         }
 
         let effort = resolve_quick_action_effort(
-            &settings,
-            quick_action_type.as_deref(),
-            effective_provider.as_deref(),
+            settings,
+            quick_action_type,
+            effective_provider,
             &run_provider,
-            reasoning_effort.as_deref(),
+            reasoning_effort,
         );
 
         // An orchestrator runs the one-shot on a machine (agent-aux.md
@@ -476,14 +519,17 @@ impl Services {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+            let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(max_timeout_ms);
             return self
                 .complete_once_on_machine(
                     &run_provider,
                     &prompt,
                     system_prompt,
                     model.as_deref(),
-                    workspace_id,
+                    match &cwd {
+                        CompleteOnceCwd::Workspace(id) => id.clone(),
+                        CompleteOnceCwd::Private(_) => None,
+                    },
                     timeout,
                     &effort,
                 )
@@ -493,13 +539,14 @@ impl Services {
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd
         // (mirrors §5.31).
-        let cwd: Option<PathBuf> = match &workspace_id {
-            Some(id) => {
-                let ws = self.store.get_workspace(id).await?;
+        let cwd: Option<PathBuf> = match cwd {
+            CompleteOnceCwd::Workspace(Some(id)) => {
+                let ws = self.store.get_workspace(&id).await?;
                 let root = file_ops::workspace_root(&ws);
                 (!root.is_empty()).then(|| PathBuf::from(root))
             }
-            None => None,
+            CompleteOnceCwd::Workspace(None) => None,
+            CompleteOnceCwd::Private(dir) => Some(dir),
         };
         // A blank system prompt counts as none. The auggie CLI route composes
         // it into the prompt text; the ACP route decides per provider
@@ -508,7 +555,7 @@ impl Services {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(max_timeout_ms);
 
         // `auggie` and its profiles take the `auggie --print` route.
         if intent_providers::base_provider_id(&run_provider) != "auggie" {

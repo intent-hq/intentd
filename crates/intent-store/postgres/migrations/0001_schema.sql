@@ -1033,6 +1033,26 @@ CREATE TABLE IF NOT EXISTS known_repo (
     PRIMARY KEY (tenant_id, path)
 );
 
+-- sqlite: 0202_intent_apps.sql
+CREATE TABLE IF NOT EXISTS intent_app (
+    tenant_id text NOT NULL,
+    app_id text NOT NULL,
+    record_json text NOT NULL,
+    updated_at text NOT NULL,
+    row_seq bigint NOT NULL,
+    PRIMARY KEY (tenant_id, app_id)
+);
+
+CREATE TABLE IF NOT EXISTS intent_app_storage (
+    tenant_id text NOT NULL,
+    app_id text NOT NULL,
+    key text NOT NULL,
+    value_json text NOT NULL,
+    size_bytes bigint NOT NULL,
+    row_seq bigint NOT NULL,
+    PRIMARY KEY (tenant_id, app_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
     tenant_id text NOT NULL,
     server_id text NOT NULL,
@@ -3435,6 +3455,14 @@ CREATE OR REPLACE TRIGGER row_seq_save AFTER INSERT ON interrupted_agent
 CREATE OR REPLACE TRIGGER row_seq_from_tenant_counter BEFORE INSERT ON known_repo
     FOR EACH ROW EXECUTE FUNCTION trg_row_seq_from_tenant_counter();
 CREATE OR REPLACE TRIGGER row_seq_save AFTER INSERT ON known_repo
+    FOR EACH STATEMENT EXECUTE FUNCTION trg_row_seq_save();
+CREATE OR REPLACE TRIGGER row_seq_from_tenant_counter BEFORE INSERT ON intent_app
+    FOR EACH ROW EXECUTE FUNCTION trg_row_seq_from_tenant_counter();
+CREATE OR REPLACE TRIGGER row_seq_save AFTER INSERT ON intent_app
+    FOR EACH STATEMENT EXECUTE FUNCTION trg_row_seq_save();
+CREATE OR REPLACE TRIGGER row_seq_from_tenant_counter BEFORE INSERT ON intent_app_storage
+    FOR EACH ROW EXECUTE FUNCTION trg_row_seq_from_tenant_counter();
+CREATE OR REPLACE TRIGGER row_seq_save AFTER INSERT ON intent_app_storage
     FOR EACH STATEMENT EXECUTE FUNCTION trg_row_seq_save();
 CREATE OR REPLACE TRIGGER row_seq_from_tenant_counter BEFORE INSERT ON mcp_oauth_tokens
     FOR EACH ROW EXECUTE FUNCTION trg_row_seq_from_tenant_counter();

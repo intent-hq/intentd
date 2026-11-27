@@ -278,7 +278,9 @@ impl Services {
             Some(Caller::Agent { .. } | Caller::Daemon) => {
                 Ok((self.store.get_primary_principal().await?.id, true))
             }
-            Some(Caller::Executor { .. }) => Err(crate::principal_ops::executor_forbidden()),
+            Some(Caller::Executor { .. } | Caller::App(_)) => {
+                Err(crate::principal_ops::executor_forbidden())
+            }
         }
     }
 

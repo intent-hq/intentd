@@ -66,6 +66,8 @@ macro_rules! sqlite_only {
 }
 
 mod advisory_wake_delivery_repo;
+mod app_repo;
+pub use app_repo::AppStorageWrite;
 mod agent_flipped_completion_repo;
 mod agent_queue_merge;
 mod agent_queue_repo;

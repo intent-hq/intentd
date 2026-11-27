@@ -110,9 +110,12 @@ impl Services {
                 Ok(_) | Err(Error::NotFound(_)) => Err(forbidden(what)),
                 Err(error) => Err(error),
             },
-            Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Executor { .. }) => {
-                Err(forbidden(what))
-            }
+            Some(
+                Caller::Wire { .. }
+                | Caller::Agent { .. }
+                | Caller::Executor { .. }
+                | Caller::App(_),
+            ) => Err(forbidden(what)),
             None => {
                 // Logs the unbound gate (and aborts under the e2e assert).
                 crate::capability::gated_collaborator_caller(what)?;

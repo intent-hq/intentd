@@ -50,6 +50,12 @@ pub enum Caller {
         /// The backend's head id the credential was minted for.
         backend_id: String,
     },
+    /// An app connection after `app.session.attach` (PROTOCOL §5.60). It
+    /// holds no authority: every capability gate refuses it, and the
+    /// transport admits only its level allowlist. The app-principal
+    /// methods (`app.storage.*`, `app.notify`, `app.models.list`,
+    /// `app.complete`) read the app from here.
+    App(std::sync::Arc<crate::apps::AppPrincipal>),
 }
 
 /// Queue contents reach the recipient through normal delivery, never through
@@ -124,7 +130,18 @@ impl Caller {
     pub fn principal_id(&self) -> Option<&PrincipalId> {
         match self {
             Caller::Wire { principal_id, .. } => Some(principal_id),
-            Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. } => None,
+            Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. } | Caller::App(_) => {
+                None
+            }
+        }
+    }
+
+    /// The bound app principal, for an attached app connection.
+    #[must_use]
+    pub fn app(&self) -> Option<&crate::apps::AppPrincipal> {
+        match self {
+            Caller::App(app) => Some(app),
+            _ => None,
         }
     }
 
@@ -135,7 +152,7 @@ impl Caller {
         match self {
             Caller::Wire { host_role, .. } => *host_role == crate::HostRole::Owner,
             Caller::Daemon => true,
-            Caller::Agent { .. } | Caller::Executor { .. } => false,
+            Caller::Agent { .. } | Caller::Executor { .. } | Caller::App(_) => false,
         }
     }
 }
