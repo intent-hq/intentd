@@ -670,7 +670,7 @@ CREATE TABLE IF NOT EXISTS quota_lock (
     CHECK (scope IN ('pr-monitor', 'invite-nonce'))
 );
 
--- sqlite: 0203_invite_nonce.sql
+-- sqlite: 0204_invite_nonce.sql
 CREATE TABLE IF NOT EXISTS invite_nonce (
     tenant_id text NOT NULL,
     nonce_hash text NOT NULL,
