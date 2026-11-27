@@ -190,9 +190,7 @@ impl Harness {
         Self::boot_seeded(ids, support, history, hold, native, async |_, _| {}).await
     }
     /// [`Self::boot_case`], running `seed` on the store and workspace before
-    /// the daemon starts: a test's own store writes land there, since a
-    /// second writer racing the live daemon fails at random with "database
-    /// is locked".
+    /// the daemon starts ([`common::seed_then_start`]).
     async fn boot_seeded(
         ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
         support: bool,
@@ -218,107 +216,127 @@ impl Harness {
                 "https://github.com/fixture/registered.git",
             ],
         );
-        let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
-        let mut ws = intent_core::chief_workspace();
-        ws.id = ids
-            .as_ref()
-            .map_or_else(WorkspaceId::new, |ids| ids.0.clone());
-        ws.branch = "main".into();
-        ws.path = Some(dir.path().join("workspace").to_string_lossy().into_owned());
-        ws.repository_path = Some(root.to_string_lossy().into_owned());
-        store.insert_workspace(&ws).await.unwrap();
-        let registered = ids.map_or_else(WorkspaceGitRootId::new, |ids| ids.1);
-        let row=serde_json::from_value(json!({"id":registered,"workspaceId":ws.id,"path":registered_path,"source":"auto","registeredByAgentIds":[],"createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
-        store.upsert_workspace_git_root(&row).await.unwrap();
-        let guest = Principal {
-            id: PrincipalId::new(),
-            identity: None,
-            github_user_id: Some(4242),
-            login: Some("guest".into()),
-            display_name: None,
-            avatar_url: None,
-            is_primary: false,
-            created_at: now_iso(),
-            updated_at: now_iso(),
-        };
-        store.upsert_principal(&guest).await.unwrap();
-        let hash = Sha256::digest(GUEST.as_bytes()).iter().fold(
-            String::with_capacity(64),
-            |mut hash, byte| {
-                use std::fmt::Write as _;
-                write!(hash, "{byte:02x}").unwrap();
-                hash
+        let ((workspace, registered, guest), child) = common::seed_then_start(
+            dir.path(),
+            async |store, _| {
+                let mut ws = intent_core::chief_workspace();
+                ws.id = ids
+                    .as_ref()
+                    .map_or_else(WorkspaceId::new, |ids| ids.0.clone());
+                ws.branch = "main".into();
+                ws.path = Some(dir.path().join("workspace").to_string_lossy().into_owned());
+                ws.repository_path = Some(root.to_string_lossy().into_owned());
+                store.insert_workspace(&ws).await.unwrap();
+                let registered = ids.map_or_else(WorkspaceGitRootId::new, |ids| ids.1);
+                let row = serde_json::from_value(json!({
+                    "id": registered,
+                    "workspaceId": ws.id,
+                    "path": registered_path,
+                    "source": "auto",
+                    "registeredByAgentIds": [],
+                    "createdAt": now_iso(),
+                    "updatedAt": now_iso(),
+                }))
+                .unwrap();
+                store.upsert_workspace_git_root(&row).await.unwrap();
+                let guest = Principal {
+                    id: PrincipalId::new(),
+                    identity: None,
+                    github_user_id: Some(4242),
+                    login: Some("guest".into()),
+                    display_name: None,
+                    avatar_url: None,
+                    is_primary: false,
+                    created_at: now_iso(),
+                    updated_at: now_iso(),
+                };
+                store.upsert_principal(&guest).await.unwrap();
+                let hash = Sha256::digest(GUEST.as_bytes()).iter().fold(
+                    String::with_capacity(64),
+                    |mut hash, byte| {
+                        use std::fmt::Write as _;
+                        write!(hash, "{byte:02x}").unwrap();
+                        hash
+                    },
+                );
+                store
+                    .insert_principal_credential(&guest.id, &hash)
+                    .await
+                    .unwrap();
+                store
+                    .add_workspace_member(&ws.id, &guest.id, WorkspaceRole::Collaborator)
+                    .await
+                    .unwrap();
+                seed(store, &ws.id).await;
+                (ws.id, registered, guest.id)
             },
-        );
-        store
-            .insert_principal_credential(&guest.id, &hash)
-            .await
-            .unwrap();
-        store
-            .add_workspace_member(&ws.id, &guest.id, WorkspaceRole::Collaborator)
-            .await
-            .unwrap();
-        seed(&store, &ws.id).await;
-        store.close().await;
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
-        )
-        .unwrap();
-        if let Some((_, endpoint)) = history {
-            let config = dir.path().join("config.toml");
-            let text = std::fs::read_to_string(&config).unwrap();
-            std::fs::write(&config,format!("{text}\n[sourceControl.gitlab]\nhost = \"gitlab.test\"\ninstanceBaseUrl = \"https://gitlab.test/forge\"\napiBaseUrl = {endpoint:?}\n")).unwrap();
-        }
-        common::enable_ws_api(dir.path());
-        let bins = dir.path().join("bin");
-        std::fs::create_dir(&bins).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/git", bins.join("git")).unwrap();
-        std::fs::create_dir(dir.path().join("specialists")).unwrap();
-        let workspaces = dir.path().join("workspaces");
-        std::fs::create_dir(&workspaces).unwrap();
-        let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
-        let mut cmd = common::hermetic_serve_command(dir.path());
-        #[cfg(not(feature = "repository-test-fixtures"))]
-        let _ = native;
-        cmd.env_remove("INTENTD_TEST_REVIEW_LAUNCHER");
-        #[cfg(feature = "repository-test-fixtures")]
-        if native {
-            monitor_history::configure_native_daemon(dir.path(), &mut cmd);
-        }
-        cmd.env_remove("INTENT_TEST_PRIVATE_WRITE_HOLD");
-        if hold {
-            let barrier = dir.path().join("private-write-hold");
-            std::fs::create_dir(&barrier).unwrap();
-            cmd.env("INTENT_TEST_PRIVATE_WRITE_HOLD", barrier);
-        }
-        cmd.env_remove("INTENTD_REVIEW_MONITOR_TEST_SUPPORT");
-        if let Some((_, endpoint)) = history {
-            cmd.env(
-                "INTENTD_REPOSITORY_TEST_TRANSPORTS",
-                json!([["https://gitlab.test/forge", endpoint]]).to_string(),
-            );
-        }
-        if support {
-            cmd.env("INTENTD_REVIEW_MONITOR_TEST_SUPPORT", "1");
-        }
+            async |seeded| {
+                std::fs::write(
+                    dir.path().join("config.toml"),
+                    "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+                )
+                .unwrap();
+                if let Some((_, endpoint)) = history {
+                    let config = dir.path().join("config.toml");
+                    let text = std::fs::read_to_string(&config).unwrap();
+                    let gitlab = format!(
+                        "[sourceControl.gitlab]\nhost = \"gitlab.test\"\n\
+                         instanceBaseUrl = \"https://gitlab.test/forge\"\napiBaseUrl = {endpoint:?}\n"
+                    );
+                    std::fs::write(&config, format!("{text}\n{gitlab}")).unwrap();
+                }
+                common::enable_ws_api(dir.path());
+                let bins = dir.path().join("bin");
+                std::fs::create_dir(&bins).unwrap();
+                std::os::unix::fs::symlink("/usr/bin/git", bins.join("git")).unwrap();
+                std::fs::create_dir(dir.path().join("specialists")).unwrap();
+                let workspaces = dir.path().join("workspaces");
+                std::fs::create_dir(&workspaces).unwrap();
+                let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
+                let mut cmd = common::hermetic_serve_command(dir.path());
+                #[cfg(not(feature = "repository-test-fixtures"))]
+                let _ = native;
+                cmd.env_remove("INTENTD_TEST_REVIEW_LAUNCHER");
+                #[cfg(feature = "repository-test-fixtures")]
+                if native {
+                    monitor_history::configure_native_daemon(dir.path(), &mut cmd);
+                }
+                cmd.env_remove("INTENT_TEST_PRIVATE_WRITE_HOLD");
+                if hold {
+                    let barrier = dir.path().join("private-write-hold");
+                    std::fs::create_dir(&barrier).unwrap();
+                    cmd.env("INTENT_TEST_PRIVATE_WRITE_HOLD", barrier);
+                }
+                cmd.env_remove("INTENTD_REVIEW_MONITOR_TEST_SUPPORT");
+                if let Some((_, endpoint)) = history {
+                    cmd.env(
+                        "INTENTD_REPOSITORY_TEST_TRANSPORTS",
+                        json!([["https://gitlab.test/forge", endpoint]]).to_string(),
+                    );
+                }
+                if support {
+                    cmd.env("INTENTD_REVIEW_MONITOR_TEST_SUPPORT", "1");
+                }
 
-        cmd.env("INTENTD_DATA_DIR", dir.path())
-            .env("INTENTD_WORKSPACES_DIR", workspaces)
-            .env("INTENTD_AUTH_TOKEN", TOKEN)
-            .env("INTENTD_SPECIALISTS_DIR", dir.path().join("specialists"))
-            .env(
-                "RUST_LOG",
-                "warn,intentd=info,intent_services::repository_native_wire=debug",
-            )
-            .env_remove("GITLAB_TOKEN")
-            .env("PATH", bins)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(log));
-        let child = GuardedChild::spawn(&mut cmd).unwrap();
+                cmd.env("INTENTD_DATA_DIR", dir.path())
+                    .env("INTENTD_WORKSPACES_DIR", workspaces)
+                    .env("INTENTD_AUTH_TOKEN", TOKEN)
+                    .env("INTENTD_SPECIALISTS_DIR", dir.path().join("specialists"))
+                    .env(
+                        "RUST_LOG",
+                        "warn,intentd=info,intent_services::repository_native_wire=debug",
+                    )
+                    .env_remove("GITLAB_TOKEN")
+                    .env("PATH", bins)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(log));
+                (seeded, GuardedChild::spawn(&mut cmd).unwrap())
+            },
+        )
+        .await;
         let socket = dir.path().join("intentd.sock");
         timeout(common::daemon_startup_timeout(), async {
             loop {
@@ -337,9 +355,9 @@ impl Harness {
             child,
             dir,
             root,
-            workspace: ws.id,
+            workspace,
             registered,
-            guest: guest.id,
+            guest,
             port,
             cfg,
         };

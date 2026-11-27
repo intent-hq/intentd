@@ -225,8 +225,8 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     boot_in(temp_data_dir()).await
 }
 
-/// [`boot`] on `data_dir_guard`, which a test may seed first: a second
-/// writer racing the live daemon fails at random with "database is locked".
+/// [`boot`] on `data_dir_guard`; a test seeds it first through
+/// [`common::seed_then_start`].
 async fn boot_in(data_dir_guard: tempfile::TempDir) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
@@ -825,13 +825,10 @@ async fn host_check_auggie_is_resolution_only_over_wss() {
     );
 }
 
-/// Seed one workspace with a filesystem root so `host.exec` can enforce the
-/// within-workspace containment guard on `cwd`. Returns `(workspace_id, root)`.
-async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
+/// Insert one workspace with a filesystem root so `host.exec` can enforce
+/// the within-workspace containment guard on `cwd`. Returns its id.
+async fn insert_workspace_with_path(store: &intent_store::Store, root: &Path) -> String {
     use intent_core::{now_iso, Workspace, WorkspaceId};
-    use intent_store::Store;
-    let db_path = data_dir.join("intentd.db");
-    let store = Store::open(&db_path).await.expect("open store");
     let ws_id = WorkspaceId::new();
     let ts = now_iso();
     let ws = Workspace {
@@ -888,8 +885,13 @@ async fn host_exec_over_wss() {
     let root_guard = common::test_tempdir("itd-wss-exec-root-");
     let root = root_guard.path().to_path_buf();
     let data_dir_guard = temp_data_dir();
-    let ws_id = seed_workspace_with_path(data_dir_guard.path(), &root).await;
-    let (_daemon, port, cfg) = boot_in(data_dir_guard).await;
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ((_daemon, port, cfg), ws_id) = common::seed_then_start(
+        &data_dir,
+        async |store, _| insert_workspace_with_path(store, &root).await,
+        async |ws_id| (boot_in(data_dir_guard).await, ws_id),
+    )
+    .await;
     let mut ws = connect_ws(port, cfg).await;
 
     // 1) Happy path — echo returns stdout + exitCode 0 without cwd validation.
