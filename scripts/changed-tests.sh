@@ -656,7 +656,11 @@ reader_target() {
 #  - resolves the crates/ directory: env!("CARGO_MANIFEST_DIR"), package_dir()
 #    or workspace_root() followed within two lines by .parent() or
 #    .join("crates").
-# This is a textual check, not a proof. Source lints (crates/*/tests/*_lint.rs)
+# A path into a crate whose src change already selects every test of the
+# reader's crate (src_change_selects) does not count. Each path a reader names
+# must also match the glob of an entry targeting it, so a mapped reader that
+# starts reading another crate fails too; a crates/ walk can only be held to
+# having an entry. This is a textual check, not a proof. Source lints (crates/*/tests/*_lint.rs)
 # are exempt: every crates/ change already runs them. A file that matches but
 # reads no other crate's source opts out with a line carrying
 # "changed-tests: not a source reader: <reason>". It is covered by an entry
@@ -664,7 +668,8 @@ reader_target() {
 # target whole (for a suite module: a suite binary that declares it).
 # Appends one map_errors line per uncovered reader.
 check_source_readers() {
-  local manifest crate alternation="" hits line file lit lit_crate readers=$'\n' anchors entry_glob e_crate e_binary e_module covered
+  local manifest crate alternation="" hits line file lit lit_crate readers=$'\n' reads="" anchors entry_glob e_crate e_binary e_module covered
+  local globs r_file r_path sample matched
   local marker='changed-tests: not a source reader:'
   for manifest in crates/*/Cargo.toml; do
     [[ -f "$manifest" ]] || continue
@@ -687,7 +692,12 @@ check_source_readers() {
     lit_crate=${lit%%/*}
     crate=${file#crates/}
     crate=${crate%%/*}
-    [[ "$lit_crate" == "$crate" || "$readers" == *$'\n'"$file"$'\n'* ]] || readers+="$file"$'\n'
+    lit=${lit%\"}
+    [[ "$lit_crate" != "$crate" ]] || continue
+    # A change there already runs every test of this crate.
+    ! src_change_selects "$lit_crate" "$crate" || continue
+    [[ "$readers" == *$'\n'"$file"$'\n'* ]] || readers+="$file"$'\n'
+    reads+="$file"$'\t'"$lit_crate"$'\t'"crates/$lit"$'\n'
   done <<<"$hits"
   anchors='CARGO_MANIFEST_DIR|package_dir\(\)|workspace_root\(\)'
   hits=$(git -c core.quotePath=false grep --untracked -I -l -E "$anchors" -- "${specs[@]}" </dev/null) ||
@@ -707,6 +717,7 @@ check_source_readers() {
     fi
     reader_target "$file"
     covered=""
+    globs=""
     while IFS=$'\t' read -r entry_glob e_crate e_binary e_module; do
       [[ -n "$entry_glob" && "$e_crate" == "$reader_crate" ]] || continue
       [[ "$reader_binary" == "*" || "$e_binary" == "$reader_binary" ]] || continue
@@ -722,15 +733,69 @@ check_source_readers() {
         (-n "$reader_module" && ("$e_module" == "$reader_module::"* || "$reader_module" == "$e_module::"*)) ]]; then
         covered=1
       fi
-      [[ -z "$covered" ]] || break
+      if [[ -n "$covered" ]]; then
+        globs+="$entry_glob"$'\n'
+        covered=""
+      fi
     done <<<"$e2e_entries"
-    if [[ -z "$covered" ]]; then
-      local where="$reader_crate::$reader_binary"
-      [[ "$reader_binary" != "*" ]] || where="any $reader_crate test binary"
-      map_errors+="$file reads another crate's source but no $e2e_map entry targets it ($where${reader_module:+, module $reader_module}): map each file it reads under 'Source readers', or mark it '$marker <reason>'"$'\n'
+    local where="$reader_crate::$reader_binary"
+    [[ "$reader_binary" != "*" ]] || where="any $reader_crate test binary"
+    where+="${reader_module:+, module $reader_module}"
+    if [[ -z "$globs" ]]; then
+      map_errors+="$file reads another crate's source but no $e2e_map entry targets it ($where): map each file it reads under 'Source readers', or mark it '$marker <reason>'"$'\n'
+      continue
     fi
+    # Each path it names in another crate's src/ must be one an entry for
+    # it maps, unless a change there already selects the reader's crate.
+    while IFS=$'\t' read -r r_file _ r_path; do
+      [[ "$r_file" == "$file" ]] || continue
+      # A directory ("<crate>/src", "<crate>/src/dir/") is matched through
+      # a file under it.
+      sample=$r_path
+      if [[ "$r_path" == */ || "$r_path" == */src ]]; then
+        sample=$(git -c core.quotePath=false ls-files -- "${r_path%/}/" </dev/null) || sample=""
+        sample=${sample%%$'\n'*}
+        [[ -n "$sample" ]] || sample="${r_path%/}/"
+      fi
+      matched=""
+      while IFS= read -r entry_glob; do
+        # shellcheck disable=SC2053 # the glob is a pattern on purpose
+        if [[ -n "$entry_glob" && "$sample" == $entry_glob ]]; then
+          matched=1
+          break
+        fi
+      done <<<"$globs"
+      [[ -n "$matched" ]] ||
+        map_errors+="$file reads $r_path but no $e2e_map entry for it ($where) matches that path: add one under 'Source readers'"$'\n'
+    done <<<"$reads"
   done <<<"$readers"
 }
+
+# True when a change to crates/$1/src already selects every test of crate $2
+# through the propagation rules above: $2 depends on an rdeps root $1, $1 is
+# intent-services and $2 a feature crate or intent-app, or $1 is a feature
+# crate and $2 intent-app.
+src_change_selects() {
+  local root=$1 reader=$2 dependent dependents
+  case "$root:$reader" in
+    intent-services:intent-svc-* | intent-services:intent-app | intent-svc-*:intent-app) return 0 ;;
+  esac
+  [[ " $rdeps_roots " == *" $root "* ]] || return 1
+  # reader_rdeps holds " <root>: <dependent> ... ;" per root asked about.
+  if [[ "$reader_rdeps" != *" $root:"* ]]; then
+    [[ -n "$reader_rdeps_edges" ]] || reader_rdeps_edges=$(workspace_edges)
+    dependents=""
+    while IFS= read -r dependent; do
+      [[ -z "$dependent" ]] || dependents+=" $dependent"
+    done <<<"$(reverse_dependents "$root" "$reader_rdeps_edges")"
+    reader_rdeps+=" $root:$dependents ;"
+  fi
+  dependents=${reader_rdeps#* "$root":}
+  dependents=${dependents%%;*}
+  [[ "$dependents" == *" $reader "* ]]
+}
+reader_rdeps_edges=""
+reader_rdeps=""
 
 load_e2e_map
 check_source_readers

@@ -2089,7 +2089,7 @@ expect_reader_error() {
     for line in "$@"; do
       [[ "$stderr" == *"$line"* ]] || fail "$case_name ($mode): stderr is missing '$line':"$'\n'"$stderr"
     done
-    [[ "$(grep -c "$reader_note\|needs a reason" <<<"$stderr")" -eq $# ]] || fail "$case_name ($mode): expected $# reader line(s):"$'\n'"$stderr"
+    [[ "$(grep -c "$reader_note\|needs a reason\|matches that path" <<<"$stderr")" -eq $# ]] || fail "$case_name ($mode): expected $# reader line(s):"$'\n'"$stderr"
     [[ "$stderr" == *"invalid end-to-end test map"* ]] || fail "$case_name ($mode): no summary: $stderr"
     [[ -z "$cargo_log" ]] || fail "$case_name ($mode) invoked cargo: $cargo_log"
   done
@@ -2160,6 +2160,30 @@ DRY_RUN=1 run_script --base HEAD
 expect_ok
 expect_plan "-p alpha --lib --bins --tests" "-p gamma --test sweep"
 
+# Coverage is per path, not per reader: a mapped reader that starts naming
+# another crate's src must have that path mapped too.
+case_name="a mapped reader naming a path no entry for it maps fails"
+reset_repo
+write crates/gamma/tests/smoke.rs $'const ALPHA: &str = "../alpha/src/lib.rs";\nconst DELTA: &str = "crates/delta/src/script.rs";\nconst ALL: &str = "../beta/src/";'
+echo "crates/alpha/src/lib.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+expect_reader_error "crates/gamma/tests/smoke.rs reads crates/delta/src/script.rs but no .config/e2e-test-map.txt entry for it (gamma::smoke) matches that path" \
+  "crates/gamma/tests/smoke.rs reads crates/beta/src/ but no .config/e2e-test-map.txt entry for it (gamma::smoke) matches that path"
+echo "crates/delta/src/*.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+echo "crates/beta/src/*.rs gamma::smoke" >>"$repo/.config/e2e-test-map.txt"
+expect_map_valid 7
+
+# A path into a crate whose src change already runs every test of the reader's
+# crate needs no entry: an intent-core dependent, a feature crate or
+# intent-app reading intent-services, intent-app reading a feature crate.
+case_name="paths whose change already selects the reader's crate need no entry"
+reset_repo
+write crates/alpha/tests/one.rs 'const CORE: &str = "../intent-core/src/lib.rs";'
+write crates/intent-app/tests/smoke.rs $'const SERVICES: &str = "../intent-services/src/lib.rs";\nconst TRANSFER: &str = "intent-svc-transfer/src/lib.rs";'
+write crates/intent-svc-transfer/tests/smoke.rs 'const SERVICES: &str = "../intent-services/src/lib.rs";'
+expect_map_valid 4
+write crates/beta/tests/smoke.rs 'const CORE: &str = "../intent-core/src/lib.rs";'
+expect_reader_error "crates/beta/tests/smoke.rs $reader_note (beta::smoke)"
+
 case_name="a file that reads no other crate's source opts out with a reasoned marker"
 reset_repo
 write crates/gamma/tests/smoke.rs $'// changed-tests: not a source reader: names the path in a message only\nconst ALPHA: &str = "../alpha/src/lib.rs";'
@@ -2195,9 +2219,10 @@ real_tree_cases() {
     fail "cannot set the real tree's sparse checkout"
   git -C "$real_repo" -c advice.detachedHead=false checkout -q "$(git -C "$real_root" rev-parse HEAD)" ||
     fail "cannot check out the real tree"
-  # Uncommitted edits: modified and untracked files are copied, deleted ones
-  # removed.
-  git -C "$real_root" -c core.quotePath=false ls-files -z --modified --others --exclude-standard -- "${real_specs[@]}" >"$temp_dir/real-files" ||
+  # Uncommitted edits, staged or not, against HEAD (which the copy checks
+  # out) and untracked files are copied; deleted ones removed.
+  { git -C "$real_root" -c core.quotePath=false diff --name-only -z HEAD -- "${real_specs[@]}" &&
+    git -C "$real_root" -c core.quotePath=false ls-files -z --others --exclude-standard -- "${real_specs[@]}"; } >"$temp_dir/real-files" ||
     fail "cannot list the real tree's edits"
   while IFS= read -r -d '' file; do
     if [[ -f "$real_root/$file" ]]; then
