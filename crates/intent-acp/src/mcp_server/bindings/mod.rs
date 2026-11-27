@@ -20,6 +20,7 @@ use serde_json::Value;
 
 pub(crate) mod agent;
 pub(crate) mod app;
+pub(crate) mod app_library;
 pub(crate) mod browser;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
@@ -143,6 +144,7 @@ fn namespaces_prelude(features: &AgentFeaturesSettings, is_sub_agent: bool) -> S
         fragments.push(mcp::PRELUDE);
     }
     fragments.push(file::PRELUDE);
+    fragments.push(app_library::PRELUDE);
     let app = app::prelude_for(features);
     fragments.push(&app);
     let mut out = fragments.join("\n");
@@ -273,6 +275,8 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "agent.snapshot",
     "agent.status",
     "agent.summary",
+    "appLibrary.get",
+    "appLibrary.list",
     "browser.clients",
     "browser.docs",
     "browser.listTabs",
@@ -564,6 +568,11 @@ async fn dispatch_binding(
     }
     if let Some(rest) = method.strip_prefix("file.") {
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("appLibrary.") {
+        return app_library::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
     }
