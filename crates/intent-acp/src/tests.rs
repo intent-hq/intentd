@@ -4076,15 +4076,13 @@ mod client_served_tests {
         use std::future::Future;
 
         struct GatedSink {
-            entered: tokio::sync::Notify,
-            release: tokio::sync::Notify,
+            pause: Arc<intentd_test_support::PausePoint>,
             events: Mutex<Vec<SinkEvent>>,
         }
         impl EventSink for GatedSink {
             fn publish(&self, event: SinkEvent) -> BoxFuture<'_, ()> {
                 Box::pin(async move {
-                    self.entered.notify_one();
-                    self.release.notified().await;
+                    self.pause.pause().await;
                     self.events.lock().unwrap().push(event);
                 })
             }
@@ -4092,8 +4090,7 @@ mod client_served_tests {
 
         let root = temp_dir();
         let sink = Arc::new(GatedSink {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            pause: intentd_test_support::PausePoint::new("file:changed publish"),
             events: Mutex::new(Vec::new()),
         });
         let handler = ClientRequestHandler::new(
@@ -4124,7 +4121,7 @@ mod client_served_tests {
         });
 
         // Wait until the handler is inside the (suspended) sink publish.
-        sink.entered.notified().await;
+        sink.pause.wait_reached().await;
         // Cooperative yields: let the connection's writer task flush anything
         // that was enqueued before the publish started.
         for _ in 0..8 {
@@ -4145,7 +4142,7 @@ mod client_served_tests {
         }
 
         // Release the publish; only now may the response go out.
-        sink.release.notify_one();
+        sink.pause.release();
         let _conn = serve.await.unwrap();
         let resp = read_frame(&mut reader).await;
         assert_eq!(resp["id"], json!(7));
