@@ -16,6 +16,7 @@ pub(super) enum Change {
     Account,
     /// The review source is replaced.
     Source,
+    /// Nothing changes; the held write completes.
     Unchanged,
 }
 
