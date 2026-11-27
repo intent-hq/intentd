@@ -21,6 +21,7 @@ use serde_json::json;
 use sqlx::postgres::{PgArguments, PgRow, Postgres};
 use sqlx::Row;
 
+use super::quotas::{active_pr_monitors, lock_quota, QuotaScope};
 use super::{PgStore, WriteTx};
 use crate::agent_repo::SESSION_SUMMARY_COLUMNS;
 use crate::pr_monitor_repo::{
@@ -32,6 +33,7 @@ use crate::pr_monitor_repo::{
     LEGACY_LOOKUP, PAUSE_UNTIL_SEPARATOR, PR_MONITOR_PAUSE_MARKER, TARGET_COLUMNS,
 };
 use crate::subscription_agent_repo::{SubscriptionAgentProjection, IDS_PER_STATEMENT};
+use crate::QuotaWrite;
 
 type PgQuery = sqlx::query::Query<'static, Postgres, PgArguments>;
 
@@ -153,17 +155,29 @@ pub(crate) fn captured_monitor_exists(tenant: &str, expected: &QualifiedPrMonito
 /// A prepared monitor write holding the tenant's writer lock until it
 /// finishes, like `SQLite`'s reserved `BEGIN IMMEDIATE` writer.
 pub(crate) struct PreparedPgWrite {
+    tenant: String,
     tx: WriteTx,
     query: PgQuery,
     insert: bool,
 }
 
 impl PreparedPgWrite {
+    /// Locks `agent`'s PR-monitor quota row in the held writer transaction
+    /// and returns its active monitors when they are at or above `max`.
+    pub(crate) async fn admit_under_quota(
+        &mut self,
+        agent: &AgentId,
+        max: u64,
+    ) -> Result<Option<u64>> {
+        monitor_quota_full(&mut self.tx, &self.tenant, agent, Some(max)).await
+    }
+
     pub(crate) async fn finish(self) -> Result<bool> {
         let Self {
             mut tx,
             query,
             insert,
+            ..
         } = self;
         let changed = match query.execute(&mut *tx).await {
             Ok(result) => result.rows_affected() == 1,
@@ -343,6 +357,21 @@ impl PgStore {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<bool> {
+        Ok(self
+            .insert_qualified_pr_monitor_within_quota(m, target, provenance, None)
+            .await?
+            == QuotaWrite::Written)
+    }
+
+    /// With `max`, the owner's quota row is locked and its active monitors
+    /// counted in the insert's writer transaction first.
+    pub async fn insert_qualified_pr_monitor_within_quota(
+        &self,
+        m: &PrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+        max: Option<u64>,
+    ) -> Result<QuotaWrite> {
         validate_monitor_target(m, target, provenance)?;
         let sql = format!(
             "INSERT INTO pr_monitor (tenant_id, {COLUMNS}, {TARGET_COLUMNS}) \
@@ -350,6 +379,9 @@ impl PgStore {
              $18, $19, $20, $21, $22, NULL)"
         );
         let mut tx = self.begin_write().await?;
+        if let Some(active) = monitor_quota_full(&mut tx, self.tenant(), &m.agent_id, max).await? {
+            return Ok(QuotaWrite::Full { active });
+        }
         let query = bind_monitor(
             sqlx::query(sqlx::AssertSqlSafe(sql)).bind(self.tenant().to_owned()),
             m,
@@ -361,13 +393,13 @@ impl PgStore {
         .bind(provenance.as_str());
         match query.execute(&mut *tx).await {
             Ok(_) => {}
-            Err(e) if unique_violation(&e) => return Ok(false),
+            Err(e) if unique_violation(&e) => return Ok(QuotaWrite::Lost),
             Err(e) => return Err(internal("insert qualified monitor", e)),
         }
         tx.commit()
             .await
             .map_err(|e| internal("insert qualified monitor", e))?;
-        Ok(true)
+        Ok(QuotaWrite::Written)
     }
 
     pub async fn qualify_legacy_pr_monitor_target(
@@ -901,6 +933,7 @@ impl PgStore {
         .bind(MonitorTargetProvenance::CapturedRequest.as_str());
         let tx = self.begin_write().await?;
         Ok(PreparedMonitorWrite::postgres(PreparedPgWrite {
+            tenant: self.tenant().to_owned(),
             tx,
             query,
             insert: true,
@@ -935,6 +968,7 @@ impl PgStore {
         let query = bind_captured(query, expected);
         let tx = self.begin_write().await?;
         Ok(PreparedMonitorWrite::postgres(PreparedPgWrite {
+            tenant: self.tenant().to_owned(),
             tx,
             query,
             insert: false,
@@ -957,6 +991,7 @@ impl PgStore {
         let query = bind_captured(query, expected);
         let tx = self.begin_write().await?;
         Ok(PreparedMonitorWrite::postgres(PreparedPgWrite {
+            tenant: self.tenant().to_owned(),
             tx,
             query,
             insert: false,
@@ -972,6 +1007,30 @@ impl PgStore {
         now: &str,
         pause: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .rearm_legacy_pr_monitor_within_quota(
+                expected, owner, target, baseline, now, pause, None,
+            )
+            .await?
+            == QuotaWrite::Written)
+    }
+
+    /// With `max`, `owner`'s quota row is locked and its active monitors
+    /// counted in the re-arm's writer transaction first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the re-arm's arguments plus the cap"
+    )]
+    pub async fn rearm_legacy_pr_monitor_within_quota(
+        &self,
+        expected: &PrMonitor,
+        owner: &AgentId,
+        target: &ReviewTarget,
+        baseline: Option<&str>,
+        now: &str,
+        pause: Option<&str>,
+        max: Option<u64>,
+    ) -> Result<QuotaWrite> {
         validate_monitor_target(
             expected,
             target,
@@ -979,6 +1038,9 @@ impl PgStore {
         )?;
         let context = "rearm legacy pr monitor";
         let mut tx = self.begin_write().await?;
+        if let Some(active) = monitor_quota_full(&mut tx, self.tenant(), owner, max).await? {
+            return Ok(QuotaWrite::Full { active });
+        }
         let captured = qualified_in(&mut tx, self.tenant(), &expected.monitor_id).await?;
         check_rearm_compatible(&captured)?;
         let sql = format!(
@@ -1027,8 +1089,26 @@ impl PgStore {
             .rows_affected()
             == 1;
         tx.commit().await.map_err(|e| internal(context, e))?;
-        Ok(changed)
+        Ok(if changed {
+            QuotaWrite::Written
+        } else {
+            QuotaWrite::Lost
+        })
     }
+}
+
+/// With `max`, locks `agent`'s PR-monitor quota row in `tx` and returns its
+/// active monitors when they are at or above `max`; `None` admits.
+pub(crate) async fn monitor_quota_full(
+    tx: &mut WriteTx,
+    tenant: &str,
+    agent: &AgentId,
+    max: Option<u64>,
+) -> Result<Option<u64>> {
+    let Some(max) = max else { return Ok(None) };
+    lock_quota(tx, tenant, QuotaScope::PrMonitor, &agent.0).await?;
+    let active = active_pr_monitors(tx, tenant, &agent.0).await?;
+    Ok((active >= max).then_some(active))
 }
 
 impl PgStore {

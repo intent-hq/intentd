@@ -652,6 +652,40 @@ CREATE TABLE IF NOT EXISTS lease (
     CHECK (token >= 1)
 );
 
+-- Postgres only (orchestrator mode): quota lock rows. A write that counts
+-- rows and then inserts (a quota) locks its (scope, lock_key) row first, in
+-- its writer transaction, so two processes of a tenant never both count
+-- below a cap and both insert. The row holds no count: the count is read
+-- from the quota's own rows under the lock, so nothing can drift. Scopes:
+-- 'pr-monitor' (lock_key: the agent id; its active monitors) and
+-- 'invite-nonce' (lock_key ''; the tenant's outstanding nonces). SQLite
+-- (desktop) has one writer, so its transaction alone serializes the count.
+-- A row outlives its agent: one key-sized row per agent that ever admitted
+-- a monitor, and deleting it could race a concurrent seed.
+CREATE TABLE IF NOT EXISTS quota_lock (
+    tenant_id text NOT NULL,
+    scope text NOT NULL,
+    lock_key text NOT NULL,
+    PRIMARY KEY (tenant_id, scope, lock_key),
+    CHECK (scope IN ('pr-monitor', 'invite-nonce'))
+);
+
+-- sqlite: 0204_invite_nonce.sql
+CREATE TABLE IF NOT EXISTS invite_nonce (
+    tenant_id text NOT NULL,
+    nonce_hash text NOT NULL,
+    invite_id text NOT NULL,
+    scope text NOT NULL,
+    authorization_generation bigint NOT NULL,
+    issued_at_ms bigint NOT NULL,
+    expires_at_ms bigint NOT NULL,
+    claimed_at_ms bigint,
+    PRIMARY KEY (tenant_id, nonce_hash),
+    CHECK (scope IN ('workspace', 'host'))
+);
+
+CREATE INDEX IF NOT EXISTS invite_nonce_invite_idx ON invite_nonce (tenant_id, invite_id);
+
 -- Postgres only: bounded, resumable workspace and agent deletes. A delete
 -- first records itself here in a short writer transaction, then drains the
 -- heavy child tables in bounded batches (each its own writer transaction,

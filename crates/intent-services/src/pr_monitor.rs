@@ -82,7 +82,7 @@ use intent_core::{
 use intent_sourcecontrol::{
     PrObservation, PrState, PullRequest, RateLimitStatus, RepoRef, SourceControl,
 };
-use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
+use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate, QuotaWrite};
 use serde_json::{json, Value};
 
 use crate::feature_ports::CancelSettlement;
@@ -1776,6 +1776,14 @@ fn pending_survives_recompute(m: &PrMonitor) -> bool {
     !pending.is_empty() && diff_snapshots(&baseline, &last) == pending
 }
 
+/// The refusal of a PR-monitor registration at the agent's cap: `active`
+/// monitors counted, `cap` allowed.
+pub(crate) fn pr_monitor_cap_error(active: u64, cap: u32) -> Error {
+    Error::InvalidParams(format!(
+        "pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory"
+    ))
+}
+
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
 /// Wording owned by the harness (H6).
 pub(crate) fn monitor_label(m: &PrMonitor) -> String {
@@ -3007,7 +3015,10 @@ impl Services {
                 }
                 None => {}
             }
-            let cap = self.pr_monitor_max_per_agent() as usize;
+            // An early refusal before the forge read; the write below
+            // counts again under the agent's quota lock, so two processes
+            // that both pass here still admit one monitor between them.
+            let cap = self.pr_monitor_max_per_agent();
             let active = self
                 .store
                 .list_pr_monitors_by_agent(agent_id)
@@ -3015,10 +3026,8 @@ impl Services {
                 .into_iter()
                 .filter(|m| m.state == PrMonitorState::Active)
                 .count();
-            if active >= cap {
-                return Err(Error::InvalidParams(format!(
-                    "pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory"
-                )));
+            if active as u64 >= u64::from(cap) {
+                return Err(pr_monitor_cap_error(active as u64, cap));
             }
         }
 
@@ -3130,14 +3139,40 @@ impl Services {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                self.store
-                    .insert_qualified_pr_monitor(
+                let cap = self.pr_monitor_max_per_agent();
+                match self
+                    .store
+                    .insert_qualified_pr_monitor_within_quota(
                         &m,
                         &target,
                         intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                        u64::from(cap),
                     )
                     .await?
-                    .then_some(m)
+                {
+                    QuotaWrite::Written => Some(m),
+                    QuotaWrite::Lost => None,
+                    // A concurrent register of this same PR for this agent
+                    // (a retry on another process) took the last slot: that
+                    // is not a new monitor, so fall through and re-arm it,
+                    // as a lost insert race does.
+                    QuotaWrite::Full { active } => {
+                        if self
+                            .store
+                            .find_active_pr_monitor(
+                                agent_id,
+                                repo_owner,
+                                repo_name,
+                                pr_number.cast_signed(),
+                            )
+                            .await?
+                            .is_none()
+                        {
+                            return Err(pr_monitor_cap_error(active, cap));
+                        }
+                        None
+                    }
+                }
             };
             if let Some(m) = inserted {
                 monitor = Some(m);
@@ -3513,19 +3548,24 @@ impl Services {
         let pause = self
             .sweeps_rate_limited()
             .then(|| self.rate_limit_pause_error());
-        let updated = self
+        // The adoption counts against the adopter's quota in its own write.
+        let cap = self.pr_monitor_max_per_agent();
+        match self
             .store
-            .rearm_legacy_pr_monitor(
+            .rearm_legacy_pr_monitor_within_quota(
                 &m,
                 agent_id,
                 target,
                 baseline.as_deref(),
                 now,
                 pause.as_deref(),
+                u64::from(cap),
             )
-            .await?;
-        if !updated {
-            return Ok(None);
+            .await?
+        {
+            QuotaWrite::Written => {}
+            QuotaWrite::Lost => return Ok(None),
+            QuotaWrite::Full { active } => return Err(pr_monitor_cap_error(active, cap)),
         }
         // A restart catch-up marker ([`Services::rehydrate_pr_monitors`])
         // belongs to the dead owner's pre-restart backlog, which the fresh

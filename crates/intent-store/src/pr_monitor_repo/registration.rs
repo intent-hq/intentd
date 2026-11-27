@@ -4,6 +4,7 @@ use super::{
     MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitor, QualifiedPrMonitor, Result,
     ReviewTarget, Store, PR_MONITOR_PAUSE_MARKER,
 };
+use crate::QuotaWrite;
 
 impl Store {
     /// Re-arm or adopt a legacy monitor using the current registration's target.
@@ -20,6 +21,9 @@ impl Store {
     /// # Errors
     /// Returns invalid parameters for incompatible provenance/identity, or a
     /// database error. A concurrent lifecycle/identity change returns false.
+    ///
+    /// Not quota-checked: an adoption (`owner` differs from the row's) goes
+    /// through [`Store::rearm_legacy_pr_monitor_within_quota`].
     pub async fn rearm_legacy_pr_monitor(
         &self,
         expected: &PrMonitor,
@@ -43,6 +47,30 @@ impl crate::SqliteStore {
         now: &str,
         pause: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .rearm_legacy_pr_monitor_within_quota(
+                expected, owner, target, baseline, now, pause, None,
+            )
+            .await?
+            == QuotaWrite::Written)
+    }
+
+    /// The re-arm; with `max`, `owner`'s active monitors are counted in its
+    /// `BEGIN IMMEDIATE` transaction first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the re-arm's arguments plus the cap"
+    )]
+    pub async fn rearm_legacy_pr_monitor_within_quota(
+        &self,
+        expected: &PrMonitor,
+        owner: &AgentId,
+        target: &ReviewTarget,
+        baseline: Option<&str>,
+        now: &str,
+        pause: Option<&str>,
+        max: Option<u64>,
+    ) -> Result<QuotaWrite> {
         validate_monitor_target(
             expected,
             target,
@@ -83,10 +111,27 @@ impl crate::SqliteStore {
             query = query.bind(value);
         }
         query = query.bind(pause);
-        let result = query.execute(self.write_pool()).await.map_err(|error| {
+        let internal = |error: sqlx::Error| {
             intent_core::Error::Internal(format!("rearm legacy pr monitor: {error}"))
-        })?;
-        Ok(result.rows_affected() == 1)
+        };
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal)?;
+        if let Some(max) = max {
+            let active = super::quota::sqlite_active_monitors(&mut tx, owner).await?;
+            if active >= max {
+                return Ok(QuotaWrite::Full { active });
+            }
+        }
+        let result = query.execute(&mut *tx).await.map_err(internal)?;
+        tx.commit().await.map_err(internal)?;
+        Ok(if result.rows_affected() == 1 {
+            QuotaWrite::Written
+        } else {
+            QuotaWrite::Lost
+        })
     }
 }
 

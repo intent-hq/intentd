@@ -1410,11 +1410,6 @@ pub struct Services {
     /// commits only when it still holds the current generation (see
     /// [`principal_ops::IdentityRekeyGeneration`]). Shared across clones.
     identity_rekey_generation: principal_ops::IdentityRekeyGeneration,
-    /// Outstanding `invite.challenge` nonces awaiting their `invite.prove`
-    /// (gist identity proof), keyed by nonce; shared across clones.
-    invite_nonces: invite_ops::InviteNonceState,
-    /// Admission permits for those nonces (`MAX_OUTSTANDING_NONCES`).
-    invite_nonce_permits: invite_ops::InviteNoncePermits,
     /// Live feed of principals whose credentials were just revoked
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
@@ -2077,8 +2072,6 @@ impl Services {
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
-            invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            invite_nonce_permits: invite_ops::new_nonce_permits(),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
             discussion_control_gates: Arc::default(),
             #[cfg(test)]

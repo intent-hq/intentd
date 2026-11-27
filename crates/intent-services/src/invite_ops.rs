@@ -33,7 +33,6 @@
 //! account was proven earlier, so the join commits with the stored identity
 //! and GitHub is never contacted. Valid credentials are rechecked and reused.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -42,19 +41,20 @@ use intent_core::{
     InviteLinkEnvelope, InvitePin, InviteProofClaim, InviteScope, Principal, PrincipalId,
     PrincipalIdentity, Result, WorkspaceId, WorkspaceInvite, WorkspaceRole,
 };
+use intent_sourcecontrol::identity_proof::provider::ProofProvider;
 use intent_sourcecontrol::identity_proof::provider::ProofView;
 use intent_sourcecontrol::identity_proof::IdentityProofError;
 use intent_sourcecontrol::{gitlab_auth, SourceControl};
 use intent_store::{
-    HostInviteJoinOutcome, HostJoinCredential, InviteInsertOutcome, InviteJoinOutcome,
+    HostInviteJoinOutcome, HostJoinCredential, InviteInsertOutcome, InviteJoinOutcome, InviteNonce,
+    InviteNonceCaps, QuotaWrite,
 };
 
 mod account_search;
 mod host;
 use host::ScopedInvite;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
+use tokio::sync::broadcast;
 
 use crate::principal_ops::{ForgeLink, ForgeUser};
 use crate::source_control_auth_ops::{Provider, Target};
@@ -81,32 +81,62 @@ pub(crate) const NONCE_TTL: Duration = Duration::from_secs(10 * 60);
 /// peer holding one valid link cannot grow the store past this.
 pub(crate) const MAX_NONCES_PER_INVITE: usize = 8;
 
-/// Outstanding nonces daemon-wide, enforced as a semaphore whose permit
-/// lives in the nonce's slot, so the store is bounded however many links
-/// are open.
+/// Outstanding nonces of the tenant (the whole daemon on `SQLite`):
+/// nonces are rows, counted under the tenant's quota lock when one is
+/// issued ([`intent_store::Store::issue_invite_nonce`]), so the bound holds
+/// across processes however many links are open.
 pub(crate) const MAX_OUTSTANDING_NONCES: usize = 256;
 
-/// One issued `invite.challenge` nonce awaiting its `invite.prove`.
-pub(crate) struct NonceSlot {
-    invite_id: String,
-    scope: InviteScope,
-    authorization_generation: u64,
-    /// Wall-clock issue time — the proof gist must not predate it (GitHub
-    /// reports `created_at` at second precision, so the comparison floors).
-    issued_at: SystemTime,
-    expires_at: Instant,
-    /// The [`MAX_OUTSTANDING_NONCES`] permit; released with the slot.
-    _permit: OwnedSemaphorePermit,
+/// The caps a challenge issues its nonce under.
+const NONCE_CAPS: InviteNonceCaps = InviteNonceCaps {
+    per_invite: MAX_NONCES_PER_INVITE as u64,
+    total: MAX_OUTSTANDING_NONCES as u64,
+};
+
+/// Unix milliseconds of `at` (0 before the epoch).
+fn unix_ms(at: SystemTime) -> i64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// Issued nonces keyed by nonce.
-pub(crate) type InviteNonceState = Arc<tokio::sync::Mutex<HashMap<String, NonceSlot>>>;
+/// A claimed nonce the prove has not settled yet: dropped while armed (the
+/// prove's future was cancelled), it spends the nonce in the background.
+struct ClaimedNonce {
+    /// `Some` while armed.
+    store: Option<intent_store::Store>,
+    key: String,
+}
 
-/// Admission permits for nonces ([`MAX_OUTSTANDING_NONCES`]).
-pub(crate) type InviteNoncePermits = Arc<Semaphore>;
+impl Drop for ClaimedNonce {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let key = std::mem::take(&mut self.key);
+        runtime.spawn(async move {
+            if let Err(e) = store.delete_invite_nonce(&key).await {
+                tracing::warn!(error = %e, "invite.prove: could not spend a cancelled prove's nonce");
+            }
+        });
+    }
+}
 
-pub(crate) fn new_nonce_permits() -> InviteNoncePermits {
-    Arc::new(Semaphore::new(MAX_OUTSTANDING_NONCES))
+/// What [`Services::verify_invite_proof`] checks a claimed nonce's proof
+/// with.
+struct VerifyProof<'a> {
+    invite: &'a ScopedInvite,
+    slot: &'a InviteNonce,
+    scope: InviteScope,
+    target: Target,
+    provider: Provider,
+    proof_provider: &'a ProofProvider,
+    login: &'a str,
+    proof_id: &'a str,
+    nonce: &'a str,
+    retry: &'a mut bool,
 }
 
 /// 32 random bytes (two `UUIDv4`s, OS randomness) as unpadded base64url —
@@ -117,11 +147,6 @@ pub(crate) fn random_nonce() -> String {
     bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Drop nonces whose lifetime passed, returning their permits.
-fn purge_nonces(nonces: &mut HashMap<String, NonceSlot>, now: Instant) {
-    nonces.retain(|_, slot| slot.expires_at > now);
 }
 
 /// Whether a proof gist created at `created_at` (RFC 3339, as GitHub reports
@@ -888,9 +913,11 @@ impl Services {
     }
 
     /// `invite.challenge`: see
-    /// [`intent_core::WorkspaceApi::invite_challenge`]. The nonce takes a
-    /// daemon-wide permit and counts against the invite's outstanding
-    /// nonces; either bound spent is [`InviteErrorKind::FlowBusy`].
+    /// [`intent_core::WorkspaceApi::invite_challenge`]. The nonce is a row,
+    /// counted under the tenant's quota lock against the tenant's
+    /// ([`MAX_OUTSTANDING_NONCES`]) and the invite's
+    /// ([`MAX_NONCES_PER_INVITE`]) outstanding nonces; either bound spent is
+    /// [`InviteErrorKind::FlowBusy`].
     pub(crate) async fn invite_challenge_op(
         &self,
         invite_id: &str,
@@ -906,35 +933,28 @@ impl Services {
             .await?
             .authorization_generation;
         let nonce = random_nonce();
-        let now = Instant::now();
-        let issued_at = SystemTime::now();
-        let expires_at = now + NONCE_TTL;
-        let nonce_expires_at = iso_ms_from_now(u64::try_from(NONCE_TTL.as_millis()).unwrap_or(0));
+        let issued_at_ms = unix_ms(SystemTime::now());
+        let ttl_ms = u64::try_from(NONCE_TTL.as_millis()).unwrap_or(0);
+        let nonce_expires_at = iso_ms_from_now(ttl_ms);
+        let slot = InviteNonce {
+            invite_id: invite.id().to_string(),
+            scope,
+            authorization_generation,
+            issued_at_ms,
+            expires_at_ms: issued_at_ms.saturating_add(ttl_ms.cast_signed()),
+        };
+        match self
+            .store
+            .issue_invite_nonce(&hash_secret(&nonce), &slot, issued_at_ms, NONCE_CAPS)
+            .await?
         {
-            let mut nonces = self.invite_nonces.lock().await;
-            purge_nonces(&mut nonces, now);
-            if nonces
-                .values()
-                .filter(|slot| slot.invite_id == invite.id())
-                .count()
-                >= MAX_NONCES_PER_INVITE
-            {
-                return Err(Error::Invite(InviteErrorKind::FlowBusy));
+            QuotaWrite::Written => {}
+            QuotaWrite::Full { .. } => return Err(Error::Invite(InviteErrorKind::FlowBusy)),
+            QuotaWrite::Lost => {
+                return Err(Error::Internal(
+                    "invite.challenge: a fresh nonce collided with an outstanding one".into(),
+                ))
             }
-            let Ok(permit) = self.invite_nonce_permits.clone().try_acquire_owned() else {
-                return Err(Error::Invite(InviteErrorKind::FlowBusy));
-            };
-            nonces.insert(
-                nonce.clone(),
-                NonceSlot {
-                    invite_id: invite.id().to_string(),
-                    scope,
-                    authorization_generation,
-                    issued_at,
-                    expires_at,
-                    _permit: permit,
-                },
-            );
         }
         preview["nonce"] = json!(nonce);
         preview["nonceExpiresAt"] = json!(nonce_expires_at);
@@ -1021,23 +1041,81 @@ impl Services {
             }));
         }
 
-        // Consume the nonce under the lock: exactly one concurrent attempt
-        // gets the slot; every other one is `ProofInvalid` right here. The
-        // slot (and its permit) is held by this frame until the verdict —
-        // put back only when the forge could not be consulted.
-        let slot = {
-            let mut nonces = self.invite_nonces.lock().await;
-            nonces.remove(nonce.trim())
-        };
-        let Some(slot) = slot else {
+        // Claim the nonce's row: exactly one concurrent attempt, in any
+        // process, gets it; every other one is `ProofInvalid` right here.
+        // The claimed row keeps counting against the caps until the verdict
+        // spends it, or a forge outage releases it for a retry.
+        let nonce = nonce.trim();
+        let key = hash_secret(nonce);
+        let Some(slot) = self
+            .store
+            .claim_invite_nonce(&key, unix_ms(SystemTime::now()))
+            .await?
+        else {
             return Err(Error::Invite(InviteErrorKind::ProofInvalid));
         };
+        // A prove dropped mid-verdict (the client went away) spends the
+        // nonce, as dropping its slot did, rather than holding it claimed
+        // until it expires.
+        let mut claimed = ClaimedNonce {
+            store: Some(self.store.clone()),
+            key: key.clone(),
+        };
+        let mut retry = false;
+        let verdict = self
+            .verify_invite_proof(VerifyProof {
+                invite: &invite,
+                slot: &slot,
+                scope,
+                target,
+                provider,
+                proof_provider: &proof_provider,
+                login,
+                proof_id,
+                nonce,
+                retry: &mut retry,
+            })
+            .await;
+        // Every verdict spends the nonce; a forge that could not be
+        // consulted gives it back. A failed write leaves the row claimed,
+        // so it is spent either way and lapses with its lifetime.
+        let settled = if retry {
+            self.store.release_invite_nonce(&key).await
+        } else {
+            self.store.delete_invite_nonce(&key).await
+        };
+        claimed.store = None;
+        if let Err(e) = settled {
+            tracing::warn!(error = %e, retry, "invite.prove: could not settle the nonce");
+        }
+        let user = verdict?;
+        self.complete_invite_join(invite.id(), &user, scope, slot.authorization_generation)
+            .await
+    }
+
+    /// The forge's verdict on a claimed nonce's proof. Sets `retry` when the
+    /// forge could not be consulted (the nonce goes back).
+    async fn verify_invite_proof(&self, v: VerifyProof<'_>) -> Result<ForgeUser> {
+        let VerifyProof {
+            invite,
+            slot,
+            scope,
+            target,
+            provider,
+            proof_provider,
+            login,
+            proof_id,
+            nonce,
+            retry,
+        } = v;
         if slot.invite_id != invite.id() || slot.scope != scope {
             return Err(Error::Invite(InviteErrorKind::ProofInvalid));
         }
-        if slot.expires_at <= Instant::now() {
+        if slot.expires_at_ms <= unix_ms(SystemTime::now()) {
             return Err(Error::Invite(InviteErrorKind::ProofExpired));
         }
+        let issued_at = SystemTime::UNIX_EPOCH
+            + Duration::from_millis(u64::try_from(slot.issued_at_ms).unwrap_or(0));
 
         let user = match target {
             Target::Github => {
@@ -1056,11 +1134,11 @@ impl Services {
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, proof_id, "proof gist read failed");
-                        self.restore_nonce(nonce, slot).await;
+                        *retry = true;
                         return Err(Error::Invite(InviteErrorKind::GithubUnreachable));
                     }
                 };
-                if !proof_matches(&gist, login, nonce.trim(), slot.issued_at) {
+                if !proof_matches(&gist, login, nonce, issued_at) {
                     return Err(Error::Invite(InviteErrorKind::ProofInvalid));
                 }
                 let user = match sc.get_user_by_login(login).await {
@@ -1070,7 +1148,7 @@ impl Services {
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, login, "proof account lookup failed");
-                        self.restore_nonce(nonce, slot).await;
+                        *retry = true;
                         return Err(Error::Invite(InviteErrorKind::GithubUnreachable));
                     }
                 };
@@ -1100,7 +1178,7 @@ impl Services {
                         return Err(Error::Invite(InviteErrorKind::ProofInvalid));
                     }
                     Err(e @ IdentityProofError::Unverifiable { .. }) => {
-                        self.restore_nonce(nonce, slot).await;
+                        *retry = true;
                         return Err(github_auth_ops::map_identity_proof_err_for(provider, e));
                     }
                     // Transport failure or a server error: the documented
@@ -1108,11 +1186,11 @@ impl Services {
                     // nonce goes back for a retry.
                     Err(e) => {
                         tracing::debug!(error = %e, proof_id, host = host.host(), "proof snippet read failed");
-                        self.restore_nonce(nonce, slot).await;
+                        *retry = true;
                         return Err(Error::Invite(InviteErrorKind::GithubUnreachable));
                     }
                 };
-                if !proof_matches(&snippet, login, nonce.trim(), slot.issued_at) {
+                if !proof_matches(&snippet, login, nonce, issued_at) {
                     return Err(Error::Invite(InviteErrorKind::ProofInvalid));
                 }
                 // The snippet's author carries the stable account id: the
@@ -1129,17 +1207,7 @@ impl Services {
                 )
             }
         };
-        let generation = slot.authorization_generation;
-        drop(slot);
-        self.complete_invite_join(invite.id(), &user, scope, generation)
-            .await
-    }
-
-    /// Put a consumed nonce back for a retry after the forge could not be
-    /// reached (its lifetime keeps running).
-    async fn restore_nonce(&self, nonce: &str, slot: NonceSlot) {
-        let mut nonces = self.invite_nonces.lock().await;
-        nonces.entry(nonce.trim().to_string()).or_insert(slot);
+        Ok(user)
     }
 
     /// The first-time join, once the invitee's forge identity is proven:

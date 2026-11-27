@@ -14,9 +14,10 @@ use intent_core::{
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite};
 
-use crate::Store;
+use crate::{QuotaWrite, Store};
 
 mod prepared_write;
+mod quota;
 mod registration;
 #[cfg(feature = "postgres")]
 pub(crate) use prepared_write::check_replacement_identity;
@@ -477,6 +478,9 @@ impl Store {
     /// # Errors
     /// Returns `InvalidParams` for inconsistent data and `Internal` on database failure.
     /// A uniqueness conflict returns `Ok(false)` without changing the existing owner.
+    ///
+    /// Not quota-checked: a registration that gives an agent one more active
+    /// monitor uses [`Store::insert_qualified_pr_monitor_within_quota`].
     pub async fn insert_qualified_pr_monitor(
         &self,
         m: &PrMonitor,
@@ -602,7 +606,35 @@ impl crate::SqliteStore {
         target: &ReviewTarget,
         provenance: MonitorTargetProvenance,
     ) -> Result<bool> {
+        Ok(self
+            .insert_qualified_pr_monitor_within_quota(m, target, provenance, None)
+            .await?
+            == QuotaWrite::Written)
+    }
+
+    /// [`Store::insert_qualified_pr_monitor_within_quota`]; no quota with
+    /// `max: None`. One `BEGIN IMMEDIATE` transaction counts and inserts.
+    pub async fn insert_qualified_pr_monitor_within_quota(
+        &self,
+        m: &PrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+        max: Option<u64>,
+    ) -> Result<QuotaWrite> {
         validate_monitor_target(m, target, provenance)?;
+        let internal =
+            |e: sqlx::Error| intent_core::Error::Internal(format!("insert qualified monitor: {e}"));
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal)?;
+        if let Some(max) = max {
+            let active = quota::sqlite_active_monitors(&mut tx, &m.agent_id).await?;
+            if active >= max {
+                return Ok(QuotaWrite::Full { active });
+            }
+        }
         let sql = format!(
             "INSERT INTO pr_monitor ({COLUMNS}, {TARGET_COLUMNS}) VALUES ({})",
             vec!["?"; 22].join(",")
@@ -630,20 +662,20 @@ impl crate::SqliteStore {
             .bind(kind_word(target.kind))
             .bind(provenance.as_str())
             .bind(None::<String>)
-            .execute(self.write_pool())
+            .execute(&mut *tx)
             .await;
         match result {
-            Ok(_) => Ok(true),
+            Ok(_) => {}
             Err(e)
                 if e.as_database_error()
                     .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
             {
-                Ok(false)
+                return Ok(QuotaWrite::Lost);
             }
-            Err(e) => Err(intent_core::Error::Internal(format!(
-                "insert qualified monitor: {e}"
-            ))),
+            Err(e) => return Err(internal(e)),
         }
+        tx.commit().await.map_err(internal)?;
+        Ok(QuotaWrite::Written)
     }
 
     pub async fn qualify_legacy_pr_monitor_target(
@@ -1545,6 +1577,9 @@ impl Store {
     /// `from_agent_id`, so two siblings adopting concurrently cannot both
     /// win. Returns `false` when the guard fails. `last_error` composes
     /// against the row like the poll write-back.
+    ///
+    /// Not quota-checked, and no service path calls it: an adoption goes
+    /// through [`Store::rearm_legacy_pr_monitor_within_quota`].
     ///
     /// # Errors
     ///

@@ -120,6 +120,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("agent_dismissal_notice", "notice dedupe receipts of the source daemon; an imported agent's persisted dismissal marker still guards its latest id"),
     ("agent_browser_sender", "connection-bound device receipts belong to the source daemon; imported agents must not inherit its client identities"),
+    ("invite_nonce", "short-lived invite.challenge nonces bound to this daemon's invites; never transferred"),
     ("discussion_agent_grant", "local explicit addressing authority is never restored on import"),
     ("discussion_agent_activity", "local invocation receipts are not restored on import"),
     ("discussion_agent_delivery", "pending addressed messages must not replay on a destination"),

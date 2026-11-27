@@ -71,7 +71,7 @@ async fn host_invitation_owner_administration_and_scope_privacy() {
         ),
         InviteErrorKind::ScopeMismatch
     );
-    assert!(f.services.invite_nonces.lock().await.is_empty());
+    assert_eq!(super::tests::outstanding_nonces(&f.store).await, 0);
     let members = with_caller(Caller::Daemon, f.services.host_members_list_op())
         .await
         .unwrap();
