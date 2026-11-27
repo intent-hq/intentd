@@ -203,6 +203,14 @@ pub(crate) struct AppsState {
     /// Serializes every library mutation (install, uninstall, approve,
     /// revoke) so a check and its write never interleave with another.
     library: tokio::sync::Mutex<()>,
+    /// Storage writes hold it shared and recheck their session under it;
+    /// uninstall holds it exclusively while it ends the session and deletes
+    /// the storage, so a write admitted before an uninstall can never land
+    /// after it.
+    storage_gate: tokio::sync::RwLock<()>,
+    /// Test seam: parks a storage write after admission, before the gate.
+    #[cfg(test)]
+    storage_write_pause: Mutex<Option<StorageWritePause>>,
     sessions: Mutex<Sessions>,
     notify: Mutex<HashMap<String, VecDeque<Instant>>>,
     in_flight: Mutex<HashMap<String, usize>>,
@@ -213,6 +221,9 @@ impl AppsState {
         Self {
             root,
             library: tokio::sync::Mutex::new(()),
+            storage_gate: tokio::sync::RwLock::new(()),
+            #[cfg(test)]
+            storage_write_pause: Mutex::new(None),
             sessions: Mutex::new(Sessions::default()),
             notify: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -236,6 +247,14 @@ impl AppsState {
     fn is_open(&self, app_id: &str) -> bool {
         self.sessions().apps_open.contains_key(app_id)
     }
+}
+
+/// Test seam for [`AppsState::storage_write_pause`]: the write signals
+/// `entered`, then waits for `release`.
+#[cfg(test)]
+pub(crate) struct StorageWritePause {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 /// Releases one `app.complete` in-flight slot on drop.
@@ -699,6 +718,7 @@ impl Services {
         require_library_caller("app.uninstall")?;
         let app_id = req_str(params, "appId")?.to_owned();
         let _library = self.apps.library.lock().await;
+        let _storage = self.apps.storage_gate.write().await;
         self.apps
             .sessions()
             .end_app(&app_id, AppSessionEnd::Uninstalled);
@@ -973,6 +993,33 @@ impl Services {
         }
     }
 
+    /// Enter the storage gate for a write and recheck, under it, that the
+    /// session is still live (an uninstall in between ended it).
+    async fn storage_write_guard(
+        &self,
+        app: &AppPrincipal,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        #[cfg(test)]
+        {
+            let pause = self
+                .apps
+                .storage_write_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(pause) = pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        let guard = self.apps.storage_gate.read().await;
+        if self.apps.sessions().ids.contains_key(&app.session_id) {
+            Ok(guard)
+        } else {
+            Err(Error::Forbidden("app session ended".into()))
+        }
+    }
+
     async fn app_storage_get(&self, params: &Map<String, Value>) -> Result<Value> {
         let app = self.live_app()?;
         let key = storage_key(params)?;
@@ -1001,6 +1048,7 @@ impl Services {
             ));
         }
         let size = (key.len() + encoded.len()) as u64;
+        let _storage = self.storage_write_guard(&app).await?;
         match self
             .store
             .app_storage_set(&app.app_id, &key, &encoded, size, STORAGE_QUOTA_BYTES)
@@ -1019,6 +1067,7 @@ impl Services {
     async fn app_storage_delete(&self, params: &Map<String, Value>) -> Result<Value> {
         let app = self.live_app()?;
         let key = storage_key(params)?;
+        let _storage = self.storage_write_guard(&app).await?;
         let deleted = self.store.app_storage_delete(&app.app_id, &key).await?;
         Ok(json!({ "deleted": deleted }))
     }

@@ -1483,3 +1483,41 @@ async fn a_default_with_saved_overrides_ignores_the_bare_verdict() {
     crate::provider_auth::seed_auth_verdict_for_tests("codex", None);
     assert_eq!(row(&listed, "codex")["available"], true, "{listed}");
 }
+
+/// A storage write admitted before an uninstall cannot land after it: the
+/// write parks after admission, the app is uninstalled, the write resumes
+/// and is refused, and a reinstall of the same id starts with empty storage.
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
+async fn a_write_admitted_before_uninstall_never_lands_after_it() {
+    let f = Arc::new(fx().await);
+    let app = level1_app(&f, "race-app").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *f.svc.apps.storage_write_pause.lock().unwrap() = Some(super::StorageWritePause {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let writer = {
+        let f = f.clone();
+        tokio::spawn(with_caller(Caller::Daemon, async move {
+            f.call_as(
+                app,
+                "app.storage.set",
+                json!({ "key": "k", "value": "old" }),
+            )
+            .await
+        }))
+    };
+    entered.notified().await;
+    f.call("app.uninstall", json!({ "appId": "race-app" }))
+        .await;
+    release.notify_one();
+    let written = writer.await.unwrap();
+    assert!(matches!(written, Err(Error::Forbidden(_))), "{written:?}");
+    let again = level1_app(&f, "race-app").await;
+    let got = f
+        .call_as(again, "app.storage.get", json!({ "key": "k" }))
+        .await
+        .unwrap();
+    assert_eq!(got["found"], false, "{got}");
+}
