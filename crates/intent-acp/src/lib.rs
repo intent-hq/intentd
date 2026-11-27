@@ -97,6 +97,9 @@ mod tests_wsapi5;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod egress_registry;
 
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
+pub mod fake_npx;
+
 #[cfg(test)]
 mod tests_hidden_field_egress;
 
