@@ -57,6 +57,8 @@ struct State {
     observed: u64,
     /// Releases granted and not yet used by a held operation.
     permits: u64,
+    /// [`PausePoint::open`] was called: every pause passes from now on.
+    open: bool,
 }
 
 /// A pause point an operation under test stops at until the test releases
@@ -76,6 +78,8 @@ struct State {
 /// operation several times; each [`PausePoint::reached`] observes one
 /// arrival and each [`PausePoint::release`] lets one held caller through
 /// (a release given before the arrival is kept for it).
+/// [`PausePoint::open`] instead lets every held and later caller through,
+/// for a gate many workers wait on at once.
 #[derive(Debug)]
 pub struct PausePoint {
     name: String,
@@ -144,6 +148,13 @@ impl PausePoint {
         self.wake();
     }
 
+    /// Let every held operation through, and every later one pass without
+    /// stopping. Arrivals are still counted and observable.
+    pub fn open(&self) {
+        self.lock().open = true;
+        self.wake();
+    }
+
     /// Operation side, async: record the arrival, then wait for a
     /// [`PausePoint::release`].
     ///
@@ -190,8 +201,11 @@ impl PausePoint {
         let guard = self.lock();
         let (mut guard, _) = self
             .changed
-            .wait_timeout_while(guard, self.hold_timeout, |s| s.permits == 0)
+            .wait_timeout_while(guard, self.hold_timeout, |s| s.permits == 0 && !s.open)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.open {
+            return;
+        }
         if guard.permits == 0 {
             drop(guard);
             panic!("{}", self.hold_expired());
@@ -303,6 +317,9 @@ impl PausePoint {
 
     fn take_permit(&self) -> bool {
         let mut state = self.lock();
+        if state.open {
+            return true;
+        }
         if state.permits == 0 {
             return false;
         }
@@ -529,6 +546,55 @@ mod tests {
         pause.release();
         op.await.unwrap();
         assert_eq!(pause.arrivals(), 2);
+    }
+
+    /// A gate that opens for good: the held operation and every later
+    /// arrival pass at once, and each arrival is still observable.
+    #[tokio::test]
+    async fn open_lets_held_and_later_arrivals_through() {
+        let pause = PausePoint::new("open");
+        let held = pause.clone();
+        let mut op = tokio::spawn(async move {
+            held.pause().await;
+            held.pause().await;
+            held.pause().await;
+        });
+        pause.reached(&mut op).await;
+        pause.open();
+        op.await.unwrap();
+        assert_eq!(pause.arrivals(), 3);
+        pause.wait_reached().await;
+        pause.wait_reached().await;
+    }
+
+    /// Opened before anything arrives, a blocking pause never waits, even
+    /// with a hold budget that would otherwise expire.
+    #[test]
+    fn open_before_arrival_passes_blocking_pauses() {
+        let pause = PausePoint::unshared("pre-opened").with_hold_timeout(SHORT);
+        pause.open();
+        pause.pause_blocking();
+        pause.pause_blocking();
+        assert_eq!(pause.arrivals(), 2);
+    }
+
+    /// `open` wakes callers parked in `pause_blocking` on other threads.
+    #[test]
+    fn open_wakes_every_blocked_caller() {
+        let pause = Arc::new(PausePoint::unshared("many"));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let held = pause.clone();
+                std::thread::spawn(move || held.pause_blocking())
+            })
+            .collect();
+        for _ in 0..4 {
+            pause.wait_reached_blocking();
+        }
+        pause.open();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     /// An unspawned operation only runs while `reached` polls it, so with a
