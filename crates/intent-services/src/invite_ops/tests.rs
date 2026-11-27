@@ -2333,6 +2333,57 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
     assert_eq!(outstanding_nonces(&f.store).await, 1);
 }
 
+/// A prove whose future is dropped after it claimed its nonce (the client
+/// went away mid-verdict) spends the nonce, as dropping its slot did,
+/// instead of holding it claimed until it expires.
+#[tokio::test]
+async fn a_cancelled_prove_spends_its_claimed_nonce() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let now = unix_ms(SystemTime::now());
+    let nonce = InviteNonce {
+        invite_id: "inv".into(),
+        scope: InviteScope::Workspace,
+        authorization_generation: 0,
+        issued_at_ms: now,
+        expires_at_ms: now + 600_000,
+    };
+    f.store
+        .issue_invite_nonce("held", &nonce, now, NONCE_CAPS)
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .claim_invite_nonce("held", now)
+        .await
+        .unwrap()
+        .is_some());
+    drop(ClaimedNonce {
+        store: Some(f.store.clone()),
+        key: "held".into(),
+    });
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while outstanding_nonces(&f.store).await != 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("the dropped claim spends its nonce");
+    // A settled claim (disarmed) leaves the row alone.
+    f.store
+        .issue_invite_nonce("kept", &nonce, now, NONCE_CAPS)
+        .await
+        .unwrap();
+    drop(ClaimedNonce {
+        store: None,
+        key: "kept".into(),
+    });
+    assert_eq!(outstanding_nonces(&f.store).await, 1);
+}
+
 /// The tenant-wide bound: with `MAX_OUTSTANDING_NONCES` outstanding (of
 /// other invites), a challenge is `FlowBusy` and issues nothing; once they
 /// expire it succeeds.

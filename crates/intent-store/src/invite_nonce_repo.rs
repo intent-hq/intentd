@@ -8,8 +8,8 @@
 //!
 //! A row is keyed by the nonce's hash, never the nonce. A prove claims its
 //! row first ([`Store::claim_invite_nonce`]): exactly one claim wins, and
-//! the claimed row keeps counting against both caps while the prove asks
-//! the forge. A verdict deletes it ([`Store::delete_invite_nonce`]); a forge
+//! the claimed row keeps counting against the tenant cap (not the invite's,
+//! as before rows) while the prove asks the forge. A verdict deletes it ([`Store::delete_invite_nonce`]); a forge
 //! outage releases it for a retry ([`Store::release_invite_nonce`]). A
 //! claim a crash left behind expires like any other row. Times are Unix
 //! milliseconds from the caller's clock.
@@ -34,7 +34,8 @@ pub struct InviteNonce {
 /// The caps [`Store::issue_invite_nonce`] admits a new nonce under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InviteNonceCaps {
-    /// Outstanding nonces of one invite.
+    /// Unclaimed outstanding nonces of one invite (a nonce a prove holds
+    /// counts only against `total`).
     pub per_invite: u64,
     /// Outstanding nonces of the tenant (the whole daemon on `SQLite`).
     pub total: u64,
@@ -85,8 +86,8 @@ pub(crate) fn nonce_from_row(row: NonceRow) -> Result<InviteNonce> {
 
 impl Store {
     /// Issue a nonce: in one write transaction, drop the expired nonces
-    /// (`expires_at_ms <= now_ms`, claimed or not), count the outstanding
-    /// ones of the invite and of the tenant, and insert `nonce_hash` unless
+    /// (`expires_at_ms <= now_ms`, claimed or not), count the unclaimed
+    /// ones of the invite and all outstanding ones of the tenant, and insert `nonce_hash` unless
     /// either count is at its cap ([`QuotaWrite::Full`] with that count).
     /// A hash already present is [`QuotaWrite::Lost`].
     ///
@@ -166,12 +167,14 @@ impl crate::SqliteStore {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        let (per_invite, total): (i64, i64) =
-            sqlx::query_as("SELECT COALESCE(SUM(invite_id = ?), 0), COUNT(*) FROM invite_nonce")
-                .bind(&nonce.invite_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db)?;
+        let (per_invite, total): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(invite_id = ? AND claimed_at_ms IS NULL), 0), COUNT(*) \
+             FROM invite_nonce",
+        )
+        .bind(&nonce.invite_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
         if let Some(refused) = full(per_invite.cast_unsigned(), total.cast_unsigned(), caps) {
             tx.commit().await.map_err(db)?;
             return Ok(refused);

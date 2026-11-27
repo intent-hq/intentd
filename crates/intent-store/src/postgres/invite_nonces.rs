@@ -29,8 +29,8 @@ impl PgStore {
             .await
             .map_err(db)?;
         let (per_invite, total): (i64, i64) = sqlx::query_as(
-            "SELECT count(*) FILTER (WHERE invite_id = $2), count(*) FROM invite_nonce \
-             WHERE tenant_id = $1",
+            "SELECT count(*) FILTER (WHERE invite_id = $2 AND claimed_at_ms IS NULL), count(*) \
+             FROM invite_nonce WHERE tenant_id = $1",
         )
         .bind(self.tenant())
         .bind(&nonce.invite_id)

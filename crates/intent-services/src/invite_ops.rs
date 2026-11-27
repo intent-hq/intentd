@@ -99,6 +99,31 @@ fn unix_ms(at: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// A claimed nonce the prove has not settled yet: dropped while armed (the
+/// prove's future was cancelled), it spends the nonce in the background.
+struct ClaimedNonce {
+    /// `Some` while armed.
+    store: Option<intent_store::Store>,
+    key: String,
+}
+
+impl Drop for ClaimedNonce {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let key = std::mem::take(&mut self.key);
+        runtime.spawn(async move {
+            if let Err(e) = store.delete_invite_nonce(&key).await {
+                tracing::warn!(error = %e, "invite.prove: could not spend a cancelled prove's nonce");
+            }
+        });
+    }
+}
+
 /// What [`Services::verify_invite_proof`] checks a claimed nonce's proof
 /// with.
 struct VerifyProof<'a> {
@@ -888,9 +913,11 @@ impl Services {
     }
 
     /// `invite.challenge`: see
-    /// [`intent_core::WorkspaceApi::invite_challenge`]. The nonce takes a
-    /// daemon-wide permit and counts against the invite's outstanding
-    /// nonces; either bound spent is [`InviteErrorKind::FlowBusy`].
+    /// [`intent_core::WorkspaceApi::invite_challenge`]. The nonce is a row,
+    /// counted under the tenant's quota lock against the tenant's
+    /// ([`MAX_OUTSTANDING_NONCES`]) and the invite's
+    /// ([`MAX_NONCES_PER_INVITE`]) outstanding nonces; either bound spent is
+    /// [`InviteErrorKind::FlowBusy`].
     pub(crate) async fn invite_challenge_op(
         &self,
         invite_id: &str,
@@ -1027,6 +1054,13 @@ impl Services {
         else {
             return Err(Error::Invite(InviteErrorKind::ProofInvalid));
         };
+        // A prove dropped mid-verdict (the client went away) spends the
+        // nonce, as dropping its slot did, rather than holding it claimed
+        // until it expires.
+        let mut claimed = ClaimedNonce {
+            store: Some(self.store.clone()),
+            key: key.clone(),
+        };
         let mut retry = false;
         let verdict = self
             .verify_invite_proof(VerifyProof {
@@ -1050,6 +1084,7 @@ impl Services {
         } else {
             self.store.delete_invite_nonce(&key).await
         };
+        claimed.store = None;
         if let Err(e) = settled {
             tracing::warn!(error = %e, retry, "invite.prove: could not settle the nonce");
         }

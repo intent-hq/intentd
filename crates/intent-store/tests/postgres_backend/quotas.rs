@@ -77,7 +77,14 @@ parity_test!(invite_nonces_issue_under_caps_and_claim_once, |store| {
     assert_eq!(
         issue("h5", "inv-c", NOW).await,
         QuotaWrite::Full { active: 3 },
-        "a claimed nonce still counts"
+        "a claimed nonce still counts against the tenant"
+    );
+    // ...but not against its invite (a prove holds it, as before rows).
+    store.delete_invite_nonce("h4").await.unwrap();
+    assert_eq!(
+        issue("h7", "inv-a", NOW).await,
+        QuotaWrite::Written,
+        "inv-a has one unclaimed nonce left of two"
     );
     // Released, it can be claimed again; spent, it is gone.
     store.release_invite_nonce("h1").await.unwrap();

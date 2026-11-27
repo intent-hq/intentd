@@ -358,8 +358,23 @@ impl Services {
             #[cfg(test)]
             self.monitor_write_ready();
             let mut write = self.store.prepare_monitor_insert(&monitor, &target).await?;
-            self.admit_monitor_write(&mut write, agent).await?;
-            authority.commit(self, write).await?.then_some(monitor)
+            match self.monitor_quota_refusal(&mut write, agent).await? {
+                None => authority.commit(self, write).await?.then_some(monitor),
+                Some(refusal) => {
+                    drop(write);
+                    // A concurrent register of this same PR for this agent
+                    // (a retry on another process) took the last slot: that
+                    // is the lost-race answer, not a cap refusal.
+                    let winner = self
+                        .store
+                        .find_active_qualified_pr_monitor_in_workspace(workspace, &target)
+                        .await?;
+                    if winner.is_none_or(|w| w.monitor().agent_id != *agent) {
+                        return Err(refusal);
+                    }
+                    None
+                }
+            }
         }
         .ok_or_else(|| {
             Error::InvalidParams("pr.monitor: registration changed concurrently; retry".into())
@@ -391,18 +406,18 @@ impl Services {
     }
 
     /// Admit a prepared write that makes `agent` own one more active monitor
-    /// under its quota, in the write's own transaction; at the cap the write
-    /// is dropped (rolled back) and the registration refused.
-    async fn admit_monitor_write(
+    /// under its quota, in the write's own transaction. At the cap, the
+    /// refusal to return once the caller dropped (rolled back) the write.
+    async fn monitor_quota_refusal(
         &self,
         write: &mut intent_store::PreparedMonitorWrite,
         agent: &AgentId,
-    ) -> Result<()> {
+    ) -> Result<Option<Error>> {
         let cap = self.pr_monitor_max_per_agent();
-        match write.admit_under_quota(agent, u64::from(cap)).await? {
-            None => Ok(()),
-            Some(active) => Err(crate::pr_monitor::pr_monitor_cap_error(active, cap)),
-        }
+        Ok(write
+            .admit_under_quota(agent, u64::from(cap))
+            .await?
+            .map(|active| crate::pr_monitor::pr_monitor_cap_error(active, cap)))
     }
 
     /// Qualified deferred registrations retain their private binding even with
@@ -432,7 +447,9 @@ impl Services {
             .await?;
         if expected.monitor().agent_id != *agent {
             // An ownership transfer counts against the adopter's quota.
-            self.admit_monitor_write(&mut write, agent).await?;
+            if let Some(refusal) = self.monitor_quota_refusal(&mut write, agent).await? {
+                return Err(refusal);
+            }
         }
         if !authority.commit(self, write).await? {
             return Ok(None);

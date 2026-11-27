@@ -478,6 +478,9 @@ impl Store {
     /// # Errors
     /// Returns `InvalidParams` for inconsistent data and `Internal` on database failure.
     /// A uniqueness conflict returns `Ok(false)` without changing the existing owner.
+    ///
+    /// Not quota-checked: a registration that gives an agent one more active
+    /// monitor uses [`Store::insert_qualified_pr_monitor_within_quota`].
     pub async fn insert_qualified_pr_monitor(
         &self,
         m: &PrMonitor,
@@ -1574,6 +1577,9 @@ impl Store {
     /// `from_agent_id`, so two siblings adopting concurrently cannot both
     /// win. Returns `false` when the guard fails. `last_error` composes
     /// against the row like the poll write-back.
+    ///
+    /// Not quota-checked, and no service path calls it: an adoption goes
+    /// through [`Store::rearm_legacy_pr_monitor_within_quota`].
     ///
     /// # Errors
     ///

@@ -180,6 +180,44 @@ async fn two_processes_never_register_past_the_agent_cap() {
     assert_eq!(active_monitors(&store_b, &owner).await, 1);
 }
 
+/// Both processes register the SAME PR for the agent with one slot left (a
+/// retry landing on another process): one inserts the monitor, the other
+/// counts it at the cap but re-arms that same monitor, as on one process,
+/// instead of being refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_registering_one_pr_at_the_cap_share_its_monitor() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant("quota-same-pr");
+    let store_a = open(&pool, &tenant, "process-a").await;
+    let store_b = open(&pool, &tenant, "process-b").await;
+    let owner = AgentId::from("agent-quota");
+    let ws = seed(&store_a, &owner).await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = monitor_quota(&dir, 1);
+    let (a, park_a) = process(store_a, &settings);
+    let (b, park_b) = process(store_b.clone(), &settings);
+
+    let run_a = tokio::spawn({
+        let (ws, owner) = (ws.clone(), owner.clone());
+        async move { a.pr_monitor_register(&ws, &owner, "o", "r", 1).await }
+    });
+    let run_b = tokio::spawn({
+        let (ws, owner) = (ws.clone(), owner.clone());
+        async move { b.pr_monitor_register(&ws, &owner, "o", "r", 1).await }
+    });
+    parked(&park_a).await;
+    parked(&park_b).await;
+    park_a.release.notify_one();
+    park_b.release.notify_one();
+    let (left, right) = (run_a.await.unwrap(), run_b.await.unwrap());
+    let (left, right) = (
+        left.expect("process A registers"),
+        right.expect("process B re-arms, not refused"),
+    );
+    assert_eq!(left.0.monitor_id, right.0.monitor_id, "one monitor");
+    assert_eq!(active_monitors(&store_b, &owner).await, 1);
+}
+
 /// One process adopts an orphaned monitor for the agent while the other
 /// registers a new PR for it, with one slot left: an adoption counts
 /// against the adopter's cap in the same write, so only one lands.
@@ -261,6 +299,13 @@ async fn an_adoption_and_a_registration_never_pass_the_agent_cap() {
     assert_eq!(active_monitors(&store_b, &owner).await, 1);
 }
 
+/// One `invite.challenge` on `svc`; the preview is dropped.
+async fn challenge(svc: &Services, id: &str, secret: &str) -> intent_core::Result<()> {
+    svc.invite_challenge(id.into(), secret.into(), InviteScope::Workspace)
+        .await
+        .map(drop)
+}
+
 /// Issue challenges on one invite from both processes: they share the
 /// invite's outstanding-nonce cap, so the second process is refused once
 /// the first spent it, and a nonce one process issued is seen by the other.
@@ -282,17 +327,15 @@ async fn two_processes_share_the_invite_nonce_cap() {
     .expect("create the invite");
     let id = created["invite"]["id"].as_str().unwrap().to_string();
     let secret = created["secret"].as_str().unwrap().to_string();
-    async fn challenge(svc: &Services, id: &str, secret: &str) -> intent_core::Result<()> {
-        svc.invite_challenge(id.into(), secret.into(), InviteScope::Workspace)
-            .await
-            .map(drop)
-    }
     let mut issued = 0;
     while challenge(&a, &id, &secret).await.is_ok() {
         issued += 1;
         assert!(issued <= 64, "process A's challenges are capped");
     }
-    assert!(issued > 0);
+    assert_eq!(
+        issued, 8,
+        "process A issues the invite's MAX_NONCES_PER_INVITE"
+    );
     assert!(
         matches!(
             challenge(&b, &id, &secret).await,

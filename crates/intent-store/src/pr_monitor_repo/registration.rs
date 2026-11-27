@@ -21,6 +21,9 @@ impl Store {
     /// # Errors
     /// Returns invalid parameters for incompatible provenance/identity, or a
     /// database error. A concurrent lifecycle/identity change returns false.
+    ///
+    /// Not quota-checked: an adoption (`owner` differs from the row's) goes
+    /// through [`Store::rearm_legacy_pr_monitor_within_quota`].
     pub async fn rearm_legacy_pr_monitor(
         &self,
         expected: &PrMonitor,

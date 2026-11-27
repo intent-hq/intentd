@@ -3152,8 +3152,25 @@ impl Services {
                 {
                     QuotaWrite::Written => Some(m),
                     QuotaWrite::Lost => None,
+                    // A concurrent register of this same PR for this agent
+                    // (a retry on another process) took the last slot: that
+                    // is not a new monitor, so fall through and re-arm it,
+                    // as a lost insert race does.
                     QuotaWrite::Full { active } => {
-                        return Err(pr_monitor_cap_error(active, cap));
+                        if self
+                            .store
+                            .find_active_pr_monitor(
+                                agent_id,
+                                repo_owner,
+                                repo_name,
+                                pr_number.cast_signed(),
+                            )
+                            .await?
+                            .is_none()
+                        {
+                            return Err(pr_monitor_cap_error(active, cap));
+                        }
+                        None
                     }
                 }
             };
