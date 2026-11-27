@@ -796,8 +796,10 @@ async fn stopped_host_with_workspace(
     (dir, store, ws_id, primary.id)
 }
 
-/// Boot again on `dir` and wait for the restarted daemon's startup profile
-/// refresh to reach the forge, so it stays out of a test's forge-call count.
+/// Boot again on `dir` and wait for the restarted daemon's first forge
+/// request — the one `GET /user` identity refresh per process, which
+/// `boot_in`'s settle loop triggers through `principal.me` — so it stays out
+/// of the test's forge-call count.
 async fn reboot(dir: tempfile::TempDir, mock: &MockForge) -> Host {
     let before = mock.requests.load(Ordering::SeqCst);
     let host = boot_in(dir, mock, OWNER_FORGE).await;
@@ -805,13 +807,13 @@ async fn reboot(dir: tempfile::TempDir, mock: &MockForge) -> Host {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             while mock.requests.load(Ordering::SeqCst) == before {
-                // timing-guard: wait for the restarted daemon's startup refresh request
+                // timing-guard: wait for the restarted daemon's identity refresh request
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         },
     )
     .await
-    .expect("restarted daemon's startup profile refresh");
+    .expect("restarted daemon's identity refresh");
     host
 }
 

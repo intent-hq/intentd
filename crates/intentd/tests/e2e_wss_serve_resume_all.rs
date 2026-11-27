@@ -358,9 +358,10 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
 
     eprintln!("Killing daemon1 to simulate interruption");
     drop(daemon1); // Kill daemon1
-                   // Manually insert an interrupted_agent row (simulating daemon crash)
-                   // now that daemon1 is dead: a second writer racing a live daemon fails
-                   // at random with "database is locked".
+
+    // Manually insert an interrupted_agent row (simulating daemon crash)
+    // now that daemon1 is dead: a second writer racing a live daemon fails
+    // at random with "database is locked".
     {
         use intent_core::{now_iso, AgentId, WorkspaceId};
         use intent_store::Store;

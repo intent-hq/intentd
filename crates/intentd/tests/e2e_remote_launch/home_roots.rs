@@ -183,6 +183,11 @@ async fn a_submodule_root_of_a_workspace_with_a_home_runs_on_the_home() {
         if response.get("error").is_none() {
             break;
         }
+        // Only a home still unbound is retried; any other error fails now.
+        assert_eq!(
+            response["error"]["data"]["code"], "home-unavailable",
+            "{response}"
+        );
         assert!(
             tokio::time::Instant::now() < deadline,
             "the home never came back: {response}"

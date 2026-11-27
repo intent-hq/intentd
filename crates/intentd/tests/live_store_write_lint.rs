@@ -14,32 +14,41 @@
 //! The heuristic, per function in `crates/intentd/tests/**` (each top-level
 //! test module — `X.rs` plus `X/` — is analysed together with `common/`):
 //!
-//! - **Daemon handles.** A statement that spawns (`GuardedChild::spawn(`,
-//!   `spawn_guarded(`, `DaemonGuard::new(` / `::process_only(`, `.spawn()` in a
-//!   function that builds an `intentd serve` command, or a call to a helper
-//!   that leaves a daemon running) makes its `let` binding — or the receiver
-//!   of a method-call statement — a live handle. A later `let` whose
+//! - **Daemon handles.** A statement that spawns (`DaemonGuard::new(` /
+//!   `::process_only(`; `GuardedChild::spawn(`, `spawn_guarded(` or
+//!   `.spawn()` in a function that calls a hermetic serve builder or a helper
+//!   returning a serve `Command`, or holds a `"serve"` literal; or a call to a
+//!   helper that leaves a daemon running) makes its `let` binding — or the
+//!   receiver of a method-call statement — a live handle. A later `let` whose
 //!   initializer names a handle aliases it (`let daemon = Daemon { child }`).
-//!   A handle stops at `drop(handle)`, at a statement naming it that calls
-//!   `kill` / `kill_tree` / `wait` / `try_wait` / a signal / a helper that
-//!   stops a daemon, or when its block ends.
+//!   A handle stops at `drop(handle)`, at a statement naming it that kills or
+//!   reaps it (`kill` without a graceful signal, `kill_tree`, `wait`,
+//!   `wait_with_output`, `SIGKILL`, `await_wss_stopped`, or
+//!   `wait_with_timeout` whose statement also unwraps the `Option`) or calls
+//!   a helper that does, or when its block ends. `try_wait`, a timed wait that
+//!   may have returned `Ok(None)`, and a `SIGTERM` / `SIGINT` / `SIGHUP` alone
+//!   do not stop it: the daemon may still be writing.
 //! - **Store writes.** `let s = Store::open(…)` (or `open_for_daemon`, or a
 //!   helper returning a `Store`) and a `Store`-typed parameter are store
 //!   bindings; `s.method(` is a write unless `method` reads (`get_*`,
 //!   `list_*`, `count_*`, …, see [`is_read_method`]). A call to a helper that
 //!   writes the store (transitively) is a write too.
 //! - A write while any handle is live fails, naming `file:line` and the
-//!   method or helper.
+//!   method or helper. So does a malformed marker, or one that excuses no
+//!   live write (stale).
 //!
 //! This is not name resolution or control-flow analysis: helpers are matched
 //! by name within the module, handles passed between functions or held in
 //! fields, writes through fields, and loops that restart a daemon are outside
-//! the contract. A write that provably cannot race (the daemon is known to
-//! be stopped by other means, the running daemon owns another data dir, or
-//! the test injects a fault into the live daemon on purpose) opts out with
-//! `// live-store-write: allow — <reason>` on the line above the write or its
-//! statement (or trailing either), or on the line above the `let` that opens
-//! the store, which covers every write through that binding.
+//! the contract. A write opts out with `// live-store-write: allow —
+//! <reason>` on the line above the write or its statement (or trailing
+//! either), or on the line above the `let` that opens the store, which covers
+//! every write through that binding, only when it cannot race (the daemon is
+//! stopped by other means, or the one still running owns another data dir) or
+//! when the test needs state behind a live daemon that no RPC can produce (a
+//! fault, a revoked row, an Owner role) and the write either retries busy
+//! upgrades (`with_write_txn_retry`) or is one autocommit statement, so the
+//! test's own side waits instead of failing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -78,20 +87,42 @@ const READ_NAMES: &[&str] = &[
     "script_notification_jobs",
 ];
 /// Calls that end a daemon handle when a statement naming the handle makes
-/// them.
+/// them: a kill or a reap. `try_wait` only probes, and a graceful signal
+/// (`SIGTERM` / `SIGINT` / `SIGHUP`) leaves the daemon writing while it shuts
+/// down, so a `kill` sending one does not count; a later reap does.
 const STOP_PRIMITIVES: &[&str] = &[
     "kill",
     "kill_tree",
     "wait",
-    "try_wait",
     "wait_with_output",
     "wait_with_timeout",
-    "SIGTERM",
     "SIGKILL",
-    "SIGINT",
     "await_wss_stopped",
     "await_wss_stopped_logged",
 ];
+const GRACEFUL_SIGNALS: &[&str] = &["SIGTERM", "SIGINT", "SIGHUP"];
+
+/// Whether `tokens[k]` stops a daemon within the statement `range`.
+fn is_stop(tokens: &[Token], k: usize, range: (usize, usize)) -> bool {
+    let t = &tokens[k];
+    if !STOP_PRIMITIVES.contains(&t.text.as_str())
+        || (k > 0 && tokens[k - 1].is("fn"))
+        || !tokens.get(k + 1).is_some_and(|n| n.is("(")) && !t.is("SIGKILL")
+    {
+        return false;
+    }
+    if t.is("wait_with_timeout") {
+        // `Ok(None)` is a timeout with the daemon still running: only a
+        // statement that also unwraps the `Option` establishes the exit.
+        let close = matching_close(tokens, k + 1).unwrap_or(k + 1);
+        return (close + 1..range.1)
+            .filter(|&j| tokens[j].is("unwrap") || tokens[j].is("expect"))
+            .count()
+            >= 2;
+    }
+    !t.is("kill")
+        || !(range.0..range.1).any(|j| GRACEFUL_SIGNALS.contains(&tokens[j].text.as_str()))
+}
 
 /// Whether a store method only reads.
 fn is_read_method(name: &str) -> bool {
@@ -139,15 +170,31 @@ impl Source {
         &lits[a..b]
     }
 
-    fn allowed(&self, line: usize) -> bool {
-        self.lexed.line_comments.iter().any(|c| {
-            let adjacent = if c.standalone {
-                c.line + 1 == line
-            } else {
-                c.line == line
-            };
-            adjacent && classify_marker(&c.text, TAG) == Marker::WithReason
-        })
+    /// The line of the well-formed marker covering `line`: a standalone
+    /// marker on the line above, or one trailing `line`.
+    fn marker(&self, line: usize) -> Option<usize> {
+        self.lexed
+            .line_comments
+            .iter()
+            .find(|c| {
+                let adjacent = if c.standalone {
+                    c.line + 1 == line
+                } else {
+                    c.line == line
+                };
+                adjacent && classify_marker(&c.text, TAG) == Marker::WithReason
+            })
+            .map(|c| c.line)
+    }
+
+    /// Lines of every marker in the file, well-formed or not.
+    fn markers(&self) -> Vec<(usize, Marker)> {
+        self.lexed
+            .line_comments
+            .iter()
+            .map(|c| (c.line, classify_marker(&c.text, TAG)))
+            .filter(|(_, m)| *m != Marker::Absent)
+            .collect()
     }
 }
 
@@ -256,6 +303,8 @@ struct Ctx {
     /// Per named-field struct: each field and whether its type holds a
     /// daemon.
     structs: BTreeMap<String, Vec<(String, bool)>>,
+    /// The `impl` types defining a method of each name, for `.name(` calls.
+    methods: BTreeMap<String, Vec<String>>,
 }
 
 /// The entries of `map` for the call whose name token is `tokens[i]`,
@@ -267,6 +316,7 @@ fn resolve<'m, V>(
     tokens: &[Token],
     i: usize,
     own_impl: Option<&str>,
+    methods: &BTreeMap<String, Vec<String>>,
     map: &'m BTreeMap<Key, V>,
 ) -> Vec<&'m V> {
     if !tokens[i].is_ident() || !tokens.get(i + 1).is_some_and(|t| t.is("(")) {
@@ -274,10 +324,11 @@ fn resolve<'m, V>(
     }
     let name = &tokens[i].text;
     match i.checked_sub(1).map(|k| tokens[k].text.as_str()) {
-        Some(".") => map
-            .iter()
-            .filter(|((ty, n), _)| ty.is_some() && n == name)
-            .map(|(_, v)| v)
+        Some(".") => methods
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|ty| map.get(&(Some(ty.clone()), name.clone())))
             .collect(),
         Some("::") => {
             let owner = &tokens[i - 2].text;
@@ -295,7 +346,7 @@ fn resolve<'m, V>(
 }
 
 fn call_effects(tokens: &[Token], i: usize, own_impl: Option<&str>, ctx: &Ctx) -> Effects {
-    resolve(tokens, i, own_impl, &ctx.effects)
+    resolve(tokens, i, own_impl, &ctx.methods, &ctx.effects)
         .into_iter()
         .fold(Effects::default(), |acc, e| Effects {
             spawns: acc.spawns || e.spawns,
@@ -375,6 +426,8 @@ struct Hit {
 struct Analysis {
     effects: Effects,
     hits: Vec<Hit>,
+    /// Lines of the markers that excused a live write.
+    used: BTreeSet<usize>,
 }
 
 /// A named binding with the depth of the `let` that made it.
@@ -382,8 +435,8 @@ struct Analysis {
 struct Binding {
     name: Option<String>,
     depth: usize,
-    /// A store binding whose `let` carries the opt-out marker.
-    allowed: bool,
+    /// The line of the opt-out marker on a store binding's `let`.
+    marker: Option<usize>,
 }
 
 /// A process spawn at `tokens[i]`. Child-process spawns count only in a
@@ -485,12 +538,20 @@ fn moved_handles(tokens: &[Token], range: (usize, usize), names: &[Binding]) -> 
         .collect()
 }
 
-/// Whether a helper body stops a daemon: a kill or signal, or dropping a
-/// field of `self`.
+/// Whether a helper body stops a daemon: a kill or reap (a bare `wait` is
+/// too common to count here), or dropping a field of `self`.
 fn body_stops(tokens: &[Token], (open, close): (usize, usize)) -> bool {
     (open + 1..close).any(|j| {
         let t = &tokens[j];
-        (STOP_PRIMITIVES.contains(&t.text.as_str()) && !t.is("wait") && !t.is("try_wait"))
+        (!t.is("wait")
+            && is_stop(
+                tokens,
+                j,
+                (
+                    statement_start(tokens, j, open),
+                    statement_end(tokens, j, close),
+                ),
+            ))
             || (t.is("drop")
                 && tokens.get(j + 1).is_some_and(|n| n.is("("))
                 && tokens.get(j + 2).is_some_and(|n| n.is("self")))
@@ -506,14 +567,23 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
     let mut out = Analysis::default();
     let mut escapes = false;
     let mut spawned_at: Option<usize> = None;
-    let serve = builds_serve(src, f, ctx);
+    let calls: Vec<Effects> = (open..=close)
+        .map(|k| call_effects(tokens, k, own_impl, ctx))
+        .collect();
+    let serve = builds_serve(src, f, &calls);
+    let spawns_at: Vec<bool> = (open..=close)
+        .map(|k| is_spawn_primitive(tokens, k, serve) || calls[k - open].spawns)
+        .collect();
+    let opens_at: Vec<bool> = (open..=close)
+        .map(|k| opens_store_primitive(tokens, k) || calls[k - open].opens_store)
+        .collect();
 
     for (p_name, ty_has_store) in store_params(tokens, f.params) {
         if ty_has_store {
             stores.push(Binding {
                 name: Some(p_name),
                 depth: tokens[open].depth + 1,
-                allowed: false,
+                marker: None,
             });
         }
     }
@@ -530,9 +600,14 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
         if t.is("let") {
             pending.push((statement_end(tokens, k, close), k));
         }
-        let call = call_effects(tokens, k, own_impl, ctx);
-        let is_spawn = is_spawn_primitive(tokens, k, serve) || call.spawns;
-        if is_spawn {
+        if t.is("return")
+            && !handles.is_empty()
+            && !mentions(tokens, (k, statement_end(tokens, k, close)), &handles).is_empty()
+        {
+            escapes = true;
+        }
+        let call = calls[k - open];
+        if spawns_at[k - open] {
             spawned_at.get_or_insert(k);
             if !pending.iter().any(|(end, l)| *l < k && k < *end) {
                 let start = statement_start(tokens, k, open);
@@ -548,18 +623,22 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
                 handles.push(Binding {
                     name: receiver,
                     depth: tokens[start].depth,
-                    allowed: false,
+                    marker: None,
                 });
             }
         } else if !handles.is_empty() {
-            let stop_call = (t.is("drop") && tokens.get(k + 1).is_some_and(|n| n.is("(")))
+            let candidate = (t.is("drop") && tokens.get(k + 1).is_some_and(|n| n.is("(")))
                 || STOP_PRIMITIVES.contains(&t.text.as_str())
                 || call.stops;
-            if stop_call {
-                let range = (
+            let range = candidate.then(|| {
+                (
                     statement_start(tokens, k, open),
                     statement_end(tokens, k, close),
-                );
+                )
+            });
+            if let Some(range) =
+                range.filter(|&range| t.is("drop") || call.stops || is_stop(tokens, k, range))
+            {
                 let named = mentions(tokens, range, &handles);
                 handles.retain(|b| !b.name.as_ref().is_some_and(|n| named.contains(n)));
             }
@@ -594,13 +673,18 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
         };
         if let Some(what) = write {
             out.effects.writes = true;
-            let statement_line = tokens[statement_start(tokens, k, open)].line;
-            if !handles.is_empty()
-                && !src.allowed(t.line)
-                && !src.allowed(statement_line)
-                && !receiver.is_some_and(|b| b.allowed)
-            {
-                out.hits.push(Hit { line: t.line, what });
+            if !handles.is_empty() {
+                let statement_line = tokens[statement_start(tokens, k, open)].line;
+                match src
+                    .marker(t.line)
+                    .or_else(|| src.marker(statement_line))
+                    .or_else(|| receiver.and_then(|b| b.marker))
+                {
+                    Some(marker) => {
+                        out.used.insert(marker);
+                    }
+                    None => out.hits.push(Hit { line: t.line, what }),
+                }
             }
         }
         // Close every `let` ending here: bind handles, aliases and stores.
@@ -611,33 +695,22 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
             pending.pop();
             let depth = tokens[l].depth;
             let (handle_names, store_names) = let_bindings(tokens, l, end, own_impl, ctx);
-            let spawned_inside = (l..end).any(|j| {
-                is_spawn_primitive(tokens, j, serve)
-                    || call_effects(tokens, j, own_impl, ctx).spawns
-            });
+            let spawned_inside = spawns_at[l - open..end - open].contains(&true);
             let moved = moved_handles(tokens, (l + 1, end), &handles);
             if spawned_inside || !moved.is_empty() {
                 handles.retain(|b| !b.name.as_ref().is_some_and(|n| moved.contains(n)));
                 handles.extend(handle_names.into_iter().map(|name| Binding {
                     name: Some(name),
                     depth,
-                    allowed: false,
+                    marker: None,
                 }));
             }
-            let opens = (l..end).any(|j| {
-                let t = &tokens[j];
-                ((t.is("open") || t.is("open_for_daemon"))
-                    && j >= 2
-                    && tokens[j - 1].is("::")
-                    && tokens[j - 2].is("Store"))
-                    || call_effects(tokens, j, own_impl, ctx).opens_store
-            });
-            if opens {
-                let allowed = src.allowed(tokens[l].line);
+            if opens_at[l - open..end - open].contains(&true) {
+                let marker = src.marker(tokens[l].line);
                 stores.extend(store_names.into_iter().map(|name| Binding {
                     name: Some(name),
                     depth,
-                    allowed,
+                    marker,
                 }));
             }
         }
@@ -645,17 +718,9 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
     }
 
     // A daemon outlives the function when an anonymous or `self` handle is
-    // live, or a named one is returned (tail expression or `return`).
+    // live, a `return` hands one back, or the tail expression names one.
     let tail_start = statement_start(tokens, close, open);
-    let returned = |name: &str| {
-        (tail_start..close).any(|j| tokens[j].is(name))
-            || (open + 1..close).any(|j| {
-                tokens[j].is("return") && {
-                    let end = statement_end(tokens, j, close);
-                    (j..end).any(|m| tokens[m].is(name))
-                }
-            })
-    };
+    let returned = |name: &str| (tail_start..close).any(|j| tokens[j].is(name));
     out.effects.spawns = spawned_at.is_some()
         && (escapes
             || handles
@@ -665,25 +730,29 @@ fn analyse(src: &Source, f: &FnItem, ctx: &Ctx) -> Analysis {
     let ret = &tokens[f.ret.0..f.ret.1];
     out.effects.serve_command = serve && ret.iter().any(|t| t.is("Command"));
     out.effects.opens_store = ret.iter().any(|t| t.is("Store"))
-        && (open + 1..close).any(|j| {
-            (tokens[j].is("open") || tokens[j].is("open_for_daemon"))
-                && j >= 2
-                && tokens[j - 2].is("Store")
-        });
+        && (open + 1..close).any(|j| opens_store_primitive(tokens, j));
     out
+}
+
+/// `Store::open(` / `Store::open_for_daemon(` at `tokens[j]`.
+fn opens_store_primitive(tokens: &[Token], j: usize) -> bool {
+    (tokens[j].is("open") || tokens[j].is("open_for_daemon"))
+        && j >= 2
+        && tokens[j - 1].is("::")
+        && tokens[j - 2].is("Store")
 }
 
 /// Whether the body of `f` builds an `intentd serve` command: it calls a
 /// hermetic serve builder or a helper returning a serve command, or holds a
 /// `"serve"` literal.
-fn builds_serve(src: &Source, f: &FnItem, ctx: &Ctx) -> bool {
+fn builds_serve(src: &Source, f: &FnItem, calls: &[Effects]) -> bool {
     let tokens = &src.tokens;
     let (open, close) = f.body;
     let (from, to) = (tokens[open].start, tokens[close].start);
     (open + 1..close).any(|j| {
         tokens[j].is("hermetic_serve_command")
             || tokens[j].is("hermetic_serve_command_fixed_port")
-            || call_effects(tokens, j, f.impl_ty.as_deref(), ctx).serve_command
+            || calls[j - open].serve_command
     }) || src.literals_in(from, to).iter().any(|l| l.text == "serve")
 }
 
@@ -752,6 +821,16 @@ fn module_types(sources: &[&Source]) -> Ctx {
     }
     for src in sources {
         for f in &src.fns {
+            if let Some(ty) = &f.impl_ty {
+                ctx.methods
+                    .entry(f.name.clone())
+                    .or_default()
+                    .push(ty.clone());
+            }
+        }
+    }
+    for src in sources {
+        for f in &src.fns {
             let tokens = &src.tokens;
             let Some(open) = (f.ret.0..f.ret.1).find(|&k| tokens[k].is("(")) else {
                 continue;
@@ -805,7 +884,11 @@ fn let_bindings(
             .collect();
         let ret = eq.and_then(|eq| {
             (eq + 1..end)
-                .find_map(|k| resolve(tokens, k, own_impl, &ctx.rets).into_iter().next())
+                .find_map(|k| {
+                    resolve(tokens, k, own_impl, &ctx.methods, &ctx.rets)
+                        .into_iter()
+                        .next()
+                })
                 .filter(|ret| ret.len() == elements.len())
         });
         if let Some(ret) = ret {
@@ -843,15 +926,14 @@ fn let_bindings(
     }
 }
 
-/// Live-store-write hits of one module (its files plus `common/`), as
-/// `(file, hit)` for the module's own files.
-fn module_hits(sources: &[&Source], own: &[&str]) -> Vec<(String, Hit)> {
-    let mut ctx = module_types(sources);
+/// One round of the effects fixed point over `sources`, on top of `base`
+/// (the effects of `common/`, already settled).
+fn settle_effects(sources: &[&Source], ctx: &mut Ctx, base: &BTreeMap<Key, Effects>) {
     for _ in 0..8 {
-        let mut next: BTreeMap<Key, Effects> = BTreeMap::new();
+        let mut next = base.clone();
         for src in sources {
             for f in &src.fns {
-                let e = analyse(src, f, &ctx).effects;
+                let e = analyse(src, f, ctx).effects;
                 let slot = next.entry((f.impl_ty.clone(), f.name.clone())).or_default();
                 slot.spawns |= e.spawns;
                 slot.stops |= e.stops;
@@ -861,18 +943,56 @@ fn module_hits(sources: &[&Source], own: &[&str]) -> Vec<(String, Hit)> {
             }
         }
         if next == ctx.effects {
-            break;
+            return;
         }
         ctx.effects = next;
     }
+}
+
+/// The settled effects of `common/`'s own functions.
+fn common_effects(common: &[&Source]) -> BTreeMap<Key, Effects> {
+    let mut ctx = module_types(common);
+    settle_effects(common, &mut ctx, &BTreeMap::new());
+    ctx.effects
+}
+
+/// Offenders in the module's own files `own` (`sources` also holds
+/// `common/`, whose effects are `base`), as `(file, line, what)`: live
+/// writes, and markers that are malformed or excuse no live write.
+fn module_hits(
+    sources: &[&Source],
+    own: &[&Source],
+    base: &BTreeMap<Key, Effects>,
+) -> Vec<(String, usize, String)> {
+    let mut ctx = module_types(sources);
+    ctx.effects = base.clone();
+    settle_effects(own, &mut ctx, base);
     let mut out = Vec::new();
-    for src in sources.iter().filter(|s| own.contains(&s.rel.as_str())) {
+    for src in own {
         let mut seen = BTreeSet::new();
+        let mut used = BTreeSet::new();
         for f in &src.fns {
-            for hit in analyse(src, f, &ctx).hits {
+            let analysis = analyse(src, f, &ctx);
+            used.extend(analysis.used);
+            for hit in analysis.hits {
                 if seen.insert(hit.line) {
-                    out.push((src.rel.clone(), hit));
+                    out.push((src.rel.clone(), hit.line, hit.what));
                 }
+            }
+        }
+        for (line, marker) in src.markers() {
+            if marker == Marker::Malformed {
+                out.push((
+                    src.rel.clone(),
+                    line,
+                    "malformed marker: needs a reason".into(),
+                ));
+            } else if !used.contains(&line) {
+                out.push((
+                    src.rel.clone(),
+                    line,
+                    "stale marker: excuses no live write".into(),
+                ));
             }
         }
     }
@@ -909,14 +1029,16 @@ fn scan(root: &Path) -> (usize, Vec<String>) {
             .push(Source::new(rel, &text));
     }
     let common = modules.remove("common").unwrap_or_default();
+    let common: Vec<&Source> = common.iter().collect();
+    let base = common_effects(&common);
     let mut scanned = common.len();
     let mut offenders = Vec::new();
     for files in modules.values() {
         scanned += files.len();
-        let own: Vec<&str> = files.iter().map(|s| s.rel.as_str()).collect();
-        let sources: Vec<&Source> = files.iter().chain(common.iter()).collect();
-        for (rel, hit) in module_hits(&sources, &own) {
-            offenders.push(format!("{rel}:{} ({})", hit.line, hit.what));
+        let own: Vec<&Source> = files.iter().collect();
+        let sources: Vec<&Source> = own.iter().chain(common.iter()).copied().collect();
+        for (rel, line, what) in module_hits(&sources, &own, &base) {
+            offenders.push(format!("{rel}:{line} ({what})"));
         }
     }
     offenders.sort();
@@ -947,9 +1069,9 @@ fn tests_do_not_write_the_store_of_a_live_daemon() {
 #[cfg(test)]
 fn hits_of(src: &str) -> Vec<(usize, String)> {
     let source = Source::new("t.rs".into(), src);
-    module_hits(&[&source], &["t.rs"])
+    module_hits(&[&source], &[&source], &BTreeMap::new())
         .into_iter()
-        .map(|(_, h)| (h.line, h.what))
+        .map(|(_, line, what)| (line, what))
         .collect()
 }
 
@@ -1045,7 +1167,7 @@ async fn t(fixture: &mut Fixture) {
         let _d = spawn_guarded(&mut cmd).unwrap();
     }
     let mut child = GuardedChild::spawn(&mut cmd).unwrap();
-    let status = child.wait_with_timeout(limit).unwrap();
+    let status = child.wait_with_timeout(limit).unwrap().expect(\"exited\");
     let s = Store::open(&db).await.unwrap();
     s.insert_agent(&a).await.unwrap();
     fixture.start();
@@ -1097,6 +1219,7 @@ async fn t(d: &Path) {
             (20, "seed_dir()".to_owned()),
             (23, "seed_dir()".to_owned()),
             (27, "store.insert_note".to_owned()),
+            (23, "malformed marker: needs a reason".to_owned()),
         ]
     );
 }
@@ -1165,6 +1288,80 @@ async fn t(d: &Path) {
         vec![
             (9, "other.insert_note".to_owned()),
             (16, "other.delete_note".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn probes_and_graceful_signals_do_not_stop_a_daemon() {
+    let src = "\
+async fn t(d: &Path, s: &Store) {
+    let mut cmd = common::hermetic_serve_command(d);
+    let mut daemon = GuardedChild::spawn(&mut cmd).unwrap();
+    assert!(daemon.try_wait().unwrap().is_none());
+    s.insert_note(&n).await.unwrap();
+    signal::kill(Pid::from_raw(daemon.id()), Signal::SIGTERM).unwrap();
+    s.insert_note(&n).await.unwrap();
+    let timed_out = daemon.wait_with_timeout(limit).unwrap();
+    s.insert_note(&n).await.unwrap();
+    daemon.wait().unwrap();
+    s.insert_note(&n).await.unwrap();
+}
+";
+    assert_eq!(
+        hits_of(src),
+        vec![
+            (5, "s.insert_note".to_owned()),
+            (7, "s.insert_note".to_owned()),
+            (9, "s.insert_note".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn resolves_self_returns_store_helpers_and_pragmas() {
+    let src = "\
+struct Fixture { child: Option<GuardedChild> }
+impl Fixture {
+    fn boot(&mut self) {
+        let mut cmd = common::hermetic_serve_command(&self.dir);
+        let child = GuardedChild::spawn(&mut cmd).unwrap();
+        if self.keep { return child; }
+        drop(child);
+    }
+    async fn run(&mut self) {
+        let s = open_db(&self.dir).await;
+        let daemon = Self::boot(self);
+        s.set_setting(&k).await.unwrap();
+        sqlx::query(\"PRAGMA wal_checkpoint\").execute(s.write_pool()).await.unwrap();
+    }
+}
+async fn open_db(dir: &Path) -> Store {
+    Store::open(&dir.join(\"intentd.db\")).await.unwrap()
+}
+";
+    assert_eq!(hits_of(src), vec![(12, "s.set_setting".to_owned())]);
+}
+
+#[test]
+fn a_marker_that_excuses_nothing_is_stale() {
+    let src = "\
+async fn t(d: &Path, s: &Store) {
+    // live-store-write: allow — no daemon runs here
+    s.insert_note(&n).await.unwrap();
+    let mut cmd = common::hermetic_serve_command(d);
+    let _daemon = GuardedChild::spawn(&mut cmd).unwrap();
+    // live-store-write: allow — the test injects a fault on purpose
+    s.insert_note(&n).await.unwrap();
+    // live-store-write: allow — nothing below writes
+    s.get_note(&n).await.unwrap();
+}
+";
+    assert_eq!(
+        hits_of(src),
+        vec![
+            (2, "stale marker: excuses no live write".to_owned()),
+            (8, "stale marker: excuses no live write".to_owned()),
         ]
     );
 }
