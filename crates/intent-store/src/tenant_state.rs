@@ -120,7 +120,9 @@ impl crate::Store {
     pub async fn move_tenant_state(&self, to: TenantState) -> Result<TenantStateMove> {
         match &self.backend {
             #[cfg(feature = "postgres")]
-            crate::Backend::Postgres(store) => store.move_state(to).await,
+            crate::Backend::Postgres(store) => {
+                crate::postgres::boxed_call(|| store.move_state(to)).await
+            }
             crate::Backend::Sqlite(_) => Ok(sqlite_move()),
         }
     }
@@ -137,7 +139,9 @@ impl crate::Store {
     pub async fn tenant_state(&self) -> Result<TenantState> {
         match &self.backend {
             #[cfg(feature = "postgres")]
-            crate::Backend::Postgres(store) => store.read_state().await,
+            crate::Backend::Postgres(store) => {
+                crate::postgres::boxed_call(|| store.read_state()).await
+            }
             crate::Backend::Sqlite(_) => Ok(TenantState::Open),
         }
     }
