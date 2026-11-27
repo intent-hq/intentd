@@ -1661,8 +1661,9 @@ fn configure_params(extra: Value) -> Value {
 /// its event connection ([`agent_events`]) right before the step that
 /// waits for an event.
 ///
-/// Fields drop in order: the backend and its connection go before the fake,
-/// which owns the scratch dir the backend's data dir is in.
+/// Its `Drop` stops the backend before the fake, which owns the scratch dir
+/// the backend's data dir is in, goes. A test borrows its fields: moving
+/// one out is a compile error (E0509), so none can drop early or late.
 struct CloudBackend {
     repo: std::path::PathBuf,
     head_dir: std::path::PathBuf,
@@ -1748,6 +1749,12 @@ impl CloudBackend {
     }
 }
 
+impl Drop for CloudBackend {
+    fn drop(&mut self) {
+        let _ = self.head.kill_tree();
+    }
+}
+
 /// The run cap (50 settings minutes) with a minute of 100 ms. A test with
 /// that minute that does not test the run cap sets it past its end
 /// ([`NO_RUN_CAP`]): a planned pause may come at any idle moment after it,
@@ -1765,7 +1772,6 @@ const NO_RUN_CAP: &str = "864000";
 /// state instead of reading it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_is_paused_and_resumed_before_the_run_cap() {
-    // Fields are borrowed, so the backend drops whole, in its field order.
     let Some(mut backend) =
         CloudBackend::start("itd-e2bcap-", &[("INTENTD_E2B_MINUTE_MS", "100")]).await
     else {
@@ -2280,22 +2286,22 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
 /// and retrying the prompt starts a new sandbox from that work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
-    let Some(CloudBackend {
+    let Some(mut backend) = CloudBackend::start("itd-e2bu-", &[]).await else {
+        return;
+    };
+    let CloudBackend {
         repo,
         fake,
         head_dir,
-        head: _head,
         port,
         cfg,
         ws_id,
         keyed_ref,
-        mut rpc_ws,
-    }) = CloudBackend::start("itd-e2bu-", &[]).await
-    else {
-        return;
-    };
+        rpc_ws,
+        ..
+    } = &mut backend;
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         5,
         "agent.create",
         json!({
@@ -2306,13 +2312,13 @@ async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
-    send_and_reply(&mut rpc_ws, agent, "before the update", 10).await;
-    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+    send_and_reply(rpc_ws, agent, "before the update", 10).await;
+    let machine = machine_until(rpc_ws, 20, "sbx1", |m| m.is_some())
         .await
         .unwrap();
     let sandbox_port = u16::try_from(machine["port"].as_u64().unwrap()).unwrap();
     let paused = ok(
-        &mut rpc_ws,
+        rpc_ws,
         30,
         "cloudMachines.pause",
         json!({ "machineId": machine["id"] }),
@@ -2321,17 +2327,17 @@ async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
     assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
     let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
     let pushed = (
-        try_rev(&repo, &format!("{refs}/head")),
-        try_rev(&repo, &format!("{refs}/wip")),
+        try_rev(repo, &format!("{refs}/head")),
+        try_rev(repo, &format!("{refs}/wip")),
     );
 
     // The backend was updated past the sandbox's link protocol.
     fake.state()
         .outdated
         .insert("sbx1".to_owned(), sandbox_port);
-    let mut events = agent_events(port, cfg.clone(), &ws_id).await;
+    let mut events = agent_events(*port, cfg.clone(), ws_id).await;
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         40,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "after the update" }),
@@ -2343,19 +2349,19 @@ async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
         failed.contains("next message starts a new sandbox"),
         "{failed}"
     );
-    machine_until(&mut rpc_ws, 50, "sbx1", |m| m.is_none()).await;
-    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+    machine_until(rpc_ws, 50, "sbx1", |m| m.is_none()).await;
+    call_until(fake, rpc_ws, "sbx1", |calls| {
         calls
             .iter()
             .any(|c| is_call(c, "DELETE", "/sandboxes/sbx1"))
     })
     .await;
-    let sandboxless = agent_until(&mut rpc_ws, agent, 100, |a| a.get("nodeId").is_none()).await;
+    let sandboxless = agent_until(rpc_ws, agent, 100, |a| a.get("nodeId").is_none()).await;
     assert_eq!(sandboxless["placement"]["target"], "e2b", "{sandboxless}");
     assert_eq!(
         (
-            try_rev(&repo, &format!("{refs}/head")),
-            try_rev(&repo, &format!("{refs}/wip")),
+            try_rev(repo, &format!("{refs}/head")),
+            try_rev(repo, &format!("{refs}/wip")),
         ),
         pushed,
         "the agent keeps the work it pushed"
@@ -2363,15 +2369,15 @@ async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
 
     // Retrying the prompt starts a new sandbox.
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         200,
         "agent.retry",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    reply_containing(&mut rpc_ws, agent, "after the update", 201).await;
-    machine_until(&mut rpc_ws, 300, "sbx2", |m| m.is_some()).await;
-    assert_no_secret_logged(&head_dir, &fake);
+    reply_containing(rpc_ws, agent, "after the update", 201).await;
+    machine_until(rpc_ws, 300, "sbx2", |m| m.is_some()).await;
+    assert_no_secret_logged(head_dir, fake);
 }
 
 /// What the agent echoes of its prompt after `content`, once it replied.
@@ -2406,22 +2412,20 @@ async fn retire_and_restore(
 /// the same paused sandbox and its later turns get none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
-    let Some(CloudBackend {
+    let Some(mut backend) = CloudBackend::start("itd-e2bn-", &[]).await else {
+        return;
+    };
+    let CloudBackend {
         repo,
         fake,
         head_dir,
-        head: _head,
-        port: _,
-        cfg: _,
         ws_id,
         keyed_ref,
-        mut rpc_ws,
-    }) = CloudBackend::start("itd-e2bn-", &[]).await
-    else {
-        return;
-    };
+        rpc_ws,
+        ..
+    } = &mut backend;
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         5,
         "agent.create",
         json!({
@@ -2433,7 +2437,7 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         6,
         "agent.create",
         json!({ "workspaceId": ws_id, "name": "Keeper", "model": "default", "provider": keyed_ref }),
@@ -2441,28 +2445,28 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     .await;
 
     // The first launch: no notice.
-    let first = echoed(&mut rpc_ws, agent, "first launch", 10).await;
+    let first = echoed(rpc_ws, agent, "first launch", 10).await;
     assert!(!first.contains(NOTICE), "{first}");
-    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+    let machine = machine_until(rpc_ws, 20, "sbx1", |m| m.is_some())
         .await
         .unwrap();
 
     // The same sandbox, paused and resumed: no notice.
     let paused = ok(
-        &mut rpc_ws,
+        rpc_ws,
         30,
         "cloudMachines.pause",
         json!({ "machineId": machine["id"] }),
     )
     .await;
     assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
-    let resumed = echoed(&mut rpc_ws, agent, "after the pause", 40).await;
+    let resumed = echoed(rpc_ws, agent, "after the pause", 40).await;
     assert!(!resumed.contains(NOTICE), "{resumed}");
 
     // Retired then restored: a new sandbox, one notice naming it.
-    retire_and_restore(&mut rpc_ws, agent, "sbx1", 100).await;
-    let moved = echoed(&mut rpc_ws, agent, "after restore one", 700).await;
-    let second = machine_until(&mut rpc_ws, 710, "sbx2", |m| m.is_some())
+    retire_and_restore(rpc_ws, agent, "sbx1", 100).await;
+    let moved = echoed(rpc_ws, agent, "after restore one", 700).await;
+    let second = machine_until(rpc_ws, 710, "sbx2", |m| m.is_some())
         .await
         .unwrap();
     let name = second["name"].as_str().unwrap();
@@ -2472,17 +2476,17 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     );
     assert!(moved.contains("Re-run any setup you need"), "{moved}");
     assert_eq!(moved.matches("Note from Intent").count(), 1, "{moved}");
-    let later = echoed(&mut rpc_ws, agent, "a later turn", 800).await;
+    let later = echoed(rpc_ws, agent, "a later turn", 800).await;
     assert!(!later.contains(NOTICE), "{later}");
 
     // Saved work that does not apply on the new machine: still one notice,
     // which names the new machine and where the work is kept.
-    retire_and_restore(&mut rpc_ws, agent, "sbx2", 900).await;
+    retire_and_restore(rpc_ws, agent, "sbx2", 900).await;
     let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
-    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let base = git(repo, &["rev-parse", "HEAD"]);
     let scratch_tree = fake.scratch().join("conflict");
     git(
-        &repo,
+        repo,
         &[
             "worktree",
             "add",
@@ -2500,10 +2504,10 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     };
     let wip = commit("wip\n");
     let saved_head = commit("head\n");
-    git(&repo, &["update-ref", &format!("{refs}/wip"), &wip]);
-    git(&repo, &["update-ref", &format!("{refs}/head"), &saved_head]);
+    git(repo, &["update-ref", &format!("{refs}/wip"), &wip]);
+    git(repo, &["update-ref", &format!("{refs}/head"), &saved_head]);
     git(
-        &repo,
+        repo,
         &[
             "worktree",
             "remove",
@@ -2511,8 +2515,8 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
             scratch_tree.to_str().unwrap(),
         ],
     );
-    let combined = echoed(&mut rpc_ws, agent, "after restore two", 1600).await;
-    let third = machine_until(&mut rpc_ws, 1610, "sbx3", |m| m.is_some())
+    let combined = echoed(rpc_ws, agent, "after restore two", 1600).await;
+    let third = machine_until(rpc_ws, 1610, "sbx3", |m| m.is_some())
         .await
         .unwrap();
     let name = third["name"].as_str().unwrap();
@@ -2529,11 +2533,8 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
         1,
         "{combined}"
     );
-    assert_eq!(
-        try_rev(&repo, &format!("{refs}/unapplied/{wip}")),
-        Some(wip)
-    );
-    assert_no_secret_logged(&head_dir, &fake);
+    assert_eq!(try_rev(repo, &format!("{refs}/unapplied/{wip}")), Some(wip));
+    assert_no_secret_logged(head_dir, fake);
 }
 
 /// No E2B key, envd token, executor token or profile secret in the

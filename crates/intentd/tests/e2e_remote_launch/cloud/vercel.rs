@@ -296,17 +296,29 @@ async fn refused(rpc_ws: &mut common::TlsWs, id: i64, method: &str, params: Valu
 }
 
 /// A backend against a fake Vercel, with one settings minute of 100 ms,
-/// and an API-key profile. `None` (the test skips) without node or git.
-async fn backend(
-    prefix: &str,
-) -> Option<(
-    FakeVercel,
-    common::DaemonGuard,
-    String,
-    String,
-    common::TlsWs,
-    (u16, Arc<ClientConfig>),
-)> {
+/// an API-key profile (`keyed_ref`) and one connection for calls.
+///
+/// Its `Drop` stops the backend before the fake, which owns the scratch dir
+/// the backend's data dir is in, goes. A test borrows its fields: moving
+/// one out is a compile error (E0509), so none can drop early or late.
+struct VercelBackend {
+    head: common::DaemonGuard,
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    ws_id: String,
+    keyed_ref: String,
+    rpc_ws: common::TlsWs,
+    fake: FakeVercel,
+}
+
+impl Drop for VercelBackend {
+    fn drop(&mut self) {
+        let _ = self.head.kill_tree();
+    }
+}
+
+/// `None` (the test skips) without node or git on PATH.
+async fn backend(prefix: &str) -> Option<VercelBackend> {
     if intent_providers::resolve_on_path("node").is_none()
         || intent_providers::resolve_on_path("git").is_none()
     {
@@ -357,7 +369,15 @@ async fn backend(
     )
     .await;
     let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
-    Some((fake, head, ws_id, keyed_ref, rpc_ws, (port, cfg)))
+    Some(VercelBackend {
+        head,
+        port,
+        cfg,
+        ws_id,
+        keyed_ref,
+        rpc_ws,
+        fake,
+    })
 }
 
 /// Configure refusals, before anything is saved.
@@ -449,15 +469,22 @@ async fn configure_refusals(fake: &FakeVercel, rpc_ws: &mut common::TlsWs) {
 /// The life of one agent on a Vercel sandbox.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
-    let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws, _)) = backend("itd-vc-").await else {
+    let Some(mut backend) = backend("itd-vc-").await else {
         return;
     };
+    let VercelBackend {
+        ws_id,
+        keyed_ref,
+        rpc_ws,
+        fake,
+        ..
+    } = &mut backend;
     let head_dir = fake.scratch.path().join("head");
     let image = format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION"));
-    configure_refusals(&fake, &mut rpc_ws).await;
+    configure_refusals(fake, rpc_ws).await;
 
     let saved = ok(
-        &mut rpc_ws,
+        rpc_ws,
         50,
         "cloudMachines.configure",
         vercel_params(&json!({ "size": "2x4", "idlePauseMinutes": 1440 })),
@@ -486,7 +513,7 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     // and no smaller size in its place.
     fake.api().max_vcpus = 1;
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         60,
         "agent.create",
         json!({
@@ -500,7 +527,7 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
         created["agent"]["placement"]["cloudMachineId"],
         entry.as_str()
     );
-    let failed = agent_until(&mut rpc_ws, (ws_id.as_str(), small.as_str()), 61, |a| {
+    let failed = agent_until(rpc_ws, (ws_id.as_str(), small.as_str()), 61, |a| {
         a.get("placementError").is_some()
     })
     .await;
@@ -512,7 +539,7 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
 
     // An agent starts on a new persistent sandbox of the entry.
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         70,
         "agent.create",
         json!({
@@ -523,10 +550,10 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
-    let first = echoed(&mut rpc_ws, agent, "first turn", 71).await;
+    let first = echoed(rpc_ws, agent, "first turn", 71).await;
     assert!(!first.contains(DISK_NOTICE), "{first}");
     let name = fake.only_sandbox().unwrap();
-    let machine = machine_until(&mut rpc_ws, 80, &name, |m| m.is_some())
+    let machine = machine_until(rpc_ws, 80, &name, |m| m.is_some())
         .await
         .unwrap();
     let machine_id = machine["id"].as_str().unwrap().to_owned();
@@ -553,7 +580,7 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     fake.api().sandbox_mut(&name).unwrap().session.timeout = 60_000;
     timeout(common::test_timeout(Duration::from_secs(30)), async {
         while fake.count("/extend-timeout") == 0 {
-            keep_alive(&mut rpc_ws).await;
+            keep_alive(rpc_ws).await;
             // timing-guard: poll interval for the renewal (every 10 minutes = 1 s)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -574,7 +601,7 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
         while fake.session_of(&name) == before
             || fake.api().sandbox(&name).unwrap().session.status != "running"
         {
-            keep_alive(&mut rpc_ws).await;
+            keep_alive(rpc_ws).await;
             // timing-guard: poll interval for the planned stop and resume
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -582,24 +609,24 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     .await
     .expect("the backend stops and resumes a capped session");
     fake.api().max_session_ms = intent_nodes::vercel::fake_api::PRO_MAX_SESSION_MS;
-    machine_until(&mut rpc_ws, 90, &name, |m| {
+    machine_until(rpc_ws, 90, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "running")
     })
     .await;
-    let capped = echoed(&mut rpc_ws, agent, "after the cap", 95).await;
+    let capped = echoed(rpc_ws, agent, "after the cap", 95).await;
     assert!(capped.contains(DISK_NOTICE), "{capped}");
     assert_eq!(capped.matches("Note from Intent").count(), 1, "{capped}");
 
     // Idle: it stops; a message resumes it from the disk, the
     // conversation kept, and the agent told once.
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         100,
         "cloudMachines.configure",
         json!({ "cloudMachineId": entry, "idlePauseMinutes": 1 }),
     )
     .await;
-    machine_until(&mut rpc_ws, 101, &name, |m| {
+    machine_until(rpc_ws, 101, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })
     .await;
@@ -610,18 +637,18 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
         assert!(sandbox.snapshot.is_some());
     }
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         110,
         "cloudMachines.configure",
         json!({ "cloudMachineId": entry, "idlePauseMinutes": 1440 }),
     )
     .await;
-    let resumed = echoed(&mut rpc_ws, agent, "after the stop", 111).await;
+    let resumed = echoed(rpc_ws, agent, "after the stop", 111).await;
     assert!(resumed.contains(DISK_NOTICE), "{resumed}");
     assert_eq!(resumed.matches("Note from Intent").count(), 1, "{resumed}");
-    let recalled = echoed(&mut rpc_ws, agent, "recall first turn", 115).await;
+    let recalled = echoed(rpc_ws, agent, "recall first turn", 115).await;
     assert!(recalled.contains("recall first turn: yes"), "{recalled}");
-    let same = machine_until(&mut rpc_ws, 120, &name, |m| m.is_some())
+    let same = machine_until(rpc_ws, 120, &name, |m| m.is_some())
         .await
         .unwrap();
     assert_eq!(
@@ -634,23 +661,23 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
     // resumed on demand.
     let before = fake.session_of(&name);
     fake.api().time_out(&name);
-    machine_until(&mut rpc_ws, 130, &name, |m| {
+    machine_until(rpc_ws, 130, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused") || fake.session_of(&name) != before
     })
     .await;
-    let back = echoed(&mut rpc_ws, agent, "after the timeout", 140).await;
+    let back = echoed(rpc_ws, agent, "after the timeout", 140).await;
     assert!(back.contains(DISK_NOTICE), "{back}");
 
     // Removing the entry with its agents deletes the sandbox.
     let removed = ok(
-        &mut rpc_ws,
+        rpc_ws,
         150,
         "cloudMachines.remove",
         json!({ "cloudMachineId": entry, "stopAgents": true }),
     )
     .await;
     assert_eq!(removed["ok"], true, "{removed}");
-    machine_until(&mut rpc_ws, 151, &name, |m| m.is_none()).await;
+    machine_until(rpc_ws, 151, &name, |m| m.is_none()).await;
     assert!(fake.api().sandboxes.is_empty());
     let delete = fake
         .server
@@ -693,11 +720,18 @@ async fn an_agent_on_a_vercel_sandbox_stops_resumes_from_disk_and_is_removed() {
 /// "Could not reach … on any of its routes" (intent#9825).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_whose_relay_does_not_answer_says_so() {
-    let Some((fake, _head, ws_id, keyed_ref, mut rpc_ws, (port, cfg))) =
-        backend("itd-vc-relay-").await
-    else {
+    let Some(mut backend) = backend("itd-vc-relay-").await else {
         return;
     };
+    let VercelBackend {
+        port,
+        cfg,
+        ws_id,
+        keyed_ref,
+        rpc_ws,
+        fake,
+        ..
+    } = &mut backend;
     let tailcat = super::relay::write_logging_tailcat(fake.scratch.path());
     fake.host.extra_env.lock().unwrap().extend([
         (
@@ -714,16 +748,16 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
         ),
     ]);
     let relay = fake_relay().await;
-    super::relay::set_relay(&mut rpc_ws, 10, &relay.url).await;
+    super::relay::set_relay(rpc_ws, 10, &relay.url).await;
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         11,
         "cloudMachines.configure",
         vercel_params(&json!({ "size": "2x4", "idlePauseMinutes": 1440 })),
     )
     .await;
     let created = ok(
-        &mut rpc_ws,
+        rpc_ws,
         20,
         "agent.create",
         json!({
@@ -734,14 +768,14 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     echoed(
-        &mut rpc_ws,
+        rpc_ws,
         (ws_id.as_str(), agent_id.as_str()),
         "first turn",
         21,
     )
     .await;
     let name = fake.only_sandbox().unwrap();
-    let machine = machine_until(&mut rpc_ws, 30, &name, |m| m.is_some())
+    let machine = machine_until(rpc_ws, 30, &name, |m| m.is_some())
         .await
         .unwrap();
     assert_eq!(
@@ -750,23 +784,23 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
         "{machine}"
     );
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         40,
         "cloudMachines.pause",
         json!({ "machineId": machine["id"] }),
     )
     .await;
-    machine_until(&mut rpc_ws, 41, &name, |m| {
+    machine_until(rpc_ws, 41, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })
     .await;
 
     let silent = silent_relay_url().await;
-    super::relay::set_relay(&mut rpc_ws, 50, &silent).await;
+    super::relay::set_relay(rpc_ws, 50, &silent).await;
     let resumes = fake.host.machines().resumes;
-    let mut events = agent_events(port, cfg, &ws_id).await;
+    let mut events = agent_events(*port, cfg.clone(), ws_id).await;
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         51,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "over a silent relay" }),
@@ -776,13 +810,13 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
     assert!(failure.contains("never falls back"), "{failure}");
     assert!(!failure.contains("any of its routes"), "{failure}");
     drop(events);
-    idle(&mut rpc_ws, Duration::from_secs(15)).await;
+    idle(rpc_ws, Duration::from_secs(15)).await;
     assert_eq!(
         fake.host.machines().resumes - resumes,
         1,
         "one message resumed the sandbox more than once"
     );
-    machine_until(&mut rpc_ws, 60, &name, |m| {
+    machine_until(rpc_ws, 60, &name, |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })
     .await;
@@ -794,13 +828,14 @@ async fn a_resume_whose_relay_does_not_answer_says_so() {
 /// alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reaper_deletes_this_backends_leftover_vercel_sandboxes() {
-    let Some((fake, _head, _ws_id, _keyed, mut rpc_ws, _)) = backend("itd-vc-reap-").await else {
+    let Some(mut backend) = backend("itd-vc-reap-").await else {
         return;
     };
-    let backend_info = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
+    let VercelBackend { rpc_ws, fake, .. } = &mut backend;
+    let backend_info = ok(rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend_info["backendId"].as_str().unwrap().to_owned();
     ok(
-        &mut rpc_ws,
+        rpc_ws,
         4,
         "cloudMachines.configure",
         vercel_params(&json!({ "size": "2x4" })),
@@ -829,7 +864,7 @@ async fn the_reaper_deletes_this_backends_leftover_vercel_sandboxes() {
     seed("another-backend", "intent-theirs00001");
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         while fake.api().sandbox("intent-leftover0001").is_some() {
-            keep_alive(&mut rpc_ws).await;
+            keep_alive(rpc_ws).await;
             // timing-guard: poll interval for the reaper (every 10 minutes = 1 s)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
