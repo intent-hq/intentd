@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.11.307"
+version = "0.11.308"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

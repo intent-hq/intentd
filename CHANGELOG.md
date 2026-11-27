@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.308] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- *(cloud)* Stop the E2B lifecycle test racing the run cap and a stale supervisor row ([#3817](https://github.com/intent-hq/intentd/pull/3817))
+
+### 🔧 Refactor
+
+- *(providers)* Reserve Codex INITIAL_AGENT_MODE through its profile spec ([#3816](https://github.com/intent-hq/intentd/pull/3816))
+
+
 ## [0.11.307] - 2026-11-26
 
 ### 📚 Documentation
