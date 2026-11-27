@@ -26,15 +26,22 @@
 //!   crash once they are a few minutes old, even when retention is disabled.
 //! - Reads stream the file and hold at most the requested lines (plus one line
 //!   at a time), never the whole log.
+//! - Every byte of a run has a stream position that never goes back within
+//!   one store (one daemon boot): compaction drops bytes without moving the
+//!   kept ones, a reopened run continues where it stopped, and output that
+//!   could not be saved still advances the count. All writers of a run share
+//!   one state, and a cursor read takes its bytes and positions under that
+//!   state's lock, so they always agree.
 //! - IDs are percent-encoded into a single safe path segment, so no ID can
 //!   name `.`/`..` or contain a separator and escape the root. Symlinks below
 //!   the root are never followed: a symlinked folder or log is an error (the
 //!   root itself may be a symlink, e.g. a relocated data dir).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use intent_core::blob::{BlobFile, BlobKey, BlobKind, BlobStorage, LocalBlobStorage};
@@ -71,6 +78,54 @@ pub(crate) struct TailText {
     pub total_lines: usize,
 }
 
+/// A run log's newest bytes with their stream positions (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CursorTail {
+    /// The raw log bytes at `[start, end)`.
+    pub bytes: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+    /// Position of the oldest byte the log keeps.
+    pub log_start: u64,
+    /// `split('\n')` line count of the whole log.
+    pub total_lines: usize,
+}
+
+/// One run's write state, shared by its writers and cursor reads.
+#[derive(Debug)]
+struct RunState {
+    file: Option<Box<dyn BlobFile>>,
+    /// Bytes in the log.
+    len: u64,
+    /// Stream position of the log's first byte (`base + len` is the end).
+    base: u64,
+    cap: u64,
+    retry: CompactionRetry,
+    writers: usize,
+}
+
+impl RunState {
+    fn new(cap: u64) -> Self {
+        Self {
+            file: None,
+            len: 0,
+            base: 0,
+            cap,
+            retry: CompactionRetry::default(),
+            writers: 0,
+        }
+    }
+}
+
+/// Run states by log key. Lock order: this map, then a run's state. An entry
+/// with no writer and `base == 0` is dropped, since a missing entry means
+/// exactly that.
+type Runs = Arc<Mutex<HashMap<BlobKey, Arc<Mutex<RunState>>>>>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Outcome of [`ScriptOutputStore::sweep`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SweepReport {
@@ -90,6 +145,7 @@ pub(crate) struct SweepReport {
 pub(crate) struct ScriptOutputStore {
     storage: Arc<dyn BlobStorage>,
     max_bytes_per_run: u64,
+    runs: Runs,
 }
 
 impl ScriptOutputStore {
@@ -109,6 +165,7 @@ impl ScriptOutputStore {
         Self {
             storage,
             max_bytes_per_run: max_bytes_per_run.max(1),
+            runs: Runs::default(),
         }
     }
 
@@ -192,7 +249,9 @@ impl ScriptOutputStore {
 
     /// Open (creating parents) the append writer for one run. Never fails: an
     /// invalid ID or disk error logs a warning and yields a disabled writer
-    /// whose appends are no-ops. Reopening an existing run's log appends to it.
+    /// whose appends are no-ops on disk but still advance the run's position.
+    /// Reopening an existing run's log appends to it and continues its
+    /// positions; writers open at the same time share one state.
     pub(crate) fn open_writer(
         &self,
         workspace_id: &str,
@@ -203,34 +262,55 @@ impl ScriptOutputStore {
             Ok(key) => key,
             Err(e) => {
                 tracing::warn!(workspace = %workspace_id, script = %script_id, run = %run_id, error = %e, "script output log disabled: invalid id");
-                return RunOutputWriter::disabled(
-                    Arc::clone(&self.storage),
-                    BlobKey::root(),
-                    PathBuf::new(),
-                    self.max_bytes_per_run,
-                );
+                let mut state = RunState::new(self.max_bytes_per_run);
+                state.writers = 1;
+                return RunOutputWriter {
+                    storage: Arc::clone(&self.storage),
+                    key: None,
+                    path: PathBuf::new(),
+                    state: Arc::new(Mutex::new(state)),
+                    runs: Arc::clone(&self.runs),
+                };
             }
         };
         let path = self.storage.display_path(&key);
-        match open_append(&*self.storage, &key, &path, self.max_bytes_per_run) {
-            Ok((file, len)) => RunOutputWriter {
-                storage: Arc::clone(&self.storage),
-                key,
-                path,
-                file: Some(file),
-                len,
-                cap: self.max_bytes_per_run,
-                retry: CompactionRetry::default(),
-            },
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "script output log disabled: open failed");
-                RunOutputWriter::disabled(
-                    Arc::clone(&self.storage),
-                    key,
-                    path,
-                    self.max_bytes_per_run,
-                )
+        let mut runs = lock(&self.runs);
+        let known = runs.contains_key(&key);
+        let state = Arc::clone(
+            runs.entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(RunState::new(self.max_bytes_per_run)))),
+        );
+        {
+            let mut s = lock(&state);
+            s.writers += 1;
+            s.cap = self.max_bytes_per_run;
+            if s.file.is_none() {
+                match open_append(&*self.storage, &key, &path, s.cap) {
+                    Ok((file, on_disk, len)) => {
+                        // The log on disk holds the newest bytes before the
+                        // run's end; positions in a new store count from 0.
+                        let base = if known {
+                            (s.base + s.len).saturating_sub(on_disk)
+                        } else {
+                            0
+                        };
+                        s.base = base + (on_disk - len);
+                        s.len = len;
+                        s.file = Some(file);
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "script output log disabled: open failed");
+                    }
+                }
             }
+        }
+        drop(runs);
+        RunOutputWriter {
+            storage: Arc::clone(&self.storage),
+            key: Some(key),
+            path,
+            state,
+            runs: Arc::clone(&self.runs),
         }
     }
 
@@ -288,6 +368,67 @@ impl ScriptOutputStore {
         Ok(Some(bytes))
     }
 
+    /// The newest `max_lines` lines (at least 1) of a run's log, cut to its
+    /// newest `max_bytes` bytes (starting after a newline when the cut lands
+    /// inside a line and the window holds one), with their stream positions;
+    /// `None` when the run has no log.
+    pub(crate) fn cursor_tail(
+        &self,
+        workspace_id: &str,
+        script_id: &str,
+        run_id: &str,
+        max_lines: usize,
+        max_bytes: u64,
+    ) -> Result<Option<CursorTail>> {
+        let key = Self::run_key(workspace_id, script_id, run_id)?;
+        let err = |e: io::Error| self.key_err(&key, &e);
+        let Some((mut file, base, len)) = self.positioned_read(&key).map_err(err)? else {
+            return Ok(None);
+        };
+        let file = &mut *file;
+        let cut = tail_cut(file, len, max_lines.max(1)).map_err(err)?;
+        let bytes = if len - cut > max_bytes {
+            newest_bytes_at_line_start(file, len, max_bytes).map_err(err)?
+        } else {
+            file.seek(SeekFrom::Start(cut)).map_err(err)?;
+            let mut bytes = Vec::new();
+            (&mut *file)
+                .take(len - cut)
+                .read_to_end(&mut bytes)
+                .map_err(err)?;
+            bytes
+        };
+        file.seek(SeekFrom::Start(0)).map_err(err)?;
+        let total_lines = count_newlines(&mut (&mut *file).take(len)).map_err(err)? + 1;
+        Ok(Some(CursorTail {
+            start: base + len - bytes.len() as u64,
+            end: base + len,
+            log_start: base,
+            total_lines,
+            bytes,
+        }))
+    }
+
+    /// Open a run's log with the stream position of its first byte and the
+    /// length to read, taken atomically with the run's writes.
+    fn positioned_read(&self, key: &BlobKey) -> io::Result<Option<(Box<dyn BlobFile>, u64, u64)>> {
+        // Held throughout, so no writer opens (or reopens) the run meanwhile.
+        let runs = lock(&self.runs);
+        let Some(state) = runs.get(key) else {
+            let Some(file) = self.storage.open_read(key)? else {
+                return Ok(None);
+            };
+            let len = file.len()?;
+            return Ok(Some((file, 0, len)));
+        };
+        let s = lock(state);
+        let Some(file) = self.storage.open_read(key)? else {
+            return Ok(None);
+        };
+        let len = s.len.min(file.len()?);
+        Ok(Some((file, s.base + s.len - len, len)))
+    }
+
     /// The newest→oldest `{ items, nextToken }` page of a run's log lines —
     /// identical to [`intent_services::feature_api::pagination::paginate_text_lines`] over the whole
     /// log, without loading it. A missing log yields an empty page.
@@ -322,6 +463,7 @@ impl ScriptOutputStore {
         run_id: &str,
     ) -> Result<()> {
         let key = Self::run_key(workspace_id, script_id, run_id)?;
+        self.forget(&key);
         self.storage
             .delete(&key)
             .map_err(|e| self.key_err(&key, &e))
@@ -330,6 +472,7 @@ impl ScriptOutputStore {
     /// Delete every log of one script. A missing folder is not an error.
     pub(crate) fn delete_script(&self, workspace_id: &str, script_id: &str) -> Result<()> {
         let key = Self::script_key(workspace_id, script_id)?;
+        self.forget(&key);
         self.storage
             .delete_prefix(&key)
             .map_err(|e| self.key_err(&key, &e))
@@ -338,6 +481,7 @@ impl ScriptOutputStore {
     /// Delete every log of one workspace. A missing folder is not an error.
     pub(crate) fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
         let key = Self::workspace_key(workspace_id)?;
+        self.forget(&key);
         self.storage
             .delete_prefix(&key)
             .map_err(|e| self.key_err(&key, &e))
@@ -402,7 +546,10 @@ impl ScriptOutputStore {
                         continue;
                     }
                     match self.storage.delete(&log_key) {
-                        Ok(()) => report.deleted += 1,
+                        Ok(()) => {
+                            self.forget(&log_key);
+                            report.deleted += 1;
+                        }
                         Err(e) => {
                             tracing::warn!(path = %self.storage.display_path(&log_key).display(), error = %e, "script output sweep: delete failed");
                             report.failed += 1;
@@ -416,6 +563,14 @@ impl ScriptOutputStore {
             }
         }
         report
+    }
+
+    /// Drop the positions of runs without writers at or under `prefix`: their
+    /// logs are going away.
+    fn forget(&self, prefix: &BlobKey) {
+        lock(&self.runs).retain(|key, state| {
+            !key.segments().starts_with(prefix.segments()) || lock(state).writers > 0
+        });
     }
 
     fn open_read(&self, key: &BlobKey) -> Result<Option<Box<dyn BlobFile>>> {
@@ -481,16 +636,15 @@ fn segment_key(parent: &BlobKey, segment: String) -> Result<BlobKey> {
 
 /// Append writer for one run's log. Every [`append`](Self::append) is written
 /// and flushed to the OS before it returns. Disk errors never propagate: the
-/// first one logs a warning and disables the writer.
+/// first one logs a warning and disables the run's log.
 #[derive(Debug)]
 pub(crate) struct RunOutputWriter {
     storage: Arc<dyn BlobStorage>,
-    key: BlobKey,
+    /// `None` for a writer disabled by an invalid ID.
+    key: Option<BlobKey>,
     path: PathBuf,
-    file: Option<Box<dyn BlobFile>>,
-    len: u64,
-    cap: u64,
-    retry: CompactionRetry,
+    state: Arc<Mutex<RunState>>,
+    runs: Runs,
 }
 
 /// Backoff state after a failed compaction (see [`write_capped`]).
@@ -504,18 +658,6 @@ struct CompactionRetry {
 }
 
 impl RunOutputWriter {
-    fn disabled(storage: Arc<dyn BlobStorage>, key: BlobKey, path: PathBuf, cap: u64) -> Self {
-        Self {
-            storage,
-            key,
-            path,
-            file: None,
-            len: 0,
-            cap,
-            retry: CompactionRetry::default(),
-        }
-    }
-
     /// The log path (empty for a writer disabled by an invalid ID).
     #[cfg_attr(
         not(test),
@@ -531,16 +673,23 @@ impl RunOutputWriter {
         expect(dead_code, reason = "wired by the script output cleanup change")
     )]
     pub(crate) fn is_enabled(&self) -> bool {
-        self.file.is_some()
+        lock(&self.state).file.is_some()
     }
 
-    /// The log's current size in bytes, as tracked by this writer.
+    /// The log's current size in bytes.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "wired by the script output cleanup change")
     )]
     pub(crate) fn len(&self) -> u64 {
-        self.len
+        lock(&self.state).len
+    }
+
+    /// The run's stream position after its last byte: where the next
+    /// appended chunk starts.
+    pub(crate) fn end(&self) -> u64 {
+        let s = lock(&self.state);
+        s.base + s.len
     }
 
     /// Append one output chunk, compacting first so the log never exceeds the
@@ -549,18 +698,37 @@ impl RunOutputWriter {
         if chunk.is_empty() {
             return;
         }
-        let Some(file) = self.file.as_mut() else {
+        let mut guard = lock(&self.state);
+        let s = &mut *guard;
+        let end = s.base + s.len + chunk.len() as u64;
+        if let (Some(file), Some(key)) = (s.file.as_mut(), self.key.as_ref()) {
+            let log = Log {
+                storage: &*self.storage,
+                key,
+                path: &self.path,
+            };
+            if let Err(e) = write_capped(log, file, &mut s.len, s.cap, &mut s.retry, chunk) {
+                tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
+                s.file = None;
+            }
+        }
+        s.base = end - s.len;
+    }
+}
+
+impl Drop for RunOutputWriter {
+    fn drop(&mut self) {
+        let Some(key) = &self.key else { return };
+        let mut runs = lock(&self.runs);
+        let mut s = lock(&self.state);
+        s.writers = s.writers.saturating_sub(1);
+        if s.writers > 0 {
             return;
-        };
-        let log = Log {
-            storage: &*self.storage,
-            key: &self.key,
-            path: &self.path,
-        };
-        let result = write_capped(log, file, &mut self.len, self.cap, &mut self.retry, chunk);
-        if let Err(e) = result {
-            tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
-            self.file = None;
+        }
+        s.file = None;
+        if s.base == 0 && runs.get(key).is_some_and(|r| Arc::ptr_eq(r, &self.state)) {
+            drop(s);
+            runs.remove(key);
         }
     }
 }
@@ -676,15 +844,17 @@ fn newest_bytes_at_line_start(
 }
 
 /// Open a run's log for append (creating folders, never through a symlink)
-/// and enforce `cap` on what is already there. Returns the file and its size.
+/// and enforce `cap` on what is already there. Returns the file, its size
+/// when opened, and its size after any compaction.
 fn open_append(
     storage: &dyn BlobStorage,
     key: &BlobKey,
     path: &Path,
     cap: u64,
-) -> io::Result<(Box<dyn BlobFile>, u64)> {
+) -> io::Result<(Box<dyn BlobFile>, u64, u64)> {
     let mut file = storage.open_append(key)?;
-    let mut len = file.len()?;
+    let on_disk = file.len()?;
+    let mut len = on_disk;
     if len > cap {
         // Reopened under a smaller cap: keep the newest bytes now.
         // If the replace fails the oversized log is kept; the writer retries
@@ -700,17 +870,26 @@ fn open_append(
             }
         }
     }
-    Ok((file, len))
+    Ok((file, on_disk, len))
 }
 
 /// The trailing `n` `'\n'`-delimited lines, read backwards in chunks.
 fn tail_lines(file: &mut dyn BlobFile, n: usize) -> io::Result<String> {
     let len = file.len()?;
+    let cut = tail_cut(file, len, n)?;
+    file.seek(SeekFrom::Start(cut))?;
+    let mut out = Vec::new();
+    file.take(len - cut).read_to_end(&mut out)?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Where the trailing `n` `'\n'`-delimited lines of the first `len` bytes
+/// start, scanning backwards in chunks.
+fn tail_cut(file: &mut dyn BlobFile, len: u64, n: usize) -> io::Result<u64> {
     let mut pos = len;
     let mut newlines = 0usize;
-    let mut cut = 0u64;
     let mut buf = vec![0u8; SCAN_CHUNK];
-    'scan: while pos > 0 {
+    while pos > 0 {
         let step = usize::try_from(pos.min(SCAN_CHUNK as u64)).expect("chunk fits in usize");
         pos -= step as u64;
         file.seek(SeekFrom::Start(pos))?;
@@ -719,19 +898,15 @@ fn tail_lines(file: &mut dyn BlobFile, n: usize) -> io::Result<String> {
             if buf[i] == b'\n' {
                 newlines += 1;
                 if newlines == n {
-                    cut = pos + i as u64 + 1;
-                    break 'scan;
+                    return Ok(pos + i as u64 + 1);
                 }
             }
         }
     }
-    file.seek(SeekFrom::Start(cut))?;
-    let mut out = Vec::new();
-    file.take(len - cut).read_to_end(&mut out)?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok(0)
 }
 
-fn count_newlines(file: &mut dyn BlobFile) -> io::Result<usize> {
+fn count_newlines(file: &mut (impl Read + ?Sized)) -> io::Result<usize> {
     let mut buf = vec![0u8; SCAN_CHUNK];
     let mut count = 0;
     loop {

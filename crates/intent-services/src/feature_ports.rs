@@ -437,6 +437,14 @@ pub trait RuntimePort: Send + Sync + 'static {
         page_token: Option<String>,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    fn script_output_cursor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
     fn script_status<'a>(
         &'a self,
         svc: &'a Services,
@@ -2247,6 +2255,16 @@ impl RuntimePort for UnavailableRuntime {
             paginate,
             page_token,
         )
+    }
+
+    fn script_output_cursor<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_output_cursor(workspace_id, script_id, max_lines)
     }
 
     fn script_status<'a>(

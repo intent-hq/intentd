@@ -6513,6 +6513,17 @@ async fn script_methods(
             let max_lines = opt_int(params, "maxLines");
             let paginate = params.get("paginate").and_then(Value::as_bool);
             let page_token = opt_str(params, "nextToken");
+            if params.get("cursor").and_then(Value::as_bool) == Some(true) {
+                if paginate == Some(true) || page_token.is_some() {
+                    return Err(invalid_params(
+                        "cursor cannot be combined with paginate or nextToken",
+                    ));
+                }
+                return api
+                    .script_output_cursor(ws, script_id, max_lines)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             api.script_output(ws, script_id, max_lines, paginate, page_token)
                 .await
                 .map_err(domain_to_rpc)

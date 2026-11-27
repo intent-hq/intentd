@@ -8808,6 +8808,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `script.output` with `cursor: true`: the latest run's newest log bytes
+    /// (base64) with their stream positions (PROTOCOL §5.8 output cursors).
+    /// Workspace-scoped.
+    fn script_output_cursor(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id, max_lines);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_output_cursor not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `script.status`: the script's [`ScriptRuntimeState`](crate::model::ScriptRuntimeState)
     /// (PROTOCOL §5.8). Workspace-scoped.
     fn script_status(

@@ -127,6 +127,8 @@ pub(crate) fn server_json(
     // Conversation goal (§5.5): the `goal` session field, `agent.setGoal`,
     // `interpretCommands` on sends and `goal_command` notice rows.
     capabilities["conversationGoal"] = json!(1);
+    // `script.output` `cursor: true` and positioned `script:output` (§5.8).
+    capabilities["scriptOutputCursor"] = json!(1);
     // Per-agent CoW sandboxes are retired (protocol 16).
     capabilities["agentIsolation"] = json!(2);
     let mut server = json!({

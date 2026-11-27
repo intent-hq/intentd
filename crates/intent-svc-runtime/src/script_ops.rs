@@ -24,7 +24,7 @@ use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
     ScriptStartedBy, ScriptStatus, WorkspaceId,
 };
-use intent_pty::{OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
+use intent_pty::{OutputChunk, OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
 use intent_services::feature_api::pagination::{
     tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
 };
@@ -112,6 +112,15 @@ const FULL_PAGE_MAX_BYTES: usize = 480_000;
 /// when one oversized row is fitted on its own.
 const LIST_ENVELOPE_RESERVE: usize = 1024;
 
+/// Where one PTY's output sits in its run's log: PTY byte `n` is run stream
+/// position `base + n` (the sink logs exactly the bytes the PTY fans out).
+#[derive(Debug, Clone)]
+struct OutputCursor {
+    pty: PtyId,
+    run: String,
+    base: u64,
+}
+
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
 ///
@@ -121,6 +130,8 @@ pub(crate) struct ManagedScript {
     state: ScriptRuntimeState,
     pty_id: Option<PtyId>,
     monitor_attempt: Option<PtyId>,
+    /// Stream position of the run log where `monitor_attempt`'s output starts.
+    output_cursor: Option<OutputCursor>,
     stopped_by_user: bool,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     /// Identity stamp assigned at every registry insertion and admitted run:
@@ -557,8 +568,14 @@ impl ScriptManager {
     }
 
     /// Open the run's on-disk log with the cap read live from settings, and
-    /// wrap it as a PTY output sink (written on the PTY reader thread).
-    async fn open_output_sink(&self, ws: &WorkspaceId, id: &str, run: &str) -> Option<OutputSink> {
+    /// wrap it as a PTY output sink (written on the PTY reader thread). Also
+    /// returns the run's stream position where the sink starts.
+    async fn open_output_sink(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        run: &str,
+    ) -> Option<(OutputSink, u64)> {
         if self.locks.is_closing(ws) {
             return None;
         }
@@ -572,7 +589,8 @@ impl ScriptManager {
             .await
             .inspect_err(|error| tracing::warn!(%error, "script output log open failed"))
             .ok()?;
-        Some(OutputSink::new(move |bytes| writer.append(bytes)))
+        let base = writer.end();
+        Some((OutputSink::new(move |bytes| writer.append(bytes)), base))
     }
 
     /// Release an exited script PTY session (its buffers and fds). The output
@@ -1045,6 +1063,7 @@ impl ScriptManager {
                 state: ScriptRuntimeState::default(),
                 pty_id: None,
                 monitor_attempt: None,
+                output_cursor: None,
                 stopped_by_user: false,
                 supervisor: None,
                 generation: next_generation(),
@@ -1219,6 +1238,7 @@ impl ScriptManager {
                     state,
                     pty_id: None,
                     monitor_attempt: None,
+                    output_cursor: None,
                     stopped_by_user: false,
                     supervisor: None,
                     generation: next_generation(),
@@ -1316,6 +1336,7 @@ impl ScriptManager {
                 state,
                 pty_id: None,
                 monitor_attempt: None,
+                output_cursor: None,
                 stopped_by_user: false,
                 supervisor: None,
                 generation: next_generation(),
@@ -1411,6 +1432,7 @@ impl ScriptManager {
                 },
                 pty_id: None,
                 monitor_attempt: None,
+                output_cursor: None,
                 stopped_by_user: false,
                 supervisor: None,
                 generation: next_generation(),
@@ -1787,6 +1809,7 @@ impl ScriptManager {
                                             state: ScriptRuntimeState::default(),
                                             pty_id: None,
                                             monitor_attempt: None,
+                                            output_cursor: None,
                                             stopped_by_user: false,
                                             supervisor: None,
                                             generation: next_generation(),
@@ -2180,6 +2203,64 @@ impl ScriptManager {
         })
         .await
         .map_err(|e| Error::Internal(format!("script output read failed: {e}")))?
+    }
+
+    /// `script.output` with `cursor: true` (§5.8 output cursors): the latest
+    /// run's newest `max_lines` log lines (default 100) as base64 raw bytes,
+    /// cut to the serve window, with their stream positions.
+    pub(crate) async fn output_cursor(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        max_lines: Option<i64>,
+    ) -> Result<Value> {
+        let run = {
+            let guard = self.scripts.lock().unwrap();
+            let m = guard
+                .get(&(workspace_id.clone(), script_id.to_string()))
+                .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+            m.state.run_id.clone()
+        };
+        let boot = self.pty.daemon_boot_id().to_owned();
+        let Some(run) = run else {
+            return Ok(json!({
+                "runId": null, "daemonBootId": boot, "data": "",
+                "startOffset": "0", "endOffset": "0", "logStartOffset": "0", "totalLines": 0,
+            }));
+        };
+        let store = self.output_store.clone();
+        let (ws, id, run_id) = (
+            workspace_id.as_str().to_owned(),
+            script_id.to_owned(),
+            run.clone(),
+        );
+        let line_count = clamp_line_count(max_lines, 100);
+        let tail = tokio::task::spawn_blocking(move || {
+            store.cursor_tail(&ws, &id, &run_id, line_count, OUTPUT_CURSOR_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("script output read failed: {e}")))??;
+        let (data, start, end, log_start, total_lines) = tail.map_or_else(
+            || (String::new(), 0, 0, 0, 0),
+            |t| {
+                (
+                    base64::engine::general_purpose::STANDARD.encode(&t.bytes),
+                    t.start,
+                    t.end,
+                    t.log_start,
+                    t.total_lines,
+                )
+            },
+        );
+        Ok(json!({
+            "runId": run,
+            "daemonBootId": boot,
+            "data": data,
+            "startOffset": start.to_string(),
+            "endOffset": end.to_string(),
+            "logStartOffset": log_start.to_string(),
+            "totalLines": total_lines,
+        }))
     }
 
     /// The trailing [`RUN_RESULT_OUTPUT_BYTES`] of one run's log as text.
@@ -3182,7 +3263,7 @@ impl ScriptManager {
         if !attachment.backlog.is_empty() {
             self.observe_monitor_chunk(ws, script_id, pty_id, &attachment.backlog)
                 .await;
-            self.emit_output_for(ws, script_id, generation, &attachment.backlog);
+            self.emit_output_for(ws, script_id, generation, pty_id, &attachment.backlog);
             if !url_done {
                 url_done = self
                     .try_detect_url(ws, script_id, generation, &attachment.backlog)
@@ -3207,7 +3288,7 @@ impl ScriptManager {
                             match live.try_recv() {
                                 Ok(chunk) => {
                                     self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
-                                    self.emit_output_for(ws, script_id, generation, &chunk);
+                                    self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
                                     if !url_done {
                                         url_done =
                                             self.try_detect_url(ws, script_id, generation, &chunk).await;
@@ -3223,7 +3304,7 @@ impl ScriptManager {
                 recv = live.recv() => match recv {
                     Ok(chunk) => {
                         self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
-                                    self.emit_output_for(ws, script_id, generation, &chunk);
+                                    self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
                         if !url_done {
                             url_done = self.try_detect_url(ws, script_id, generation, &chunk).await;
                         }
@@ -3595,26 +3676,53 @@ impl ScriptManager {
     /// supervisor task that broadcasts output, so state never overtakes
     /// previously-broadcast chunks; the `exited` transition in particular is
     /// emitted only after `run_one` has broadcast every chunk.
+    ///
+    /// Run-log output adds its `runId`, `daemonBootId` and half-open
+    /// `startOffset`/`endOffset` stream positions (decimal strings); notices
+    /// that are not in the log carry none of them (§5.8 output cursors).
     fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
-        let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
-        publish_event_transient(
-            self.bus.as_ref(),
-            &script_event(
-                ws,
-                SCRIPT_OUTPUT,
-                json!({ "scriptId": script_id, "chunk": chunk }),
-            ),
-        );
+        self.publish_output(ws, script_id, bytes, None);
     }
 
-    fn emit_output_for(&self, ws: &WorkspaceId, id: &str, generation: u64, bytes: &[u8]) {
-        let scripts = self.scripts.lock().unwrap();
-        if scripts
-            .get(&(ws.clone(), id.to_owned()))
-            .is_some_and(|m| m.generation == generation)
-        {
-            self.emit_output(ws, id, bytes);
+    fn publish_output(
+        &self,
+        ws: &WorkspaceId,
+        script_id: &str,
+        bytes: &[u8],
+        position: Option<(&str, u64)>,
+    ) {
+        let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mut data = json!({ "scriptId": script_id, "chunk": chunk });
+        if let Some((run, start)) = position {
+            data["runId"] = json!(run);
+            data["daemonBootId"] = json!(self.pty.daemon_boot_id());
+            data["startOffset"] = json!(start.to_string());
+            data["endOffset"] = json!((start + bytes.len() as u64).to_string());
         }
+        publish_event_transient(self.bus.as_ref(), &script_event(ws, SCRIPT_OUTPUT, data));
+    }
+
+    fn emit_output_for(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        generation: u64,
+        pty: PtyId,
+        chunk: &OutputChunk,
+    ) {
+        let scripts = self.scripts.lock().unwrap();
+        let Some(m) = scripts
+            .get(&(ws.clone(), id.to_owned()))
+            .filter(|m| m.generation == generation)
+        else {
+            return;
+        };
+        let position = m
+            .output_cursor
+            .as_ref()
+            .filter(|c| c.pty == pty)
+            .map(|c| (c.run.as_str(), c.base + chunk.start_offset));
+        self.publish_output(ws, id, chunk, position);
     }
 
     /// Publish a self-sufficient `script:state` event (the runtime state plus the
@@ -3822,6 +3930,10 @@ const OUTPUT_TAIL_TRUNCATED_NOTE: &str = "older output omitted to fit the reply 
 fn output_tail_within_budget(text: &str) -> (&str, bool) {
     tail_within_json_bytes(text, OUTPUT_TAIL_MAX_JSON_BYTES)
 }
+
+/// Raw bytes a `cursor: true` `script.output` reply carries at most: the
+/// §5.13 serve window, whose base64 fits the 480,000-byte reply budget.
+const OUTPUT_CURSOR_MAX_BYTES: u64 = 359_424;
 
 /// `script.output`'s text: a line-count header, then the tail (already
 /// clamped to `line_count` lines) cut to the newest bytes within the budget.

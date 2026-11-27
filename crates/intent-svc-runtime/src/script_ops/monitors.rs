@@ -826,8 +826,11 @@ impl ScriptManager {
             .unwrap()
             .get(&(ws.clone(), id.into()))
             .and_then(|m| m.state.run_id.clone());
+        let mut cursor = None;
         if let Some(run) = run {
-            launch.set_output_sink(self.open_output_sink(ws, id, &run).await);
+            let sink = self.open_output_sink(ws, id, &run).await;
+            cursor = sink.as_ref().map(|(_, base)| (run, *base));
+            launch.set_output_sink(sink.map(|(sink, _)| sink));
         }
         let pty = self.spawn_launch(ws, launch).await?;
         if let Some(m) = self
@@ -838,6 +841,7 @@ impl ScriptManager {
             .filter(|m| m.generation == generation)
         {
             m.monitor_attempt = Some(pty);
+            m.output_cursor = cursor.map(|(run, base)| super::OutputCursor { pty, run, base });
         }
         for window in self
             .locks
