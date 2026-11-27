@@ -12,6 +12,48 @@ thread_local! {
     /// Tests set this to make every compaction replace fail, like Windows
     /// refusing to replace a log another process holds open.
     static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Bytes appends may still write before failing, like a disk filling up
+    /// mid-write; `None` never fails.
+    static WRITE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A log handle whose writes stop at [`WRITE_BUDGET`], leaving a prefix on disk.
+#[derive(Debug)]
+struct PartialWrites(Box<dyn BlobFile>);
+
+impl Read for PartialWrites {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Seek for PartialWrites {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl io::Write for PartialWrites {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match WRITE_BUDGET.with(std::cell::Cell::get) {
+            None => self.0.write(buf),
+            Some(0) => Err(io::Error::other("disk full")),
+            Some(left) => {
+                let written = self.0.write(&buf[..left.min(buf.len())])?;
+                WRITE_BUDGET.with(|b| b.set(Some(left - written)));
+                Ok(written)
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl BlobFile for PartialWrites {
+    fn len(&self) -> io::Result<u64> {
+        self.0.len()
+    }
 }
 
 /// [`LocalBlobStorage`] whose `replace` fails while [`FAIL_RENAME`] is set.
@@ -23,7 +65,7 @@ impl BlobStorage for RenameGate {
         self.0.display_path(key)
     }
     fn open_append(&self, key: &BlobKey) -> io::Result<Box<dyn BlobFile>> {
-        self.0.open_append(key)
+        Ok(Box::new(PartialWrites(self.0.open_append(key)?)))
     }
     fn replace(&self, key: &BlobKey, contents: &[u8]) -> io::Result<Box<dyn BlobFile>> {
         if FAIL_RENAME.with(std::cell::Cell::get) {
@@ -1141,6 +1183,36 @@ fn cursor_reads_never_span_an_unsaved_hole() {
         assert!(tail.log_start >= 2400, "never reaches back across the hole");
         assert_cursor_slice(&tail, &stream);
     }
+}
+
+/// Regression (intentd#3837 review): a write that fails after saving part of
+/// a chunk, then a reopen of the same run (a service auto-restart), must not
+/// give the saved bytes new positions.
+#[test]
+fn reopening_after_a_partial_write_keeps_positions() {
+    let (_dir, store) = store(1000);
+    let stream = numbered_stream(10);
+    {
+        let mut w = store.open_writer("ws", "s", "r");
+        w.append(&stream[..100]);
+        WRITE_BUDGET.with(|b| b.set(Some(20)));
+        w.append(&stream[100..140]);
+        WRITE_BUDGET.with(|b| b.set(None));
+        assert!(!w.is_enabled());
+        assert_eq!(w.end(), 140);
+    }
+    let mut w = store.open_writer("ws", "s", "r");
+    assert_eq!(w.end(), 140, "the run continues at its end");
+    let tail = cursor(&store, 10_000);
+    assert_eq!(
+        (tail.start, tail.end),
+        (140, 140),
+        "no saved byte is known to sit before 140"
+    );
+    w.append(&stream[140..200]);
+    let tail = cursor(&store, 10_000);
+    assert_eq!((tail.log_start, tail.end), (140, 200));
+    assert_cursor_slice(&tail, &stream);
 }
 
 #[test]

@@ -297,18 +297,22 @@ impl ScriptOutputStore {
             if s.file.is_none() {
                 match open_append(&*self.storage, &key, &path, s.cap) {
                     Ok((file, on_disk, len)) => {
-                        // The log on disk holds the newest bytes before the
-                        // run's end; positions in a new store count from 0.
-                        let base = if known {
-                            (s.base + s.len).saturating_sub(on_disk)
+                        if known {
+                            // The run continues at its end. A log whose size
+                            // differs from the tracked one (a write that failed
+                            // partway, or a deleted log) holds bytes of unknown
+                            // position, so none of it is contiguous.
+                            let end = s.base + s.len;
+                            s.contiguous = if on_disk == s.len {
+                                s.contiguous.saturating_sub(on_disk - len)
+                            } else {
+                                len
+                            };
+                            s.base = end.saturating_sub(len);
                         } else {
-                            0
-                        };
-                        if on_disk != s.len {
-                            s.contiguous = 0;
+                            // Positions in a new store count the log from 0.
+                            s.base = on_disk - len;
                         }
-                        s.contiguous = s.contiguous.saturating_sub(on_disk - len);
-                        s.base = base + (on_disk - len);
                         s.len = len;
                         s.file = Some(file);
                     }
