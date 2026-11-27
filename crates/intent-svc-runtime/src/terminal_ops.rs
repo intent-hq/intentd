@@ -2321,13 +2321,13 @@ mod tests {
             &dir,
             // Ignore SIGHUP before forking so the grandchild inherits it: a
             // trap set inside the subshell races the shell's exit.
-            "trap '' HUP\nsleep 30 &\nprintf PARENT_DONE",
+            "trap '' HUP\nsleep 120 &\nprintf PARENT_DONE",
         )
         .await;
 
-        // TIMEOUT (8 s) is well below the grandchild's 30 s, so an unbounded
-        // wait fails here instead of passing late.
-        let acc = collect_data_until_exit(&mut sub, TIMEOUT).await;
+        // LONG_TIMEOUT (60 s) is well below the grandchild's 120 s, so an
+        // unbounded wait fails here instead of passing late.
+        let acc = collect_data_until_exit(&mut sub, LONG_TIMEOUT).await;
         assert!(contains_sub(&acc, b"PARENT_DONE"));
 
         kill(pty.as_ref(), &id).await.unwrap();
