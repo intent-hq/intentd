@@ -551,6 +551,46 @@ impl Store {
         }
     }
 
+    /// This store for request writes: a Postgres handle with the request
+    /// write role (`postgres::WriteRole::Request`) sharing this one's process-local
+    /// gates (its claim included), for an owner process's RPC path. While
+    /// this process holds a claim its writes still compare the owner, so
+    /// they stop at a takeover; owner-only writes refuse it. Taken from a
+    /// store that never claimed, it is not an admin escape hatch: in a
+    /// process with no claim it skips the owner comparison, so it writes to
+    /// a tenant another process owns. On `SQLite` (one daemon per database)
+    /// it is this store.
+    #[must_use]
+    pub fn request_writer(&self) -> Self {
+        match &self.backend {
+            Backend::Sqlite(_) => self.clone(),
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(store) => Self {
+                backend: Backend::Postgres(Box::new(store.with_role(postgres::WriteRole::Request))),
+            },
+        }
+    }
+
+    /// Test-only: take an owner-only write transaction (`begin_owner_write`)
+    /// and roll it back. `Ok` on `SQLite`.
+    ///
+    /// # Errors
+    /// `Error::NotOwner` on a request handle or where an owner write is
+    /// fenced; otherwise as any write.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(clippy::unused_async, reason = "SQLite: always the owner")
+    )]
+    pub async fn probe_owner_write(&self) -> Result<()> {
+        match &self.backend {
+            Backend::Sqlite(_) => Ok(()),
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(store) => postgres::boxed_call(|| store.probe_owner_write()).await,
+        }
+    }
+
     /// The fence of this process's current claim on the store's tenant:
     /// `None` on `SQLite` (no lease) and on a Postgres store whose process
     /// never claimed the tenant. See [`TenantFence`].

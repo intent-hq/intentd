@@ -127,6 +127,7 @@ impl crate::Store {
             pool: _,
             tenant: _,
             options: _,
+            role: _,
             note_write_lanes,
             task_event_baselines,
             task_events_enabled,

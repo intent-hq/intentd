@@ -222,6 +222,18 @@ impl ClaimSlot {
         checked
     }
 
+    /// For a request write ([`super::Fence::Request`]): no claim passes
+    /// (a replica never compares the owner); a claim is checked as
+    /// [`Self::check`] does, because this process's in-memory gates are not
+    /// converted yet, so its request writes must stop, and fire its fence,
+    /// as soon as it lost the tenant.
+    pub(crate) fn check_if_claimed(&self, tenant: &str, row: &WriterRow) -> Result<()> {
+        if self.get().is_none() {
+            return Ok(());
+        }
+        self.check(tenant, row)
+    }
+
     /// The fence: may a store of this process write, given the tenant lease
     /// it read under the writer lock?
     ///
@@ -473,6 +485,7 @@ impl PgStore {
         ttl: Duration,
         epoch: Option<i64>,
     ) -> Result<OffsetDateTime> {
+        self.refuse_request_role("a tenant lease renewal")?;
         let ttl_ms = ttl_millis(ttl)?;
         let Some(claim) = self.claim.get() else {
             return Err(Error::NotOwner(format!(
@@ -512,6 +525,7 @@ impl PgStore {
     /// See [`Store::release_tenant_lease`](crate::Store::release_tenant_lease).
     /// One statement on the lease row, outside the writer lock.
     pub(crate) async fn release_lease(&self, epoch: i64) -> Result<bool> {
+        self.refuse_request_role("a tenant lease release")?;
         let Some(claim) = self.claim.get() else {
             return Err(Error::NotOwner(format!(
                 "tenant {}: this process never claimed it, so it has no lease to release",
@@ -681,9 +695,15 @@ impl crate::Store {
         tenant: TenantId,
     ) -> Result<Option<Duration>> {
         let key = super::tenant_registry::tenant_key(&pool, &tenant);
-        PgStore::for_key(pool, tenant, PostgresOptions::default(), key)
-            .lease_expires_in()
-            .await
+        PgStore::for_key(
+            pool,
+            tenant,
+            PostgresOptions::default(),
+            key,
+            super::WriteRole::Unclaimed,
+        )
+        .lease_expires_in()
+        .await
     }
 
     /// The orchestrator's startup open: [`Self::open_postgres`] that claims
@@ -762,7 +782,7 @@ impl crate::Store {
         instance: &str,
         ttl: Duration,
     ) -> Result<OwnedOpen> {
-        let store = PgStore::for_key(pool, tenant, options, key);
+        let store = PgStore::for_key(pool, tenant, options, key, super::WriteRole::Owner);
         super::check_schema(&store.pool).await?;
         let lease = match store.claim_lease(instance, ttl).await? {
             TenantClaim::TenantOwned(lease) => lease,

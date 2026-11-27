@@ -166,7 +166,7 @@ impl PgStore {
 
     pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
         validate_enrollment(record, initial)?;
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         self.insert_node(&mut tx, record).await?;
         self.insert_lease(&mut tx, &record.id, initial).await?;
         tx.commit().await.map_err(db)
@@ -179,7 +179,7 @@ impl PgStore {
         generation: NodeCounter,
     ) -> Result<()> {
         validate_enrollment(record, initial)?;
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         let head: Option<String> = sqlx::query_scalar(
             "SELECT head_id FROM execution_node WHERE tenant_id = $1 AND id = $2",
         )
@@ -213,7 +213,7 @@ impl PgStore {
     }
 
     pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         let owned: Option<String> = sqlx::query_scalar(
             "SELECT id FROM execution_node WHERE tenant_id = $1 AND id = $2 AND head_id = $3",
         )
@@ -281,7 +281,7 @@ impl PgStore {
         owner: &LeaseOwner,
         next: LeaseState,
     ) -> Result<NodeLease> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         let mut record = self.lease(&mut tx, owner).await?;
         if next.is_terminal() || record.release_requested || !record.state.can_transition_to(next) {
             return Err(invalid("invalid lease transition"));
@@ -297,7 +297,7 @@ impl PgStore {
         owner: &LeaseOwner,
         guard: Option<&crate::Lease>,
     ) -> Result<NodeCounter> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         if let Some(lease) = guard {
             self.guard_lease(&mut tx, lease).await?;
         }
@@ -312,7 +312,7 @@ impl PgStore {
     }
 
     pub async fn request_node_lease_release(&self, owner: &LeaseOwner) -> Result<NodeLease> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         let mut record = self.lease(&mut tx, owner).await?;
         let mut host = self.node(&mut tx, &owner.node_id, &owner.head_id).await?;
         static_only(&host)?;
@@ -362,7 +362,7 @@ impl PgStore {
         version: &str,
         guard: Option<&crate::Lease>,
     ) -> Result<NodeLease> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         if let Some(lease) = guard {
             self.guard_lease(&mut tx, lease).await?;
         }
@@ -394,7 +394,7 @@ impl PgStore {
         seq: NodeCounter,
         guard: Option<&crate::Lease>,
     ) -> Result<NodeCounter> {
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         if let Some(lease) = guard {
             self.guard_lease(&mut tx, lease).await?;
         }
@@ -1359,7 +1359,7 @@ impl PgStore {
         if !terminal.is_terminal() || fence.recorded_at.is_empty() {
             return Err(invalid("terminal lease requires fence evidence"));
         }
-        let mut tx = self.begin_write().await?;
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         let mut record = self.lease(&mut tx, owner).await?;
         let mut host = self.node(&mut tx, &owner.node_id, &owner.head_id).await?;
         static_only(&host)?;

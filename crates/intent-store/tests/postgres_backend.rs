@@ -106,6 +106,8 @@ mod tenant_state;
 mod usage_metrics;
 #[path = "postgres_backend/workspaces.rs"]
 mod workspaces;
+#[path = "postgres_backend/write_role.rs"]
+mod write_role;
 #[path = "postgres_backend/writer_lock.rs"]
 mod writer_lock;
 #[path = "support/writer_race.rs"]

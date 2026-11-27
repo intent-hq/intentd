@@ -96,8 +96,10 @@ impl PgStore {
         delivered_at: &str,
         claim: &Lease,
     ) -> Result<()> {
-        // A process that lost the tenant gets `NotOwner` as it is.
-        let mut tx = self.begin_write().await?;
+        // A process that lost the tenant gets `NotOwner` as it is. Owner
+        // work: it retires the claim's lease row, so a request handle is
+        // refused.
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         self.guard_lease(&mut tx, claim).await?;
         if let Some(identity) = completion_identity {
             sqlx::query(
@@ -140,8 +142,10 @@ impl PgStore {
         claim: &Lease,
     ) -> Result<()> {
         let retained: Vec<&str> = retain_children.iter().map(|id| id.0.as_str()).collect();
-        // A process that lost the tenant gets `NotOwner` as it is.
-        let mut tx = self.begin_write().await?;
+        // A process that lost the tenant gets `NotOwner` as it is. Owner
+        // work: it retires the claim's lease row, so a request handle is
+        // refused.
+        let mut tx: WriteTx = self.begin_owner_write().await?;
         self.guard_lease(&mut tx, claim).await?;
         sqlx::query(
             "UPDATE completion_watch SET group_id = NULL \
