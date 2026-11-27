@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.311] - 2026-11-27
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.12.1 ([#3831](https://github.com/intent-hq/intentd/pull/3831))
+
+### 🧪 Testing
+
+- Write the store only while no daemon runs, and lint it ([#3824](https://github.com/intent-hq/intentd/pull/3824))
+
+
 ## [0.11.310] - 2026-11-27
 
 ### 🚀 Features
