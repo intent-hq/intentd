@@ -13395,6 +13395,27 @@ impl AgentManager {
         if let Some(npx) = resolved.npx_fallback_binary.clone() {
             if !self.contains(agent_id) {
                 boxed_await(|| crate::npx_cli::check_npx_version(&npx)).await?;
+                // A provider CLI run from its npm package (OpenCode, Grok, ...)
+                // is a stub until its install script runs: drop a cached
+                // install left unfinished so this launch installs it again.
+                if let Some(package) = resolved
+                    .npx_fallback_package
+                    .filter(|p| resolved.provider.fallback_npx_package == Some(*p))
+                {
+                    let cli = crate::provider_cli_launch::ProviderCli::Npx {
+                        npx,
+                        package: package.to_owned(),
+                    };
+                    let command = resolved.provider.command;
+                    boxed_await(|| async move {
+                        cli.remove_unfinished_install(
+                            command,
+                            crate::provider_cli_launch::UNFINISHED_INSTALL_GRACE,
+                        )
+                        .await
+                    })
+                    .await;
+                }
             }
         }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
@@ -25097,15 +25118,17 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
-        // with `--workspaces=false -y <package>`, not the bare `codex-acp`
-        // command.
+        // with `--workspaces=false <npx_install_args> -y <package>`, not
+        // the bare `codex-acp` command.
         let cmd = intent_acp::spawn::build_command(&rebuilt);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
         assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
-        assert_eq!(args[1], "-y");
+        let package = provider.npx_only_package.expect("codex is npx-only");
+        assert_eq!(args[1..4], intent_providers::npx_install_args(package));
+        assert_eq!(args[4], "-y");
         assert_eq!(
-            args[2],
+            args[5],
             provider.npx_only_package.expect("codex is npx-only")
         );
     }

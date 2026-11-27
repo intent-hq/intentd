@@ -7,7 +7,7 @@ if (args.length === 1 && args[0] === '--version') {
   process.exit(0);
 }
 fs.appendFileSync(path.join(fixture, 'events.jsonl'), JSON.stringify({role:'npx',args,home:process.env.HOME})+'\n');
-if (args[0] !== '--workspaces=false' || args[1] !== '-y' || !args[2]?.startsWith('@agentclientprotocol/codex-acp@')) {
+if (args[0] !== '--workspaces=false' || args[1] !== '--ignore-scripts=false' || args[2] !== '--include=optional' || args[3] !== '--allow-scripts=' + args[5] || args[4] !== '-y' || !args[5]?.startsWith('@agentclientprotocol/codex-acp@')) {
   throw new Error('unexpected package request');
 }
 const target = path.join(process.env.HOME, 'npm-cache', 'node_modules');

@@ -41,6 +41,7 @@ pub use args::{
     build_provider_args, build_provider_env, build_provider_env_for_spawn,
     build_provider_env_with_unsloth, enhanced_path, ArgInputs, UnslothEndpoint, UnslothModelLimit,
 };
+pub use config::npx_install_args;
 pub use config::{
     all_provider_ids, auth_error_message, base_provider_id, find_provider,
     find_provider_or_legacy_alias, first_provider_id, is_provider_authentication_error,
@@ -51,9 +52,9 @@ pub use config::{
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
     CODEX_ACP_NPX_PACKAGE, CODEX_ACP_PREREQUISITE_ERROR, CODEX_API_KEY_AUTH_REQUEST,
     CODEX_INITIAL_AGENT_MODE_ENV, CODEX_SUBAGENT_POLICY_CONFIG, CURSOR_CREDENTIAL_STORE_ENV,
-    CURSOR_SUBAGENT_PROMPT_NOTE, DROID_NPX_PACKAGE, GROK_NPX_PACKAGE, NPX_MIN_NPM_VERSION,
-    NPX_NPM_REQUIREMENT, OPENCODE_NPX_PACKAGE, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION,
-    PI_CLI_REQUIREMENT, PROFILE_BASE_PROVIDERS, PROFILE_REF_SEPARATOR,
+    CURSOR_SUBAGENT_PROMPT_NOTE, DROID_NPX_PACKAGE, GROK_NPX_PACKAGE, NPM_INSTALL_ARGS,
+    NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, OPENCODE_NPX_PACKAGE, PI_ACP_NPX_PACKAGE,
+    PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT, PROFILE_BASE_PROVIDERS, PROFILE_REF_SEPARATOR,
 };
 #[cfg(test)]
 pub(crate) use config::{

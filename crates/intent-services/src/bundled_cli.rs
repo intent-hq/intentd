@@ -171,6 +171,15 @@ pub async fn ensure_in(
             .map_err(|e| format!("cannot create a staging directory for {staging_spec}: {e}"))
     })
     .await?;
+    // npm 12 skips dependency install scripts unless the project allows
+    // them, and rejects `--allow-scripts` on this project-scoped install.
+    let manifest = serde_json::json!({ "private": true, "allowScripts": { &spec: true } });
+    let staging_manifest = staging.path().join("package.json");
+    blocking(move || {
+        std::fs::write(&staging_manifest, manifest.to_string())
+            .map_err(|e| format!("cannot write {}: {e}", staging_manifest.display()))
+    })
+    .await?;
     tracing::info!(%spec, "installing Intent's bundled CLI");
     let mut command = tokio::process::Command::new(npm);
     command
@@ -181,8 +190,9 @@ pub async fn ensure_in(
             "--no-audit",
             "--no-fund",
             "--loglevel=error",
-            "--prefix",
         ])
+        .args(intent_providers::NPM_INSTALL_ARGS)
+        .arg("--prefix")
         .arg(staging.path())
         .arg(&spec)
         .current_dir(staging.path())

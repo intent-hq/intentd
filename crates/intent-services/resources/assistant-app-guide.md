@@ -592,7 +592,10 @@ is present (Auggie too, once enabled; see Auggie visibility below). Without thei
 Claude Code and Codex through Intent's own bundled copy, downloaded at the first launch.
 Cursor, Antigravity, DeepSeek Harness, Pi and Unsloth still need their own install. An
 installed CLI is always used first, with its version checks and update prompts. A card
-running from npm shows **Log in**, which runs the login command through npx. OpenCode's
+running from npm shows **Log in**, which runs the login command through npx. These npm runs
+always run the package's install steps, which add its native program, even when npm is set
+to skip install scripts or (npm 12 and later) skips them by default; a copy that an earlier skipped or interrupted install left unable to
+start is removed and installed again. OpenCode's
 free models need no account, so when onboarding finds no other provider installed,
 OpenCode comes first with a **Free** label and is selected. When you continue with another
 provider, onboarding also enables OpenCode (unless you turned it off) as a free backup in

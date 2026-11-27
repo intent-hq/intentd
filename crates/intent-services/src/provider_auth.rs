@@ -1263,25 +1263,40 @@ async fn resolve_auth_status(
 fn npx_probe(
     provider_id: &'static str,
 ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = AuthVerdict> + Send>>> {
-    let cli = if let Some(cli) = crate::provider_cli_launch::ProviderCli::npx(provider_id) {
-        cli
-    } else {
-        let bundled = intent_providers::adapter_cli::missing_fallback(provider_id)?;
-        let npx = if provider_id == "codex" {
-            intent_providers::find_codex_npx()
+    let provider = intent_providers::find_provider(provider_id)?;
+    let (cli, command) =
+        if let Some(cli) = crate::provider_cli_launch::ProviderCli::npx(provider_id) {
+            (cli, provider.command)
         } else {
-            intent_providers::find_npx()
-        }?;
-        crate::provider_cli_launch::ProviderCli::Npx {
-            npx,
-            package: bundled.spec(),
-        }
-    };
-    let auth_args = intent_providers::find_provider(provider_id)?
-        .auth_check_args
-        .unwrap_or_default();
+            let bundled = intent_providers::adapter_cli::missing_fallback(provider_id)?;
+            let npx = if provider_id == "codex" {
+                intent_providers::find_codex_npx()
+            } else {
+                intent_providers::find_npx()
+            }?;
+            let cli = crate::provider_cli_launch::ProviderCli::Npx {
+                npx,
+                package: bundled.spec(),
+            };
+            (
+                cli,
+                intent_providers::installed_cli::InstalledCli::for_provider(provider_id)?.command(),
+            )
+        };
+    let auth_args = provider.auth_check_args.unwrap_or_default();
     Some(Box::pin(async move {
         if auth_args.is_empty() || !cli.runs_without_download(CLI_AUTH_TIMEOUT).await {
+            return AuthVerdict::default();
+        }
+        // A stub left by an unfinished install is not a sign-out: remove it
+        // so the next launch or Log in installs the CLI again.
+        if cli
+            .remove_unfinished_install(
+                command,
+                crate::provider_cli_launch::UNFINISHED_INSTALL_GRACE,
+            )
+            .await
+        {
             return AuthVerdict::default();
         }
         let (program, mut args) = cli.cached_program();
@@ -2057,7 +2072,7 @@ if [ "$#" = 1 ] && [ "$1" = --version ]; then
   printf '11.0.0\n'
   exit 0
 fi
-[ "$#" = 3 ] && [ "$1" = --workspaces=false ] && [ "$2" = -y ] && [ "$3" = '{}' ] || exit 93
+[ "$#" = 6 ] && [ "$1" = --workspaces=false ] && [ "$2" = --ignore-scripts=false ] && [ "$3" = --include=optional ] && [ "$4" = --allow-scripts='{0}' ] && [ "$5" = -y ] && [ "$6" = '{0}' ] || exit 93
 [ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
 printf '%s\n' "$*" >> "$HOME/packages"
 IFS= read -r request
@@ -2151,7 +2166,7 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(
             std::fs::read_to_string(root.join("packages")).unwrap(),
             format!(
-                "--workspaces=false -y {}\n",
+                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0}\n",
                 intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
             )
         );

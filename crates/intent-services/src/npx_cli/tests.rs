@@ -324,7 +324,7 @@ async fn assert_public_launches_succeed() {
         lines("packages"),
         vec![
             format!(
-                "--workspaces=false -y {}",
+                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0}",
                 intent_providers::CODEX_ACP_NPX_PACKAGE
             );
             4
