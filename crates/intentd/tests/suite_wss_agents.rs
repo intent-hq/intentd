@@ -14,6 +14,7 @@ mod e2e_agent_bindings_followup;
 mod e2e_agent_features_gating;
 mod e2e_agent_ops_bindings_followup;
 mod e2e_mock_agent;
+mod e2e_mock_agent_app_library;
 mod e2e_mock_agent_client_services;
 mod e2e_mock_agent_tmpdir;
 mod e2e_mock_agent_workspace_api_bindings;

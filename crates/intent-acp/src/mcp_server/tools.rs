@@ -1384,6 +1384,11 @@ pub(super) fn help_namespace(
         .trim_start_matches("ws.")
         .trim_end_matches('*')
         .trim_end_matches('.');
+    // Labs: `ws.appLibrary` is installed for every agent but documented only
+    // here, outside the description (and so outside the system prompt).
+    if ns == "appLibrary" {
+        return Ok(super::bindings::app_library::HELP.to_owned());
+    }
     let desc = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
     if !ns.is_empty() {
         // Direct calls like `ws.help(...)` are documented without a trailing
@@ -1683,6 +1688,7 @@ mod tests {
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_MCP: &str = include_str!("bindings/mcp.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
+    const BINDINGS_APP_LIBRARY: &str = include_str!("bindings/app_library.rs");
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
     const BINDINGS_APP_AGENTS: &str = include_str!("bindings/app/agents.rs");
@@ -1720,6 +1726,7 @@ mod tests {
             ("terminal", BINDINGS_TERMINAL),
             ("mcp", BINDINGS_MCP),
             ("file", BINDINGS_FILE),
+            ("appLibrary", BINDINGS_APP_LIBRARY),
         ]
     }
 
@@ -1925,11 +1932,14 @@ mod tests {
             [("agent", "machineModels"), ("workspace", "retrySetup")]
                 .into_iter()
                 .collect();
+        // Labs: documented only by `ws.help("appLibrary")` (`app_library::HELP`).
+        let help_only: HashSet<&str> = ["appLibrary"].into_iter().collect();
         let documented = extract_ws_methods(WORKSPACE_API_DESCRIPTION);
         for (ns, src) in all_namespaces() {
             for method in bound_methods(src) {
                 if deferred.contains(&(*ns, method.as_str()))
                     || capability_gated.contains(&(*ns, method.as_str()))
+                    || help_only.contains(ns)
                 {
                     continue;
                 }
