@@ -387,11 +387,11 @@ mod tests {
 
     #[test]
     fn npx_min_version_constant_parses() {
-        assert_eq!(parse_cli_version(NPX_MIN_NPM_VERSION), Some((7, 0, 0)));
+        assert_eq!(parse_cli_version(NPX_MIN_NPM_VERSION), Some((7, 7, 0)));
     }
 
     #[test]
-    fn npx_npm6_gates_as_too_old_and_npm7_plus_is_ok() {
+    fn npx_npm6_gates_as_too_old_and_npm_7_7_plus_is_ok() {
         // The exact stale shim from intent-hq/intent#5725.
         assert_eq!(
             npx_gate_output("6.14.15"),
@@ -401,11 +401,22 @@ mod tests {
             npx_gate_output("6.14.18\n"),
             PiCliGate::TooOld("6.14.18".into())
         );
-        assert_eq!(npx_gate_output("7.0.0"), PiCliGate::Ok);
+        assert_eq!(npx_gate_output("7.7.0"), PiCliGate::Ok);
         assert_eq!(npx_gate_output("11.13.0"), PiCliGate::Ok);
         assert_eq!(npx_gate_output("garbage"), PiCliGate::Unknown);
         assert_eq!(npx_gate(&PiCliProbe::Failed), PiCliGate::Unknown);
         assert_eq!(npx_gate(&PiCliProbe::Missing), PiCliGate::Missing);
+    }
+
+    /// npm 7.0–7.6's npx parses flags after the package as its own: `npx -y
+    /// @xai-official/grok@1.0.89 --version` prints `7.6.0` and every
+    /// provider launched with flags fails. npm 7.7.0 passes them through.
+    #[test]
+    fn npx_before_npm_7_7_gates_as_too_old() {
+        for old in ["7.0.0", "7.6.0"] {
+            assert_eq!(npx_gate_output(old), PiCliGate::TooOld(old.into()), "{old}");
+        }
+        assert_eq!(npx_gate_output("7.7.0"), PiCliGate::Ok);
     }
 
     #[test]

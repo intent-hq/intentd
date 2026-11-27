@@ -337,7 +337,7 @@ async fn assert_public_launches_succeed() {
 async fn minimum_npx_version_runs_all_public_paths_with_one_probe() {
     if in_subprocess(
         "minimum_npx_version_runs_all_public_paths_with_one_probe",
-        "7.0.0",
+        intent_providers::NPX_MIN_NPM_VERSION,
     ) {
         return;
     }

@@ -37,14 +37,16 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 
 /// Minimum npm version whose `npx` runs the pinned `npx -y <package>` spawns.
 /// npm 6's npx rejects that invocation with `ERROR: You must supply a
-/// command.` (intent-hq/intent#5725); npm 7 shipped the rewritten npx that
-/// every supported Node (16+) bundles. Feeds the pure spawn-time gate in
+/// command.` (intent-hq/intent#5725), and npm 7.0–7.6's rewritten npx takes
+/// the CLI's flags after the package as its own (`npx -y <cli> --version`
+/// prints the npm version). npm 7.7.0 passes them through; Node 22 bundles
+/// npm 10. Feeds the pure spawn-time gate in
 /// [`crate::version_gate::npx_gate`].
-pub const NPX_MIN_NPM_VERSION: &str = "7.0.0";
+pub const NPX_MIN_NPM_VERSION: &str = "7.7.0";
 
 /// npm requirement for user-facing messages; must match
 /// [`NPX_MIN_NPM_VERSION`].
-pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
+pub const NPX_NPM_REQUIREMENT: &str = "npm 7.7+";
 
 /// Pinned npx package for every daemon-managed Codex launch. Native and
 /// arbitrary PATH adapters are not selected: their config contracts differ.

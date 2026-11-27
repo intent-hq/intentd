@@ -20487,7 +20487,7 @@ fn guard_npx_version_reprobes_when_npx_is_repointed_to_an_identical_looking_targ
     guard_npx_version(&npx, None).expect("repointed npx is re-probed and accepted");
 }
 
-/// npm 7+ and an unprobeable npx both pass the guard (permissive on Unknown,
+/// npm 7.7+ and an unprobeable npx both pass the guard (permissive on Unknown,
 /// matching the pi/auggie gates), so a changed `--version` format never
 /// blocks a spawn.
 #[cfg(unix)]
