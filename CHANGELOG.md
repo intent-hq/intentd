@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.313] - 2026-11-27
+
+### 🚀 Features
+
+- *(scripts)* Exact stream positions for script output ([#3837](https://github.com/intent-hq/intentd/pull/3837))
+
+### 🐛 Bug Fixes
+
+- *(store)* Stop the Postgres feature from overflowing intent-services test stacks ([#3815](https://github.com/intent-hq/intentd/pull/3815))
+- *(remote)* Apply the requested model and effort to remote agents ([#3833](https://github.com/intent-hq/intentd/pull/3833))
+
+
 ## [0.11.312] - 2026-11-27
 
 ### 🚀 Features
