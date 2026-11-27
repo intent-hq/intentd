@@ -252,6 +252,7 @@ mod human_attribution_tests;
 mod image_dimensions;
 mod invite_ops;
 mod issue_cache;
+pub mod lifecycle_fence;
 mod line_attribution;
 mod linear_ops;
 mod local_work;
@@ -16536,6 +16537,24 @@ impl ArchiveFenceGuard {
     pub fn lease_token(&self) -> Option<u64> {
         self.lease.token()
     }
+
+    /// Runs `fut` with its store writes fenced by this hold's lease (see
+    /// [`lifecycle_fence`]).
+    pub fn guard_writes<F: std::future::Future>(
+        &self,
+        fut: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        self.lease.guard_writes(fut)
+    }
+
+    /// `Ok` while the lease is held.
+    ///
+    /// # Errors
+    ///
+    /// `Error::LeaseLost` once it was lost: stop the archive or unarchive.
+    pub fn check(&self) -> Result<()> {
+        self.lease.check()
+    }
 }
 
 impl Drop for ArchiveFenceGuard {
@@ -18806,9 +18825,13 @@ impl Services {
             // fail, and orders after every one they already committed, so
             // the session snapshot below sees them. A duplicate delete in
             // another process waits here. Held until this delete returns.
-            let _deletion_lease = store
+            // Every write below guards it (`lifecycle_fence`): once it is
+            // lost, the delete writes nothing more and fails with
+            // `LeaseLost`; a retry takes it again and re-reads everything.
+            let deletion_lease = store
                 .hold_lifecycle_lease(intent_store::WORKSPACE_DELETION_SCOPE, id.as_str())
                 .await?;
+            deletion_lease.guard_writes(async {
             services
                 .ports
                 .runtime()
@@ -19052,6 +19075,11 @@ impl Services {
             let branch_auto_generated = branch_observation.unwrap_or(false);
             #[cfg(test)]
             services.workspace_delete_test_gate.pause(&id).await;
+            lifecycle_fence::park(lifecycle_fence::steps::DELETE_BEFORE_ROW_DELETE, id.as_str())
+                .await;
+            // A lost lease stops here; the guarded row delete below would
+            // fail anyway.
+            deletion_lease.check()?;
             // Idempotent DB delete: swallow `NotFound` so retries and
             // orphan-dir-only cleanups don't surface as `"Failed to delete
             // space"` on the FE. Any other error still propagates. Publish
@@ -19472,6 +19500,8 @@ impl Services {
             }
             drop(cleanup_task);
             Ok(())
+            })
+            .await
         })
     }
 }
@@ -37239,36 +37269,42 @@ impl Services {
         // a fresh blank checkout on a new branch, provisioned under the same
         // fence so the retire folder sweep can never delete it.
         let (flipped, revived) = {
-            let _fence = match held_fence {
+            let fence = match held_fence {
                 Some(fence) => fence,
                 None => self.archive_fence_after_archive_script(&id).await?,
             };
-            let current = store.get_workspace(&id).await?;
-            let (flipped, revived) = if current.is_retired() {
-                // The agent whose turn triggered the revive gets its notice in
-                // that turn; every other agent's notice is written with the
-                // flip (see `revive_retired_checkout`).
-                let trigger = auto_unarchive
-                    .as_ref()
-                    .and_then(|stamp| stamp.get("agentId"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(AgentId::from);
-                let revived = self
-                    .revive_retired_checkout(&current, trigger.as_ref())
-                    .await?;
-                (revived.is_some(), revived)
-            } else {
-                let flipped = store
-                    .unarchive_workspace_if_archived(&id, &now_iso())
-                    .await?;
-                (flipped, None)
-            };
-            // Under the fence with the flip, so a later archive's removal is
-            // never cancelled (see `agent_resources`).
-            if flipped {
-                self.reclaim_unarchived_workspace_agents(&id).await;
-            }
-            (flipped, revived)
+            // Fenced by the archive-fence lease (`lifecycle_fence`).
+            fence
+                .guard_writes(Box::pin(async {
+                    let current = store.get_workspace(&id).await?;
+                    let (flipped, revived) = if current.is_retired() {
+                        // The agent whose turn triggered the revive gets its notice in
+                        // that turn; every other agent's notice is written with the
+                        // flip (see `revive_retired_checkout`).
+                        let trigger = auto_unarchive
+                            .as_ref()
+                            .and_then(|stamp| stamp.get("agentId"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(AgentId::from);
+                        let revived = self
+                            .revive_retired_checkout(&current, trigger.as_ref())
+                            .await?;
+                        (revived.is_some(), revived)
+                    } else {
+                        let flipped = store
+                            .unarchive_workspace_if_archived(&id, &now_iso())
+                            .await?;
+                        (flipped, None)
+                    };
+                    // Under the fence with the flip, so a later archive's removal is
+                    // never cancelled (see `agent_resources`).
+                    if flipped {
+                        self.reclaim_unarchived_workspace_agents(&id).await;
+                    }
+                    fence.check()?;
+                    Ok::<_, Error>((flipped, revived))
+                }))
+                .await?
         };
         let mut ws = store.get_workspace(&id).await?;
         if ws.is_retired() {
@@ -40658,29 +40694,48 @@ impl Services {
             // The cancel's completion redelivery runs only once the fence is
             // released: it can start a watcher's turn, and a turn-start gate
             // ranks before the fence (see `lock_order`).
+            // Every write under the fence guards its lease
+            // (`lifecycle_fence`): once it is lost, the archive commits
+            // nothing and fails with `LeaseLost`.
             let mut deferred_redelivery = Vec::new();
             if !automatic {
-                deferred_redelivery = this
-                    .ports
-                    .runtime()
-                    .cancel_script_monitors_deferring_redelivery(
-                        &this,
-                        &id,
-                        None,
-                        "workspace-archived",
+                deferred_redelivery = fence
+                    .guard_writes(
+                        this.ports
+                            .runtime()
+                            .cancel_script_monitors_deferring_redelivery(
+                                &this,
+                                &id,
+                                None,
+                                "workspace-archived",
+                            ),
                     )
                     .await?;
             }
+            lifecycle_fence::park(lifecycle_fence::steps::ARCHIVE_BEFORE_COMMIT, id.as_str()).await;
             let guest_sweep = if automatic {
-                match store
-                    .archive_workspace_detaching_guests_unless_auto_archive_disabled(&id, &now)
+                fence.check()?;
+                match fence
+                    .guard_writes(
+                        store.archive_workspace_detaching_guests_unless_auto_archive_disabled(
+                            &id, &now,
+                        ),
+                    )
                     .await?
                 {
                     Some(sweep) => sweep,
                     None => return Ok(None),
                 }
             } else {
-                match store.archive_workspace_detaching_guests(&id, &now).await {
+                let committed = match fence.check() {
+                    Ok(()) => {
+                        fence
+                            .guard_writes(store.archive_workspace_detaching_guests(&id, &now))
+                            .await
+                    }
+                    Err(lost) => Err(lost),
+                };
+                match committed {
                     Ok(sweep) => sweep,
                     Err(error) => {
                         drop(fence);
@@ -40694,16 +40749,20 @@ impl Services {
             // The archive retired the workspace's home: its machine gets
             // the stop now (or after its next bind).
             this.home_setups.forget(&id);
-            this.ports.remote_launch().send_home_stops(&this, &id).await;
+            fence
+                .guard_writes(this.ports.remote_launch().send_home_stops(&this, &id))
+                .await;
             if automatic {
-                match this
-                    .ports
-                    .runtime()
-                    .cancel_script_monitors_deferring_redelivery(
-                        &this,
-                        &id,
-                        None,
-                        "workspace-archived",
+                match fence
+                    .guard_writes(
+                        this.ports
+                            .runtime()
+                            .cancel_script_monitors_deferring_redelivery(
+                                &this,
+                                &id,
+                                None,
+                                "workspace-archived",
+                            ),
                     )
                     .await
                 {
@@ -40750,7 +40809,9 @@ impl Services {
                     park.entered.notify_one();
                     park.release.notified().await;
                 }
-                this.publish_archived_guest_deltas(&id, &guest_sweep).await;
+                fence
+                    .guard_writes(this.publish_archived_guest_deltas(&id, &guest_sweep))
+                    .await;
                 if let Some(park) = &this.archive_tail_park {
                     park.entered.notify_one();
                     park.release.notified().await;

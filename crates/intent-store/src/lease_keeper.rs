@@ -199,6 +199,12 @@ impl LeaseKeeper {
         crate::lease_write_guard::guard_scope(Arc::clone(&self.guard), fut)
     }
 
+    /// The lease as [`Self::guard_writes`] guards it, for a guard that
+    /// outlives a borrow of the keeper.
+    pub(crate) fn write_guard(&self) -> Arc<GuardedLease> {
+        Arc::clone(&self.guard)
+    }
+
     /// The kept lease, for a write that guards it (`guard_lease`); `None`
     /// once released. Renewal waits while the guard is held, so hold it
     /// only for the write.
