@@ -24,12 +24,12 @@ use sqlx::Row;
 use super::{PgStore, WriteTx};
 use crate::agent_repo::SESSION_SUMMARY_COLUMNS;
 use crate::pr_monitor_repo::{
-    check_rearm_compatible, check_replacement_identity, kind_word, list_entry_from_row,
-    monitor_from_row, pending_to_db, provider_word, qualified_from_row, state_to_db, target_number,
-    validate_monitor_target, workspace_reads_from_rows, MonitorQualificationOutcome,
-    MonitorTargetProvenance, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
-    PreparedMonitorWrite, QualifiedPrMonitor, TargetColumns, WorkspacePrMonitorReads, COLUMNS,
-    LEGACY_LOOKUP, PAUSE_UNTIL_SEPARATOR, PR_MONITOR_PAUSE_MARKER, TARGET_COLUMNS,
+    check_rearm_compatible, check_replacement_identity, kind_word, monitor_from_row, pending_to_db,
+    provider_word, qualified_from_row, state_to_db, target_number, validate_monitor_target,
+    workspace_reads_by_workspace_from_rows, workspace_reads_from_rows, MonitorQualificationOutcome,
+    MonitorTargetProvenance, PersistedMonitorTarget, PrMonitorPollUpdate, PreparedMonitorWrite,
+    QualifiedPrMonitor, TargetColumns, WorkspacePrMonitorReads, COLUMNS, LEGACY_LOOKUP,
+    PAUSE_UNTIL_SEPARATOR, PR_MONITOR_PAUSE_MARKER, TARGET_COLUMNS,
 };
 use crate::subscription_agent_repo::{SubscriptionAgentProjection, IDS_PER_STATEMENT};
 
@@ -95,7 +95,7 @@ fn json_bool(doc: &str, path: &str) -> String {
     )
 }
 
-/// The [`PrMonitorListEntry`] snapshot scalars of the valid-JSON `doc`.
+/// The `PrMonitorListEntry` snapshot scalars of the valid-JSON `doc`.
 fn snapshot_scalars(doc: &str) -> String {
     format!(
         "sqlite_json_extract({doc}, '$.url') AS snapshot_url, \
@@ -605,34 +605,6 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn list_display_status_pr_monitors_by_workspaces(
-        &self,
-        workspace_ids: &[WorkspaceId],
-    ) -> Result<Vec<PrMonitor>> {
-        if workspace_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<String> = workspace_ids.iter().map(|id| id.0.clone()).collect();
-        let sql = format!(
-            "SELECT {COLUMNS} FROM ( \
-               SELECT {COLUMNS}, row_seq, ROW_NUMBER() OVER ( \
-                 PARTITION BY workspace_id, state ORDER BY updated_at COLLATE \"C\" DESC, row_seq \
-               ) AS state_rank FROM pr_monitor \
-               WHERE tenant_id = $1 AND workspace_id = ANY($2) \
-               AND state IN ('active', 'completed')) d \
-             WHERE state = 'active' OR state_rank = 1 \
-             ORDER BY workspace_id COLLATE \"C\", created_at COLLATE \"C\", row_seq"
-        );
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(self.tenant().to_owned())
-            .bind(ids);
-        self.fetch_monitors(query, "batch list display-status pr monitors failed")
-            .await?
-            .iter()
-            .map(monitor_from_row)
-            .collect()
-    }
-
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
         let sql = format!(
             "SELECT {COLUMNS} FROM pr_monitor WHERE tenant_id = $1 AND state = 'active' \
@@ -646,59 +618,35 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn load_non_cancelled_pr_monitor_list_entries(
-        &self,
-        include_archived: bool,
-    ) -> Result<Vec<PrMonitorListEntry>> {
-        let sql = format!(
-            "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, {} \
-             FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, row_seq, \
-             CASE WHEN sqlite_json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
-             FROM pr_monitor WHERE tenant_id = $1 AND state != 'cancelled' \
-             AND ($2 OR workspace_id IN ( \
-               SELECT id FROM workspace WHERE tenant_id = $1 AND archived = 0))) e \
-             ORDER BY created_at COLLATE \"C\", row_seq",
-            snapshot_scalars("snapshot")
-        );
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(self.tenant().to_owned())
-            .bind(include_archived);
-        self.fetch_monitors(query, "load pr monitor list entries failed")
-            .await?
-            .iter()
-            .map(list_entry_from_row)
-            .collect()
-    }
-
     pub async fn load_workspace_pr_monitor_reads(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspacePrMonitorReads> {
-        let sql = format!(
-            "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, pr_number, \
-             state, created_at, updated_at, {}, display_row, \
-             CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
-             FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
-             m.pr_number, m.state, m.created_at, m.updated_at, m.last_snapshot, m.row_seq, \
-             CASE WHEN sqlite_json_valid(m.last_snapshot) THEN m.last_snapshot END AS snapshot, \
-             (m.state = 'active' OR r.state_rank = 1) AS display_row \
-             FROM (SELECT monitor_id, ROW_NUMBER() OVER ( \
-               PARTITION BY state ORDER BY updated_at COLLATE \"C\" DESC, row_seq) AS state_rank \
-             FROM pr_monitor WHERE tenant_id = $1 AND workspace_id = $2 \
-             AND state != 'cancelled') AS r \
-             JOIN pr_monitor AS m ON m.tenant_id = $1 AND m.monitor_id = r.monitor_id) s \
-             ORDER BY created_at COLLATE \"C\", row_seq",
-            snapshot_scalars("snapshot")
-        );
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(self.tenant().to_owned())
-            .bind(workspace_id.0.clone());
+        let query = sqlx::query(sqlx::AssertSqlSafe(pr_monitor_reads_sql(
+            "workspace_id = $2",
+        )))
+        .bind(self.tenant().to_owned())
+        .bind(workspace_id.0.clone());
         let rows = self
             .fetch_monitors(query, "load pr monitor reads for workspace failed")
             .await?;
         workspace_reads_from_rows(&rows)
+    }
+
+    pub async fn load_pr_monitor_reads_by_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspacePrMonitorReads>> {
+        let ids: Vec<String> = workspace_ids.iter().map(|id| id.0.clone()).collect();
+        let query = sqlx::query(sqlx::AssertSqlSafe(pr_monitor_reads_sql(
+            "workspace_id = ANY($2)",
+        )))
+        .bind(self.tenant().to_owned())
+        .bind(ids);
+        let rows = self
+            .fetch_monitors(query, "batch load pr monitor reads failed")
+            .await?;
+        workspace_reads_by_workspace_from_rows(&rows)
     }
 
     pub async fn update_pr_monitor_state(
@@ -1185,4 +1133,29 @@ async fn qualified_in(
         .map_err(|e| internal("get qualified monitor", e))?
         .ok_or_else(|| not_found(id))?;
     qualified_from_row(&row)
+}
+
+/// The Postgres shape of `SQLite`'s `pr_monitor_reads_sql`: every
+/// non-cancelled row of the filtered workspaces as list entries, plus the
+/// displayStatus rows (active rows and each workspace's latest completed
+/// row) carrying `last_snapshot`. `$1` is the tenant; `workspace_filter`
+/// binds the workspace id(s) as `$2`.
+fn pr_monitor_reads_sql(workspace_filter: &str) -> String {
+    format!(
+        "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, pr_number, \
+         state, created_at, updated_at, {}, display_row, \
+         CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
+         FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
+         m.pr_number, m.state, m.created_at, m.updated_at, m.last_snapshot, m.row_seq, \
+         CASE WHEN sqlite_json_valid(m.last_snapshot) THEN m.last_snapshot END AS snapshot, \
+         (m.state = 'active' OR r.state_rank = 1) AS display_row \
+         FROM (SELECT monitor_id, ROW_NUMBER() OVER ( \
+           PARTITION BY workspace_id, state ORDER BY updated_at COLLATE \"C\" DESC, row_seq) \
+           AS state_rank \
+         FROM pr_monitor WHERE tenant_id = $1 AND {workspace_filter} \
+         AND state != 'cancelled') AS r \
+         JOIN pr_monitor AS m ON m.tenant_id = $1 AND m.monitor_id = r.monitor_id) s \
+         ORDER BY created_at COLLATE \"C\", row_seq",
+        snapshot_scalars("snapshot")
+    )
 }

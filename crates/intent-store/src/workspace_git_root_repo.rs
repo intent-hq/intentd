@@ -163,22 +163,25 @@ impl Store {
         dispatch!(self, backend => backend.list_workspace_git_roots(workspace_id).await)
     }
 
-    /// Every git root across ALL workspaces that carries a discovered
-    /// `pull_requests` list, oldest first — the single bulk read backing the
-    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge (one query per
-    /// list call instead of one per workspace). SQL-filtered on
-    /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
-    /// owning workspace being live, so cost is O(PR-bearing roots of returned
-    /// workspaces) and a large archive never inflates the hot list paths.
+    /// The git roots of `workspace_ids` that carry a discovered
+    /// `pull_requests` list, oldest first — the single bulk read backing each
+    /// `workspace.list` page and `workspace.subscribe` seq-0 PR merge (one
+    /// query per page instead of one per workspace). Scoped to the page's ids
+    /// and SQL-filtered on `pull_requests IS NOT NULL`, so a page costs
+    /// O(PR-bearing roots of its workspaces): the old unscoped read returned
+    /// every workspace's roots on every page.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots_with_prs(
         &self,
-        include_archived: bool,
+        workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<WorkspaceGitRoot>> {
-        dispatch!(self, backend => backend.list_workspace_git_roots_with_prs(include_archived).await)
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        dispatch!(self, backend => backend.list_workspace_git_roots_with_prs(workspace_ids).await)
     }
 
     /// Git roots of live (non-archived, non-remote) workspaces referencing a
@@ -456,23 +459,20 @@ impl crate::SqliteStore {
 
     pub async fn list_workspace_git_roots_with_prs(
         &self,
-        include_archived: bool,
+        workspace_ids: &[WorkspaceId],
     ) -> Result<Vec<WorkspaceGitRoot>> {
-        let archived_filter = if include_archived {
-            ""
-        } else {
-            " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
-        };
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
         let sql = format!(
-            "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL\
-             {archived_filter} ORDER BY created_at"
+            "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL \
+             AND workspace_id IN ({placeholders}) ORDER BY created_at"
         );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("list workspace git roots with prs failed: {e}"))
-            })?;
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("list workspace git roots with prs failed: {e}"))
+        })?;
         rows.iter().map(root_from_row).collect()
     }
 

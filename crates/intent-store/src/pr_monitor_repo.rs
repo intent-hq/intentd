@@ -5,6 +5,7 @@
 //! of the case-insensitive `RepoRef` identity in `intent-sourcecontrol` —
 //! while the stored casing is kept verbatim.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use intent_core::{
@@ -1012,32 +1013,6 @@ pub struct WorkspacePrMonitorReads {
     pub list_entries: Vec<PrMonitorListEntry>,
 }
 
-/// The [`PrMonitorListEntry`] projection query over the non-cancelled rows,
-/// with `extra_filter` appended to the inner `WHERE` (the archived-workspace
-/// exclusion). The blob columns are never
-/// selected: the few `last_snapshot` scalars the merge consumes are
-/// `json_extract`ed in SQL, guarded by `json_valid` so a malformed blob
-/// degrades to NULL scalars instead of failing the query.
-fn non_cancelled_list_entry_sql(extra_filter: &str) -> String {
-    format!(
-        "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-         updated_at, \
-         json_extract(snapshot, '$.url') AS snapshot_url, \
-         json_extract(snapshot, '$.title') AS snapshot_title, \
-         json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
-         json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
-         json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
-         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
-         json_extract(snapshot, '$.requirements.isInMergeQueue') AS snapshot_is_in_merge_queue, \
-         json_extract(snapshot, '$.prUpdatedAt') AS snapshot_pr_updated_at \
-         FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-         updated_at, \
-         CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
-         FROM pr_monitor WHERE state != 'cancelled'{extra_filter}) \
-         ORDER BY created_at"
-    )
-}
-
 /// The single statement behind [`Store::load_workspace_pr_monitor_reads`]
 /// (one `?` bind: the workspace id), exposed so the plan-shape regression
 /// test EXPLAINs the exact production SQL.
@@ -1052,28 +1027,40 @@ fn non_cancelled_list_entry_sql(extra_filter: &str) -> String {
 /// result row for the displayStatus set — ranking the full row instead
 /// carried every completed monitor's snapshot into the window sort
 /// (intentd#2001 review).
-fn workspace_pr_monitor_reads_sql() -> &'static str {
-    "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, pr_number, \
-     state, created_at, updated_at, \
-     json_extract(snapshot, '$.url') AS snapshot_url, \
-     json_extract(snapshot, '$.title') AS snapshot_title, \
-     json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
-     json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
-     json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
-     json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
-     json_extract(snapshot, '$.requirements.isInMergeQueue') AS snapshot_is_in_merge_queue, \
-     json_extract(snapshot, '$.prUpdatedAt') AS snapshot_pr_updated_at, \
-     display_row, \
-     CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
-     FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
-     m.pr_number, m.state, m.created_at, m.updated_at, m.last_snapshot, \
-     CASE WHEN json_valid(m.last_snapshot) THEN m.last_snapshot END AS snapshot, \
-     (m.state = 'active' OR r.state_rank = 1) AS display_row \
-     FROM (SELECT monitor_id, \
-     ROW_NUMBER() OVER (PARTITION BY state ORDER BY updated_at DESC) AS state_rank \
-     FROM pr_monitor WHERE workspace_id = ? AND state != 'cancelled') AS r \
-     JOIN pr_monitor AS m ON m.monitor_id = r.monitor_id) \
-     ORDER BY created_at"
+fn workspace_pr_monitor_reads_sql() -> String {
+    pr_monitor_reads_sql("workspace_id = ?")
+}
+
+/// [`workspace_pr_monitor_reads_sql`] over `count` workspaces (one `?` bind
+/// per id): the batch read behind [`Store::load_pr_monitor_reads_by_workspaces`].
+fn pr_monitor_reads_by_workspaces_sql(count: usize) -> String {
+    pr_monitor_reads_sql(&format!("workspace_id IN ({})", vec!["?"; count].join(",")))
+}
+
+fn pr_monitor_reads_sql(workspace_filter: &str) -> String {
+    format!(
+        "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, pr_number, \
+         state, created_at, updated_at, \
+         json_extract(snapshot, '$.url') AS snapshot_url, \
+         json_extract(snapshot, '$.title') AS snapshot_title, \
+         json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
+         json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
+         json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
+         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
+         json_extract(snapshot, '$.requirements.isInMergeQueue') AS snapshot_is_in_merge_queue, \
+         json_extract(snapshot, '$.prUpdatedAt') AS snapshot_pr_updated_at, \
+         display_row, \
+         CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
+         FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
+         m.pr_number, m.state, m.created_at, m.updated_at, m.last_snapshot, \
+         CASE WHEN json_valid(m.last_snapshot) THEN m.last_snapshot END AS snapshot, \
+         (m.state = 'active' OR r.state_rank = 1) AS display_row \
+         FROM (SELECT monitor_id, \
+         ROW_NUMBER() OVER (PARTITION BY workspace_id, state ORDER BY updated_at DESC) AS state_rank \
+         FROM pr_monitor WHERE {workspace_filter} AND state != 'cancelled') AS r \
+         JOIN pr_monitor AS m ON m.monitor_id = r.monitor_id) \
+         ORDER BY created_at"
+    )
 }
 
 /// The column reads both backends' monitor rows share, so one decoder serves
@@ -1164,34 +1151,55 @@ pub(crate) fn monitor_from_row(r: &impl MonitorRow) -> Result<PrMonitor> {
 pub(crate) fn workspace_reads_from_rows(
     rows: &[impl MonitorRow],
 ) -> Result<WorkspacePrMonitorReads> {
-    let err =
-        |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
     let mut reads = WorkspacePrMonitorReads::default();
     for r in rows {
-        let entry = list_entry_from_row(r)?;
-        if r.boolean("display_row").map_err(err)? {
-            reads.display_rows.push(PrMonitor {
-                monitor_id: PrMonitorId(r.text("monitor_id").map_err(err)?),
-                workspace_id: entry.workspace_id.clone(),
-                agent_id: AgentId(r.text("agent_id").map_err(err)?),
-                repo_owner: entry.repo_owner.clone(),
-                repo_name: entry.repo_name.clone(),
-                pr_number: entry.pr_number,
-                state: entry.state,
-                last_snapshot: r.opt_text("display_snapshot").map_err(err)?,
-                baseline_snapshot: None,
-                pending_changes: Vec::new(),
-                pending_since: None,
-                last_change_at: None,
-                last_polled_at: None,
-                last_error: None,
-                created_at: entry.created_at.clone(),
-                updated_at: entry.updated_at.clone(),
-            });
-        }
-        reads.list_entries.push(entry);
+        push_monitor_read(&mut reads, r)?;
     }
     Ok(reads)
+}
+
+/// [`workspace_reads_from_rows`] for a multi-workspace read, keyed by
+/// workspace; each workspace keeps the rows' order.
+pub(crate) fn workspace_reads_by_workspace_from_rows(
+    rows: &[impl MonitorRow],
+) -> Result<HashMap<WorkspaceId, WorkspacePrMonitorReads>> {
+    let mut out: HashMap<WorkspaceId, WorkspacePrMonitorReads> = HashMap::new();
+    for r in rows {
+        let workspace_id =
+            WorkspaceId(r.text("workspace_id").map_err(|e| {
+                intent_core::Error::Internal(format!("read pr monitor list row: {e}"))
+            })?);
+        push_monitor_read(out.entry(workspace_id).or_default(), r)?;
+    }
+    Ok(out)
+}
+
+fn push_monitor_read(reads: &mut WorkspacePrMonitorReads, r: &impl MonitorRow) -> Result<()> {
+    let err =
+        |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
+    let entry = list_entry_from_row(r)?;
+    if r.boolean("display_row").map_err(err)? {
+        reads.display_rows.push(PrMonitor {
+            monitor_id: PrMonitorId(r.text("monitor_id").map_err(err)?),
+            workspace_id: entry.workspace_id.clone(),
+            agent_id: AgentId(r.text("agent_id").map_err(err)?),
+            repo_owner: entry.repo_owner.clone(),
+            repo_name: entry.repo_name.clone(),
+            pr_number: entry.pr_number,
+            state: entry.state,
+            last_snapshot: r.opt_text("display_snapshot").map_err(err)?,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: entry.created_at.clone(),
+            updated_at: entry.updated_at.clone(),
+        });
+    }
+    reads.list_entries.push(entry);
+    Ok(())
 }
 
 impl Store {
@@ -1327,19 +1335,6 @@ impl Store {
         dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspace(workspace_id).await)
     }
 
-    /// Display-status monitor rows for every requested workspace in one
-    /// statement: all active rows plus the latest completed row per workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` when the query or row projection fails.
-    pub async fn list_display_status_pr_monitors_by_workspaces(
-        &self,
-        workspace_ids: &[WorkspaceId],
-    ) -> Result<Vec<PrMonitor>> {
-        dispatch!(self, backend => backend.list_display_status_pr_monitors_by_workspaces(workspace_ids).await)
-    }
-
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
     ///
@@ -1350,38 +1345,32 @@ impl Store {
         dispatch!(self, backend => backend.load_active_pr_monitors().await)
     }
 
-    /// Every non-cancelled (active or completed) monitor across all
-    /// workspaces, oldest first, as narrow [`PrMonitorListEntry`] projections
-    /// — the single bulk read backing the `workspace.list` /
-    /// `workspace.subscribe` seq-0 PR merge. Completed rows are retained so
-    /// merged PRs stay visible; cancelled rows are excluded (they are removed
-    /// from the UI), matching the services-level per-workspace view
-    /// ([`Services::pr_monitors_for_workspace`]). Unless `include_archived`,
-    /// rows owned by archived workspaces are filtered in SQL so cost tracks
-    /// the workspaces the list call actually returns.
-    ///
-    /// The blob columns are never selected: the few `last_snapshot` scalars
-    /// the merge consumes are `json_extract`ed in SQL (guarded by
-    /// `json_valid` so a malformed blob degrades to NULL scalars instead of
-    /// failing the query), and `baseline_snapshot` / `pending_changes` are
-    /// not touched at all — this read grows with monitor history, and
-    /// hydrating full snapshot JSON per row put it at 1.26s for 440 rows on
-    /// one of the hottest RPCs (intent-hq/monorepo#3878).
+    /// [`Store::load_workspace_pr_monitor_reads`] for every requested
+    /// workspace in ONE statement, keyed by workspace (a workspace with no
+    /// non-cancelled monitor has no entry): the read behind each
+    /// `workspace.list` page and `workspace.subscribe` seq-0 snapshot. It is
+    /// scoped to the page's ids, so a page costs O(monitors of its
+    /// workspaces) however much history other workspaces hold — the old
+    /// list-entry read scanned every workspace's monitors on every page
+    /// (~2,000 rows per page on a 771-workspace host). Same projection and
+    /// blob rules as the single-workspace read.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn load_non_cancelled_pr_monitor_list_entries(
+    pub async fn load_pr_monitor_reads_by_workspaces(
         &self,
-        include_archived: bool,
-    ) -> Result<Vec<PrMonitorListEntry>> {
-        dispatch!(self, backend => backend.load_non_cancelled_pr_monitor_list_entries(include_archived).await)
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspacePrMonitorReads>> {
+        if workspace_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        dispatch!(self, backend => backend.load_pr_monitor_reads_by_workspaces(workspace_ids).await)
     }
 
     /// One workspace's PR-monitor inputs for `workspace.get` in ONE
     /// statement: every non-cancelled row as the narrow
-    /// [`PrMonitorListEntry`] projection (the PR merge, same shape as
-    /// [`Store::load_non_cancelled_pr_monitor_list_entries`]) plus the
+    /// [`PrMonitorListEntry`] projection (the PR merge) plus the
     /// displayStatus rows — the ACTIVE rows and the single most recently
     /// updated COMPLETED row, exactly the set
     /// [`Store::list_display_status_pr_monitors_by_workspace`] returns. The
@@ -1756,35 +1745,6 @@ impl crate::SqliteStore {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    pub async fn list_display_status_pr_monitors_by_workspaces(
-        &self,
-        workspace_ids: &[WorkspaceId],
-    ) -> Result<Vec<PrMonitor>> {
-        if workspace_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = vec!["?"; workspace_ids.len()].join(",");
-        let sql = format!(
-            "SELECT {COLUMNS} FROM (\
-                SELECT {COLUMNS}, ROW_NUMBER() OVER (\
-                    PARTITION BY workspace_id, state ORDER BY updated_at DESC\
-                ) AS state_rank FROM pr_monitor \
-                WHERE workspace_id IN ({placeholders}) AND state IN ('active', 'completed')\
-             ) WHERE state = 'active' OR state_rank = 1 \
-             ORDER BY workspace_id, created_at"
-        );
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        for id in workspace_ids {
-            query = query.bind(&id.0);
-        }
-        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
-            intent_core::Error::Internal(format!(
-                "batch list display-status pr monitors failed: {e}"
-            ))
-        })?;
-        rows.iter().map(monitor_from_row).collect()
-    }
-
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at");
@@ -1797,31 +1757,26 @@ impl crate::SqliteStore {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    pub async fn load_non_cancelled_pr_monitor_list_entries(
+    pub async fn load_pr_monitor_reads_by_workspaces(
         &self,
-        include_archived: bool,
-    ) -> Result<Vec<PrMonitorListEntry>> {
-        let archived_filter = if include_archived {
-            ""
-        } else {
-            " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
-        };
-        let rows = sqlx::query(sqlx::AssertSqlSafe(non_cancelled_list_entry_sql(
-            archived_filter,
-        )))
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(|e| {
-            intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspacePrMonitorReads>> {
+        let sql = pr_monitor_reads_by_workspaces_sql(workspace_ids.len());
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            intent_core::Error::Internal(format!("batch load pr monitor reads failed: {e}"))
         })?;
-        rows.iter().map(list_entry_from_row).collect()
+        workspace_reads_by_workspace_from_rows(&rows)
     }
 
     pub async fn load_workspace_pr_monitor_reads(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspacePrMonitorReads> {
-        let rows = sqlx::query(workspace_pr_monitor_reads_sql())
+        let rows = sqlx::query(sqlx::AssertSqlSafe(workspace_pr_monitor_reads_sql()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -2707,7 +2662,8 @@ mod tests {
         ] {
             assert!(store.insert_pr_monitor(&m).await.expect("insert"));
         }
-        // A monitor in an archived workspace: excluded unless include_archived.
+        // A monitor in another (archived) workspace: never in this
+        // workspace's batch entry.
         let ts = now_iso();
         let archived_ws = WorkspaceId("ws-pr-monitor-archived".to_string());
         let mut w = test_workspace(&archived_ws, &ts);
@@ -2718,15 +2674,17 @@ mod tests {
         m.pr_number = 5;
         assert!(store.insert_pr_monitor(&m).await.expect("insert archived"));
 
-        let entries = store
-            .load_non_cancelled_pr_monitor_list_entries(false)
+        let batch = store
+            .load_pr_monitor_reads_by_workspaces(std::slice::from_ref(&ws_id))
             .await
-            .expect("list entries");
+            .expect("batch reads");
+        assert_eq!(batch.len(), 1, "only the requested workspace");
+        let entries = &batch[&ws_id].list_entries;
         let numbers: Vec<i64> = entries.iter().map(|e| e.pr_number).collect();
         assert_eq!(
             numbers,
             vec![1, 2, 3],
-            "cancelled + archived-workspace rows excluded, oldest first"
+            "cancelled + other-workspace rows excluded, oldest first"
         );
 
         // Snapshot-backed row: scalars extracted from the JSON blob in SQL.
@@ -2761,16 +2719,30 @@ mod tests {
             assert_eq!(e.snapshot_pr_updated_at, None, "pr {}", e.pr_number);
         }
 
+        let none = WorkspaceId("ws-pr-monitor-none".to_string());
         let all = store
-            .load_non_cancelled_pr_monitor_list_entries(true)
+            .load_pr_monitor_reads_by_workspaces(&[
+                ws_id.clone(),
+                archived_ws.clone(),
+                none.clone(),
+            ])
             .await
-            .expect("list entries incl. archived");
-        let numbers: Vec<i64> = all.iter().map(|e| e.pr_number).collect();
+            .expect("batch reads incl. archived");
+        let numbers = |id: &WorkspaceId| -> Vec<i64> {
+            all[id].list_entries.iter().map(|e| e.pr_number).collect()
+        };
+        assert_eq!(numbers(&ws_id), vec![1, 2, 3]);
         assert_eq!(
-            numbers,
-            vec![1, 2, 3, 5],
-            "include_archived adds the archived workspace's row; cancelled stays excluded"
+            numbers(&archived_ws),
+            vec![5],
+            "archived ids are served when asked"
         );
+        assert!(!all.contains_key(&none), "no monitors, no entry");
+        assert!(store
+            .load_pr_monitor_reads_by_workspaces(&[])
+            .await
+            .expect("empty batch")
+            .is_empty());
 
         // Per-workspace `workspace.get` read: the same projection over this
         // workspace's non-cancelled rows (archived served regardless), plus
@@ -2862,6 +2834,18 @@ mod tests {
             "workspace read has no archived filter"
         );
         assert_eq!(archived_reads.display_rows.len(), 1);
+
+        // The batch read returns exactly the per-workspace read for each id,
+        // including the per-workspace "latest completed" display row.
+        let batch = store
+            .load_pr_monitor_reads_by_workspaces(&[ws_id.clone(), archived_ws.clone()])
+            .await
+            .expect("batch reads");
+        assert_eq!(format!("{:?}", batch[&ws_id]), format!("{reads:?}"));
+        assert_eq!(
+            format!("{:?}", batch[&archived_ws]),
+            format!("{archived_reads:?}")
+        );
     }
 
     /// Plan-shape guard for [`workspace_pr_monitor_reads_sql`] (intentd#2001
