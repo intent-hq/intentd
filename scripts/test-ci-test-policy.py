@@ -562,6 +562,7 @@ def violations(workflow, policy):
 REQUIRED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Real Claude adapter utility-session contract"): 1,
+    ("check", "Stack guards with the Postgres store compiled in"): 1,
     ("check", "Source lints"): 1,
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 2,
     ("check", "No provider CLIs on the runner"): 1,
@@ -1019,6 +1020,7 @@ else:
 NAMED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Real Claude adapter utility-session contract"): 1,
+    ("check", "Stack guards with the Postgres store compiled in"): 9,
     ("check", "Source lints"): 1,
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 5,
     ("check", "No provider CLIs on the runner"): 1,
@@ -1030,7 +1032,6 @@ NAMED_TEST_STEPS = {
     ("windows", "Headless workspace setup (Windows runtime)"): 3,
     ("windows", "Codex diagnostic process ownership (Windows runtime)"): 3,
     ("store-postgres", "Postgres backend tests"): 3,
-    ("services-postgres", "Stack guards (postgres feature)"): 9,
 }
 
 # The macOS queue step as intentd#3205 first queued it: the PR deleted five of

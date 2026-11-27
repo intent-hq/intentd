@@ -34,8 +34,8 @@
 //! Every `Store` future sits under these frames too, so the store keeps
 //! them the same size with its `postgres` feature on (`intent_store`'s
 //! `dispatch!` boxes Postgres futures; holding them inline overflowed 30
-//! tests in that build only). CI's `services-postgres` job runs these guards
-//! with the feature.
+//! tests in that build only). CI's `check` job runs these guards with
+//! the feature.
 
 use std::future::Future;
 use std::pin::Pin;
