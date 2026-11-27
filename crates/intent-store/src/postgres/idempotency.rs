@@ -2,7 +2,7 @@
 
 use intent_core::{now_iso, Result};
 
-use crate::idempotency_repo::{IdempotencyReservation, IDEMPOTENCY_CLAIM_TTL};
+use crate::idempotency_repo::{IdempotencyClaim, IdempotencyReservation, IDEMPOTENCY_CLAIM_TTL};
 
 use super::{db, PgStore};
 
@@ -18,10 +18,11 @@ fn claim_ttl_millis() -> Result<i64> {
 }
 
 impl PgStore {
-    /// Inserts a `pending` row for the key, or takes over one that is this
-    /// process's or whose expiry passed by the database clock, under the
-    /// writer lock; else reports the row that is there. The tenant epoch
-    /// plays no part: a takeover leaves live reservations alone.
+    /// Inserts a `pending` row for the key, or takes over one whose expiry
+    /// passed by the database clock, under the writer lock; else reports the
+    /// row that is there. The new reservation's token is this process's
+    /// token plus a random id. The tenant epoch plays no part: a takeover
+    /// leaves live reservations alone.
     pub async fn reserve_idempotent(
         &self,
         workspace_id: &str,
@@ -29,6 +30,8 @@ impl PgStore {
         method: &str,
     ) -> Result<IdempotencyReservation> {
         let ttl = claim_ttl_millis()?;
+        let claim =
+            IdempotencyClaim::new(format!("{}/{}", self.process_token(), uuid::Uuid::new_v4()));
         let mut tx = self.begin_write().await?;
         let reserved = sqlx::query(
             "INSERT INTO idempotency_key (tenant_id, workspace_id, idempotency_key, method, \
@@ -39,14 +42,13 @@ impl PgStore {
              method = excluded.method, claim_token = excluded.claim_token, \
              claim_expires_at = excluded.claim_expires_at \
              WHERE idempotency_key.result_json IS NULL \
-             AND (idempotency_key.claim_token = excluded.claim_token \
-               OR idempotency_key.claim_expires_at <= clock_timestamp())",
+             AND idempotency_key.claim_expires_at <= clock_timestamp()",
         )
         .bind(self.tenant())
         .bind(workspace_id)
         .bind(key)
         .bind(method)
-        .bind(self.process_token())
+        .bind(claim.token())
         .bind(ttl)
         .bind(now_iso())
         .execute(&mut *tx)
@@ -55,7 +57,7 @@ impl PgStore {
         .rows_affected()
             > 0;
         let outcome = if reserved {
-            IdempotencyReservation::Reserved
+            IdempotencyReservation::Reserved(claim)
         } else {
             let row: Option<Option<String>> = sqlx::query_scalar(
                 "SELECT result_json FROM idempotency_key \
@@ -76,18 +78,20 @@ impl PgStore {
         Ok(outcome)
     }
 
-    /// Marks this process's reservation `done` with the result. When the
+    /// Marks `claim`'s reservation `done` with the result. When the
     /// reservation is gone (reaped) the result is inserted as before; when
-    /// another process took it over, that process's outcome stands.
+    /// another process took it over, that process's outcome stands and this
+    /// returns `false`.
     pub async fn complete_idempotent(
         &self,
         workspace_id: &str,
         key: &str,
         method: &str,
+        claim: &IdempotencyClaim,
         result_json: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut tx = self.begin_write().await?;
-        let done = sqlx::query(
+        let mut stored = sqlx::query(
             "UPDATE idempotency_key SET result_json = $4, \
              claim_token = NULL, claim_expires_at = NULL \
              WHERE tenant_id = $1 AND workspace_id = $2 AND idempotency_key = $3 \
@@ -97,13 +101,13 @@ impl PgStore {
         .bind(workspace_id)
         .bind(key)
         .bind(result_json)
-        .bind(self.process_token())
+        .bind(claim.token())
         .execute(&mut *tx)
         .await
         .map_err(db)?
         .rows_affected();
-        if done == 0 {
-            sqlx::query(
+        if stored == 0 {
+            stored = sqlx::query(
                 "INSERT INTO idempotency_key \
                  (tenant_id, workspace_id, idempotency_key, method, result_json, created_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -116,14 +120,21 @@ impl PgStore {
             .bind(now_iso())
             .execute(&mut *tx)
             .await
-            .map_err(db)?;
+            .map_err(db)?
+            .rows_affected();
         }
-        tx.commit().await.map_err(db)
+        tx.commit().await.map_err(db)?;
+        Ok(stored > 0)
     }
 
-    /// Restarts the expiry of this process's `pending` reservation, also
-    /// after it passed while nobody took the key over.
-    pub async fn renew_idempotent(&self, workspace_id: &str, key: &str) -> Result<bool> {
+    /// Restarts the expiry of `claim`'s `pending` reservation, also after it
+    /// passed while nobody took the key over.
+    pub async fn renew_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        claim: &IdempotencyClaim,
+    ) -> Result<bool> {
         let ttl = claim_ttl_millis()?;
         let mut tx = self.begin_write().await?;
         let renewed = sqlx::query(
@@ -135,7 +146,7 @@ impl PgStore {
         .bind(self.tenant())
         .bind(workspace_id)
         .bind(key)
-        .bind(self.process_token())
+        .bind(claim.token())
         .bind(ttl)
         .execute(&mut *tx)
         .await
@@ -146,8 +157,13 @@ impl PgStore {
         Ok(renewed)
     }
 
-    /// Deletes this process's `pending` reservation; another's stays.
-    pub async fn release_idempotent(&self, workspace_id: &str, key: &str) -> Result<()> {
+    /// Deletes `claim`'s `pending` reservation; another's stays.
+    pub async fn release_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        claim: &IdempotencyClaim,
+    ) -> Result<()> {
         let mut tx = self.begin_write().await?;
         sqlx::query(
             "DELETE FROM idempotency_key \
@@ -157,7 +173,7 @@ impl PgStore {
         .bind(self.tenant())
         .bind(workspace_id)
         .bind(key)
-        .bind(self.process_token())
+        .bind(claim.token())
         .execute(&mut *tx)
         .await
         .map_err(db)?;

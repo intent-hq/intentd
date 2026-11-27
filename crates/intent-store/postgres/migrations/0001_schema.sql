@@ -1006,8 +1006,8 @@ CREATE TABLE IF NOT EXISTS idempotency_key (
     result_json text,
     created_at text NOT NULL,
     row_seq bigint NOT NULL,
-    -- Postgres only (orchestrator mode): the reservation names the
-    -- reserving process (a token per process) and an expiry set and
+    -- Postgres only (orchestrator mode): the reservation names itself
+    -- (`<process token>/<random id>`) and an expiry set and
     -- compared by the database clock. The holder renews it while the
     -- operation runs; another process may take it over only once it
     -- expired (a holder that died), never because of a tenant takeover:

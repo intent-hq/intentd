@@ -9,13 +9,30 @@ use sqlx::Row;
 
 use crate::Store;
 
+/// One reservation of a key: renew, complete or release it with this
+/// claim. Each reservation has its own token (on Postgres, the process
+/// token plus a random id), so a late release or renewal of an earlier
+/// reservation never touches a later one, also in the same process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyClaim(String);
+
+impl IdempotencyClaim {
+    pub(crate) fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.0
+    }
+}
+
 /// What [`Store::reserve_idempotent`] found for a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdempotencyReservation {
-    /// This process reserved the key: run the operation, then
+    /// This call reserved the key: run the operation, then
     /// [`Store::complete_idempotent`] (or [`Store::release_idempotent`] when
-    /// it fails).
-    Reserved,
+    /// it fails) with the claim.
+    Reserved(IdempotencyClaim),
     /// The operation already ran: replay its stored `result_json`.
     Done(String),
     /// Another process holds a live reservation of the key and is still
@@ -51,8 +68,10 @@ impl Store {
         dispatch!(self, backend => backend.reserve_idempotent(workspace_id, key, method).await)
     }
 
-    /// Store the result of an operation this process reserved; it is then
-    /// replayed to every later caller with the key.
+    /// Store the result of the operation `claim` reserved; it is then
+    /// replayed to every later caller with the key. `false` when another
+    /// reservation's result is stored instead: this one expired and another
+    /// process took the key over and ran the operation too.
     ///
     /// # Errors
     ///
@@ -62,12 +81,13 @@ impl Store {
         workspace_id: &str,
         key: &str,
         method: &str,
+        claim: &IdempotencyClaim,
         result_json: &str,
-    ) -> Result<()> {
-        dispatch!(self, backend => backend.complete_idempotent(workspace_id, key, method, result_json).await)
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.complete_idempotent(workspace_id, key, method, claim, result_json).await)
     }
 
-    /// Restart the expiry of this process's reservation while its operation
+    /// Restart the expiry of `claim`'s reservation while its operation
     /// runs. `false` when the reservation is gone: another process took it
     /// over after it expired, so this run's result will not be stored.
     /// Always `true` on `SQLite`.
@@ -76,18 +96,29 @@ impl Store {
     ///
     /// Returns `Error::NotOwner` when this process lost the tenant, and
     /// `Error::Internal` if the database operation fails.
-    pub async fn renew_idempotent(&self, workspace_id: &str, key: &str) -> Result<bool> {
-        dispatch!(self, backend => backend.renew_idempotent(workspace_id, key).await)
+    pub async fn renew_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        claim: &IdempotencyClaim,
+    ) -> Result<bool> {
+        dispatch!(self, backend => backend.renew_idempotent(workspace_id, key, claim).await)
     }
 
-    /// Drop this process's reservation after the operation failed, so a
-    /// retry may run it (nothing is stored for a failed operation).
+    /// Drop `claim`'s reservation after the operation failed, so a retry
+    /// may run it (nothing is stored for a failed operation). A no-op when
+    /// the key no longer names this reservation.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn release_idempotent(&self, workspace_id: &str, key: &str) -> Result<()> {
-        dispatch!(self, backend => backend.release_idempotent(workspace_id, key).await)
+    pub async fn release_idempotent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        claim: &IdempotencyClaim,
+    ) -> Result<()> {
+        dispatch!(self, backend => backend.release_idempotent(workspace_id, key, claim).await)
     }
 
     /// Look up the stored `result_json` for `(workspace_id, key)`, or `None` when
@@ -141,7 +172,7 @@ impl crate::SqliteStore {
     ) -> Result<IdempotencyReservation> {
         Ok(match self.get_idempotent(workspace_id, key).await? {
             Some(stored) => IdempotencyReservation::Done(stored),
-            None => IdempotencyReservation::Reserved,
+            None => IdempotencyReservation::Reserved(IdempotencyClaim::new(String::new())),
         })
     }
 
@@ -150,20 +181,30 @@ impl crate::SqliteStore {
         workspace_id: &str,
         key: &str,
         method: &str,
+        _claim: &IdempotencyClaim,
         result_json: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.put_idempotent(workspace_id, key, method, result_json)
             .await
-            .map(|_| ())
     }
 
     #[expect(clippy::unused_async, reason = "mirrors the Postgres reservation")]
-    pub async fn renew_idempotent(&self, _workspace_id: &str, _key: &str) -> Result<bool> {
+    pub async fn renew_idempotent(
+        &self,
+        _workspace_id: &str,
+        _key: &str,
+        _claim: &IdempotencyClaim,
+    ) -> Result<bool> {
         Ok(true)
     }
 
     #[expect(clippy::unused_async, reason = "mirrors the Postgres reservation")]
-    pub async fn release_idempotent(&self, _workspace_id: &str, _key: &str) -> Result<()> {
+    pub async fn release_idempotent(
+        &self,
+        _workspace_id: &str,
+        _key: &str,
+        _claim: &IdempotencyClaim,
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -529,9 +529,11 @@ impl PgStore {
 }
 
 /// Drops the idempotency reservations of every other process ($1 tenant,
-/// $2 process token), so a retry runs the operation again (batch G 2b).
+/// $2 process token; a reservation's token is `<process token>/<id>`), so a
+/// retry runs the operation again (batch G 2b).
 const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
-     WHERE tenant_id = $1 AND result_json IS NULL AND claim_token <> $2";
+     WHERE tenant_id = $1 AND result_json IS NULL \
+     AND claim_token NOT LIKE ($2 || '/%')";
 /// Drops the delete grace claims of every other process ($1 tenant, $2
 /// process token): their commits never finished, so the rows re-arm here.
 const CLEAR_FOREIGN_GRACE_CLAIMS_SQL: &str = "UPDATE delete_grace \

@@ -16642,11 +16642,29 @@ where
     let result = op().await?;
     let result_json = serde_json::to_string(&result)
         .map_err(|e| Error::Internal(format!("encode idempotent result failed: {e}")))?;
-    store
-        .complete_idempotent(workspace_id, &key, method, &result_json)
+    let stored = store
+        .complete_idempotent(workspace_id, &key, method, &reservation.claim, &result_json)
         .await?;
     reservation.disarm();
-    Ok(result)
+    if stored {
+        return Ok(result);
+    }
+    // This reservation expired and another process took the key over and
+    // ran `op` as well: every caller must see one outcome, so answer with
+    // the stored one (or a retry once it is stored), not this run's.
+    tracing::error!(
+        method,
+        "idempotent operation ran in two daemons after its reservation expired; \
+         replaying the stored result"
+    );
+    match store.get_idempotent(workspace_id, &key).await? {
+        Some(stored) => serde_json::from_str(&stored)
+            .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}"))),
+        None => Err(Error::StoreBusy(format!(
+            "{method} with this idempotency key is still running in another daemon; \
+             retry with the same key"
+        ))),
+    }
 }
 
 /// What [`reserve_idempotency_key`] got for a key.
@@ -16675,12 +16693,13 @@ pub(crate) async fn reserve_idempotency_key(
     let waited_since = tokio::time::Instant::now();
     loop {
         match store.reserve_idempotent(workspace_id, key, method).await? {
-            IdempotencyReservation::Reserved => {
+            IdempotencyReservation::Reserved(claim) => {
                 return Ok(KeyReservation::Held(HeldReservation::hold(
                     store,
                     workspace_id,
                     key,
                     method,
+                    claim,
                 )));
             }
             IdempotencyReservation::Done(stored) => return Ok(KeyReservation::Done(stored)),
@@ -16712,29 +16731,37 @@ pub(crate) struct HeldReservation {
     workspace_id: String,
     key: String,
     method: String,
+    claim: intent_store::IdempotencyClaim,
     armed: bool,
     renewer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HeldReservation {
-    fn hold(store: &Store, workspace_id: &str, key: &str, method: &str) -> Self {
+    fn hold(
+        store: &Store,
+        workspace_id: &str,
+        key: &str,
+        method: &str,
+        claim: intent_store::IdempotencyClaim,
+    ) -> Self {
         let renewer = tokio::runtime::Handle::try_current().ok().map(|runtime| {
-            let (store, workspace_id, key, method) = (
+            let (store, workspace_id, key, method, claim) = (
                 store.clone(),
                 workspace_id.to_string(),
                 key.to_string(),
                 method.to_string(),
+                claim.clone(),
             );
             runtime.spawn(async move {
                 loop {
                     tokio::time::sleep(IDEMPOTENCY_RENEW_EVERY).await;
-                    match store.renew_idempotent(&workspace_id, &key).await {
+                    match store.renew_idempotent(&workspace_id, &key, &claim).await {
                         Ok(true) => {}
                         Ok(false) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 method,
                                 "idempotency reservation was taken over after it expired; \
-                                 this run's result will not be replayed"
+                                 another daemon may run the operation too"
                             );
                             return;
                         }
@@ -16750,6 +16777,7 @@ impl HeldReservation {
             workspace_id: workspace_id.to_string(),
             key: key.to_string(),
             method: method.to_string(),
+            claim,
             armed: true,
             renewer,
         }
@@ -16773,13 +16801,18 @@ impl Drop for HeldReservation {
             return;
         };
         let store = self.store.clone();
-        let (workspace_id, key, method) = (
+        let (workspace_id, key, method, claim) = (
             std::mem::take(&mut self.workspace_id),
             std::mem::take(&mut self.key),
             std::mem::take(&mut self.method),
+            self.claim.clone(),
         );
+        // The release names this reservation's own token, so when it runs
+        // after a later reservation of the key (this process's next caller,
+        // which no longer waits once the in-process lock is dropped), it
+        // leaves that one alone.
         runtime.spawn(async move {
-            if let Err(e) = store.release_idempotent(&workspace_id, &key).await {
+            if let Err(e) = store.release_idempotent(&workspace_id, &key, &claim).await {
                 tracing::warn!(method, error = %e, "idempotency key release failed");
             }
         });

@@ -6,7 +6,7 @@
 //! a cutoff of `<date>t` sorts after `<date>T…` bytewise but before it under
 //! a case-insensitive locale, so `COLLATE "C"` decides that reap.
 
-use intent_store::{IdempotencyReservation, Store};
+use intent_store::{IdempotencyClaim, IdempotencyReservation, Store};
 
 use crate::harness::parity_test;
 
@@ -87,21 +87,29 @@ async fn open_as_process(db: &crate::harness::TestDb, tenant: &str, process: &st
     .expect("open tenant store as another process")
 }
 
+/// The claim of a `Reserved` reservation; panics on anything else.
+fn reserved(reservation: IdempotencyReservation) -> IdempotencyClaim {
+    match reservation {
+        IdempotencyReservation::Reserved(claim) => claim,
+        other => panic!("expected Reserved, got {other:?}"),
+    }
+}
+
 /// Batch G 2b: a keyed operation reserves its key before it runs, so a
 /// retry that reaches another process while the first still runs does not
 /// run it again: it sees the key in progress, then replays the stored
 /// result. A failed operation releases its key for a retry. A reservation
-/// names the reserving process and an expiry by the database clock; only
-/// its expiry frees it for another process, never a takeover.
+/// names itself and an expiry by the database clock; only its expiry frees
+/// it for another reservation, never a takeover.
 #[tokio::test]
 async fn a_keyed_operation_runs_in_one_process_at_a_time() {
     let Some(db) = crate::harness::test_db(false).await else {
         let (store, _dir) = crate::harness::sqlite_store().await;
-        assert_eq!(
-            store.reserve_idempotent("", "k", "m").await.unwrap(),
-            IdempotencyReservation::Reserved
-        );
-        store.complete_idempotent("", "k", "m", "1").await.unwrap();
+        let claim = reserved(store.reserve_idempotent("", "k", "m").await.unwrap());
+        assert!(store
+            .complete_idempotent("", "k", "m", &claim, "1")
+            .await
+            .unwrap());
         assert_eq!(
             store.reserve_idempotent("", "k", "m").await.unwrap(),
             IdempotencyReservation::Done("1".into())
@@ -113,11 +121,10 @@ async fn a_keyed_operation_runs_in_one_process_at_a_time() {
     let b = open_as_process(&db, tenant, "process-b").await;
 
     // A reserves and runs; B's retry waits, then replays A's result.
-    assert_eq!(
+    let create = reserved(
         a.reserve_idempotent("", "create", "agent.create")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
     assert_eq!(
         b.reserve_idempotent("", "create", "agent.create")
@@ -127,9 +134,10 @@ async fn a_keyed_operation_runs_in_one_process_at_a_time() {
         "a retry in another process must not run the operation again"
     );
     assert_eq!(b.get_idempotent("", "create").await.unwrap(), None);
-    a.complete_idempotent("", "create", "agent.create", "{\"id\":\"a1\"}")
+    assert!(a
+        .complete_idempotent("", "create", "agent.create", &create, "{\"id\":\"a1\"}")
         .await
-        .unwrap();
+        .unwrap());
     assert_eq!(
         b.reserve_idempotent("", "create", "agent.create")
             .await
@@ -141,52 +149,50 @@ async fn a_keyed_operation_runs_in_one_process_at_a_time() {
         Some("{\"id\":\"a1\"}")
     );
 
-    // A failed operation releases its key; a non-holder's release is a no-op.
-    assert_eq!(
+    // A failed operation releases its key; another claim's release is a
+    // no-op.
+    let commit = reserved(
         a.reserve_idempotent("ws-1", "commit", "git.commit")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
-    b.release_idempotent("ws-1", "commit").await.unwrap();
+    b.release_idempotent("ws-1", "commit", &create)
+        .await
+        .unwrap();
     assert_eq!(
         b.reserve_idempotent("ws-1", "commit", "git.commit")
             .await
             .unwrap(),
         IdempotencyReservation::InProgress
     );
-    a.release_idempotent("ws-1", "commit").await.unwrap();
-    assert_eq!(
+    a.release_idempotent("ws-1", "commit", &commit)
+        .await
+        .unwrap();
+    reserved(
         b.reserve_idempotent("ws-1", "commit", "git.commit")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
 
     // A restarted daemon (a new process, the tenant never leased) may run
     // an operation the gone process left reserved: its first open of the
     // tenant drops other processes' reservations.
-    assert_eq!(
-        a.reserve_idempotent("", "merge", "pr.merge").await.unwrap(),
-        IdempotencyReservation::Reserved
-    );
+    reserved(a.reserve_idempotent("", "merge", "pr.merge").await.unwrap());
     let restarted = open_as_process(&db, tenant, "process-restarted").await;
-    assert_eq!(
+    reserved(
         restarted
             .reserve_idempotent("", "merge", "pr.merge")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
 
     // A takeover leaves a live reservation alone: only the reservation's
     // expiry frees it. (The restarted open above dropped B's reservation,
     // so B reserves the key again first.)
-    assert_eq!(
+    reserved(
         b.reserve_idempotent("ws-1", "commit", "git.commit")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
     let (owner, _lease) = Store::open_postgres_owned_as_process(
         db.app.clone(),
@@ -208,17 +214,16 @@ async fn a_keyed_operation_runs_in_one_process_at_a_time() {
         "a takeover must not void a reservation whose holder still runs"
     );
     expire_reservation(&db, tenant, "ws-1", "commit").await;
-    assert_eq!(
+    let taken = reserved(
         owner
             .reserve_idempotent("ws-1", "commit", "git.commit")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
-    owner
-        .complete_idempotent("ws-1", "commit", "git.commit", "\"c\"")
+    assert!(owner
+        .complete_idempotent("ws-1", "commit", "git.commit", &taken, "\"c\"")
         .await
-        .unwrap();
+        .unwrap());
     assert_eq!(
         owner
             .get_idempotent("ws-1", "commit")
@@ -256,16 +261,14 @@ async fn expire_reservation(
 /// died leaves the tenant epoch unchanged, so the key must free itself by
 /// its own expiry, not wait for a takeover or the 24 h reaper. A live
 /// holder renews its reservation; a holder whose reservation another
-/// process took over can no longer renew or complete it.
+/// process took over can no longer renew, release or complete it, and its
+/// complete reports that another result stands.
 #[tokio::test]
 async fn a_dead_holders_reservation_lapses_and_a_live_one_renews() {
     let Some(db) = crate::harness::test_db(false).await else {
         let (store, _dir) = crate::harness::sqlite_store().await;
-        assert_eq!(
-            store.reserve_idempotent("", "k", "m").await.unwrap(),
-            IdempotencyReservation::Reserved
-        );
-        assert!(store.renew_idempotent("", "k").await.unwrap());
+        let claim = reserved(store.reserve_idempotent("", "k", "m").await.unwrap());
+        assert!(store.renew_idempotent("", "k", &claim).await.unwrap());
         return;
     };
     let tenant = "lapsing-reservations";
@@ -274,15 +277,14 @@ async fn a_dead_holders_reservation_lapses_and_a_live_one_renews() {
 
     // A reserves and renews while it runs: B keeps waiting, also past the
     // expiry A had before it renewed.
-    assert_eq!(
+    let held_by_a = reserved(
         a.reserve_idempotent("", "create", "agent.create")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved
     );
     expire_reservation(&db, tenant, "", "create").await;
     assert!(
-        a.renew_idempotent("", "create").await.unwrap(),
+        a.renew_idempotent("", "create", &held_by_a).await.unwrap(),
         "the holder renews its own lapsed reservation while nobody took it"
     );
     assert_eq!(
@@ -292,24 +294,26 @@ async fn a_dead_holders_reservation_lapses_and_a_live_one_renews() {
         IdempotencyReservation::InProgress,
         "a renewed reservation is live again"
     );
-    assert!(!b.renew_idempotent("", "create").await.unwrap());
 
     // A dies (no release, no renewal). Its reservation lapses and B runs
     // the operation once, with no takeover and no new open.
     expire_reservation(&db, tenant, "", "create").await;
-    assert_eq!(
+    let held_by_b = reserved(
         b.reserve_idempotent("", "create", "agent.create")
             .await
             .unwrap(),
-        IdempotencyReservation::Reserved,
-        "a lapsed reservation frees the key for a retry in another process"
     );
     // A, back from a stall, cannot renew, release or complete B's run.
-    assert!(!a.renew_idempotent("", "create").await.unwrap());
-    a.release_idempotent("", "create").await.unwrap();
-    a.complete_idempotent("", "create", "agent.create", "\"a\"")
+    assert!(!a.renew_idempotent("", "create", &held_by_a).await.unwrap());
+    a.release_idempotent("", "create", &held_by_a)
         .await
         .unwrap();
+    assert!(
+        !a.complete_idempotent("", "create", "agent.create", &held_by_a, "\"a\"")
+            .await
+            .unwrap(),
+        "a lapsed reservation's result is not stored"
+    );
     assert_eq!(
         a.reserve_idempotent("", "create", "agent.create")
             .await
@@ -317,9 +321,10 @@ async fn a_dead_holders_reservation_lapses_and_a_live_one_renews() {
         IdempotencyReservation::InProgress,
         "B still holds the key"
     );
-    b.complete_idempotent("", "create", "agent.create", "\"b\"")
+    assert!(b
+        .complete_idempotent("", "create", "agent.create", &held_by_b, "\"b\"")
         .await
-        .unwrap();
+        .unwrap());
     assert_eq!(
         a.reserve_idempotent("", "create", "agent.create")
             .await
@@ -327,4 +332,30 @@ async fn a_dead_holders_reservation_lapses_and_a_live_one_renews() {
         IdempotencyReservation::Done("\"b\"".into()),
         "every caller replays the result of the run that held the key"
     );
+}
+
+/// Each reservation has its own token, also in one process: a late release
+/// of an earlier reservation (its spawned release ran after the next
+/// caller in the same process reserved the key) leaves the later one alone.
+#[tokio::test]
+async fn a_late_release_leaves_a_later_reservation_of_the_same_process() {
+    let Some(db) = crate::harness::test_db(false).await else {
+        return;
+    };
+    let tenant = "late-release";
+    let a = open_as_process(&db, tenant, "process-a").await;
+    let b = open_as_process(&db, tenant, "process-b").await;
+
+    let first = reserved(a.reserve_idempotent("", "place", "m").await.unwrap());
+    expire_reservation(&db, tenant, "", "place").await;
+    let second = reserved(a.reserve_idempotent("", "place", "m").await.unwrap());
+    assert_ne!(first, second);
+    a.release_idempotent("", "place", &first).await.unwrap();
+    assert!(!a.renew_idempotent("", "place", &first).await.unwrap());
+    assert_eq!(
+        b.reserve_idempotent("", "place", "m").await.unwrap(),
+        IdempotencyReservation::InProgress,
+        "the later reservation survives the earlier one's release"
+    );
+    assert!(a.renew_idempotent("", "place", &second).await.unwrap());
 }

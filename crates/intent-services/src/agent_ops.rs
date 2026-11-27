@@ -12185,12 +12185,15 @@ impl Services {
         // marker has since been overwritten by (A -> B -> A) stays claimed,
         // also across a restart. The persisted marker still short-circuits
         // ids dismissed before the claims existed.
+        // The claim is held by a guard until the notice is delivered: an
+        // error, a failed delivery or a cancelled call releases it, so a
+        // retried dismissal still notifies.
         let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
-        let already_dismissed = persisted
-            || !self
-                .store
-                .claim_dismissal_notice(&agent_id, &message_id)
-                .await?;
+        let mut claim = if persisted {
+            None
+        } else {
+            DismissalNoticeClaim::claim(&self.store, &agent_id, &message_id).await?
+        };
         // Atomic single-key write (store-side `json_set`): sibling metadata
         // keys — e.g. a concurrently-advanced `lastSeenMessageId`
         // (`agent.markSeen`) — are preserved rather than clobbered by a
@@ -12214,18 +12217,8 @@ impl Services {
         {
             // Release the notice claim so a retried dismissal (after this
             // store failure) still delivers the notice.
-            if !already_dismissed {
-                if let Err(release) = self
-                    .store
-                    .release_dismissal_notice(&agent_id, &message_id)
-                    .await
-                {
-                    tracing::warn!(
-                        agent = %agent_id,
-                        error = %release,
-                        "failed to release the dismissal notice claim; a retry will not notify"
-                    );
-                }
+            if let Some(claim) = claim.take() {
+                claim.release().await;
             }
             return Err(e);
         }
@@ -12283,9 +12276,15 @@ impl Services {
         // or lost are skipped, so a repeat dismissal sends no duplicate notices.
         self.decline_secret_requests_on_message(&workspace_id, &agent_id, &message_id)
             .await;
-        if !already_dismissed {
-            self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
-                .await;
+        if let Some(claim) = claim.take() {
+            if self
+                .notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
+                .await
+            {
+                claim.keep();
+            } else {
+                claim.release().await;
+            }
         }
         // Kick the drain so entries parked for other reasons (busy race,
         // notice enqueued above) resume without waiting for the next
@@ -12479,12 +12478,13 @@ impl Services {
     /// is already gone. Fail-soft: delivery problems are logged, never
     /// surfaced to the RPC — the durable dismissal marker is the source of
     /// truth.
+    /// `false` when the notice could not be delivered.
     async fn notify_questions_dismissed(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         dismissed_message_id: &str,
-    ) {
+    ) -> bool {
         let count = self
             .dismissed_question_count(agent_id, dismissed_message_id)
             .await;
@@ -12506,6 +12506,7 @@ impl Services {
                         }
                     }
                 }
+                true
             }
             Err(e) => {
                 tracing::warn!(
@@ -12513,6 +12514,7 @@ impl Services {
                     error = %e,
                     "questions-dismissed notice delivery failed"
                 );
+                false
             }
         }
     }
@@ -23243,5 +23245,76 @@ mod legacy_auggie_shape_tests {
             "warning": "auggie CLI unavailable", "warningKind": "cli-missing",
         }));
         assert_eq!(failed, json!({ "models": [], "source": "static" }));
+    }
+}
+
+/// A won questions-dismissed notice claim (`Store::claim_dismissal_notice`).
+/// [`Self::keep`] once the notice is delivered; [`Self::release`] or a drop
+/// (a cancelled dismissal) gives it back, so a retried dismissal notifies.
+struct DismissalNoticeClaim {
+    store: intent_store::Store,
+    agent_id: AgentId,
+    message_id: String,
+    armed: bool,
+}
+
+impl DismissalNoticeClaim {
+    /// `None` when the notice was already claimed.
+    async fn claim(
+        store: &intent_store::Store,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<Self>> {
+        Ok(store
+            .claim_dismissal_notice(agent_id, message_id)
+            .await?
+            .then(|| Self {
+                store: store.clone(),
+                agent_id: agent_id.clone(),
+                message_id: message_id.to_owned(),
+                armed: true,
+            }))
+    }
+
+    fn keep(mut self) {
+        self.armed = false;
+    }
+
+    async fn release(mut self) {
+        self.armed = false;
+        release_dismissal_notice(&self.store, &self.agent_id, &self.message_id).await;
+    }
+}
+
+impl Drop for DismissalNoticeClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (store, agent_id, message_id) = (
+            self.store.clone(),
+            self.agent_id.clone(),
+            std::mem::take(&mut self.message_id),
+        );
+        runtime.spawn(async move {
+            release_dismissal_notice(&store, &agent_id, &message_id).await;
+        });
+    }
+}
+
+async fn release_dismissal_notice(
+    store: &intent_store::Store,
+    agent_id: &AgentId,
+    message_id: &str,
+) {
+    if let Err(e) = store.release_dismissal_notice(agent_id, message_id).await {
+        tracing::warn!(
+            agent = %agent_id,
+            error = %e,
+            "failed to release the dismissal notice claim; a retry will not notify"
+        );
     }
 }
