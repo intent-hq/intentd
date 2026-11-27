@@ -1086,33 +1086,90 @@ impl Services {
     }
 
     /// The `AppModelProvider` rows and the default provider (§5.60).
+    /// The `AppModelProvider` rows and the default provider (§5.60): every
+    /// registered one-shot provider and every named profile of one, as the
+    /// exact reference the shared one-shot route runs (a profile keeps its
+    /// own account). `available` is the same readiness decision the route
+    /// depends on: enabled, not refused by a cached sign-in verdict, and
+    /// installed (adapter and CLI) — or, on an orchestrator, enabled only,
+    /// since the call runs on a machine.
     fn app_model_providers(&self) -> (Option<String>, Vec<Value>) {
         let settings = self.effective_settings();
         let catalog = self.cached_models();
-        let mut providers = Vec::new();
+        let mut refs: Vec<(String, String)> = Vec::new();
         for id in ONE_SHOT_PROVIDERS {
-            if intent_providers::find_provider(id).is_none() {
-                continue;
+            if intent_providers::find_provider(id).is_some() {
+                refs.push((
+                    (*id).to_owned(),
+                    intent_providers::provider_config(id)
+                        .display_name
+                        .to_owned(),
+                ));
             }
-            let disabled =
-                crate::agent_ops::provider_is_disabled(id, settings.providers.enabled.as_ref());
+        }
+        for meta in self.provider_profiles.profiles().unwrap_or_default().iter() {
+            let base = meta.base_provider.as_str();
+            if ONE_SHOT_PROVIDERS.contains(&base) && intent_providers::find_provider(base).is_some()
+            {
+                refs.push((
+                    format!("{base}@{}", meta.id),
+                    format!(
+                        "{} ({})",
+                        intent_providers::provider_config(base).display_name,
+                        meta.name
+                    ),
+                ));
+            }
+        }
+        let local = self.may_spawn_provider_locally();
+        let mut providers = Vec::new();
+        for (provider_ref, display) in &refs {
+            let is_profile = intent_providers::split_profile_ref(provider_ref).is_some();
+            let ready = if local {
+                crate::agent_ops::ensure_provider_available_checked(
+                    "app.complete",
+                    provider_ref,
+                    &settings.providers,
+                    !is_profile,
+                )
+            } else {
+                crate::agent_ops::ensure_provider_enabled(
+                    "app.complete",
+                    provider_ref,
+                    settings.providers.enabled.as_ref(),
+                )
+            }
+            .and_then(|()| {
+                self.ensure_provider_ref_selectable_in(provider_ref, &settings.providers)
+            })
+            .and_then(|()| {
+                // The auggie print route resolves its own CLI
+                // (`context.auggiePath`, else discovery): the same check.
+                if local && intent_providers::base_provider_id(provider_ref) == "auggie" {
+                    self.one_shot_auggie_bin().map(|_| ())
+                } else {
+                    Ok(())
+                }
+            });
             let models: Vec<Value> = catalog
-                .cached_catalog_rows(id)
+                .cached_catalog_rows(provider_ref)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|row| json!({ "id": row.id, "displayName": row.name }))
                 .collect();
             providers.push(json!({
-                "providerId": id,
-                "displayName": intent_providers::provider_config(id).display_name,
-                "available": !disabled,
-                "reason": if disabled { Value::String("The provider is turned off in Settings.".into()) } else { Value::Null },
-                "defaultModel": catalog.cached_default_model(id),
+                "providerId": provider_ref,
+                "displayName": display,
+                "available": ready.is_ok(),
+                "reason": ready.err().map(|e| e.to_string()),
+                "defaultModel": catalog.cached_default_model(provider_ref),
                 "models": models,
             }));
         }
+        // The effective default as configured (a profile reference stays a
+        // profile reference), when it is one of the rows.
         let default = crate::agent_session::derived_default_provider(&settings)
-            .filter(|p| ONE_SHOT_PROVIDERS.contains(&p.as_str()));
+            .filter(|p| refs.iter().any(|(r, _)| r == p));
         (default, providers)
     }
 
@@ -1180,30 +1237,54 @@ impl Services {
             model = model.as_deref().unwrap_or(""),
             "app.complete"
         );
-        let settings = self.effective_settings();
-        let effective = crate::agent_session::derived_default_provider(&settings);
-        // The inner route keeps its own (longer) deadline; the outer one
-        // wins and drops the call, which reaps the provider process.
+        // The call runs in its own task and the deadline is applied from
+        // here: a provider step that blocks its thread (CLI discovery, a
+        // stuck spawn) cannot hold the timeout back. On expiry the task is
+        // aborted, which drops the provider child (`kill_on_drop`) and the
+        // private cwd. The inner route keeps a longer deadline of its own.
         let inner_timeout = timeout_ms + 5_000;
-        let run = self.complete_once_on_route(
-            &settings,
-            effective.as_deref(),
-            provider_id.clone(),
-            model.clone(),
-            None,
-            reasoning_effort,
+        let svc = self.clone();
+        let (run_provider, run_model) = (provider_id.clone(), model.clone());
+        let (prompt, system, effort) = (
             prompt.to_owned(),
             system.map(str::to_owned),
-            crate::complete_ops::CompleteOnceCwd::Private(cwd.path().to_path_buf()),
-            Some(inner_timeout),
-            inner_timeout,
+            reasoning_effort.map(str::to_owned),
         );
-        let outcome = tokio::time::timeout(Duration::from_millis(timeout_ms), Box::pin(run)).await;
-        drop(cwd);
+        let task = intent_core::caller::spawn_with_current_caller(async move {
+            let settings = svc.effective_settings();
+            let effective = crate::agent_session::derived_default_provider(&settings);
+            let result = Box::pin(svc.complete_once_on_route(
+                &settings,
+                effective.as_deref(),
+                run_provider,
+                run_model,
+                None,
+                effort.as_deref(),
+                prompt,
+                system,
+                crate::complete_ops::CompleteOnceCwd::Private(cwd.path().to_path_buf()),
+                Some(inner_timeout),
+                inner_timeout,
+            ))
+            .await;
+            drop(cwd);
+            result
+        });
+        let abort = task.abort_handle();
+        let outcome = match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
+            Err(_) => {
+                abort.abort();
+                Err(())
+            }
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(join)) => {
+                return Err(Error::Internal(format!("app.complete task failed: {join}")))
+            }
+        };
         let timeout =
             || AppError::service("timeout", "the model call timed out", json!({})).into_error();
         let result = match outcome {
-            Err(_) => return Err(timeout()),
+            Err(()) => return Err(timeout()),
             Ok(Err(e)) if e.to_string().contains("timed out") => return Err(timeout()),
             Ok(other) => other?,
         };
@@ -1218,7 +1299,7 @@ impl Services {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let ran_model = result
+        let model_used = result
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned)
@@ -1228,7 +1309,7 @@ impl Services {
             "available": true,
             "text": text,
             "provider": provider_id,
-            "model": ran_model,
+            "model": model_used,
         }))
     }
 }

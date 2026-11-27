@@ -35,6 +35,7 @@ use Step::{Gap, Plumbing, Refused, Wired};
 /// them.
 const STEPS: &[(&str, Step)] = &[
     // The services the orchestrator builds per tenant (`tenant_services`).
+    (".with_apps_dir", Wired("with_apps_dir")),
     (".with_assets_root", Wired("with_assets_root")),
     (".with_chief_cwd_root", Wired("with_chief_cwd_root")),
     (".with_event_bus", Wired("with_event_bus")),

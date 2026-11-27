@@ -1276,3 +1276,166 @@ fn an_explicit_provider_is_never_overridden_by_the_default() {
         AppRoute::Unavailable(_)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes: provider readiness, profile defaults, plain segments
+// ---------------------------------------------------------------------------
+
+/// A level 2 `models` app on a `Services` with a settings registry, a
+/// profile store and deterministic provider availability: claude-code and
+/// codex marked installed, auggie pointed at a missing binary.
+async fn models_fx() -> (Fx, Caller) {
+    let dir = crate::test_support::test_tempdir("app-ops-models-");
+    let store = Store::open(&dir.path().join("store.db")).await.unwrap();
+    let ws = WorkspaceId("ws-apps".to_string());
+    let root = dir.path().join("checkout");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let mut row = crate::tests::workspace(&ws);
+    row.worktree_path = Some(root.to_string_lossy().into_owned());
+    store.insert_workspace(&row).await.unwrap();
+    let registry = Arc::new(crate::SettingsRegistry::load(data.join("config.toml")).unwrap());
+    let mut paths = crate::test_support::provider_installed::paths_json(&["claude-code", "codex"]);
+    paths["auggie"] = json!(dir.path().join("no-such-auggie").to_string_lossy());
+    registry
+        .apply(&[
+            ("providers.paths".into(), paths),
+            (
+                "context.auggiePath".into(),
+                json!(dir.path().join("no-such-auggie").to_string_lossy()),
+            ),
+            ("model.defaultProvider".into(), json!("claude-code")),
+        ])
+        .unwrap();
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(registry)
+        .with_secret_store(Arc::new(intent_core::InMemorySecretStore::default()))
+        .with_provider_profiles_dir(&data)
+        .with_apps_dir(&data);
+    let f = Fx { dir, svc, ws, root };
+    write_bundle(&f.root, "m", &manifest("m-app", 2, &["models"]), &[]);
+    let hash = f.install("m", false).await["app"]["bundleHash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.approve("m-app", &hash, 2, &["models"]).await;
+    let (app, _end) = f.open_app("m-app").await;
+    (f, app)
+}
+
+fn row<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["providerId"] == id)
+        .unwrap_or_else(|| panic!("{id} in {list}"))
+}
+
+/// A provider whose adapter cannot run is listed unavailable with a reason,
+/// and `app.complete` on it is the typed unavailable result, not an error.
+#[intent_test_macros::daemon_test]
+async fn unrunnable_providers_are_unavailable_in_list_and_complete() {
+    let (f, app) = models_fx().await;
+    let listed = f
+        .call_as(app.clone(), "app.models.list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(row(&listed, "claude-code")["available"], true, "{listed}");
+    assert_eq!(row(&listed, "claude-code")["reason"], Value::Null);
+    let auggie = row(&listed, "auggie");
+    assert_eq!(auggie["available"], false, "{listed}");
+    assert!(auggie["reason"].as_str().is_some_and(|r| !r.is_empty()));
+    let r = f
+        .call_as(
+            app,
+            "app.complete",
+            json!({ "prompt": "hi", "provider": "auggie" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["available"], false, "{r}");
+    assert!(r["reason"].is_string());
+}
+
+/// A named-profile default stays a profile reference: it is listed as its
+/// own row and reported as `defaultProvider`, never the bare base.
+#[intent_test_macros::daemon_test]
+async fn a_named_profile_default_is_kept() {
+    let (f, app) = models_fx().await;
+    let created = f
+        .svc
+        .provider_profiles_create_impl(json!({ "baseProviderId": "codex", "name": "work" }))
+        .await
+        .unwrap();
+    let profile_ref = created["profile"]["providerRef"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.svc
+        .settings_registry()
+        .unwrap()
+        .apply(&[("model.defaultProvider".into(), json!(profile_ref))])
+        .unwrap();
+    let listed = f.call_as(app, "app.models.list", json!({})).await.unwrap();
+    assert_eq!(listed["defaultProvider"], json!(profile_ref), "{listed}");
+    let profile = row(&listed, &profile_ref);
+    assert_eq!(profile["available"], true, "{listed}");
+    assert!(profile["displayName"].as_str().unwrap().contains("work"));
+    assert_eq!(row(&listed, "codex")["providerId"], "codex");
+}
+
+#[test]
+fn only_plain_segments_resolve_installed_files() {
+    for ok in ["index.html", "a..b", "x.js"] {
+        assert!(bundle::is_plain_segment(ok), "{ok}");
+    }
+    for bad in ["", ".", "..", "/", "a/b"] {
+        assert!(!bundle::is_plain_segment(bad), "{bad:?}");
+    }
+    #[cfg(windows)]
+    for bad in ["C:outside.txt", "C:", "a:stream", "\\\\server"] {
+        assert!(!bundle::is_plain_segment(bad), "{bad:?}");
+    }
+}
+
+/// `timeoutMs` bounds `app.complete` even when the provider never answers:
+/// a stand-in auggie CLI that waits forever ends in `-32603 timeout`.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
+async fn complete_times_out_on_a_provider_that_never_answers() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, app) = models_fx().await;
+    let cli = f.dir.path().join("stuck-auggie");
+    std::fs::write(&cli, "#!/bin/sh\nexec tail -f /dev/null\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = f.svc.effective_settings().providers.paths;
+    paths.insert("auggie".into(), cli.to_string_lossy().into_owned());
+    f.svc
+        .settings_registry()
+        .unwrap()
+        .apply(&[
+            ("providers.paths".into(), json!(paths)),
+            ("context.auggiePath".into(), json!(cli.to_string_lossy())),
+        ])
+        .unwrap();
+    let listed = f
+        .call_as(app.clone(), "app.models.list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(row(&listed, "auggie")["available"], true, "{listed}");
+    let e = f
+        .call_as(
+            app,
+            "app.complete",
+            json!({ "prompt": "hi", "provider": "auggie", "timeoutMs": 1000 }),
+        )
+        .await
+        .unwrap_err();
+    let Error::App(app_error) = &e else {
+        panic!("{e:?}")
+    };
+    assert_eq!(app_error.rpc_code, -32603);
+    assert_eq!(app_error.data_code(), "timeout");
+}

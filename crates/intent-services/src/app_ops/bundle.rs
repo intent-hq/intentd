@@ -817,6 +817,11 @@ pub(crate) fn read_installed(dir: &Path, path: &str) -> Option<Vec<u8>> {
     }
     let mut target = dir.to_path_buf();
     for seg in path.split('/') {
+        // Each segment must be one plain name on this platform: on Windows
+        // `C:x` is a drive-relative prefix that would replace `dir`.
+        if !is_plain_segment(seg) {
+            return None;
+        }
         target.push(seg);
         // Every component must be a real directory or (last) a file; the
         // library is daemon-written, but never follow a planted link.
@@ -825,6 +830,24 @@ pub(crate) fn read_installed(dir: &Path, path: &str) -> Option<Vec<u8>> {
             return None;
         }
     }
-    let bytes = read_no_follow(&target).ok()?;
-    Some(bytes)
+    // Containment: the resolved file must be under the installed bundle.
+    let root = std::fs::canonicalize(dir).ok()?;
+    let resolved = std::fs::canonicalize(&target).ok()?;
+    if !resolved.starts_with(&root) {
+        return None;
+    }
+    read_no_follow(&resolved).ok()
+}
+
+/// Whether `seg` is exactly one normal path component (no prefix, root,
+/// `.` / `..`, separator or, on Windows, drive or stream colon).
+pub(crate) fn is_plain_segment(seg: &str) -> bool {
+    if cfg!(windows) && seg.contains(':') {
+        return false;
+    }
+    let mut parts = Path::new(seg).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(name)), None) if name == std::ffi::OsStr::new(seg)
+    )
 }

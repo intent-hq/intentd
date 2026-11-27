@@ -41,8 +41,10 @@ use crate::Services;
 /// `1_200`). Headroom stays below one `WorkspaceCreate` so a stray rebinding
 /// or clone of the request inside the block trips it. Raised to `8_448`
 /// when the `Services` clone the block holds gained the 8-byte
-/// `autocomplete_upstream` field (measured `8_208`).
-const CREATE_BLOCK_BUDGET: usize = 8_448;
+/// `autocomplete_upstream` field (measured `8_208`). Raised to `8_704`
+/// when it gained the 8-byte `apps` field (Intent apps, PROTOCOL §5.60;
+/// measured `8_464`, headroom still below one request).
+const CREATE_BLOCK_BUDGET: usize = 8_704;
 /// The `execution_call` wrapper around it (measured `2_544` bytes): holds the
 /// create block behind one `Box::pin`. Holding it inline again grows this by
 /// about `2 * 7_680`.
