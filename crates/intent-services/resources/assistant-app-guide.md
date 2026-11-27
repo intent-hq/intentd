@@ -1491,10 +1491,12 @@ PNG, JPEG, GIF, and WebP attachments may be resized or re-encoded for provider
 delivery; original attachments and their displayed previews are unchanged. SVG and
 other image formats are sent as files the agent can retrieve and read, rather than
 as vision input. To have the agent inspect their appearance, export a PNG or JPEG.
-PNG, JPEG, GIF, and WebP images in one message can total at most 30 MB, and each
-image can be at most 30 MB. An image that goes over either limit is not added when
-you attach it, and an error names it; remove an image to make room. Older versions
-may show the total-size error only after you send.
+In a workspace chat, the images in one message can total at most 30 MB, and each
+image can be at most 30 MB. Assistant chat (Home → Assistant) allows 10 MB, for each
+image and in total. Every attached image counts, including formats sent as files. An
+image that goes over a limit is not added when you attach it, and an error names it;
+remove an image to make room. Older versions may show the total-size error only after
+you send.
 If a supported image cannot be read
 or the images together exceed the delivery budget, the turn fails rather than
 silently omitting an image. Re-export an unreadable image as PNG/JPEG, or send fewer
@@ -1502,7 +1504,7 @@ images cropped to the relevant detail. A provider request-size error can also co
 from images retained in earlier turns: start a new agent conversation with only
 the images needed if sending fewer images still fails.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/input/image-context-items.ts (REFERENCE_IMAGE_MAX_BYTES, imageFilesToContextItems). Daemon: packages/intentd/crates/intent-services/src/agent_ops.rs (IMAGE_REF_MAX_BYTES). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/input/image-context-items.ts (REFERENCE_IMAGE_MAX_BYTES, INLINE_IMAGE_MAX_BYTES, admitImageItems); src/lib/components/chat/input/SimpleRichInput.svelte (imageMaxBytes). Daemon: packages/intentd/crates/intent-services/src/agent_ops.rs (IMAGE_REF_MAX_BYTES). -->
 
 <!-- Sources: packages/intentd/crates/intent-services/src/lib.rs (SETUP_TERMINAL_NAME); packages/intentd/crates/intent-pty/src/host.rs. -->
 
