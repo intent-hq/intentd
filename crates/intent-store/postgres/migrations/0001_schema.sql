@@ -1556,8 +1556,10 @@ CREATE TABLE IF NOT EXISTS tenant_config (
 -- 'closing' and 'closed' refuse every write, whoever holds the tenant lease.
 -- The writer reads it in the same statement as the lease, under the lock,
 -- and a move takes this row lock too, so it waits for the write in flight
--- and every later writer sees it. intent_next_row_seq refuses a numbered
--- row while it is not 'open', for a writer that skipped that check.
+-- and every later writer sees it. intent_next_row_seq refuses to number a
+-- new row while it is not 'open', for a writer that skipped that check; it
+-- does not cover updates, deletes, explicit row_seq values or tables
+-- without the counter (the store's check does).
 CREATE TABLE IF NOT EXISTS tenant_writer (
     tenant_id text NOT NULL,
     last_row_seq bigint NOT NULL DEFAULT 0,
@@ -3242,9 +3244,10 @@ $$;
 
 -- The tenant's next row_seq. The caller holds the tenant's writer lock, so
 -- its tenant_writer row exists; a missing row is an error, never a NULL or
--- 0 row_seq. A tenant that is not open numbers no row: the store refuses
--- its writes before they start, and this is the backstop for a writer that
--- took the lock without that check. It reads the state with the counter,
+-- 0 row_seq. A tenant that is not open numbers no new row: the store
+-- refuses its writes before they start, and this is the backstop, for
+-- inserts that take a row_seq, against a writer that took the lock without
+-- that check. It reads the state with the counter,
 -- once per transaction, and the lock keeps both from moving after.
 CREATE OR REPLACE FUNCTION intent_next_row_seq(p_tenant text) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE

@@ -49,14 +49,34 @@ const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// lease lapses after its TTL instead.
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long marking one stopped tenant closed may take on shutdown, before
+/// its lease release; past it the tenant stays closing until its next start.
+const MARK_CLOSED_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How long closing the tenants may take together on shutdown, after their
 /// drains; past it their fences fire anyway.
-const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long the tenants' drains may take together on shutdown; past it
 /// their fences fire anyway and refuse whatever the drains still write.
-/// Inside the usual 30 s stop grace (systemd, Kubernetes).
-const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// The usual stop grace before SIGKILL (systemd, Kubernetes).
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+// A stop that overruns every budget (drain, close, the self-fence's
+// budgeted steps, mark closed, release) still releases the lease before
+// the stop grace ends, so a standby claims at once instead of waiting a TTL.
+const _: () = assert!(
+    DRAIN_BUDGET.as_millis()
+        + CLOSE_BUDGET.as_millis()
+        + intent_core::tenant_fence::SELF_FENCE_STEP_BUDGET.as_millis()
+            * intent_core::tenant_fence::SELF_FENCE_BUDGETED_STEPS as u128
+        + MARK_CLOSED_BUDGET.as_millis()
+        + RELEASE_BUDGET.as_millis()
+        < STOP_GRACE.as_millis(),
+    "the shutdown budgets must fit inside the stop grace"
+);
 
 fn main() -> ExitCode {
     // The PTY workload shim: a contained terminal runs as
@@ -463,12 +483,12 @@ async fn close_all(served: &[ServedTenant]) {
     }
 }
 
-/// Mark a cleanly stopped tenant closed, then release its lease, each
-/// within [`RELEASE_BUDGET`]; a failure leaves the tenant closing (the next
+/// Mark a cleanly stopped tenant closed (within [`MARK_CLOSED_BUDGET`]),
+/// then release its lease (within [`RELEASE_BUDGET`]); a failure leaves the tenant closing (the next
 /// start opens it) or the lease to lapse after its TTL.
 async fn release(tenant: &ServedTenant) {
     let name = tenant.tenant();
-    match tokio::time::timeout(RELEASE_BUDGET, tenant.mark_closed()).await {
+    match tokio::time::timeout(MARK_CLOSED_BUDGET, tenant.mark_closed()).await {
         Ok(Ok(moved)) if moved.reached(intent_store::TenantState::Closed) => {
             tracing::info!(
                 tenant = name,
@@ -486,7 +506,7 @@ async fn release(tenant: &ServedTenant) {
         }
         Err(_) => tracing::warn!(
             tenant = name,
-            budget_ms = RELEASE_BUDGET.as_millis(),
+            budget_ms = MARK_CLOSED_BUDGET.as_millis(),
             "marking the tenant closed timed out; it stays closing until its next start"
         ),
     }

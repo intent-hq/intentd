@@ -391,9 +391,9 @@ async fn a_process_that_lost_the_tenant_cannot_move_its_state() {
 }
 
 /// A writer that takes the writer lock but skips the state check cannot
-/// number a row: the schema's `row_seq` counter refuses it.
+/// number a new row: the schema's `row_seq` counter refuses it.
 #[tokio::test]
-async fn a_writer_that_skips_the_state_check_cannot_insert_a_row() {
+async fn a_writer_that_skips_the_state_check_cannot_number_a_new_row() {
     let Some(db) = test_db(false).await else {
         return;
     };
