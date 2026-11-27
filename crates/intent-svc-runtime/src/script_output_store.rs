@@ -460,8 +460,9 @@ impl ScriptOutputStore {
             return Ok(Some((Some(file), 0, 0, len)));
         };
         let s = lock(state);
-        let Some(file) = self.storage.open_read(key)? else {
-            // The run never got a log: it still has an end position.
+        // A run whose log never opened (or cannot be read) still has an end
+        // position: answer it with no bytes rather than at 0.
+        let Ok(Some(file)) = self.storage.open_read(key) else {
             return Ok(Some((None, s.base + s.len, 0, 0)));
         };
         let len = s.len.min(file.len()?);
