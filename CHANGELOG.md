@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.310] - 2026-11-27
+
+### 🚀 Features
+
+- *(apps)* Intent apps M1 — app principal, level allowlists, library, approval per bundle hash ([#3826](https://github.com/intent-hq/intentd/pull/3826))
+
+
 ## [0.11.309] - 2026-11-27
 
 ### 🐛 Bug Fixes
