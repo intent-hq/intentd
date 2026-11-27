@@ -41,6 +41,7 @@ pub use args::{
     build_provider_args, build_provider_env, build_provider_env_for_spawn,
     build_provider_env_with_unsloth, enhanced_path, ArgInputs, UnslothEndpoint, UnslothModelLimit,
 };
+pub use config::npx_install_args;
 pub use config::{
     all_provider_ids, auth_error_message, base_provider_id, find_provider,
     find_provider_or_legacy_alias, first_provider_id, is_provider_authentication_error,

@@ -83,8 +83,22 @@ pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.34";
 /// `opencode-ai`, `@anthropic-ai/claude-code`, Grok and Droid install their
 /// native binary from a platform optional dependency in a postinstall; a user
 /// npm config with `ignore-scripts` or `omit=optional` leaves a stub CLI that
-/// only prints an error, and npx then reuses that install.
+/// only prints an error, and npx then reuses that install. npm 12 also skips
+/// every dependency's install script unless allowed: see [`npx_install_args`]
+/// and, for a project-scoped install, an `allowScripts` `package.json` entry.
 pub const NPM_INSTALL_ARGS: [&str; 2] = ["--ignore-scripts=false", "--include=optional"];
+
+/// [`NPM_INSTALL_ARGS`] plus npm 12's `--allow-scripts=<package>` for an npx
+/// run of the exact pinned `package`. Older npm ignores `allow-scripts`; npm
+/// 12 rejects it on a project-scoped `npm install`.
+#[must_use]
+pub fn npx_install_args(package: &str) -> [String; 3] {
+    [
+        NPM_INSTALL_ARGS[0].to_owned(),
+        NPM_INSTALL_ARGS[1].to_owned(),
+        format!("--allow-scripts={package}"),
+    ]
+}
 
 /// Pinned npm package Intent runs `opencode` from (via `npx -y`) when no
 /// opencode CLI is installed ([`ProviderConfig::fallback_npx_package`]). Its
@@ -463,7 +477,7 @@ impl ProviderConfig {
     }
 
     /// [`Self::login_command_hint`] run from the provider's npm package
-    /// (`npx <NPM_INSTALL_ARGS> -y <package> <args>`), for a provider that is not installed:
+    /// (`npx <npx_install_args> -y <package> <args>`), for a provider that is not installed:
     /// [`Self::fallback_npx_package`], or the bundled Codex / Claude Code CLI
     /// ([`crate::adapter_cli::missing_fallback`]). `None` without a package
     /// or a hint, or when the hint does not start with the CLI's command.
@@ -477,8 +491,12 @@ impl ProviderConfig {
             ),
         };
         let args = self.login_command_hint?.strip_prefix(command)?;
-        args.starts_with(' ')
-            .then(|| format!("npx {} -y {package}{args}", NPM_INSTALL_ARGS.join(" ")))
+        args.starts_with(' ').then(|| {
+            format!(
+                "npx {} -y {package}{args}",
+                npx_install_args(&package).join(" ")
+            )
+        })
     }
 
     const fn empty(id: &'static str, display_name: &'static str, command: &'static str) -> Self {

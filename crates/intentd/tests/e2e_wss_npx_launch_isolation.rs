@@ -643,7 +643,8 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
         format!(
             "{} {} -y {}",
             intent_acp::spawn::NPX_NO_WORKSPACES_ARG,
-            intent_providers::NPM_INSTALL_ARGS.join(" "),
+            intent_providers::npx_install_args(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+                .join(" "),
             intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
         ),
         "claude-code npx argv is the pinned package with ancestor workspaces disabled"

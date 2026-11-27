@@ -2072,7 +2072,7 @@ if [ "$#" = 1 ] && [ "$1" = --version ]; then
   printf '11.0.0\n'
   exit 0
 fi
-[ "$#" = 5 ] && [ "$1" = --workspaces=false ] && [ "$2" = --ignore-scripts=false ] && [ "$3" = --include=optional ] && [ "$4" = -y ] && [ "$5" = '{}' ] || exit 93
+[ "$#" = 6 ] && [ "$1" = --workspaces=false ] && [ "$2" = --ignore-scripts=false ] && [ "$3" = --include=optional ] && [ "$4" = --allow-scripts='{0}' ] && [ "$5" = -y ] && [ "$6" = '{0}' ] || exit 93
 [ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
 printf '%s\n' "$*" >> "$HOME/packages"
 IFS= read -r request
@@ -2166,7 +2166,7 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(
             std::fs::read_to_string(root.join("packages")).unwrap(),
             format!(
-                "--workspaces=false --ignore-scripts=false --include=optional -y {}\n",
+                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0}\n",
                 intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
             )
         );

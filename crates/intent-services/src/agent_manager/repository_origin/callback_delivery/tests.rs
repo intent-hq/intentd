@@ -8344,7 +8344,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             ),
         ));
         executable("npx", format!(
-            "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 5 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = --ignore-scripts=false ] && [ \"$3\" = --include=optional ] && [ \"$4\" = -y ] && [ \"$5\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",
+            "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 6 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = --ignore-scripts=false ] && [ \"$3\" = --include=optional ] && [ \"$4\" = --allow-scripts={package} ] && [ \"$5\" = -y ] && [ \"$6\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",
             package = quoted(Path::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)),
             runtime = quoted(&bin.join("claude")),
             record = quoted(&scratch.join("npx-launches")),

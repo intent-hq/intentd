@@ -36,31 +36,28 @@ impl ProviderCli {
     }
 
     /// The executable and the arguments that come before the CLI's own.
-    pub(crate) fn program(&self) -> (&Path, Vec<&str>) {
-        self.program_with(true)
+    pub(crate) fn program(&self) -> (&Path, Vec<String>) {
+        match self {
+            Self::Installed(bin) => (bin, Vec::new()),
+            Self::Npx { npx, package } => {
+                let mut args = vec![intent_acp::spawn::NPX_NO_WORKSPACES_ARG.to_owned()];
+                args.extend(intent_providers::npx_install_args(package));
+                args.extend(["-y".to_owned(), package.clone()]);
+                (npx, args)
+            }
+        }
     }
 
     /// [`Self::program`] that never downloads: npx runs the package only
     /// from its cache and fails otherwise (`--no`). For sign-in checks, which
     /// run on every status sweep.
     pub(crate) fn cached_program(&self) -> (&Path, Vec<&str>) {
-        self.program_with(false)
-    }
-
-    fn program_with(&self, install: bool) -> (&Path, Vec<&str>) {
         match self {
             Self::Installed(bin) => (bin, Vec::new()),
-            Self::Npx { npx, package } => {
-                let mut args = vec![intent_acp::spawn::NPX_NO_WORKSPACES_ARG];
-                if install {
-                    args.extend(intent_providers::NPM_INSTALL_ARGS);
-                    args.push("-y");
-                } else {
-                    args.push("--no");
-                }
-                args.push(package.as_str());
-                (npx, args)
-            }
+            Self::Npx { npx, package } => (
+                npx,
+                vec![intent_acp::spawn::NPX_NO_WORKSPACES_ARG, "--no", package],
+            ),
         }
     }
 
@@ -102,9 +99,10 @@ impl ProviderCli {
     /// Remove npx's cached install of the package when npm left it
     /// unfinished, so the next run installs it again: the package has an
     /// install script (which installs the native binary) and its `command`
-    /// fails `--version`. A user npm config that skips install scripts or
-    /// optional packages, or a first run stopped mid-install, leaves such a
-    /// stub, and npx otherwise reuses it forever. An install changed within
+    /// fails `--version` with the stub's own "install script did not run"
+    /// message. npm 12's default, a user npm config that skips install
+    /// scripts or optional packages, or a first run stopped mid-install
+    /// leaves such a stub, and npx otherwise reuses it forever. An install changed within
     /// `grace` may still be running and is kept. Returns whether it removed
     /// one; never for an installed CLI or an uncached package.
     pub(crate) async fn remove_unfinished_install(&self, command: &str, grace: Duration) -> bool {
@@ -196,10 +194,13 @@ fn finished_installs() -> &'static std::sync::Mutex<std::collections::HashSet<St
 }
 
 /// Run by node through `npx --no --package <pkg>` with `<name> <version>
-/// <command>`: prints the npx install root (`.../_npx/<hash>`) when the
-/// package has an install script and `<command> --version` fails, `ok` when
-/// it needs no repair, and nothing when inconclusive (not found, timeout).
-const UNFINISHED_INSTALL_SCRIPT: &str = r"
+/// <command>`: prints the npx install root (`.../_npx/<hash>`) only when the
+/// package has an install script and `<command> --version` exits non-zero
+/// with a stub's "install script did not run" message (`opencode-ai`,
+/// `@anthropic-ai/claude-code`); `ok` when it ran or failed otherwise, which
+/// a reinstall cannot fix; and nothing when inconclusive (no such bin, spawn
+/// error such as a noexec cache, timeout or signal).
+const UNFINISHED_INSTALL_SCRIPT: &str = r#"
 const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process');
 const [name, version, command] = process.argv.slice(2);
 for (const bin of (process.env.PATH || '').split(path.delimiter)) {
@@ -211,16 +212,20 @@ for (const bin of (process.env.PATH || '').split(path.delimiter)) {
   const scripts = pkg.scripts || {};
   if (!scripts.install && !scripts.postinstall) { process.stdout.write('ok'); break; }
   const windows = process.platform === 'win32';
-  const run = cp.spawnSync(path.join(bin, windows ? command + '.cmd' : command), ['--version'], {
-    stdio: 'ignore', timeout: 30000, shell: windows,
+  const shim = path.join(bin, windows ? command + '.cmd' : command);
+  if (!fs.existsSync(shim)) break;
+  // cmd.exe runs an unquoted path with a space as two words and exits 1.
+  const run = cp.spawnSync(windows ? '"' + shim + '"' : shim, ['--version'], {
+    stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: 30000, shell: windows,
   });
-  if (run.status === 0) process.stdout.write('ok');
-  else if (!(run.error && run.error.code === 'ETIMEDOUT') && run.signal !== 'SIGTERM') {
+  if (run.error || typeof run.status !== 'number') break;
+  const stub = /postinstall script was not run|native binary not installed/i;
+  if (run.status !== 0 && stub.test((run.stdout || '') + (run.stderr || ''))) {
     process.stdout.write(path.dirname(modules));
-  }
+  } else process.stdout.write('ok');
   break;
 }
-";
+"#;
 
 /// Delete `root` when it is an npx install (`<cache>/_npx/<hex>`) untouched
 /// for `grace`.
@@ -317,11 +322,11 @@ mod tests {
             package: intent_providers::OPENCODE_NPX_PACKAGE.to_owned(),
         };
         // Scripts and optional dependencies stay on whatever the user's npm
-        // config says: they install the CLI's native binary.
+        // config (or npm 12's default) says: they install the native binary.
         assert_eq!(
             argv(&cli).await,
             format!(
-                "--workspaces=false --ignore-scripts=false --include=optional -y {} models",
+                "--workspaces=false --ignore-scripts=false --include=optional --allow-scripts={0} -y {0} models",
                 intent_providers::OPENCODE_NPX_PACKAGE
             )
         );
@@ -393,7 +398,17 @@ mod tests {
         )
         .unwrap();
         let fake = bin.join("fake");
-        std::fs::write(&fake, format!("#!/bin/sh\necho stub >&2\nexit {status}\n")).unwrap();
+        // 1: an unfinished install's stub; any other failure is the CLI's own.
+        let message = if status == 1 {
+            "Error: claude native binary not installed."
+        } else {
+            "Error: cannot read config"
+        };
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho '{message}' >&2\nexit {status}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let npx = dir.join("npx");
         std::fs::write(
@@ -412,12 +427,13 @@ mod tests {
         (cli, root)
     }
 
-    /// Sam's alpha report: npm skipped `opencode-ai`'s postinstall (an
-    /// `ignore-scripts` npm config or an interrupted first run), so npx kept
-    /// a stub `opencode` that only prints an error, and every later run
-    /// reused it. The check removes such an install so the next run
-    /// reinstalls it; a working CLI, a package with nothing to finish, and an
-    /// install that may still be running stay.
+    /// Sam's alpha report: npm skipped `opencode-ai`'s postinstall (npm 12's
+    /// default, an `ignore-scripts` config or an interrupted first run), so
+    /// npx kept a stub `opencode` that only prints an error, and every later
+    /// run reused it. The check removes such an install so the next run
+    /// reinstalls it; a working CLI, a CLI failing for its own reasons, a
+    /// package with nothing to finish, and an install that may still be
+    /// running stay.
     #[tokio::test]
     async fn a_cached_cli_left_unfinished_by_npm_is_removed() {
         if intent_providers::resolve_on_path("node").is_none() {
@@ -427,6 +443,7 @@ mod tests {
         for (name, install_script, status, grace, removed) in [
             ("unfinished-cli", true, 1, Duration::ZERO, true),
             ("finished-cli", true, 0, Duration::ZERO, false),
+            ("failing-cli", true, 2, Duration::ZERO, false),
             ("scriptless-cli", false, 1, Duration::ZERO, false),
             ("installing-cli", true, 1, Duration::from_secs(600), false),
         ] {
@@ -440,6 +457,12 @@ mod tests {
             );
             assert_eq!(root.exists(), !removed, "{case}");
         }
+        // A missing bin is inconclusive, never an unfinished install.
+        let dir = tempfile::tempdir().unwrap();
+        let (cli, root) = npx_cache(dir.path(), "binless-cli", true, 1);
+        std::fs::remove_file(root.join("node_modules/.bin/fake")).unwrap();
+        assert!(!cli.remove_unfinished_install("fake", Duration::ZERO).await);
+        assert!(root.exists());
         // A finished install is not checked again this run.
         let dir = tempfile::tempdir().unwrap();
         let (cli, root) = npx_cache(dir.path(), "finished-cli", true, 1);

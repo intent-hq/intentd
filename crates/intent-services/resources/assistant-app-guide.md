@@ -594,7 +594,7 @@ Cursor, Antigravity, DeepSeek Harness, Pi and Unsloth still need their own insta
 installed CLI is always used first, with its version checks and update prompts. A card
 running from npm shows **Log in**, which runs the login command through npx. These npm runs
 always run the package's install steps, which add its native program, even when npm is set
-to skip install scripts; a copy that an earlier skipped or interrupted install left unable to
+to skip install scripts or (npm 12 and later) skips them by default; a copy that an earlier skipped or interrupted install left unable to
 start is removed and installed again. OpenCode's
 free models need no account, so when onboarding finds no other provider installed,
 OpenCode comes first with a **Free** label and is selected. When you continue with another

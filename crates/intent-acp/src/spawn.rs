@@ -345,7 +345,7 @@ impl std::fmt::Display for LaunchMode {
 /// Assemble provider launch arguments. Codex model and effort are applied
 /// through ACP config options; its selected adapter ignores CLI config flags.
 /// When spawning via npx, prepends [`NPX_NO_WORKSPACES_ARG`],
-/// [`intent_providers::NPM_INSTALL_ARGS`] and `-y <package>` before the
+/// [`intent_providers::npx_install_args`] and `-y <package>` before the
 /// provider's args.
 #[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
@@ -356,7 +356,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     if opts.via_npx() {
         if let Some(pkg) = opts.npx_fallback_package {
             args.push(NPX_NO_WORKSPACES_ARG.to_string());
-            args.extend(intent_providers::NPM_INSTALL_ARGS.map(String::from));
+            args.extend(intent_providers::npx_install_args(pkg));
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -1231,6 +1231,10 @@ mod build_args_tests {
                         NPX_NO_WORKSPACES_ARG,
                         "--ignore-scripts=false",
                         "--include=optional",
+                        &format!(
+                            "--allow-scripts={}",
+                            intent_providers::CODEX_ACP_NPX_PACKAGE
+                        ),
                         "-y",
                         intent_providers::CODEX_ACP_NPX_PACKAGE
                     ],
@@ -1552,7 +1556,7 @@ mod build_command_tests {
     #[test]
     fn claude_code_npx_spawn_argv_is_pinned() {
         // The exact spawn argv for claude-code: `<npx> --workspaces=false
-        // <NPM_INSTALL_ARGS> -y <pinned package>` — no other args
+        // <npx_install_args> -y <pinned package>` — no other args
         // (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
@@ -1569,6 +1573,7 @@ mod build_command_tests {
                 "--workspaces=false".to_string(),
                 "--ignore-scripts=false".to_string(),
                 "--include=optional".to_string(),
+                format!("--allow-scripts={}", provider.npx_only_package.unwrap()),
                 "-y".to_string(),
                 provider.npx_only_package.unwrap().to_string(),
             ]

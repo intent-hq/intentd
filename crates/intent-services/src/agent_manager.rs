@@ -25118,16 +25118,17 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
-        // with `--workspaces=false <NPM_INSTALL_ARGS> -y <package>`, not the
-        // bare `codex-acp` command.
+        // with `--workspaces=false <npx_install_args> -y <package>`, not
+        // the bare `codex-acp` command.
         let cmd = intent_acp::spawn::build_command(&rebuilt);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
         assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
-        assert_eq!(args[1..3], intent_providers::NPM_INSTALL_ARGS);
-        assert_eq!(args[3], "-y");
+        let package = provider.npx_only_package.expect("codex is npx-only");
+        assert_eq!(args[1..4], intent_providers::npx_install_args(package));
+        assert_eq!(args[4], "-y");
         assert_eq!(
-            args[4],
+            args[5],
             provider.npx_only_package.expect("codex is npx-only")
         );
     }

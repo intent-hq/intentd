@@ -82,6 +82,14 @@ async fn first_use_installs_the_exact_spec_and_later_uses_skip_npm() {
         recorded[0].contains("--ignore-scripts=false --include=optional"),
         "{recorded:?}"
     );
+    // npm 12 runs dependency install scripts only for allowed packages, and
+    // only through `package.json` on this project-scoped install.
+    assert!(!recorded[0].contains("--allow-scripts"), "{recorded:?}");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(version_dir(&root, &pin).join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["allowScripts"]["@openai/codex@0.160.1"], true);
 
     let again = ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
         .await
