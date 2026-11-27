@@ -153,6 +153,8 @@ mod subscription_agent_repo;
 mod task_agent_link_repo;
 mod task_event_repo;
 pub use task_event_repo::TaskEventBaselines;
+mod tenant_state;
+pub use tenant_state::{TenantState, TenantStateMove};
 mod home_move_repo;
 mod home_rebuild_repo;
 pub use home_move_repo::{HomeAutoStart, HomeMove, HomeMoveSwitch};

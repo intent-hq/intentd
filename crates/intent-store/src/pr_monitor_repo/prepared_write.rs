@@ -21,7 +21,8 @@ enum PreparedInner {
         insert: bool,
     },
     #[cfg(feature = "postgres")]
-    Postgres(crate::postgres::pr_monitors::PreparedPgWrite),
+    // Boxed: a held writer transaction is much larger than the SQLite one.
+    Postgres(Box<crate::postgres::pr_monitors::PreparedPgWrite>),
 }
 
 impl PreparedMonitorWrite {
@@ -41,7 +42,7 @@ impl PreparedMonitorWrite {
     #[cfg(feature = "postgres")]
     pub(crate) fn postgres(write: crate::postgres::pr_monitors::PreparedPgWrite) -> Self {
         Self {
-            inner: PreparedInner::Postgres(write),
+            inner: PreparedInner::Postgres(Box::new(write)),
         }
     }
 

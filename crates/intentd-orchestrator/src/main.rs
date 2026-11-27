@@ -49,6 +49,10 @@ const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// lease lapses after its TTL instead.
 const RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long closing the tenants may take together on shutdown, after their
+/// drains; past it their fences fire anyway.
+const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long the tenants' drains may take together on shutdown; past it
 /// their fences fire anyway and refuse whatever the drains still write.
 /// Inside the usual 30 s stop grace (systemd, Kubernetes).
@@ -384,16 +388,19 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 }
 
 /// Drain every tenant ([`ServedTenant::drain`], within [`DRAIN_BUDGET`]),
-/// fire every tenant's fence and wait until every one stopped; an overrun
-/// exits from its watcher as soon as it is reported, before any release.
-/// A tenant whose fence this call fired releases its lease once its work
-/// stopped, concurrently with the others; one already fenced (lease lost, a
-/// write met another owner) keeps it until the TTL. The exit code.
+/// close it ([`ServedTenant::close`], within [`CLOSE_BUDGET`]), fire every
+/// tenant's fence and wait until every one stopped; an overrun exits from
+/// its watcher as soon as it is reported, before any release. A tenant
+/// whose fence this call fired is marked closed and releases its lease once
+/// its work stopped, concurrently with the others; one already fenced
+/// (lease lost, a write met another owner) keeps both until the TTL. The
+/// exit code.
 async fn stop_all(
     served: &mut Vec<ServedTenant>,
     stopped: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> ExitCode {
     drain_all(served).await;
+    close_all(served).await;
     let ours: Vec<String> = served
         .iter()
         .filter(|tenant| tenant.fence().fire(STOPPING))
@@ -437,10 +444,52 @@ async fn drain_all(served: &[ServedTenant]) {
     }
 }
 
-/// Release a cleanly stopped tenant's lease, within [`RELEASE_BUDGET`]; a
-/// failure only leaves the lease to lapse after its TTL.
+/// Close every tenant concurrently, once drained.
+async fn close_all(served: &[ServedTenant]) {
+    let mut tasks = tokio::task::JoinSet::new();
+    for tenant in served {
+        tasks.spawn(tenant.close());
+    }
+    let finished = tokio::time::timeout(CLOSE_BUDGET, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if finished.is_err() {
+        tracing::error!(
+            budget_ms = CLOSE_BUDGET.as_millis(),
+            "closing the tenants timed out; their fences refuse this process's writes"
+        );
+        tasks.detach_all();
+    }
+}
+
+/// Mark a cleanly stopped tenant closed, then release its lease, each
+/// within [`RELEASE_BUDGET`]; a failure leaves the tenant closing (the next
+/// start opens it) or the lease to lapse after its TTL.
 async fn release(tenant: &ServedTenant) {
     let name = tenant.tenant();
+    match tokio::time::timeout(RELEASE_BUDGET, tenant.mark_closed()).await {
+        Ok(Ok(moved)) if moved.reached(intent_store::TenantState::Closed) => {
+            tracing::info!(
+                tenant = name,
+                last_row_seq = moved.last_row_seq,
+                "the tenant is closed"
+            );
+        }
+        Ok(Ok(moved)) => tracing::warn!(
+            tenant = name,
+            state = %moved.state,
+            "the tenant was not closing; it stays as it is"
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(tenant = name, %error, "could not mark the tenant closed");
+        }
+        Err(_) => tracing::warn!(
+            tenant = name,
+            budget_ms = RELEASE_BUDGET.as_millis(),
+            "marking the tenant closed timed out; it stays closing until its next start"
+        ),
+    }
     match tokio::time::timeout(RELEASE_BUDGET, tenant.lease().release()).await {
         Ok(Ok(true)) => tracing::info!(tenant = name, "released the tenant lease"),
         Ok(Ok(false)) => {

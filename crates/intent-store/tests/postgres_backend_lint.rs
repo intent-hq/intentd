@@ -2441,24 +2441,30 @@ fn rule5_messages_and_keys_fit_the_finding() {
     assert!(used.contains(&("sub/mod.rs".to_owned(), "b".to_owned())));
 }
 
-/// Who may move the tenant fence or write the tenant lease, as `(const,
-/// function)` in `src/postgres/lease.rs`: each SQL const that writes the
-/// `lease` row of scope `'tenant'` (or sets `tenant_writer` columns), and
-/// the one function that runs it. `Fence::Skip` (a writer lock without the
-/// fence check) is for the claim alone. The generic lease API binds its
-/// scope and refuses `tenant` (`lease_repo::TENANT_SCOPE`), so its SQL
-/// never moves the fence.
+/// Who may move the tenant fence or state or write the tenant lease, as
+/// `(const, function)` in `src/postgres/lease.rs`: each SQL const that
+/// writes the `lease` row of scope `'tenant'` (or sets `tenant_writer`
+/// columns), and the one function that runs it. `Fence::Skip` (a writer
+/// lock without the fence and state checks) is for the claim and the state
+/// move alone. The generic lease API binds its scope and refuses `tenant`
+/// (`lease_repo::TENANT_SCOPE`), so its SQL never moves the fence.
 const FENCE_MOVERS: &[(&str, &str)] = &[
     ("TENANT_ACQUIRE_SQL", "claim_lease"),
     ("TENANT_RENEW_SQL", "renew_lease"),
     ("TENANT_RELEASE_SQL", "release_lease"),
+    ("TENANT_STATE_SQL", "move_state"),
 ];
-const FENCE_SKIPPER: &str = "claim_lease";
+const FENCE_SKIPPERS: &[&str] = &["claim_lease", "move_state"];
 
 /// Who may take the writer lock without the owner check for a store lease
-/// (`Fence::LeaseOnly`), as functions in `src/postgres/leases.rs`. They
+/// (`Fence::LeaseOnly`, or `Fence::LeaseRelease`, which also skips the
+/// state check), as `(function, fence)` in `src/postgres/leases.rs`. They
 /// write only the `lease` table, never the tenant fence.
-const LEASE_ONLY_USERS: &[&str] = &["lease_acquire", "lease_renew", "lease_release"];
+const LEASE_ONLY_USERS: &[(&str, &str)] = &[
+    ("lease_acquire", "Fence::LeaseOnly"),
+    ("lease_renew", "Fence::LeaseOnly"),
+    ("lease_release", "Fence::LeaseRelease"),
+];
 
 /// What one source file says about the fence: per function, the
 /// `FENCE_MOVERS` consts and `Fence::Skip` it names; per string literal
@@ -2510,6 +2516,8 @@ impl<'ast> syn::visit::Visit<'ast> for FenceUses {
             Some("Fence::Skip".to_owned())
         } else if segments.ends_with(&["Fence".to_owned(), "LeaseOnly".to_owned()]) {
             Some("Fence::LeaseOnly".to_owned())
+        } else if segments.ends_with(&["Fence".to_owned(), "LeaseRelease".to_owned()]) {
+            Some("Fence::LeaseRelease".to_owned())
         } else {
             segments
                 .last()
@@ -2541,15 +2549,18 @@ fn fence_problems(sources: &[(PathBuf, String)]) -> Vec<String> {
         let mut uses = FenceUses::default();
         syn::visit::Visit::visit_file(&mut uses, &parsed);
         for (scope, name) in &uses.names {
-            if name == "Fence::LeaseOnly" {
-                if !(in_leases && LEASE_ONLY_USERS.contains(&scope.as_str())) {
+            if name == "Fence::LeaseOnly" || name == "Fence::LeaseRelease" {
+                let listed = LEASE_ONLY_USERS
+                    .iter()
+                    .any(|(f, fence)| f == scope && fence == name);
+                if !(in_leases && listed) {
                     problems.push(format!("{}: `{scope}` uses {name}", path.display()));
                 }
                 continue;
             }
             let allowed = in_lease
                 && if name == "Fence::Skip" {
-                    scope == FENCE_SKIPPER
+                    FENCE_SKIPPERS.contains(&scope.as_str())
                 } else {
                     FENCE_MOVERS.iter().any(|(c, f)| c == name && f == scope)
                 };
@@ -2588,9 +2599,9 @@ fn only_the_claim_moves_the_fence_and_only_claim_renewal_and_release_write_the_l
     let problems = fence_problems(&sources);
     assert!(
         problems.is_empty(),
-        "only lease.rs's claim_lease may move the fence or skip its check, only \
-         claim_lease, renew_lease and release_lease may write the tenant lease (FENCE_MOVERS), \
-         and only leases.rs's LEASE_ONLY_USERS may use Fence::LeaseOnly:\n{}",
+        "only lease.rs's FENCE_SKIPPERS may skip the fence and state checks, only \
+         FENCE_MOVERS may write the tenant lease or the tenant_writer columns, and only \
+         leases.rs's LEASE_ONLY_USERS may use Fence::LeaseOnly or Fence::LeaseRelease:\n{}",
         problems.join("\n")
     );
     let lease = std::fs::read_to_string(src().join("postgres/lease.rs")).expect("read lease.rs");
@@ -2623,14 +2634,25 @@ fn the_fence_lint_flags_a_new_fence_mover() {
               fn claim_lease() { let _ = (Fence::Skip, TENANT_ACQUIRE_SQL); }\n";
     assert!(fence_problems(&[(lease.clone(), ok.to_owned())]).is_empty());
     let leases = PathBuf::from("src/postgres/leases.rs");
-    let lease_only = "fn lease_renew() { let _ = Fence::LeaseOnly; }\n";
+    let lease_only = "fn lease_renew() { let _ = Fence::LeaseOnly; }\n\
+                      fn lease_release() { let _ = Fence::LeaseRelease; }\n";
     assert!(fence_problems(&[(leases.clone(), lease_only.to_owned())]).is_empty());
+    let state = "const TENANT_STATE_SQL: &str = \"UPDATE tenant_writer SET state = $2\";\n\
+                 fn move_state() { let _ = (Fence::Skip, TENANT_STATE_SQL); }\n";
+    assert!(fence_problems(&[(lease.clone(), state.to_owned())]).is_empty());
     for (path, bad) in [
         (&lease, "fn other() { let _ = Fence::Skip; }\n"),
         (&leases, "fn lease_renew() { let _ = Fence::Skip; }\n"),
         (&leases, "fn other() { let _ = Fence::LeaseOnly; }\n"),
         (&other, "fn lease_renew() { let _ = Fence::LeaseOnly; }\n"),
         (&lease, "fn claim_lease() { let _ = Fence::LeaseOnly; }\n"),
+        (&leases, "fn lease_acquire() { let _ = Fence::LeaseRelease; }\n"),
+        (&leases, "fn lease_release() { let _ = Fence::LeaseOnly; }\n"),
+        (&lease, "fn move_state() { let _ = TENANT_ACQUIRE_SQL; }\n"),
+        (
+            &other,
+            "fn close() { q(\"UPDATE tenant_writer SET state = 'closed' WHERE tenant_id = $1\"); }\n",
+        ),
         (&lease, "fn other() { let _ = TENANT_ACQUIRE_SQL; }\n"),
         (&lease, "fn renew_lease() { let _ = TENANT_ACQUIRE_SQL; }\n"),
         (
@@ -2651,4 +2673,93 @@ fn the_fence_lint_flags_a_new_fence_mover() {
             "not flagged: {bad}"
         );
     }
+}
+
+/// Database statements a function sends, as calls to `sqlx::query`,
+/// `query_as`, `query_scalar` or `raw_sql`, in source order.
+#[derive(Default)]
+struct StatementCalls {
+    target: &'static str,
+    inside: bool,
+    calls: Vec<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for StatementCalls {
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let outer = self.inside;
+        self.inside |= f.sig.ident == self.target;
+        syn::visit::visit_item_fn(self, f);
+        self.inside = outer;
+    }
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let outer = self.inside;
+        self.inside |= f.sig.ident == self.target;
+        syn::visit::visit_impl_item_fn(self, f);
+        self.inside = outer;
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let (true, Expr::Path(path)) = (self.inside, &*call.func) {
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if ["query", "query_as", "query_scalar", "raw_sql"].contains(&name.as_str()) {
+                let sql = call
+                    .args
+                    .first()
+                    .map(|a| quote::ToTokens::to_token_stream(a).to_string())
+                    .unwrap_or_default();
+                self.calls.push(sql);
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+fn statement_calls(file: &syn::File, function: &'static str) -> Vec<String> {
+    let mut calls = StatementCalls {
+        target: function,
+        ..StatementCalls::default()
+    };
+    syn::visit::Visit::visit_file(&mut calls, file);
+    calls.calls
+}
+
+/// The tenant state check adds no statement to a write: the writer reads
+/// the state in the statement that already reads the tenant lease once it
+/// holds the lock (`WRITER_RESET_SQL`), and `begin_write_as` sends nothing
+/// itself before handing the transaction over (the lease guards it runs
+/// are their own function).
+#[test]
+fn the_tenant_state_check_adds_no_statement_to_a_write() {
+    let text = std::fs::read_to_string(src().join("postgres/mod.rs")).expect("read mod.rs");
+    let file = syn::parse_file(&text).expect("parse mod.rs");
+    assert_eq!(
+        statement_calls(&file, "lock_tenant_writer"),
+        [
+            "WRITER_LIMITS_SQL",
+            "WRITER_LOCK_SQL",
+            "WRITER_SEED_SQL",
+            "WRITER_LOCK_SQL",
+            "WRITER_RESET_SQL"
+        ],
+        "a writer sends the limits, the lock (seeding the row once) and the reset that reads \
+         the fence and the state; nothing else"
+    );
+    assert_eq!(
+        statement_calls(&file, "begin_write_as"),
+        Vec::<String>::new(),
+        "begin_write_as checks the state it read with the lock, without a statement of its own"
+    );
+    let reset = text
+        .split("const WRITER_RESET_SQL")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("WRITER_RESET_SQL");
+    assert!(
+        reset.contains("tw.state") && reset.contains("FROM tenant_writer AS tw"),
+        "the reset statement reads the state from the locked row: {reset}"
+    );
 }

@@ -1551,10 +1551,19 @@ CREATE TABLE IF NOT EXISTS tenant_config (
 --
 -- last_row_seq is the tenant's row_seq counter: the last value handed out
 -- across all its tables (see intent_next_row_seq).
+--
+-- state is the tenant state (src/tenant_state.rs): 'open' takes writes;
+-- 'closing' and 'closed' refuse every write, whoever holds the tenant lease.
+-- The writer reads it in the same statement as the lease, under the lock,
+-- and a move takes this row lock too, so it waits for the write in flight
+-- and every later writer sees it. intent_next_row_seq refuses a numbered
+-- row while it is not 'open', for a writer that skipped that check.
 CREATE TABLE IF NOT EXISTS tenant_writer (
     tenant_id text NOT NULL,
     last_row_seq bigint NOT NULL DEFAULT 0,
-    PRIMARY KEY (tenant_id)
+    state text NOT NULL DEFAULT 'open',
+    PRIMARY KEY (tenant_id),
+    CHECK (state IN ('open', 'closing', 'closed'))
 );
 
 CREATE TABLE IF NOT EXISTS tracked_changes (
@@ -3233,19 +3242,28 @@ $$;
 
 -- The tenant's next row_seq. The caller holds the tenant's writer lock, so
 -- its tenant_writer row exists; a missing row is an error, never a NULL or
--- 0 row_seq.
+-- 0 row_seq. A tenant that is not open numbers no row: the store refuses
+-- its writes before they start, and this is the backstop for a writer that
+-- took the lock without that check. It reads the state with the counter,
+-- once per transaction, and the lock keeps both from moving after.
 CREATE OR REPLACE FUNCTION intent_next_row_seq(p_tenant text) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     v_seq bigint;
     v_stored bigint;
+    v_state text;
 BEGIN
     IF COALESCE(current_setting('intent.row_seq_tenant', true), '') = p_tenant THEN
         v_seq := current_setting('intent.row_seq_last')::bigint + 1;
     ELSE
         PERFORM intent_row_seq_save();
-        SELECT tw.last_row_seq INTO v_stored FROM tenant_writer AS tw WHERE tw.tenant_id = p_tenant;
+        SELECT tw.last_row_seq, tw.state INTO v_stored, v_state
+            FROM tenant_writer AS tw WHERE tw.tenant_id = p_tenant;
         IF NOT FOUND THEN
             RAISE EXCEPTION 'tenant % has no tenant_writer row to number its rows', p_tenant
+                USING ERRCODE = '55000';
+        END IF;
+        IF v_state <> 'open' THEN
+            RAISE EXCEPTION 'tenant % is %, so it takes no writes', p_tenant, v_state
                 USING ERRCODE = '55000';
         END IF;
         v_seq := v_stored + 1;
