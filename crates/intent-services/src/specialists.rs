@@ -295,6 +295,23 @@ pub(crate) const EMBEDDED_BUNDLED_V3_15: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v3.18 embedded specialist bundle: the v3.15 set with a Developer that
+/// writes every unit of work as a task block, also when it does the work
+/// itself.
+pub(crate) const EMBEDDED_BUNDLED_V3_18: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_15[0],
+    (
+        "developer",
+        include_str!("../resources/specialists/v3.18/developer.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_15[2],
+    EMBEDDED_BUNDLED_V3_15[3],
+    EMBEDDED_BUNDLED_V3_15[4],
+    EMBEDDED_BUNDLED_V3_15[5],
+    EMBEDDED_BUNDLED_V3_15[6],
+    EMBEDDED_BUNDLED_V3_15[7],
+];
+
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.
 const EMPTY_BUNDLE: &[(&str, &str)] = &[];

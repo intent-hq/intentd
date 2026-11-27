@@ -19,7 +19,7 @@ pub const FIRST_BREAKDOWN_HARNESS_VERSION: (u32, u32) = (3, 10);
 pub fn harness_records_prompt_breakdown(harness_version: &str) -> bool {
     matches!(
         harness_version,
-        "3.10" | "3.12" | "3.13" | "3.14" | "3.15" | "3.16" | "3.17"
+        "3.10" | "3.12" | "3.13" | "3.14" | "3.15" | "3.16" | "3.17" | "3.18"
     )
 }
 
@@ -234,11 +234,12 @@ mod tests {
         assert!(harness_records_prompt_breakdown("3.15"));
         assert!(harness_records_prompt_breakdown("3.16"));
         assert!(harness_records_prompt_breakdown("3.17"));
+        assert!(harness_records_prompt_breakdown("3.18"));
         assert!(harness_records_prompt_breakdown(
             crate::CURRENT_HARNESS_VERSION
         ));
         for version in [
-            "3.9", "3.11", "3.18", "4.0", "garbage", "3", " 3.10", "3.12 ",
+            "3.9", "3.11", "3.19", "4.0", "garbage", "3", " 3.10", "3.12 ",
         ] {
             assert!(!harness_records_prompt_breakdown(version), "{version}");
         }

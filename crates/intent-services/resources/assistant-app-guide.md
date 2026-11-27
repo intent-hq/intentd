@@ -504,7 +504,9 @@ shared quick action model or effort: Intent copies one saved by an older version
 each action at startup.
 
 **Built-in coding specialists.** Developer implements directly, plans as needed,
-and delegates focused work to general agents. Lead, Coordinator, Implementor, and
+and delegates focused work to general agents. It writes each unit of work as a task in
+the **Spec** note, also when it does the work itself, and keeps those tasks' status
+current (older versions may write tasks only for delegated work). Lead, Coordinator, Implementor, and
 Verifier are no longer built-in choices for new sessions. Developer defers verification
 until work is complete, minimizes runs, and prefers end-to-end tests with repeatable
 artifacts for complex features. For isolated testing, it identifies failure modes first.

@@ -496,8 +496,7 @@ mod tests {
             None
         );
         let current = &ENTRY;
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.17");
         assert!(std::ptr::eq(crate::harness::latest_entry(), current));
     }
 }
