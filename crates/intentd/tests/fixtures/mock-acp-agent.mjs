@@ -100,6 +100,25 @@ function log(msg) {
 // MOCK_AGENT_LOG_TMPDIR opts into `tmp`: the child's TMPDIR / TMP / TEMP,
 // Node's `os.tmpdir()` and a file `mktemp` created from a shell, so tests can
 // prove each agent gets its own temp folder that shells and tools honor.
+// MOCK_AGENT_LOG_NPM_ENV opts into `shellNpmEnv`: the npm variables
+// (`npm_*` in any case, INIT_CWD, NODE), `INTENTD_NPX_*` and NODE_OPTIONS a
+// shell started by this agent sees, so tests can prove npx's own variables
+// never reach agent tools.
+function shellNpmEnv() {
+  const env = {};
+  let out = '';
+  try {
+    out = execFileSync('sh', ['-c', 'env'], { encoding: 'utf8' });
+  } catch (err) {
+    log(`env failed: ${err.message}`);
+  }
+  for (const line of out.split('\n')) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (m && (/^(npm_|INTENTD_NPX_)/i.test(m[1]) || ['INIT_CWD', 'NODE', 'NODE_OPTIONS'].includes(m[1]))) env[m[1]] = m[2];
+  }
+  return env;
+}
+
 function tmpReport() {
   let mktemp = null;
   try {
@@ -139,6 +158,7 @@ function logSessionCall(method, sessionId, meta, cwd) {
             } }
           : {}),
         ...(process.env.MOCK_AGENT_LOG_TMPDIR === '1' ? { tmp: tmpReport() } : {}),
+        ...(process.env.MOCK_AGENT_LOG_NPM_ENV === '1' ? { shellNpmEnv: shellNpmEnv() } : {}),
       }) + '\n'
     );
   } catch (err) {

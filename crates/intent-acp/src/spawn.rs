@@ -317,6 +317,7 @@ impl NpxLaunchDir {
         builder.create(&path)?;
         let dir = Self { path };
         std::fs::write(dir.path.join("package.json"), NPX_LAUNCH_SENTINEL_MANIFEST)?;
+        std::fs::write(dir.path.join(NPX_ENV_PRELOAD_FILE), NPX_ENV_PRELOAD_SCRIPT)?;
         Ok(dir)
     }
 
@@ -325,6 +326,101 @@ impl NpxLaunchDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// The Node preload every [`NpxLaunchDir`] holds beside its sentinel manifest
+/// (see [`apply_npx_env_preload`]).
+pub const NPX_ENV_PRELOAD_FILE: &str = "intentd-npx-env.cjs";
+
+/// The `NODE_OPTIONS` entry that loads [`NPX_ENV_PRELOAD_FILE`]. Its
+/// presence tells the preload it runs in npm's own process; the preload
+/// removes it, and strips this text from `NODE_OPTIONS`, before npm starts
+/// anything.
+pub const NPX_ENV_PRELOAD_ENV: &str = "INTENTD_NPX_ENV_PRELOAD";
+
+/// npm exports its settings as `npm_config_*` into the package it runs
+/// (`@npmcli/config` `setEnvs`: `yes`, `allow-scripts`, the npx project root,
+/// every CLI flag), so the adapter, its provider CLI and every shell an agent
+/// starts would inherit them (intent-hq/intentd#3840: `EALLOWSCRIPTS` from an
+/// agent's `npm install`), along with npm's run variables (`INIT_CWD` and
+/// `npm_package_json` into the launch dir, `npm_lifecycle_event`,
+/// `npm_execpath`, `NODE`, …). npm's own process loads this file through
+/// `NODE_OPTIONS` before it exports anything. The file records the npm
+/// variables (`npm_*`, `INIT_CWD`, `NODE`) npx was launched with, takes
+/// itself out of the environment npm's children inherit, and wraps
+/// `child_process.spawn` so the npx run (npm's `npx` lifecycle event, which
+/// npm always spawns with an explicit env) starts with exactly those —
+/// whatever program the adapter is, and whatever `NODE_OPTIONS` a user's npm
+/// `node-options` setting gives it. Other npm children (install scripts)
+/// keep npm's environment.
+const NPX_ENV_PRELOAD_SCRIPT: &str = r"'use strict';
+(() => {
+  const env = process.env;
+  const preload = env.INTENTD_NPX_ENV_PRELOAD;
+  if (!preload) return;
+  delete env.INTENTD_NPX_ENV_PRELOAD;
+  const withoutPreload = (vars) => {
+    const options = vars.NODE_OPTIONS || '';
+    const at = options.lastIndexOf(preload);
+    if (at < 0) return;
+    const rest = (options.slice(0, at) + options.slice(at + preload.length)).trim();
+    if (rest) vars.NODE_OPTIONS = rest;
+    else delete vars.NODE_OPTIONS;
+  };
+  withoutPreload(env);
+  const isNpmVar = (key) =>
+    key.slice(0, 4).toLowerCase() === 'npm_' || key === 'INIT_CWD' || key === 'NODE';
+  const launched = Object.entries(env).filter(([key]) => isNpmVar(key));
+  const childProcess = require('child_process');
+  const spawn = childProcess.spawn;
+  childProcess.spawn = function (file, args, options) {
+    const withArgs = Array.isArray(args);
+    const opts = (withArgs ? options : args) || {};
+    const vars = opts.env;
+    if (!vars || vars.npm_lifecycle_event !== 'npx') return spawn.apply(this, arguments);
+    const clean = {};
+    for (const [key, value] of Object.entries(vars)) if (!isNpmVar(key)) clean[key] = value;
+    for (const [key, value] of launched) clean[key] = value;
+    withoutPreload(clean);
+    const next = { ...opts, env: clean };
+    return withArgs ? spawn.call(this, file, args, next) : spawn.call(this, file, next);
+  };
+})();
+";
+
+/// Load [`NPX_ENV_PRELOAD_FILE`] from `launch_dir` in npm's own process for
+/// the npx launch `cmd`, so the adapter starts with only the npm variables
+/// npx itself was given. Apply after every other env merge.
+/// `inherits_env` is whether `cmd` inherits the daemon's environment (it has
+/// not been `env_clear`ed): the preload is appended to the effective
+/// `NODE_OPTIONS`, which npm's children get back unchanged.
+pub fn apply_npx_env_preload(
+    cmd: &mut std::process::Command,
+    launch_dir: &Path,
+    inherits_env: bool,
+) {
+    let preload = launch_dir.join(NPX_ENV_PRELOAD_FILE);
+    let quoted = preload
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let entry = format!("--require \"{quoted}\"");
+    let explicit = cmd
+        .get_envs()
+        .find(|(key, _)| *key == "NODE_OPTIONS")
+        .map(|(_, value)| value.map(std::ffi::OsStr::to_owned));
+    let current = match explicit {
+        Some(value) => value,
+        None if inherits_env => std::env::var_os("NODE_OPTIONS"),
+        None => None,
+    };
+    let mut node_options = current.unwrap_or_default();
+    if !node_options.is_empty() {
+        node_options.push(" ");
+    }
+    node_options.push(&entry);
+    cmd.env("NODE_OPTIONS", node_options)
+        .env(NPX_ENV_PRELOAD_ENV, entry);
 }
 
 impl Drop for NpxLaunchDir {
@@ -984,7 +1080,7 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
     let agent_tmp_dir = create_agent_tmp_dir(opts, &command_name);
-    let command = build_command_in(
+    let mut command = build_command_in(
         opts,
         captured_credential_env(),
         priority,
@@ -992,6 +1088,11 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
         None,
         agent_tmp_dir.as_ref(),
     );
+    // Not in `prepare_npx_package`: its environment keys the preparation
+    // cache, and its metadata reader starts no agent shells.
+    if let Some(dir) = launch_cwd {
+        apply_npx_env_preload(command.as_std_mut(), dir, true);
+    }
     Ok(PreparedProvider {
         command,
         npx_launch_dir,

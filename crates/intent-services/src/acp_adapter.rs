@@ -900,6 +900,13 @@ fn spawn_admitted_adapter(
     if let Some(installed) = &cmd.installed {
         installed.apply(&mut command);
     }
+    if let Some(dir) = &npx_launch_dir {
+        intent_acp::spawn::apply_npx_env_preload(
+            command.as_std_mut(),
+            dir.path(),
+            cmd.installed.is_none(),
+        );
+    }
 
     let mut child = command
         .spawn()
@@ -1511,6 +1518,7 @@ mod reap_tests {
 pub(crate) mod npx_launch_tests {
     use super::*;
     use crate::test_support::test_tempdir;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     /// A workspace fixture reproducing the intent-hq/intent#5738 failure mode:
@@ -1613,12 +1621,12 @@ exit 0
     }
 
     /// The launch dir holds exactly the private sentinel `package.json` that
-    /// makes it npm's nearest project root and nothing else.
+    /// makes it npm's nearest project root, and Intent's npm-env preload.
     pub(crate) fn assert_neutral_launch_dir(npx_cwd: &Path, entries: &[String]) {
         assert_eq!(
             entries,
-            ["package.json"],
-            "npx launch dir {} must hold only the sentinel manifest",
+            [intent_acp::spawn::NPX_ENV_PRELOAD_FILE, "package.json"],
+            "npx launch dir {} must hold only the sentinel manifest and the preload",
             npx_cwd.display()
         );
         let sentinel: Value =
@@ -2000,6 +2008,176 @@ exit 0
             launch_root.display()
         );
         spawned.child.reap().await;
+    }
+
+    /// Run the local package `bin` (body `bin_body`) through the REAL npm CLI
+    /// as an ephemeral npx adapter, with the user npm settings `user_npm` and
+    /// `NODE_OPTIONS=--max-old-space-size=4096`; assert the environment the
+    /// adapter writes to `$ADAPTER_REPORT` (`env` from a shell it starts, or
+    /// its own) holds exactly those npm settings — no other `npm_*`,
+    /// `INIT_CWD` or `NODE` variable npm sets for its run — and none of
+    /// Intent's npx variables, and return it. Offline, with private user/global npmrc and
+    /// cache; `None` without `npx`.
+    async fn real_npx_adapter_env(
+        test: &str,
+        bin_body: &str,
+        user_npm: &[(&str, &str)],
+    ) -> Option<BTreeMap<String, String>> {
+        let Some(npx) = intent_providers::resolve_on_path("npx") else {
+            eprintln!("skipping {test}: npx not on PATH");
+            return None;
+        };
+        let tmp = test_tempdir("intent-adapter-npx-real-env-");
+        let home = tmp.path().join("clean-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("user.npmrc"), "").unwrap();
+        std::fs::write(home.join("global.npmrc"), "").unwrap();
+        let adapter = tmp.path().join("adapter");
+        std::fs::create_dir_all(&adapter).unwrap();
+        std::fs::write(
+            adapter.join("package.json"),
+            r#"{"name":"intentd-test-env-adapter","version":"1.0.0","bin":{"intentd-test-env-adapter":"cli"}}"#,
+        )
+        .unwrap();
+        std::fs::write(adapter.join("cli"), bin_body).unwrap();
+        let report = tmp.path().join("adapter-report");
+
+        let mut cmd = AcpAdapterCommand::npx(npx, adapter.to_str().unwrap())
+            .npx_launch_root(tmp.path().join("launch-root"))
+            .env("ADAPTER_REPORT", report.as_os_str())
+            .env("DD_TRACE_ENABLED", "false")
+            .env("NODE_OPTIONS", "--max-old-space-size=4096")
+            .env("HOME", home.as_os_str());
+        let mut expected: BTreeMap<String, String> = [
+            ("npm_config_userconfig", home.join("user.npmrc")),
+            ("npm_config_globalconfig", home.join("global.npmrc")),
+            ("npm_config_cache", tmp.path().join("npm-cache")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned()))
+        .collect();
+        for (k, v) in [
+            ("npm_config_offline", "true"),
+            ("npm_config_update_notifier", "false"),
+            ("npm_config_loglevel", "error"),
+        ]
+        .into_iter()
+        .chain(user_npm.iter().copied())
+        {
+            expected.insert(k.to_owned(), v.to_owned());
+        }
+        let is_npm_var = |key: &str| {
+            key.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("npm_"))
+                || key == "INIT_CWD"
+                || key == "NODE"
+        };
+        for (key, _) in std::env::vars_os() {
+            let key = key.to_string_lossy().into_owned();
+            if is_npm_var(&key) && !expected.contains_key(&key) {
+                cmd = cmd.env_remove(key);
+            }
+        }
+        for (k, v) in &expected {
+            cmd = cmd.env(k.clone(), v);
+        }
+
+        let slots = AdapterSlots::new(1);
+        let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn real npx");
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(120));
+        let shell_env = loop {
+            if let Ok(s) = std::fs::read_to_string(&report) {
+                break s;
+            }
+            if let Ok(Some(status)) = spawned.child.try_wait() {
+                panic!(
+                    "real npx exited {status:?} before the adapter reported; stderr: {:?}",
+                    spawned.conn.recent_stderr()
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "adapter never reported"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        spawned.child.reap().await;
+        let vars: BTreeMap<String, String> = shell_env
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let npm_vars: BTreeMap<String, String> = vars
+            .iter()
+            .filter(|(k, _)| is_npm_var(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(
+            npm_vars, expected,
+            "the adapter's shells see exactly the launch's npm variables, none of npx's"
+        );
+        assert!(
+            !vars.keys().any(|k| k.starts_with("INTENTD_NPX_")),
+            "Intent's npx plumbing leaked: {vars:?}"
+        );
+        Some(vars)
+    }
+
+    /// intent-hq/intentd#3840 against the REAL npm CLI: npm exports its own
+    /// settings (`npm_config_yes`, `npm_config_allow_scripts`, the npx project
+    /// root, every CLI flag) into the package it runs. A shell the npx-run
+    /// Node adapter starts must see exactly the npm settings the launch had —
+    /// including the user's `ignore-scripts=true` that npx ran with
+    /// `--ignore-scripts=false` — and the launch's `NODE_OPTIONS` without
+    /// Intent's preload.
+    #[tokio::test]
+    async fn real_npx_adapter_keeps_npx_settings_out_of_its_shells() {
+        let Some(vars) = real_npx_adapter_env(
+            "real-npx settings scrub regression",
+            "#!/usr/bin/env node\n\
+             const fs = require('fs');\n\
+             const out = require('child_process').execFileSync('sh', ['-c', 'env'], { encoding: 'utf8' });\n\
+             fs.writeFileSync(process.env.ADAPTER_REPORT + '.tmp', out);\n\
+             fs.renameSync(process.env.ADAPTER_REPORT + '.tmp', process.env.ADAPTER_REPORT);\n\
+             process.stdin.resume();\n",
+            &[("npm_config_ignore_scripts", "true")],
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            vars.get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096"),
+            "NODE_OPTIONS comes back without the preload"
+        );
+    }
+
+    /// The scrub cannot depend on the adapter being a Node program or on
+    /// `NODE_OPTIONS` reaching it: a shell-script bin gets a clean
+    /// environment too, and a user's npm `node-options` setting (which npm
+    /// puts in the adapter's `NODE_OPTIONS` in place of the launch's) is
+    /// honoured as npm intends.
+    #[tokio::test]
+    async fn real_npx_shell_adapter_with_npm_node_options_gets_no_npx_settings() {
+        let Some(vars) = real_npx_adapter_env(
+            "real-npx shell adapter settings scrub regression",
+            "#!/bin/sh\n\
+             env > \"$ADAPTER_REPORT.tmp\" && mv \"$ADAPTER_REPORT.tmp\" \"$ADAPTER_REPORT\"\n\
+             exec cat > /dev/null\n",
+            &[("npm_config_node_options", "--no-warnings")],
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            vars.get("NODE_OPTIONS").map(String::as_str),
+            Some("--no-warnings"),
+            "npm's node-options setting reaches the adapter, without the preload"
+        );
     }
 
     /// Control: the selector scrub is npx-only — a resolved binary receives an

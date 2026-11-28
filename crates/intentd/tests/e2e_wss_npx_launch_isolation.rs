@@ -21,8 +21,9 @@
 //! `workspaces` unless `--workspaces=false` is on its argv), fails with
 //! `EUNSUPPORTEDPROTOCOL` when that root's manifest uses `catalog:` or with
 //! `ENOENT` when its `.npmrc` names a missing `script-shell`, and otherwise
-//! execs the deterministic mock ACP fixture under `node`. Nothing is
-//! downloaded. The fixture's `MOCK_AGENT_SESSION_LOG` seam records the
+//! hands off to a fake npm process under `node` that, like npm, adds its own
+//! `npm_config_*` settings before running the deterministic mock ACP fixture
+//! as an `npx` lifecycle script. Nothing is downloaded. The fixture's `MOCK_AGENT_SESSION_LOG` seam records the
 //! `session/new` `cwd` param and the child's actual process cwd.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
@@ -95,11 +96,26 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env("DD_TRACE_ENABLED", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // npm variables exported by the shell running the tests (an agent shell
+    // started through npx carries several) are not the fixture's.
+    for (key, _) in std::env::vars_os() {
+        if is_npm_var(&key.to_string_lossy()) {
+            cmd.env_remove(key);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+/// A variable npm sets for the package it runs: `npm_*` in any case (its
+/// settings and run metadata), `INIT_CWD` and `NODE`.
+fn is_npm_var(key: &str) -> bool {
+    key.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("npm_"))
+        || key == "INIT_CWD"
+        || key == "NODE"
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -344,7 +360,7 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 /// `--no-workspaces` is absent from the argv. It fails like npm when that
 /// root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc`
 /// names a `script-shell` that does not exist (`ENOENT`, exit 254), and
-/// otherwise execs the mock fixture under `node`. The shared argv check
+/// otherwise execs [`FAKE_NPM_SCRIPT`] under `node`. The shared argv check
 /// already rejects a launch without `--workspaces=false`, so the walk always
 /// sees the switch; it stays to prove the launch dir's sentinel manifest is
 /// the root npm picks.
@@ -388,7 +404,38 @@ if [ -n "$root" ]; then
     exit 254
   fi
 fi
-exec '__NODE__' '__SCRIPT__'
+exec '__NODE__' '__NPM__' '__SCRIPT__' "$@"
+"#;
+
+/// npm's own Node process under the fake `npx` (argv: the mock script, then
+/// the npx argv). Like `@npmcli/config` `setEnvs` it exports its settings —
+/// `--yes`, the project root, `--allow-scripts` and, overriding a value the
+/// user set, `--ignore-scripts=false` — plus its run variables, then runs the
+/// adapter through `sh` as the `npx` lifecycle event with an explicit env,
+/// as `libnpmexec` / `@npmcli/run-script` do.
+const FAKE_NPM_SCRIPT: &str = r#"const { spawn } = require('node:child_process');
+const [script, ...npxArgs] = process.argv.slice(2);
+const allow = npxArgs.find((a) => a.startsWith('--allow-scripts='));
+Object.assign(process.env, {
+  npm_config_yes: 'true',
+  npm_config_local_prefix: process.cwd(),
+  npm_config_ignore_scripts: 'false',
+  npm_config_user_agent: `npm/10.9.2 node/${process.version}`,
+  npm_command: 'exec',
+  npm_execpath: __filename,
+  npm_node_execpath: process.execPath,
+  NODE: process.execPath,
+  INIT_CWD: process.cwd(),
+  ...(allow ? { npm_config_allow_scripts: allow.slice('--allow-scripts='.length) } : {}),
+});
+const env = {
+  ...process.env,
+  npm_lifecycle_event: 'npx',
+  npm_lifecycle_script: 'claude-agent-acp',
+  npm_package_json: `${process.cwd()}/package.json`,
+};
+const child = spawn('/bin/sh', ['-c', 'exec "$0" "$1"', process.execPath, script], { stdio: 'inherit', env });
+child.on('exit', (code) => process.exit(code ?? 1));
 "#;
 
 /// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `bin_dir`, beside
@@ -420,6 +467,8 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     .expect("write fake node");
     std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755))
         .expect("chmod node");
+    let npm = bin_dir.join("fake-npm.cjs");
+    std::fs::write(&npm, FAKE_NPM_SCRIPT).expect("write fake npm");
     let npx = bin_dir.join("npx");
     intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         .version("10.9.2")
@@ -427,6 +476,7 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
             &FAKE_NPX_SCRIPT
                 .replace("__REPORT__", &report.display().to_string())
                 .replace("__NODE__", &node.display().to_string())
+                .replace("__NPM__", &npm.display().to_string())
                 .replace("__SCRIPT__", script),
         )
         .write(&npx)
@@ -680,5 +730,160 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
         std::fs::canonicalize(&process_cwd).unwrap_or(process_cwd.clone()),
         canonical_workspace,
         "the adapter process must not run inside the workspace"
+    );
+}
+
+/// NPX SETTINGS STAY OUT OF AGENT SHELLS: npm exports its own `npm_config_*`
+/// settings (`yes`, `allow-scripts`, the npx project root, …) into the adapter
+/// it runs, and a shell or tool the agent starts would inherit them — an
+/// `npm install` there failed with `EALLOWSCRIPTS` and npx prompts were
+/// silently accepted (intent-hq/intentd#3840). A shell the npx-launched
+/// agent starts sees only the npm variables the daemon had before launch,
+/// with the user's values (`ignore-scripts=true` even though npx ran with
+/// `--ignore-scripts=false`), none of npm's run variables (`INIT_CWD`,
+/// `npm_lifecycle_event`, …), and none of Intent's own launch plumbing.
+#[tokio::test]
+async fn npx_launch_keeps_npx_settings_out_of_agent_shells() {
+    let Some(script) = gate("WSS npx settings scrub E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let bin_dir = data_dir.join("bin");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let report = data_dir.join("npx-report");
+    write_fake_npx(&bin_dir, &report, &script);
+    let source_repo = make_source_repo(&data_dir);
+    let session_log = data_dir.join("sessions.txt");
+    let session_log_s = session_log.to_string_lossy().into_owned();
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let behavior = json!({ "response": "NPX_SETTINGS_E2E_REPLY" }).to_string();
+    let user_npm = [
+        ("npm_config_ignore_scripts", "true"),
+        ("npm_config_registry", "http://127.0.0.1:9/"),
+        ("NPM_CONFIG_FUND", "false"),
+    ];
+    let mut env = vec![
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("PATH", path.as_str()),
+        ("HOME", home_dir.to_str().unwrap()),
+        ("SHELL", "/bin/sh"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SESSION_LOG", &session_log_s),
+        ("MOCK_AGENT_LOG_NPM_ENV", "1"),
+    ];
+    env.extend(user_npm);
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir_guard,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Npx Settings E2E",
+            "repositoryPath": source_repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Npx Settings E2E",
+            "model": "mock-model", "provider": "claude-code",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage accepted: {sent}");
+    assert_eq!(
+        await_turn_settled(&mut sub, &agent_id).await,
+        "agent:stream:end",
+        "the npx-launched agent must complete its turn"
+    );
+    assert!(
+        std::fs::read_to_string(format!("{}.args", report.display())).is_ok(),
+        "the agent must have been launched through the fake npx"
+    );
+
+    let raw = std::fs::read_to_string(&session_log).expect("session log");
+    let line = raw.lines().next().expect("one session/new");
+    let shell_env: serde_json::Map<String, Value> = serde_json::from_str::<Value>(line)
+        .expect("session log json")["shellNpmEnv"]
+        .as_object()
+        .cloned()
+        .expect("agent reported its shell's npm env");
+    let npm_vars: std::collections::BTreeMap<&str, &str> = shell_env
+        .iter()
+        .filter(|(k, _)| is_npm_var(k))
+        .map(|(k, v)| (k.as_str(), v.as_str().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        npm_vars,
+        user_npm.into_iter().collect(),
+        "agent shells see exactly the user's npm variables, none added by npx"
+    );
+    let launch_vars: Vec<&String> = shell_env
+        .keys()
+        .filter(|k| k.starts_with("INTENTD_NPX_"))
+        .collect();
+    assert!(
+        launch_vars.is_empty(),
+        "Intent's npx plumbing leaked: {launch_vars:?}"
+    );
+    let node_options = shell_env
+        .get("NODE_OPTIONS")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !node_options.contains("--require"),
+        "agent shells must not preload Intent's npx scrub: {node_options:?}"
     );
 }
