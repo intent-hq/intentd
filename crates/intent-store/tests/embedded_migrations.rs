@@ -67,6 +67,7 @@ fn names(migrations: &[(i64, String, String)]) -> Vec<String> {
         .collect()
 }
 
+#[track_caller]
 fn assert_matches_disk(migrator: &Migrator, relative_dir: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_dir);
     let embedded = embedded(migrator);
