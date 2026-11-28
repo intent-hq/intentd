@@ -923,7 +923,9 @@ async fn a_remote_run_never_starts_without_its_instructions() {
     });
     let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
     let pool = mgr.services.store.write_pool();
-    sqlx::query("CREATE TRIGGER fail_system_prompt BEFORE UPDATE OF system_prompt ON agent_session BEGIN SELECT RAISE(FAIL, 'injected'); END")
+    // The prompt is stored in `agent_session_prompt` (0205): fail both a
+    // first write and a rewrite.
+    sqlx::raw_sql("CREATE TRIGGER fail_system_prompt BEFORE INSERT ON agent_session_prompt BEGIN SELECT RAISE(FAIL, 'injected'); END; CREATE TRIGGER fail_system_prompt_rewrite BEFORE UPDATE ON agent_session_prompt BEGIN SELECT RAISE(FAIL, 'injected'); END;")
         .execute(pool)
         .await
         .unwrap();
@@ -939,7 +941,7 @@ async fn a_remote_run_never_starts_without_its_instructions() {
     );
     assert!(!mgr.contains(&id));
 
-    sqlx::query("DROP TRIGGER fail_system_prompt")
+    sqlx::raw_sql("DROP TRIGGER fail_system_prompt; DROP TRIGGER fail_system_prompt_rewrite;")
         .execute(pool)
         .await
         .unwrap();

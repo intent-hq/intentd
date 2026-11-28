@@ -18,7 +18,7 @@ use intent_store::{
     RepositoryAcpCompatibilityResult, RepositoryAcpInitialization, RepositoryInitializationBinding,
     RepositoryLifecycleKey, RepositoryLifecycleMutationTicket, RepositoryLifecycleObserver,
     RepositorySelectionChange, RepositorySelectionPersistence, RepositorySelectionWriteResult,
-    RepositoryStoredSelection, Store, TRANSFER_TABLES,
+    RepositoryStoredSelection, Store, AGENT_SESSION_PROMPT_COLUMNS, TRANSFER_TABLES,
 };
 
 use crate::harness::{open_trapped, parity_test, sqlite_store, test_db};
@@ -799,6 +799,11 @@ async fn transfer_tables_export_the_same_columns_on_both_backends() {
         .fetch_all(sqlite.read_pool())
         .await
         .unwrap();
+        if table == "agent_session" {
+            // SQLite stores these in agent_session_prompt (0205); export
+            // joins them back into each session row.
+            lite.extend(AGENT_SESSION_PROMPT_COLUMNS.map(String::from));
+        }
         let mut pg: Vec<String> = sqlx::query_scalar(
             "SELECT column_name::text FROM information_schema.columns \
              WHERE table_schema = current_schema() AND table_name = $1 \

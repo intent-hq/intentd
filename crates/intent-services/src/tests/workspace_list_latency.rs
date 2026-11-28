@@ -156,9 +156,9 @@ async fn seed(store: &Store, shape: Shape) -> Vec<WorkspaceId> {
             .await
             .unwrap();
     }
-    // Direct fixture write (never production data): the heavy agent columns
-    // the host carries — a large system prompt stored mid-row and prompt
-    // copies inside `metadata` — next to the small keys the list reads.
+    // Direct fixture write (never production data): the heavy agent state
+    // the host carries — a large system prompt and prompt copies inside
+    // `metadata` — next to the small keys the list reads.
     let body = |c: &str| c.repeat(shape.metadata_prompt_bytes);
     let metadata = json!({
         "behaviorPrompt": body("b"),
@@ -169,12 +169,22 @@ async fn seed(store: &Store, shape: Shape) -> Vec<WorkspaceId> {
         "lastSeenMessageId": "msg-1",
     })
     .to_string();
-    sqlx::query("UPDATE agent_session SET system_prompt = ?, metadata = ?")
-        .bind("p".repeat(shape.system_prompt_bytes))
+    sqlx::query("UPDATE agent_session SET metadata = ?")
         .bind(metadata)
         .execute(store.write_pool())
         .await
         .unwrap();
+    // The prompt is stored beside the row (0205), where summary reads never
+    // load it.
+    sqlx::query(
+        "INSERT INTO agent_session_prompt (agent_id, system_prompt) \
+         SELECT id, ? FROM agent_session WHERE true \
+         ON CONFLICT(agent_id) DO UPDATE SET system_prompt = excluded.system_prompt",
+    )
+    .bind("p".repeat(shape.system_prompt_bytes))
+    .execute(store.write_pool())
+    .await
+    .unwrap();
     active
 }
 
@@ -257,6 +267,18 @@ async fn workspace_list_page_reads_scale_with_the_page() {
         assert!(
             over.is_empty(),
             "statements returning more than the page's {per_page_bound} rows: {over:#?}"
+        );
+        // The stored prompt (~70 KB per agent on a host) is never read by a
+        // list page: it lives beside the session row (0205) so summary
+        // reads do not walk its overflow chain.
+        let prompt_reads: Vec<_> = queries
+            .iter()
+            .filter(|q| q.sql.contains("system_prompt") || q.sql.contains("agent_session_prompt"))
+            .map(|q| q.sql.clone())
+            .collect();
+        assert!(
+            prompt_reads.is_empty(),
+            "a list page read the stored prompt: {prompt_reads:#?}"
         );
     }
 }

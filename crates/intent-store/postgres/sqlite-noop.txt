@@ -1,0 +1,3 @@
+# SQLite migrations with no Postgres counterpart: `<file> <reason>`.
+# postgres_tenant_schema_lint counts each line as covering its migration.
+0205_agent_session_prompt.sql Postgres stores values over ~2 KB out of line (TOAST), so agent_session.system_prompt never sits in front of the other columns; the SQLite-only overflow-chain fix has nothing to port

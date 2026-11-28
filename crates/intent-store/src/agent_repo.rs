@@ -51,6 +51,66 @@ pub(crate) const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, 
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
     harness_features, retired_at, notifications_muted, pinned, permission_policy, goal, goal_set_by";
 
+/// The `FROM` clause for a full [`SESSION_COLUMNS`] read in `SQLite`. The
+/// stored prompt (~70 KB per agent on a busy host) lives in
+/// `agent_session_prompt` (0205), not the `agent_session` row: `SQLite` keeps
+/// a row's columns in one record, so a prompt mid-row put every later column
+/// behind ~17 overflow pages and every summary read walked them. The side
+/// table has no column named like an `agent_session` column except
+/// `system_prompt`, so unqualified `WHERE` / `ORDER BY` names stay
+/// unambiguous.
+pub(crate) const SESSION_FROM: &str =
+    "agent_session LEFT JOIN agent_session_prompt ON agent_session_prompt.agent_id = agent_session.id";
+
+/// The `agent_session` columns a `SQLite` insert writes:
+/// [`SESSION_COLUMNS`] without `system_prompt`, which goes to
+/// `agent_session_prompt` ([`write_session_prompt`]). Bound by
+/// [`bind_session_insert`].
+fn session_insert_columns() -> String {
+    let columns = SESSION_COLUMNS.replacen(" system_prompt,", "", 1);
+    debug_assert_ne!(columns, SESSION_COLUMNS);
+    columns
+}
+
+/// The `INSERT INTO agent_session` statement for [`bind_session_insert`].
+fn session_insert_sql() -> String {
+    let columns = session_insert_columns();
+    let placeholders = vec!["?"; columns.split(',').count()].join(",");
+    format!("INSERT INTO agent_session ({columns}) VALUES ({placeholders})")
+}
+
+/// Store a full-row write's `system_prompt` in `agent_session_prompt`, with
+/// the semantics the column had in `agent_session`: an unchanged prompt is
+/// left alone (keeping its `prompt_breakdown`, and skipping a ~70 KB
+/// rewrite on every status write), a changed one clears the breakdown, and
+/// `None` drops the stored prompt and its breakdown. Run it in the same
+/// transaction as the `agent_session` write, after the row exists.
+async fn write_session_prompt(
+    conn: &mut sqlx::SqliteConnection,
+    agent_id: &str,
+    system_prompt: Option<&str>,
+) -> Result<()> {
+    let query = match system_prompt {
+        Some(prompt) => sqlx::query(
+            "INSERT INTO agent_session_prompt (agent_id, system_prompt) VALUES (?, ?) \
+             ON CONFLICT(agent_id) DO UPDATE SET system_prompt = excluded.system_prompt, \
+             prompt_breakdown = NULL \
+             WHERE system_prompt IS NOT excluded.system_prompt",
+        )
+        .bind(agent_id)
+        .bind(prompt),
+        None => sqlx::query(
+            "DELETE FROM agent_session_prompt WHERE agent_id = ? AND system_prompt IS NOT NULL",
+        )
+        .bind(agent_id),
+    };
+    query
+        .execute(conn)
+        .await
+        .map_err(|e| Error::Internal(format!("write agent session prompt failed: {e}")))?;
+    Ok(())
+}
+
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
 /// omitted: `AgentLite::from_session` strips them from the wire, and loading
@@ -1172,8 +1232,9 @@ pub(crate) fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<St
     .transpose()
 }
 
-/// Bind the full 45-column `agent_session` insert value list onto `query`, in
-/// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
+/// Bind the `agent_session` insert value list onto `query`, in
+/// [`session_insert_columns`] order (`system_prompt` is written separately
+/// by [`write_session_prompt`]). Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
 /// `harness_features`) binds from the session struct itself.
@@ -1193,7 +1254,6 @@ fn bind_session_insert<'q>(
         .bind(&s.provider)
         .bind(enum_to_db(&s.status)?)
         .bind(i64::from(s.is_active))
-        .bind(&s.system_prompt)
         .bind(&s.created_at)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
@@ -2917,29 +2977,21 @@ impl crate::SqliteStore {
         let s = s.full_row();
         let mut lifecycle = self.repository_lifecycle_write().await?;
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
-        let mut tx = if remember_specialist {
-            Some(
-                self.write_pool()
-                    .begin()
-                    .await
-                    .map_err(|e| Error::Internal(format!("begin agent create: {e}")))?,
-            )
-        } else {
-            None
-        };
-        let sql = format!(
-            "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        );
-        let query = bind_session_insert(
+        // One transaction: the session row and its stored prompt
+        // (`agent_session_prompt`) land together.
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin agent create: {e}")))?;
+        let sql = session_insert_sql();
+        bind_session_insert(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
             s,
             task_graph_enabled,
-        )?;
-        match tx.as_mut() {
-            Some(tx) => query.execute(&mut **tx).await,
-            None => query.execute(self.write_pool()).await,
-        }
+        )?
+        .execute(&mut *tx)
+        .await
         .map_err(|e| {
             if e.as_database_error()
                 .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
@@ -2955,12 +3007,13 @@ impl crate::SqliteStore {
                 Error::Internal(format!("insert agent session failed: {e}"))
             }
         })?;
-        if let Some(mut tx) = tx {
+        write_session_prompt(&mut tx, &s.id.0, s.system_prompt.as_deref()).await?;
+        if remember_specialist {
             crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
-            tx.commit()
-                .await
-                .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
         lifecycle.settle_after_retirement().await?;
         Ok(())
     }
@@ -2995,10 +3048,7 @@ impl crate::SqliteStore {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("insert session with messages begin failed: {e}"))
             })?;
-            let session_sql = format!(
-                "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            );
+            let session_sql = session_insert_sql();
             bind_session_insert(
                 sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())),
                 s,
@@ -3007,6 +3057,7 @@ impl crate::SqliteStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
+            write_session_prompt(&mut tx, &s.id.0, s.system_prompt.as_deref()).await?;
             let (import_model, _) = normalize_compound_model(s.model.clone(), s.provider.clone());
             let import_model = import_model.unwrap_or_else(|| "unknown".to_string());
             let insert_sql = format!(
@@ -3097,7 +3148,7 @@ impl crate::SqliteStore {
     }
 
     pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
-        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM {SESSION_FROM} WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
@@ -3114,7 +3165,7 @@ impl crate::SqliteStore {
     }
 
     pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
-        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM {SESSION_FROM} WHERE id = ?");
         let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
@@ -3272,7 +3323,7 @@ impl crate::SqliteStore {
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
         let sql = format!(
-            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
+            "SELECT {SESSION_COLUMNS} FROM {SESSION_FROM} WHERE workspace_id = ? ORDER BY created_at"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
@@ -4259,7 +4310,7 @@ impl crate::SqliteStore {
     }
 
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
-        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM {SESSION_FROM} ORDER BY created_at");
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
@@ -4368,16 +4419,13 @@ impl crate::SqliteStore {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
         let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist || notifications_muted.is_some() || pinned.is_some() {
-            Some(
-                self.write_pool()
-                    .begin()
-                    .await
-                    .map_err(|e| Error::Internal(format!("begin agent update: {e}")))?,
-            )
-        } else {
-            None
-        };
+        // One transaction: the row and its stored prompt
+        // (`agent_session_prompt`) change together.
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("begin agent update: {e}")))?;
         // The daemon-owned keys (the manual-choice token and the return
         // state, PROTOCOL §5.54) are owned by their dedicated writers: this
         // whole-document write keeps the stored values and never takes them
@@ -4399,8 +4447,6 @@ impl crate::SqliteStore {
         let sql = format!(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, \
-             prompt_breakdown=CASE WHEN system_prompt IS ? THEN prompt_breakdown ELSE NULL END, \
-             system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
@@ -4420,9 +4466,6 @@ impl crate::SqliteStore {
             .bind(&s.provider)
             .bind(enum_to_db(&s.status)?)
             .bind(i64::from(s.is_active))
-            // Twice: the breakdown survives only an unchanged prompt.
-            .bind(&s.system_prompt)
-            .bind(&s.system_prompt)
             .bind(&s.updated_at)
             .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
             .bind(&s.specialist)
@@ -4453,38 +4496,37 @@ impl crate::SqliteStore {
             .bind(&s.reasoning_effort)
             .bind(&s.id.0)
             .bind(&workspace_id.0);
-        let rows = match tx.as_mut() {
-            Some(tx) => query.execute(&mut **tx).await,
-            None => query.execute(self.write_pool()).await,
-        }
-        .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?
-        .rows_affected();
+        let rows = query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?
+            .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        if let Some(mut tx) = tx {
-            for (column, value) in [
-                (SessionPreference::NotificationsMuted, notifications_muted),
-                (SessionPreference::Pinned, pinned),
-            ] {
-                if let Some(value) = value {
-                    sqlx::query(column.update_sql())
-                        .bind(i64::from(value))
-                        .bind(&s.id.0)
-                        .bind(&workspace_id.0)
-                        .bind(i64::from(value))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
-                }
+        // The breakdown survives only an unchanged prompt.
+        write_session_prompt(&mut tx, &s.id.0, s.system_prompt.as_deref()).await?;
+        for (column, value) in [
+            (SessionPreference::NotificationsMuted, notifications_muted),
+            (SessionPreference::Pinned, pinned),
+        ] {
+            if let Some(value) = value {
+                sqlx::query(column.update_sql())
+                    .bind(i64::from(value))
+                    .bind(&s.id.0)
+                    .bind(&workspace_id.0)
+                    .bind(i64::from(value))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
             }
-            if remember_specialist {
-                crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
-            }
-            tx.commit()
-                .await
-                .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         }
+        if remember_specialist {
+            crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         lifecycle.settle_after_retirement().await?;
         Ok(())
     }
@@ -5037,9 +5079,13 @@ impl crate::SqliteStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| Error::Internal(format!("serialize prompt breakdown failed: {e}")))?;
+        // `WHERE` before `ON CONFLICT` keeps the upsert unambiguous to the
+        // parser; no session row in `workspace_id` inserts nothing.
         let rows = sqlx::query(
-            "UPDATE agent_session SET system_prompt=?, prompt_breakdown=? \
-             WHERE id=? AND workspace_id=?",
+            "INSERT INTO agent_session_prompt (agent_id, system_prompt, prompt_breakdown) \
+             SELECT ?3, ?1, ?2 FROM agent_session WHERE id=?3 AND workspace_id=?4 \
+             ON CONFLICT(agent_id) DO UPDATE SET system_prompt=excluded.system_prompt, \
+             prompt_breakdown=excluded.prompt_breakdown",
         )
         .bind(system_prompt)
         .bind(breakdown)
@@ -5061,8 +5107,10 @@ impl crate::SqliteStore {
         system_prompt: Option<&str>,
     ) -> Result<Option<intent_core::prompt_breakdown::PromptBreakdown>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT CASE WHEN system_prompt IS ? THEN prompt_breakdown END \
-             FROM agent_session WHERE id=?",
+            "SELECT CASE WHEN agent_session_prompt.system_prompt IS ? \
+             THEN agent_session_prompt.prompt_breakdown END \
+             FROM agent_session LEFT JOIN agent_session_prompt \
+             ON agent_session_prompt.agent_id = agent_session.id WHERE id=?",
         )
         .bind(system_prompt)
         .bind(&id.0)
