@@ -14418,6 +14418,16 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
+        // An agent's delegation is an agent-to-agent message: attribute the
+        // kickoff (instructions or note fallback) to the delegating parent,
+        // as `ws.agent.create` does, so clients never credit it to a person.
+        if let Some(parent) = &parent_agent_id {
+            message_metadata = Some(json!({
+                "type": "agent_message",
+                "fromAgentId": parent.as_str(),
+                "fromAgentName": parent_session.as_ref().map(|s| s.name.as_str()),
+            }));
+        }
         // D2: resolve the provider up front. Precedence (PROTOCOL §5.5):
         // explicit `provider` param > specialist frontmatter `codingAgent` >
         // settings-derived default. An explicit `provider` must be known and

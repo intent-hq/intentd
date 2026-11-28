@@ -23000,6 +23000,53 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     assert_eq!(rpc_child.parent_agent_id, None);
 }
 
+/// An agent's delegation kickoff is an agent-to-agent message: it names the
+/// delegating parent, so clients never credit it to a person (the
+/// workspace-owner fallback) — whether the text comes from the caller's
+/// instructions or the task-note fallback.
+#[intent_test_macros::daemon_test]
+async fn mcp_delegate_kickoff_is_attributed_to_the_parent_agent() {
+    use intent_core::{with_caller, Caller};
+
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Coordinator").await;
+    let note_id = seed_task(&svc, &ws, "review a PR").await;
+    for input in [
+        AgentDelegateInput {
+            agent_instructions: Some("do work".into()),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            task_note_id: Some(note_id.clone()),
+            ..Default::default()
+        },
+    ] {
+        let out = with_caller(
+            Caller::Agent {
+                agent_id: parent.clone(),
+            },
+            svc.agent_delegate(ws.clone(), input, Some(parent.clone())),
+        )
+        .await
+        .expect("delegate");
+        let child = AgentId::from(out["agentId"].as_str().expect("agentId"));
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .expect("child session");
+        let kickoff = session
+            .messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("kickoff row");
+        let md = kickoff.metadata.as_ref().expect("kickoff metadata");
+        assert_eq!(md["fromAgentId"], parent.0, "{md}");
+        assert_eq!(md["fromAgentName"], "Coordinator", "{md}");
+        assert!(md.get("fromPrincipalId").is_none(), "{md}");
+    }
+}
+
 /// End-to-end parent-tracking loop driven entirely through the MCP front door
 /// (`WorkspaceMcpServer` dispatch -> `Services` -> `Store`): a parent delegates a
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
