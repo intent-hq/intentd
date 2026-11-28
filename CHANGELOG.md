@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.317] - 2026-11-27
+
+### 🚀 Features
+
+- *(store)* Convert the quota gates to quota row locks ([#3861](https://github.com/intent-hq/intentd/pull/3861))
+
+
 ## [0.11.316] - 2026-11-27
 
 ### 🚀 Features
