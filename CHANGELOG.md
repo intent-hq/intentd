@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.318] - 2026-11-28
+
+### 🚀 Features
+
+- *(specialists)* Developer writes task blocks for its own work (harness 3.18) ([#3847](https://github.com/intent-hq/intentd/pull/3847))
+
+### 🐛 Bug Fixes
+
+- Stop the E2B lifecycle test timing out after a refused resume or a slow first dial ([#3860](https://github.com/intent-hq/intentd/pull/3860))
+
+### 🧪 Testing
+
+- *(intent-transport)* Move hand-rolled test pause points to PausePoint ([#3852](https://github.com/intent-hq/intentd/pull/3852))
+- *(intent-sourcecontrol)* Move hand-rolled test pause points to PausePoint ([#3850](https://github.com/intent-hq/intentd/pull/3850))
+- Add one seed-before-start helper for daemon tests ([#3845](https://github.com/intent-hq/intentd/pull/3845))
+- Share one fake npx whose argv comes from npx_run_args ([#3844](https://github.com/intent-hq/intentd/pull/3844))
+- *(intentd)* Move hand-rolled test pause points to PausePoint ([#3854](https://github.com/intent-hq/intentd/pull/3854))
+
+
 ## [0.11.317] - 2026-11-27
 
 ### 🚀 Features
