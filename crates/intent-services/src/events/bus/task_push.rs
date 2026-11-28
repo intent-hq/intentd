@@ -1,5 +1,6 @@
 //! Publish narrow committed projections once, independent of client count.
 use super::EventBus;
+use crate::stack_frame::boxed_await;
 use intent_core::{
     events::{NOTE_DELETED, TASK_UPDATED, WORKSPACE_TASK_STATS_CHANGED},
     Error, Event, NoteId, Result,
@@ -8,6 +9,10 @@ use intent_store::NewEvent;
 use std::collections::HashMap;
 
 impl EventBus {
+    /// Runs under the deep `workspace.create` and agent-delivery poll frames,
+    /// so its store and publish awaits are built off-frame with
+    /// [`boxed_await`] (see `crate::stack_frame`; guard:
+    /// `tests::workspace_create_stack`).
     pub(super) async fn publish_note_and_task_changes(&self, source: &NewEvent) -> Result<Event> {
         // Hold through reads AND publications. Concurrent mutation notifications
         // can coalesce into current state, but an older read cannot publish last.
@@ -20,9 +25,8 @@ impl EventBus {
                 .get("noteId")
                 .and_then(serde_json::Value::as_str)
             {
-                match self
-                    .store
-                    .get_note_metadata(&source.workspace_id, &NoteId::from(id))
+                let note_id = NoteId::from(id);
+                match boxed_await(|| self.store.get_note_metadata(&source.workspace_id, &note_id))
                     .await
                 {
                     Ok(note) => {
@@ -63,10 +67,7 @@ impl EventBus {
                 })
             });
         let current = if affects_tasks {
-            match self
-                .store
-                .list_workspace_tasks(&source.workspace_id, None)
-                .await
+            match boxed_await(|| self.store.list_workspace_tasks(&source.workspace_id, None)).await
             {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
@@ -85,7 +86,7 @@ impl EventBus {
                 }
             }
         }
-        let published = self.publish_raw(&event).await?;
+        let published = boxed_await(|| self.publish_raw(&event)).await?;
         let Some(current) = current else {
             return Ok(published);
         };
@@ -108,7 +109,7 @@ impl EventBus {
             .map(|t| &t.id)
             .collect();
         if !tasks.is_empty() || !removed.is_empty() {
-            self.publish_raw(&projection_event(
+            let projection = projection_event(
                 source,
                 TASK_UPDATED,
                 serde_json::json!({
@@ -116,22 +117,22 @@ impl EventBus {
                     "tasks": tasks,
                     "removedIds": removed,
                 }),
-            ))
-            .await?;
+            );
+            boxed_await(|| self.publish_raw(&projection)).await?;
         }
         // Writes capture a pre-mutation baseline. A notification without a
         // preceding write can initialize one, but unknown counts are not a
         // statistics change (including after restart).
         if previous.is_some_and(|p| p.stats != current.stats) {
-            self.publish_raw(&projection_event(
+            let projection = projection_event(
                 source,
                 WORKSPACE_TASK_STATS_CHANGED,
                 serde_json::json!({
                     "workspaceId": source.workspace_id,
                     "taskStats": current.stats,
                 }),
-            ))
-            .await?;
+            );
+            boxed_await(|| self.publish_raw(&projection)).await?;
         }
         *baseline = Some(current);
         Ok(published)

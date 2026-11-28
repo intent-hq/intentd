@@ -12299,13 +12299,16 @@ impl Services {
 /// `note:created` exactly once. Note identity is composite (`(id,
 /// workspace_id)`, migration 0030), so every workspace owns its own spec — no
 /// cross-workspace collision is possible.
+///
+/// `workspace.create` runs this under its deep poll frames, so every await
+/// here is built off-frame with [`boxed_await`] (see `crate::stack_frame`).
 async fn ensure_spec_note(
     store: &Store,
     bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
-    if store.note_exists(workspace_id, &spec_id).await? {
+    if boxed_await(|| store.note_exists(workspace_id, &spec_id)).await? {
         return Ok(());
     }
     // The reseed writes target `note.workspace_id → workspace(id)` (migration
@@ -12314,7 +12317,7 @@ async fn ensure_spec_note(
     // `NotFound("workspace …")` instead of a raw SQLite FK violation
     // (monorepo#3404). Only the rare missing-spec path pays this SELECT — the
     // spec-exists fast path above returned already.
-    store.get_workspace(workspace_id).await?;
+    boxed_await(|| store.get_workspace(workspace_id)).await?;
     // Self-heal for workspaces damaged by the pre-#110 global-note-identity
     // bug: agents that hit "no `spec` yet" fell back to `note.create` and
     // captured a random UUID id, leaving `isSpecNote()` (id-based) blind to
@@ -12323,29 +12326,25 @@ async fn ensure_spec_note(
     // and comments follow in the same tx) and emit delete+create events so
     // live FE clients reconcile. Nothing to adopt (zero or ≥2 candidates)
     // falls through to the empty seed below.
-    if let Some((old_id, adopted_title)) = store.adopt_stray_spec_note(workspace_id).await? {
-        publish_event(
-            bus,
-            note_change_event(
-                workspace_id,
-                &old_id,
-                &adopted_title,
-                NOTE_DELETED,
-                "delete",
-            ),
-        )
-        .await;
-        publish_event(
-            bus,
-            note_change_event(
-                workspace_id,
-                &spec_id,
-                &adopted_title,
-                NOTE_CREATED,
-                "create",
-            ),
-        )
-        .await;
+    if let Some((old_id, adopted_title)) =
+        boxed_await(|| store.adopt_stray_spec_note(workspace_id)).await?
+    {
+        let deleted = note_change_event(
+            workspace_id,
+            &old_id,
+            &adopted_title,
+            NOTE_DELETED,
+            "delete",
+        );
+        boxed_await(|| publish_event(bus, deleted)).await;
+        let created = note_change_event(
+            workspace_id,
+            &spec_id,
+            &adopted_title,
+            NOTE_CREATED,
+            "create",
+        );
+        boxed_await(|| publish_event(bus, created)).await;
         return Ok(());
     }
     let now = now_iso();
@@ -12367,18 +12366,16 @@ async fn ensure_spec_note(
         updated_at: now,
     };
     // Workspace-seed spec is daemon-internal; no caller agent applies.
-    persist_new_note(store, &note, &system_version_author()).await?;
-    publish_event(
-        bus,
-        note_change_event(
-            &note.workspace_id,
-            &note.id,
-            &note.title,
-            NOTE_CREATED,
-            "create",
-        ),
-    )
-    .await;
+    let author = system_version_author();
+    boxed_await(|| persist_new_note(store, &note, &author)).await?;
+    let created = note_change_event(
+        &note.workspace_id,
+        &note.id,
+        &note.title,
+        NOTE_CREATED,
+        "create",
+    );
+    boxed_await(|| publish_event(bus, created)).await;
     Ok(())
 }
 
@@ -16214,7 +16211,7 @@ pub async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
     };
-    if let Err(e) = bus.publish(&event).await {
+    if let Err(e) = boxed_await(|| bus.publish(&event)).await {
         if bus.store().refused_by_own_fence(&e) {
             // Expected after this process stopped serving the tenant; the
             // bus writer and the fence's fire already logged it.
