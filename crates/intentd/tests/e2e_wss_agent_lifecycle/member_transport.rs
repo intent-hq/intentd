@@ -256,6 +256,10 @@ async fn collect_tool_output(events: &mut common::TlsWs, kind: &str, id: &str, m
                             continue;
                         }
                         if let Some(chunk) = event["data"]["chunk"].as_str() {
+                            assert!(
+                                kind != "terminal" || !exited,
+                                "terminal output after terminal:exit"
+                            );
                             output.extend(
                                 base64::engine::general_purpose::STANDARD
                                     .decode(chunk)

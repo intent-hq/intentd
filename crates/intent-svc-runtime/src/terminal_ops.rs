@@ -50,6 +50,15 @@ use intent_services::feature_api::{
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
+/// Upper bound on waiting for the reader to reach EOF after the child is
+/// reaped. A background grandchild holding the PTY open keeps the reader alive,
+/// so the bound keeps `terminal:exit` from waiting on it (same as scripts).
+const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
+
+/// Cap on chunks flushed after the EOF wait, so a grandchild that keeps
+/// writing cannot hold back `terminal:exit` (same cap as scripts).
+const EXIT_DRAIN_MAX_CHUNKS: usize = 4096;
+
 /// Delay after output before re-reading the foreground program. A program
 /// start or exit almost always prints (the echoed Enter, a new prompt), so
 /// output drives the check; the delay lets the new program take the
@@ -687,9 +696,9 @@ pub(crate) fn spawn_output_stream(
                 }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
-                        // Reaped: drain any output the reader flushed just before
-                        // EOF, then stop tailing.
-                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id());
+                        // Reaped, but the reader can still hold the child's last
+                        // output: stream it before `terminal:exit`.
+                        stream_until_output_eof(&mut live, &pty, pty_id, bus.as_ref(), &workspace_id, &terminal_id).await;
                         break;
                     }
                 }
@@ -698,6 +707,46 @@ pub(crate) fn spawn_output_stream(
         let exit = pty.try_exit(pty_id).ok().flatten();
         emit_exit(bus.as_ref(), &workspace_id, &terminal_id, exit).await;
     });
+}
+
+/// Emit live output until the reader reaches EOF (bounded by
+/// [`OUTPUT_EOF_WAIT`]), then flush what is left on the channel. The child can
+/// be reaped before the reader has published its final chunks; stopping at the
+/// reap dropped them from the live stream. Unix only: a `ConPTY` reader reaches
+/// EOF only at teardown, so on Windows the wait would always time out.
+async fn stream_until_output_eof(
+    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
+    pty: &PtyHost,
+    pty_id: PtyId,
+    bus: Option<&EventBus>,
+    workspace_id: &WorkspaceId,
+    terminal_id: &str,
+) {
+    if cfg!(unix) {
+        // Checked after each chunk too: a channel that never empties keeps
+        // `recv` ready, and the coop budget can then starve the timer.
+        let deadline = tokio::time::Instant::now() + OUTPUT_EOF_WAIT;
+        let eof = pty.wait_output_eof(pty_id);
+        tokio::pin!(eof);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut eof => break,
+                () = tokio::time::sleep_until(deadline) => break,
+                recv = live.recv() => match recv {
+                    Ok(chunk) => {
+                        emit_data(bus, workspace_id, terminal_id, pty.daemon_boot_id(), &chunk);
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    }
+    drain_pending(live, bus, workspace_id, terminal_id, pty.daemon_boot_id());
 }
 
 /// Flush any output buffered on the live channel without blocking (used once the
@@ -709,7 +758,7 @@ fn drain_pending(
     terminal_id: &str,
     daemon_boot_id: &str,
 ) {
-    loop {
+    for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, daemon_boot_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
@@ -2168,6 +2217,120 @@ mod tests {
 
         kill(pty.as_ref(), &id).await.unwrap();
         kill_guard.disarm();
+    }
+
+    /// Collect `terminal:data` until `terminal:exit`, failing on data that
+    /// trails the exit in the same batch.
+    async fn collect_data_until_exit(sub: &mut Subscription, timeout: Duration) -> Vec<u8> {
+        let mut acc = Vec::new();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("terminal:exit before the deadline");
+            let batch = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("terminal:exit before the deadline")
+                .expect("bus open");
+            let mut exited = false;
+            for ev in batch {
+                if ev.event_type == TERMINAL_EXIT {
+                    exited = true;
+                } else if ev.event_type == TERMINAL_DATA {
+                    assert!(!exited, "terminal:data after terminal:exit");
+                    if let Some(chunk) = ev.data.get("chunk").and_then(Value::as_str) {
+                        acc.extend_from_slice(&decode(chunk));
+                    }
+                }
+            }
+            if exited {
+                return acc;
+            }
+        }
+    }
+
+    /// Spawn an executable `sh` script as the terminal command.
+    #[cfg(unix)]
+    async fn create_script_terminal(
+        pty: &Arc<PtyHost>,
+        bus: EventBus,
+        dir: &tempfile::TempDir,
+        body: &str,
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let res = create(
+            pty.clone(),
+            Some(bus),
+            None,
+            None,
+            ws("ws-1"),
+            80,
+            24,
+            None,
+            Some(script.display().to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        term_id(&res)
+    }
+
+    /// The child is reaped before the reader publishes its last chunks; the
+    /// stream must still emit them, and before `terminal:exit`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trailing_output_streams_before_exit() {
+        let pty = host();
+        let (_tmp, bus) = bus().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let dir = tempfile::tempdir().unwrap();
+        let id = create_script_terminal(
+            &pty,
+            bus,
+            &dir,
+            "i=0; while [ $i -lt 2000 ]; do printf 'line %d\\n' $i; i=$((i+1)); done; printf TRAILING_DONE",
+        )
+        .await;
+
+        let acc = collect_data_until_exit(&mut sub, LONG_TIMEOUT).await;
+        assert!(
+            contains_sub(&acc, b"TRAILING_DONE"),
+            "final output missing from terminal:data: {:?}",
+            String::from_utf8_lossy(&acc[acc.len().saturating_sub(200)..])
+        );
+
+        kill(pty.as_ref(), &id).await.unwrap();
+    }
+
+    /// A background grandchild keeps the PTY open after the shell exits, so
+    /// the reader never reaches EOF: `terminal:exit` must still follow within
+    /// the bounded wait instead of waiting for the grandchild.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_is_not_held_by_a_grandchild_holding_the_pty() {
+        let pty = host();
+        let (_tmp, bus) = bus().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let dir = tempfile::tempdir().unwrap();
+        let id = create_script_terminal(
+            &pty,
+            bus,
+            &dir,
+            // Ignore SIGHUP before forking so the grandchild inherits it: a
+            // trap set inside the subshell races the shell's exit.
+            "trap '' HUP\nsleep 120 &\nprintf PARENT_DONE",
+        )
+        .await;
+
+        // LONG_TIMEOUT (60 s) is well below the grandchild's 120 s, so an
+        // unbounded wait fails here instead of passing late.
+        let acc = collect_data_until_exit(&mut sub, LONG_TIMEOUT).await;
+        assert!(contains_sub(&acc, b"PARENT_DONE"));
+
+        kill(pty.as_ref(), &id).await.unwrap();
     }
 
     #[tokio::test]
