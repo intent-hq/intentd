@@ -10,7 +10,7 @@
 //!
 //! A line is tab-separated: `NEXTEST_STRESS_CURRENT`, `NEXTEST_BINARY_ID`,
 //! `NEXTEST_TEST_NAME`, the test's pid, then the folder path (last, so a tab
-//! in the path survives). scripts/nextest_stress.py in the monorepo reads it.
+//! in the path survives). `scripts/nextest_stress.py` in the monorepo reads it.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -22,7 +22,8 @@ pub const TEMPDIR_RECORD_ENV: &str = "INTENTD_TEST_TEMPDIR_RECORD";
 /// is unset. Best effort: a test never fails because its folder could not
 /// be recorded.
 pub fn record_test_tempdir(dir: &Path) {
-    let Some(record) = std::env::var_os(TEMPDIR_RECORD_ENV).filter(|value| !value.is_empty()) else {
+    let Some(record) = std::env::var_os(TEMPDIR_RECORD_ENV).filter(|value| !value.is_empty())
+    else {
         return;
     };
     let field = |name: &str| std::env::var(name).unwrap_or_default();
@@ -58,7 +59,13 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch");
         let record = scratch.path().join("tempdirs.tsv");
         let pid = std::process::id();
-        append_tempdir_record(&record, "4", "intentd::suite_e2e", "a::b", Path::new("/x/itd-1"));
+        append_tempdir_record(
+            &record,
+            "4",
+            "intentd::suite_e2e",
+            "a::b",
+            Path::new("/x/itd-1"),
+        );
         append_tempdir_record(&record, "", "", "", Path::new("/x/with\ttab"));
         assert_eq!(
             std::fs::read_to_string(&record).expect("record"),
