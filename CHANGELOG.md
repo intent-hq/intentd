@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.320] - 2026-11-28
+
+### 🚀 Features
+
+- *(apps)* Install an app from an uploaded package ([#3868](https://github.com/intent-hq/intentd/pull/3868))
+
+### 🧪 Testing
+
+- *(intent-svc-runtime)* Move hand-rolled test pause points to PausePoint ([#3851](https://github.com/intent-hq/intentd/pull/3851))
+- *(intent-store)* Move hand-rolled test pause points to PausePoint ([#3853](https://github.com/intent-hq/intentd/pull/3853))
+
+
 ## [0.11.319] - 2026-11-28
 
 ### 🐛 Bug Fixes
