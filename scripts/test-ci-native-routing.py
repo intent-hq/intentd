@@ -740,6 +740,25 @@ def gitlab_errors(workflow):
     return errors
 
 
+WORKSPACE_CLIPPY = "./scripts/ci-lld-retry.sh cargo clippy --workspace --all-targets -- -D warnings"
+FIXTURE_CLIPPY = "./scripts/ci-lld-retry.sh cargo clippy -p intentd --tests --features repository-test-fixtures -- -D warnings"
+
+
+def fixture_clippy_errors(workflow):
+    step = next((s for s in workflow["jobs"]["check"]["steps"] if s.get("name") == "Clippy"), None)
+    if not step:
+        return ["missing check job Clippy step"]
+    errors = []
+    # Exact lines: any `set +e` or `|| true` would let the first pass fail silently.
+    if step.get("run", "").splitlines() != [WORKSPACE_CLIPPY, FIXTURE_CLIPPY]:
+        errors.append("Clippy must lint the workspace, then intentd tests with repository-test-fixtures, denying warnings")
+    if "shell" in step or workflow["jobs"]["check"].get("defaults") or workflow.get("defaults"):
+        errors.append("Clippy must keep the default fail-fast bash shell")
+    if "if" in step or step.get("continue-on-error") or workflow["jobs"]["check"].get("continue-on-error"):
+        errors.append("fixture-feature Clippy must run on every event and stay fatal")
+    return errors
+
+
 NODE_TOOLS = r"(?:node|npx|npm|pnpm|corepack)"
 NODE_COMMAND = re.compile(r"(?m)(?:^|[;&|(]|\$\(|\b(?:then|do|exec|time)\s)\s*(?:\w+=\S*\s+)*" + NODE_TOOLS + r"(?=\s+[^=\s]|\s*$)")
 NODE_PYTHON = re.compile(r"""(?:\[\s*|shutil\.which\(\s*)["']""" + NODE_TOOLS + r"""["']""")
@@ -1591,6 +1610,32 @@ class NativeRoutingTests(unittest.TestCase):
                     removed = {"feature": "--features repository-test-fixtures", "target": " e2e_repository_resource_read::", "threads": "--test-threads=2"}[mutation]
                     step["run"] = step["run"].replace(removed, "")
                 self.assertTrue(gitlab_errors(workflow))
+
+    def test_fixture_feature_clippy_is_required(self):
+        self.assertEqual(fixture_clippy_errors(self.workflow), [])
+
+    def test_fixture_clippy_mutations_are_rejected(self):
+        def clippy(w):
+            return next(s for s in w["jobs"]["check"]["steps"] if s.get("name") == "Clippy")
+        cases = {
+            "drop-step": lambda w: w["jobs"]["check"]["steps"].remove(clippy(w)),
+            "drop-line": lambda w: clippy(w).__setitem__("run", clippy(w)["run"].replace(FIXTURE_CLIPPY, "")),
+            "no-feature": lambda w: clippy(w).__setitem__("run", clippy(w)["run"].replace(" --features repository-test-fixtures", "")),
+            "warnings": lambda w: clippy(w).__setitem__("run", clippy(w)["run"].replace(FIXTURE_CLIPPY, FIXTURE_CLIPPY.removesuffix(" -- -D warnings"))),
+            "commented": lambda w: clippy(w).__setitem__("run", clippy(w)["run"].replace(FIXTURE_CLIPPY, "# " + FIXTURE_CLIPPY)),
+            "queue-only": lambda w: clippy(w).__setitem__("if", "github.event_name == 'merge_group'"),
+            "optional": lambda w: clippy(w).__setitem__("continue-on-error", True),
+            "drop-workspace": lambda w: clippy(w).__setitem__("run", FIXTURE_CLIPPY + "\n"),
+            "set-e-off": lambda w: clippy(w).__setitem__("run", "set +e\n" + clippy(w)["run"]),
+            "or-true": lambda w: clippy(w).__setitem__("run", clippy(w)["run"].replace(" -D warnings\n", " -D warnings || true\n", 1)),
+            "shell": lambda w: clippy(w).__setitem__("shell", "bash {0}"),
+            "job-shell": lambda w: w["jobs"]["check"].__setitem__("defaults", {"run": {"shell": "bash {0}"}}),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow)
+                self.assertTrue(fixture_clippy_errors(workflow))
 
     def test_gitlab_child_failure_propagates(self):
         step = next(s for s in self.workflow["jobs"]["check"]["steps"] if s.get("name") == GITLAB_STEP)
