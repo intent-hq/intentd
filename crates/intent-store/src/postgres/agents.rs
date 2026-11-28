@@ -3440,14 +3440,19 @@ impl PgStore {
         .map_err(db)
     }
 
+    /// Inserts `rows` under `agent_id` and returns the ones stored: an id
+    /// that is done ([`Self::mark_queue_done`]) or still has a row (another
+    /// process's live claim; this write deleted every row it rewrites) is
+    /// skipped. So no write, from any process and whatever its memory
+    /// holds, stores a delivered, cancelled or foreign-claimed entry again.
     async fn insert_queue_rows(
         &self,
         tx: &mut WriteTx,
         agent_id: &AgentId,
         rows: &[AgentQueueRow],
-    ) -> Result<()> {
+    ) -> Result<Vec<AgentQueueRow>> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let payloads = rows
             .iter()
@@ -3456,11 +3461,15 @@ impl PgStore {
                     .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        sqlx::query(
+        let stored: Vec<String> = sqlx::query_scalar(
             "INSERT INTO agent_queue (tenant_id, id, agent_id, position, payload, created_at, turn_id) \
              SELECT $1, u.id, $2, u.position, u.payload, u.created_at, u.turn_id \
              FROM unnest($3::text[], $4::bigint[], $5::text[], $6::text[], $7::text[]) \
-                 AS u(id, position, payload, created_at, turn_id)",
+                 AS u(id, position, payload, created_at, turn_id) \
+             WHERE NOT EXISTS (SELECT 1 FROM agent_queue_done d \
+                 WHERE d.tenant_id = $1 AND d.id = u.id) \
+             ON CONFLICT (tenant_id, id) DO NOTHING \
+             RETURNING id",
         )
         .bind(self.tenant())
         .bind(&agent_id.0)
@@ -3469,10 +3478,71 @@ impl PgStore {
         .bind(payloads)
         .bind(rows.iter().map(|r| r.created_at.as_str()).collect::<Vec<_>>())
         .bind(rows.iter().map(|r| r.turn_id.as_str()).collect::<Vec<_>>())
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(|e| Error::Internal(format!("bulk insert agent queue failed: {e}")))?;
+        if stored.len() == rows.len() {
+            return Ok(rows.to_vec());
+        }
+        let skipped: Vec<&str> = rows
+            .iter()
+            .map(|r| r.id.as_str())
+            .filter(|id| !stored.iter().any(|s| s == id))
+            .collect();
+        tracing::info!(agent = %agent_id, skipped = ?skipped, "agent queue write skipped entries that are done or claimed by another process");
+        Ok(rows
+            .iter()
+            .filter(|r| stored.contains(&r.id))
+            .cloned()
+            .collect())
+    }
+
+    /// Records `ids` of `agent_id` as done (delivered or cancelled) in `tx`,
+    /// the transaction that deleted their rows. The records are kept until
+    /// the agent's session row goes (cascade): a process may hold an old
+    /// copy of the queue for as long as the session lives, so no shorter
+    /// bound would be safe.
+    async fn mark_queue_done(
+        &self,
+        tx: &mut WriteTx,
+        agent_id: &AgentId,
+        ids: &[String],
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO agent_queue_done (tenant_id, id, agent_id, done_at) \
+             SELECT $1, u.id, $2, clock_timestamp() FROM unnest($3::text[]) AS u(id) \
+             ON CONFLICT (tenant_id, id) DO NOTHING",
+        )
+        .bind(self.tenant())
+        .bind(&agent_id.0)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
         Ok(())
+    }
+
+    /// The `ids` of `agent_id` that are done ([`Self::mark_queue_done`]).
+    async fn done_queue_ids(
+        &self,
+        tx: &mut WriteTx,
+        agent_id: &AgentId,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Ids are global: an entry moved to another agent stays done.
+        let _ = agent_id;
+        sqlx::query_scalar("SELECT id FROM agent_queue_done WHERE tenant_id = $1 AND id = ANY($2)")
+            .bind(self.tenant())
+            .bind(ids)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(db)
     }
 
     pub async fn replace_agent_queue(
@@ -3496,12 +3566,12 @@ impl PgStore {
         let kept = self.without_revoked_instructions(&mut tx, rows).await?;
         let rows = kept.as_deref().unwrap_or(rows);
         self.delete_queue_rows(&mut tx, agent_id, rows).await?;
-        self.insert_queue_rows(&mut tx, agent_id, rows).await?;
+        let stored = self.insert_queue_rows(&mut tx, agent_id, rows).await?;
         self.commit_queue_write(
             tx,
             queue_write,
             write_id,
-            vec![(agent_id.clone(), next, agent_queue_base(rows))],
+            vec![(agent_id.clone(), next, agent_queue_base(&stored))],
         )
         .await
     }
@@ -3603,8 +3673,10 @@ impl PgStore {
         // so the base comparison above cannot see it): lost here.
         if !claims.is_empty() {
             let foreign = self.foreign_claimed_queue_ids(&mut tx, agent_id).await?;
+            // And one that is done: another process delivered or removed it.
+            let done = self.done_queue_ids(&mut tx, agent_id, claims).await?;
             for id in claims {
-                if foreign.contains(id) && !sync.lost.contains(id) {
+                if (foreign.contains(id) || done.contains(id)) && !sync.lost.contains(id) {
                     sync.lost.push(id.clone());
                 }
             }
@@ -3619,8 +3691,20 @@ impl PgStore {
         }
         let written = sync.merged.as_deref().unwrap_or(rows);
         self.delete_queue_rows(&mut tx, agent_id, written).await?;
-        self.insert_queue_rows(&mut tx, agent_id, written).await?;
-        let base = agent_queue_base(written);
+        let stored = self.insert_queue_rows(&mut tx, agent_id, written).await?;
+        if stored.len() != written.len() {
+            // Memory follows: the skipped entries are not this queue's.
+            sync.merged = Some(stored.clone());
+        }
+        if removed == Removed::Deleted {
+            let gone: Vec<String> = claims
+                .iter()
+                .filter(|id| !sync.lost.contains(id))
+                .cloned()
+                .collect();
+            self.mark_queue_done(&mut tx, agent_id, &gone).await?;
+        }
+        let base = agent_queue_base(&stored);
         self.commit_queue_write(
             tx,
             queue_write,
@@ -3678,17 +3762,19 @@ impl PgStore {
         // Not a change to any process's queue view (a claimed row is in no
         // one's queue while the claim lives), so no version moves.
         let mut tx = self.begin_write().await?;
-        sqlx::query(
+        let finished: Vec<String> = sqlx::query_scalar(
             "DELETE FROM agent_queue WHERE tenant_id = $1 AND agent_id = $2 \
-             AND claim_token = $3 AND id = ANY($4)",
+             AND claim_token = $3 AND id = ANY($4) RETURNING id",
         )
         .bind(self.tenant())
         .bind(&agent_id.0)
         .bind(self.process_token())
         .bind(ids)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        // Delivered: no write stores these ids again, from any process.
+        self.mark_queue_done(&mut tx, agent_id, &finished).await?;
         tx.commit().await.map_err(db)
     }
 
@@ -3802,7 +3888,11 @@ impl PgStore {
         // The source keeps only live claims (deliveries in progress).
         self.delete_queue_rows(&mut tx, from, &[]).await?;
         self.delete_queue_rows(&mut tx, to, &written).await?;
-        self.insert_queue_rows(&mut tx, to, &written).await?;
+        let stored = self.insert_queue_rows(&mut tx, to, &written).await?;
+        if stored.len() != written.len() {
+            sync.merged = Some(stored.clone());
+        }
+        let written = stored;
         self.commit_queue_write(
             tx,
             queue_write,

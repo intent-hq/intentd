@@ -18130,7 +18130,6 @@ async fn run_message_worker(
             let Ok(lost) = claimed else {
                 // Put it back; a drain retry is scheduled.
                 let (entries, draining) = popped;
-                let entries = mgr.services.without_known_lost(&agent_id, entries);
                 mgr.services.requeue_front_batch(&agent_id, entries);
                 drop(draining);
                 boxed_await(|| mgr.end_turn(&agent_id, admission)).await;

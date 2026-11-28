@@ -381,6 +381,24 @@ CREATE TABLE IF NOT EXISTS agent_queue_version (
     PRIMARY KEY (tenant_id, agent_id)
 );
 
+-- Postgres only (orchestrator mode): agent queue entries that are done
+-- (delivered, or removed by a cancel), written in the transaction that
+-- deletes their row. No queue write stores such an id again and no claim
+-- takes it, whatever a process's memory still holds, so a delivered entry
+-- is never delivered twice. Kept until the agent's session row goes
+-- (cascade): a process can hold an old copy of the queue for as long as the
+-- session lives, so no shorter bound is safe. One small row per finished
+-- entry.
+CREATE TABLE IF NOT EXISTS agent_queue_done (
+    tenant_id text NOT NULL,
+    id text NOT NULL,
+    agent_id text NOT NULL,
+    done_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS agent_queue_done_agent_idx ON agent_queue_done (tenant_id, agent_id, done_at);
+
 -- Postgres only (orchestrator mode): the last queue order tag handed out
 -- for the tenant. Each process takes the next one when it first opens the
 -- tenant and puts it in the low bits of every queue submission order it
@@ -2074,6 +2092,7 @@ ALTER TABLE agent_metrics DROP CONSTRAINT IF EXISTS agent_metrics_workspace_id_f
 ALTER TABLE agent_queue DROP CONSTRAINT IF EXISTS agent_queue_agent_id_fkey, ADD CONSTRAINT agent_queue_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_queue_admission DROP CONSTRAINT IF EXISTS agent_queue_admission_agent_id_fkey, ADD CONSTRAINT agent_queue_admission_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_queue_version DROP CONSTRAINT IF EXISTS agent_queue_version_tenant_id_agent_id_fkey, ADD CONSTRAINT agent_queue_version_tenant_id_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
+ALTER TABLE agent_queue_done DROP CONSTRAINT IF EXISTS agent_queue_done_tenant_id_agent_id_fkey, ADD CONSTRAINT agent_queue_done_tenant_id_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_session DROP CONSTRAINT IF EXISTS agent_session_workspace_id_fkey, ADD CONSTRAINT agent_session_workspace_id_fkey FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspace (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_stop_redelivery DROP CONSTRAINT IF EXISTS agent_stop_redelivery_agent_id_fkey, ADD CONSTRAINT agent_stop_redelivery_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;
 ALTER TABLE agent_usage_cell DROP CONSTRAINT IF EXISTS agent_usage_cell_agent_id_fkey, ADD CONSTRAINT agent_usage_cell_agent_id_fkey FOREIGN KEY (tenant_id, agent_id) REFERENCES agent_session (tenant_id, id) ON DELETE CASCADE;

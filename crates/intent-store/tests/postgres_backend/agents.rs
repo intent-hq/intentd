@@ -1662,6 +1662,102 @@ parity_test!(
     }
 );
 
+// No write stores a done entry again, from any process and whatever its
+// memory holds: a delivered entry (its claim finished) and a cancelled one
+// are recorded as done in the transaction that deletes them, every queue
+// write skips them (sync at an equal or out-of-date version, replace, move)
+// and returns what it stored so memory follows, and a claim of one is lost.
+parity_test!(
+    a_done_queue_entry_is_never_stored_or_claimed_again,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let (agent, other) = (aid("agent-a"), aid("agent-b"));
+        let row = |id: &str| queue_row(id, "agent-a", 0, tenant);
+        let Some(test_db) = db else {
+            return;
+        };
+        let a = crate::harness::open_as_process(test_db, tenant, "process-a").await;
+        let b = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        for store in [&a, &b] {
+            store.load_all_agent_queues().await.unwrap();
+        }
+        a.sync_agent_queue(&agent, &[row("d1"), row("c1"), row("q1")], &[])
+            .await
+            .unwrap();
+        // B delivers d1 (claim, then finish) and cancels c1.
+        b.refresh_agent_queue(&agent, &[]).await.unwrap();
+        b.sync_agent_queue(&agent, &[row("c1"), row("q1")], &["d1".into()])
+            .await
+            .unwrap();
+        b.finish_agent_queue_claims(&agent, &["d1".into()])
+            .await
+            .unwrap();
+        b.remove_from_agent_queue(&agent, &[row("q1")], &["c1".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, db, tenant, "agent_queue_done", "id IN ('d1', 'c1')").await,
+            2
+        );
+
+        // A, out of date, writes both back: neither is stored, and A is
+        // told so.
+        let sync = a
+            .sync_agent_queue(&agent, &[row("d1"), row("c1"), row("q1")], &[])
+            .await
+            .unwrap();
+        let ids = |rows: Vec<AgentQueueRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(sync.merged.map(ids), Some(vec!["q1".to_owned()]));
+        // Now at the current version (the plain write path), again.
+        let sync = a
+            .sync_agent_queue(&agent, &[row("d1"), row("q1"), row("q2")], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            sync.merged.map(ids),
+            Some(vec!["q1".to_owned(), "q2".to_owned()])
+        );
+        // A replace and a move skip them too.
+        a.load_all_agent_queues().await.unwrap();
+        let _ = a
+            .replace_agent_queue(&agent, &[row("c1"), row("q1"), row("q2")])
+            .await;
+        assert_eq!(queue_ids(&b, "agent-a").await, ["q1", "q2"]);
+        let moved = a
+            .move_agent_queue(
+                &agent,
+                &other,
+                &[
+                    queue_row("d1", "agent-b", 0, tenant),
+                    queue_row("q1", "agent-b", 0, tenant),
+                ],
+                &["d1".into(), "q1".into()],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!queue_ids(&b, "agent-b").await.contains(&"d1".to_owned()));
+        assert!(moved
+            .merged
+            .is_none_or(|rows| rows.iter().all(|r| r.id != "d1")));
+        // An edit of an entry nobody claimed still lands (the write
+        // rewrites its own rows; only live foreign claims and done entries
+        // are skipped).
+        let mut edited = queue_row("q2", "agent-a", 0, tenant);
+        edited.payload = json!({ "text": "edited" });
+        a.sync_agent_queue(&agent, &[edited], &[]).await.unwrap();
+        let rows = b.load_all_agent_queues().await.unwrap();
+        let q2 = rows.iter().find(|r| r.id == "q2").expect("q2 stored");
+        assert_eq!(q2.payload, json!({ "text": "edited" }));
+        // A claim of a done entry is lost.
+        let claim = b
+            .sync_agent_queue(&other, &[], &["d1".into()])
+            .await
+            .unwrap();
+        assert_eq!(claim.lost, ["d1"]);
+    }
+);
+
 parity_test!(agent_queues_round_trip, |store, tenant| {
     assert!(store.load_all_agent_queues().await.unwrap().is_empty());
     seed_sessions(&store, tenant).await;

@@ -232,6 +232,15 @@ impl Services {
         self.pop_then_claim(agent_id, between).await
     }
 
+    /// Test seam: `pop_then_abandon`.
+    pub async fn pop_then_abandon_for_test(
+        &self,
+        agent_id: &AgentId,
+        between: impl Future<Output = ()>,
+    ) -> Option<String> {
+        self.pop_then_abandon(agent_id, between).await
+    }
+
     /// Test seam: `with_queue_claim_retry_park`.
     #[must_use]
     pub fn with_queue_claim_retry_park_for_test(

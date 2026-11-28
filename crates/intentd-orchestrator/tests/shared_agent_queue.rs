@@ -803,3 +803,44 @@ async fn a_failed_late_claim_does_not_hand_back_a_pop_known_lost() {
     );
     assert_eq!(queue_contents(&a, &agent).await, ["y", "z"]);
 }
+
+/// The worker's abandoned raced pop (it lost its slot, or the workspace was
+/// archived) hands its entry back unclaimed. One a write of this process saw
+/// another process take meanwhile is not handed back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_pop_known_lost_is_not_handed_back() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant_name("abandoned-pop");
+    let agent = AgentId("agent-abandoned-pop".into());
+    let store_a = open(&pool, &tenant, "process-a").await;
+    seed_agent(&store_a, &agent).await;
+    let store_b = open(&pool, &tenant, "process-b").await;
+    let a = Services::new_isolated(store_a);
+    let b = Services::new_isolated(store_b.clone());
+    let x = enqueue(&a, &agent, "x", None).await;
+
+    let popped = a
+        .pop_then_abandon_for_test(&agent, async {
+            let (claimed, _, draining) = b
+                .claim_next_queued_message_held_for_test(&agent)
+                .await
+                .expect("B claims x");
+            assert_eq!(claimed, x);
+            enqueue(&a, &agent, "y", None).await;
+            std::mem::forget(draining);
+            store_b
+                .finish_agent_queue_claims(&agent, std::slice::from_ref(&x))
+                .await
+                .expect("B finishes x");
+        })
+        .await;
+    assert_eq!(popped, Some(x));
+    enqueue(&a, &agent, "z", None).await;
+    let fresh = Services::new_isolated(open(&pool, &tenant, "process-c").await);
+    assert_eq!(
+        queue_contents(&fresh, &agent).await,
+        ["y", "z"],
+        "x is not handed back and stored again"
+    );
+    assert_eq!(queue_contents(&a, &agent).await, ["y", "z"]);
+}

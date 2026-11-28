@@ -19850,6 +19850,10 @@ impl Services {
         agent_id: &AgentId,
         entry: QueuedMessage,
     ) {
+        // A handback like `requeue_front_batch`: never a known-lost entry.
+        let Some(entry) = self.without_known_lost(agent_id, vec![entry]).pop() else {
+            return;
+        };
         let restored = {
             let mut guard = self
                 .agent_queues
@@ -20140,6 +20144,9 @@ impl Services {
     /// the batch-flush persist-failure path to hand back the undelivered
     /// remainder in original order (never-lost).
     pub(crate) fn requeue_front_batch(&self, agent_id: &AgentId, messages: Vec<QueuedMessage>) {
+        // Every handback goes through here or `requeue_front`: an entry
+        // another process is known to have taken is never put back.
+        let messages = self.without_known_lost(agent_id, messages);
         if messages.is_empty() {
             return;
         }
@@ -20240,6 +20247,13 @@ impl Services {
         message: QueuedMessage,
     ) -> (QueuedMessage, usize) {
         let id = message.id.clone();
+        // As `requeue_front_batch`: a known-lost entry is not put back.
+        if self
+            .without_known_lost(agent_id, vec![message.clone()])
+            .is_empty()
+        {
+            return (message, 0);
+        }
         let draining = self
             .draining_queue_entries
             .lock()
@@ -21466,12 +21480,28 @@ impl Services {
         let Ok(lost) = claimed else {
             // The worker's raced-pop handback.
             let (entry, draining) = popped;
-            let back = self.without_known_lost(agent_id, vec![entry]);
-            self.requeue_front_batch(agent_id, back);
+            self.requeue_front_batch(agent_id, vec![entry]);
             drop(draining);
             return None;
         };
         Some((popped.0.id.clone(), lost))
+    }
+
+    /// The worker's abandoned raced pop (tests): pop the queue head, run
+    /// `between`, then hand the entry back unclaimed as the worker does when
+    /// it loses its slot or the workspace is archived.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) async fn pop_then_abandon(
+        &self,
+        agent_id: &AgentId,
+        between: impl std::future::Future<Output = ()>,
+    ) -> Option<String> {
+        let (entry, draining) = self.dequeue_message_draining_provisional(agent_id)?;
+        between.await;
+        let id = entry.id.clone();
+        self.requeue_front_batch(agent_id, vec![entry]);
+        drop(draining);
+        Some(id)
     }
 
     /// Resolves once a queue claim retry ran its drain (tests).
