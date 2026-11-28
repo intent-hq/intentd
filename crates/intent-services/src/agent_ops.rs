@@ -2471,11 +2471,28 @@ impl QueuedMessage {
 /// hand-back / failure path at scope exit, and when an aborted worker's
 /// future is dropped mid-drain. Shutdown freezes this overlay first so
 /// cancelled owners leave their payloads available for durable recovery.
+///
+/// On a store other processes share (Postgres) a drain's claim keeps the
+/// entries' rows stored, claimed by this process ([`Services::claim_queue_pop`]);
+/// the guard then also ends the claim when it drops: rows of entries that
+/// are not back in the live queue (delivered, or dropped) are deleted
+/// ([`intent_store::Store::finish_agent_queue_claims`]). An entry put back
+/// keeps its row, which its next write-through rewrites as a plain row.
+/// Shutdown leaves the claims to its reconcile, which rewrites them.
 #[must_use = "drop the guard only once the drained rows are persisted"]
 pub(crate) struct DrainingGuard {
     overlay: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     agent_id: AgentId,
+    ids: Vec<String>,
+    /// The claim to end on drop, once a claim write kept these entries.
+    claim: Option<QueueClaim>,
+}
+
+/// This process's store claim on drained entries (see [`DrainingGuard`]).
+struct QueueClaim {
+    store: intent_store::Store,
+    queues: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
     ids: Vec<String>,
 }
 
@@ -2485,6 +2502,12 @@ impl DrainingGuard {
     pub(crate) fn merge(&mut self, mut other: DrainingGuard) {
         debug_assert_eq!(self.agent_id, other.agent_id);
         self.ids.append(&mut other.ids);
+        if let Some(mut theirs) = other.claim.take() {
+            match self.claim.as_mut() {
+                Some(ours) => ours.ids.append(&mut theirs.ids),
+                None => self.claim = Some(theirs),
+            }
+        }
     }
 
     /// Retire `ids` now: entries this drain will not deliver because another
@@ -2501,6 +2524,32 @@ impl DrainingGuard {
             }
         }
         self.ids.retain(|id| !ids.contains(id));
+        if let Some(claim) = self.claim.as_mut() {
+            claim.ids.retain(|id| !ids.contains(id));
+        }
+    }
+
+    /// Record the store claim a claim write made on `ids` of this guard's
+    /// entries, to end when the guard drops.
+    fn hold_claim(
+        &mut self,
+        store: &intent_store::Store,
+        queues: &Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
+        ids: Vec<String>,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        match self.claim.as_mut() {
+            Some(claim) => claim.ids.extend(ids),
+            None => {
+                self.claim = Some(QueueClaim {
+                    store: store.clone(),
+                    queues: Arc::clone(queues),
+                    ids,
+                });
+            }
+        }
     }
 }
 
@@ -2519,6 +2568,95 @@ impl Drop for DrainingGuard {
                 overlay.remove(&self.agent_id);
             }
         }
+        drop(overlay);
+        let Some(claim) = self.claim.take() else {
+            return;
+        };
+        // Entries put back keep their claimed rows for their next
+        // write-through to rewrite; the rest were delivered or dropped.
+        let done: Vec<String> = {
+            let queues = claim
+                .queues
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let live = queues.get(&self.agent_id);
+            claim
+                .ids
+                .into_iter()
+                .filter(|id| !live.is_some_and(|queue| queue.iter().any(|m| m.id == *id)))
+                .collect()
+        };
+        if done.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let (store, agent_id) = (claim.store, self.agent_id.clone());
+        intent_core::spawn_daemon(async move {
+            if let Err(e) = store.finish_agent_queue_claims(&agent_id, &done).await {
+                tracing::warn!(agent = %agent_id, error = %e, "ending a queue claim failed; the claim lapses after its TTL");
+            }
+        });
+    }
+}
+
+/// First delay of a drain retry after a failed queue claim write
+/// ([`Services::schedule_queue_claim_retry`]); each retry doubles it.
+pub(crate) const QUEUE_CLAIM_RETRY_BASE: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Drain retries after failed queue claim writes, per agent, until a claim
+/// write succeeds again.
+pub(crate) const QUEUE_CLAIM_RETRY_LIMIT: u32 = 5;
+
+/// What a claimed pop ([`Services::claim_queue_pop_outcome`]) did.
+pub(crate) enum QueuePop<T> {
+    /// Popped and claimed, with the ids another process took first (lost:
+    /// not to deliver).
+    Claimed(T, Vec<String>),
+    /// Nothing to pop.
+    Empty,
+    /// The claim write failed: the entries are back in place and a drain
+    /// retry is scheduled.
+    ClaimFailed,
+}
+
+/// A pop of queue entries with its [`DrainingGuard`], as a claim needs it.
+pub(crate) trait DrainedPop {
+    /// The popped entries.
+    fn drained_entries(&self) -> Vec<QueuedMessage>;
+    /// The guard that retires them.
+    fn draining_guard(&mut self) -> &mut DrainingGuard;
+}
+
+impl DrainedPop for (QueuedMessage, DrainingGuard) {
+    fn drained_entries(&self) -> Vec<QueuedMessage> {
+        vec![self.0.clone()]
+    }
+
+    fn draining_guard(&mut self) -> &mut DrainingGuard {
+        &mut self.1
+    }
+}
+
+impl DrainedPop for (Vec<QueuedMessage>, DrainingGuard) {
+    fn drained_entries(&self) -> Vec<QueuedMessage> {
+        self.0.clone()
+    }
+
+    fn draining_guard(&mut self) -> &mut DrainingGuard {
+        &mut self.1
+    }
+}
+
+/// Reset a migrated queue entry's per-session flags in its stored payload,
+/// as [`Services::migrate_queue_and_gc_poisoned_session`] does for the
+/// entries it holds: the editing hold, the old transcript row and the old
+/// failure die with the old session.
+fn reset_migrated_payload(payload: &mut Value) {
+    if let Some(entry) = payload.as_object_mut() {
+        for flag in ["editing", "persisted", "requeuedAfterFailure"] {
+            entry.insert(flag.to_owned(), Value::Bool(false));
+        }
+        entry.remove("editingMessageId");
     }
 }
 
@@ -10701,6 +10839,9 @@ impl Services {
             }
         }
         self.park_queue_mutation_gate(gate.as_ref()).await;
+        // On a store other processes share, the entry may have been queued
+        // by another process: read the stored queue first.
+        self.refresh_queue_from_store(&agent_id).await;
         // Serialize suppression with notification dispatch/admission. Commit
         // cancellation before removing the local row or acknowledging success.
         let monitor_lane = self.ports.runtime().script_monitor_lane(self).lock().await;
@@ -10742,13 +10883,16 @@ impl Services {
                         if let Some(gate) = gate.as_ref() {
                             gate.check(&queue[position])?;
                         }
-                        queue.remove(position);
-                        true
+                        Some(queue.remove(position).id)
                     }
-                    None => false,
+                    None => None,
                 },
-                None => false,
+                None => None,
             }
+        };
+        let removed = match removed {
+            Some(id) => self.commit_queue_removal(&agent_id, &id).await,
+            None => false,
         };
         drop(monitor_lane);
         if removed {
@@ -10776,7 +10920,9 @@ impl Services {
         message_id: String,
         caller_agent_id: AgentId,
     ) -> Result<Value> {
-        {
+        // As the FE removal: the entry may be another process's.
+        self.refresh_queue_from_store(&agent_id).await;
+        let removed = {
             let mut guard = self
                 .agent_queues
                 .lock()
@@ -10804,7 +10950,12 @@ impl Services {
                     "use discussion.stopAgent to cancel a discussion request".into(),
                 ));
             }
-            queue.remove(position);
+            queue.remove(position).id
+        };
+        if !self.commit_queue_removal(&agent_id, &removed).await {
+            // Another process delivered or removed it first.
+            self.publish_queue_updated(&agent_id).await;
+            return Err(Error::NotFound(format!("queued message {message_id}")));
         }
         self.publish_queue_updated(&agent_id).await;
         // monorepo#1280: same strand guard as the FE removal op above.
@@ -11272,15 +11423,13 @@ impl Services {
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
         let (mut entry, draining) = self
-            .take_queued_message_draining_gated(
+            .take_queued_message_for_send(
                 &agent_id,
                 &message_id,
                 gate.as_ref(),
                 destination_owner.as_ref(),
-            )?
-            .ok_or_else(|| {
-                Error::InvalidParams(format!("queued message not found: {message_id}"))
-            })?;
+            )
+            .await?;
         drop(destination_owner);
         // Identity link: parity with the runtime path.
         crate::agent_manager::stamp_queued_message_id(&mut entry);
@@ -19280,10 +19429,7 @@ impl Services {
             latest_human_submission_at: None,
             provisional: false,
             write_pending,
-            submission_order: self
-                .queue_submission_order
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1,
+            submission_order: self.next_submission_order(),
         };
         // Selection and append share the mutation/drain lock.
         if let Some((position, previous)) = queue
@@ -20713,6 +20859,53 @@ impl Services {
         }
     }
 
+    /// [`Services::take_queued_message_draining_gated`] for an explicit send
+    /// (`agent.sendQueuedMessageNow`): on a store other processes share it
+    /// is a claimed pop ([`Services::claim_queue_pop_outcome`]), so the
+    /// entry is read from the store first (another process may have queued
+    /// it) and two processes never both send it.
+    ///
+    /// # Errors
+    ///
+    /// The gate's refusal; `InvalidParams` ("queued message not found")
+    /// when the entry is absent or another process took it first;
+    /// `StoreBusy` when the claim write failed (the entry stays queued).
+    pub(crate) async fn take_queued_message_for_send(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        gate: Option<&QueueEntryGate>,
+        destination_owner: Option<&DestinationOwnerQueueAuthorization>,
+    ) -> Result<(QueuedMessage, DrainingGuard)> {
+        let mut refused = None;
+        let outcome = self
+            .claim_queue_pop_outcome(agent_id, || {
+                match self.take_queued_message_draining_gated(
+                    agent_id,
+                    message_id,
+                    gate,
+                    destination_owner,
+                ) {
+                    Ok(popped) => popped,
+                    Err(e) => {
+                        refused = Some(e);
+                        None
+                    }
+                }
+            })
+            .await;
+        let not_found = || Error::InvalidParams(format!("queued message not found: {message_id}"));
+        match outcome {
+            QueuePop::Claimed(popped, lost) if lost.is_empty() => Ok(popped),
+            // Another process sent or removed it first.
+            QueuePop::Claimed(..) => Err(not_found()),
+            QueuePop::Empty => Err(refused.unwrap_or_else(not_found)),
+            QueuePop::ClaimFailed => Err(Error::StoreBusy(
+                "the queued message could not be claimed; retry".into(),
+            )),
+        }
+    }
+
     /// Validate the complete explicit selection before changing anything. The
     /// queue and draining locks make concurrent selections and drains exclusive.
     /// A quarantined session validates with `take = false` and stays untouched.
@@ -20845,6 +21038,7 @@ impl Services {
             shutdown: Arc::clone(&self.draining_shutdown),
             agent_id: agent_id.clone(),
             ids: entries.iter().map(|m| m.id.clone()).collect(),
+            claim: None,
         }
     }
 
@@ -20880,6 +21074,33 @@ impl Services {
             }
         }
         entries
+    }
+
+    /// The next queue submission order this process assigns. On a store
+    /// other processes share, the process's queue order tag fills the low
+    /// [`intent_store::QUEUE_ORDER_TAG_BITS`] bits under its own count, so
+    /// two processes never assign the same order; `SQLite` (one process)
+    /// keeps the plain count.
+    pub(crate) fn next_submission_order(&self) -> u64 {
+        let count = self
+            .queue_submission_order
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        match self.store.queue_order_tag() {
+            Some(tag) => (count << intent_store::QUEUE_ORDER_TAG_BITS) | tag,
+            None => count,
+        }
+    }
+
+    /// Raise this process's count past `order`, an order seen on an entry
+    /// (rehydrated, or another process's), so later orders sort after it.
+    pub(crate) fn observe_submission_order(&self, order: u64) {
+        let count = match self.store.queue_order_tag() {
+            Some(_) => order >> intent_store::QUEUE_ORDER_TAG_BITS,
+            None => order,
+        };
+        self.queue_submission_order
+            .fetch_max(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Write-through persistence of an agent's queue: snapshot the in-memory
@@ -20939,6 +21160,36 @@ impl Services {
         self.refresh_queue_locked(agent_id).await;
     }
 
+    /// Commit the removal of entry `id`, already taken out of memory, to a
+    /// store other processes share: a write naming it as removed. Returns
+    /// whether this removal took it, `false` when another process removed
+    /// or drained it first (the caller answers as for an absent entry). On
+    /// a store no other process writes, and when the write fails (memory
+    /// stays the change; the next write-through carries it), `true`.
+    pub(crate) async fn commit_queue_removal(&self, agent_id: &AgentId, id: &str) -> bool {
+        if !self.store.agent_queues_shared() {
+            return true;
+        }
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let rows = self.queue_rows(agent_id);
+        match self
+            .store
+            .remove_from_agent_queue(agent_id, &rows, &[id.to_owned()])
+            .await
+        {
+            Ok(sync) => {
+                if let Some(merged) = sync.merged {
+                    self.adopt_stored_queue(agent_id, &rows, merged);
+                }
+                !sync.lost.iter().any(|lost| lost == id)
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "agent queue removal write failed; the next write-through carries it");
+                true
+            }
+        }
+    }
+
     /// [`Services::refresh_queue_from_store`] under the held persist gate.
     async fn refresh_queue_locked(&self, agent_id: &AgentId) {
         let rows = self.queue_rows(agent_id);
@@ -20954,22 +21205,41 @@ impl Services {
     /// Pop entries to deliver them so that, of several processes sharing
     /// the store, exactly one delivers each entry: under the persist gate,
     /// refresh the queue from the store, `pop`, then write the shrunk queue
-    /// claiming the popped `ids`. Returns the popped value with the claimed
-    /// ids another process removed first (lost: the caller must not deliver
-    /// them). When the claim write fails (writer lock busy, not the owner,
-    /// I/O), nothing is claimed: the popped entries go back to their place
-    /// in memory, still stored, and this returns `None` so the caller does
-    /// not deliver; a later drain retries. On a store no other process
-    /// writes this is just `pop()` and nothing is lost; the caller persists
-    /// the shrink as before.
-    pub(crate) async fn claim_queue_pop<T>(
+    /// claiming the popped entries ([`Services::claim_queue_pop_outcome`]).
+    /// Returns the popped value with the claimed ids another process removed
+    /// first (lost: the caller must not deliver them), or `None` when
+    /// nothing was popped or the claim write failed (the entries are back
+    /// in place and a drain retry is scheduled). On a store no other
+    /// process writes this is just `pop()` and nothing is lost; the caller
+    /// persists the shrink as before.
+    pub(crate) async fn claim_queue_pop<T: DrainedPop>(
         &self,
         agent_id: &AgentId,
         pop: impl FnOnce() -> Option<T>,
-        entries: impl FnOnce(&T) -> Vec<QueuedMessage>,
     ) -> Option<(T, Vec<String>)> {
+        match self.claim_queue_pop_outcome(agent_id, pop).await {
+            QueuePop::Claimed(popped, lost) => Some((popped, lost)),
+            QueuePop::Empty | QueuePop::ClaimFailed => None,
+        }
+    }
+
+    /// [`Services::claim_queue_pop`], telling an empty pop from a failed
+    /// claim write. When the claim write fails (writer lock busy, not the
+    /// owner, I/O), nothing is claimed: the popped entries go back to their
+    /// place in memory, still stored, and a bounded retry of the agent's
+    /// drain is scheduled ([`Services::schedule_queue_claim_retry`]). On a
+    /// shared store the kept entries' rows stay stored, claimed by this
+    /// process, until the popped value's [`DrainingGuard`] drops.
+    pub(crate) async fn claim_queue_pop_outcome<T: DrainedPop>(
+        &self,
+        agent_id: &AgentId,
+        pop: impl FnOnce() -> Option<T>,
+    ) -> QueuePop<T> {
         if !self.store.agent_queues_shared() {
-            return pop().map(|popped| (popped, Vec::new()));
+            return match pop() {
+                Some(popped) => QueuePop::Claimed(popped, Vec::new()),
+                None => QueuePop::Empty,
+            };
         }
         let _gate = self.agent_queue_persist_gate.lock().await;
         self.refresh_queue_locked(agent_id).await;
@@ -20983,23 +21253,169 @@ impl Services {
             .get(agent_id)
             .map(|queue| queue.iter().map(|m| m.id.clone()).collect())
             .unwrap_or_default();
-        let popped = pop()?;
-        let taken = entries(&popped);
-        let claims: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
-        let lost = match self.sync_queue_locked(agent_id, &claims).await {
-            Ok(lost) => lost,
+        let Some(mut popped) = pop() else {
+            return QueuePop::Empty;
+        };
+        let taken = popped.drained_entries();
+        match self.claim_taken_locked(agent_id, &taken).await {
+            Ok(lost) => {
+                let kept = taken
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .filter(|id| !lost.contains(id))
+                    .collect();
+                popped
+                    .draining_guard()
+                    .hold_claim(&self.store, &self.agent_queues, kept);
+                QueuePop::Claimed(popped, lost)
+            }
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "queue claim write failed; leaving the entries queued");
                 // Retire the draining overlay first, then put the entries back.
                 drop(popped);
                 self.restore_unclaimed(agent_id, &before, &taken);
-                return None;
+                self.schedule_queue_claim_retry(agent_id);
+                QueuePop::ClaimFailed
             }
-        };
+        }
+    }
+
+    /// Claim `taken`, entries already popped from memory, with the persist
+    /// gate held: the write of [`Services::persist_queue_snapshot`] naming
+    /// them as claims. Returns the ids another process removed first.
+    async fn claim_taken_locked(
+        &self,
+        agent_id: &AgentId,
+        taken: &[QueuedMessage],
+    ) -> Result<Vec<String>> {
+        let claims: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
+        let lost = self.sync_queue_locked(agent_id, &claims).await?;
         if !lost.is_empty() {
             tracing::info!(agent = %agent_id, lost = ?lost, "queue entries were drained or removed by another process; not delivering them");
         }
-        Some((popped, lost))
+        self.delivery_guards
+            .queue_claim_retries
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+        Ok(lost)
+    }
+
+    /// Claim entries a path popped where it could not await (inside the
+    /// in-flight slot claim: the recovery-send redrive, the worker's raced
+    /// pop). On a store no other process writes, every entry is kept.
+    /// Returns the ids another process removed first (not to deliver); on
+    /// a failed claim write the caller puts the entries back (a drain retry
+    /// is already scheduled).
+    ///
+    /// # Errors
+    ///
+    /// The claim write failed: nothing was claimed.
+    pub(crate) async fn claim_drained(
+        &self,
+        agent_id: &AgentId,
+        popped: &mut impl DrainedPop,
+    ) -> Result<Vec<String>> {
+        if !self.store.agent_queues_shared() {
+            return Ok(Vec::new());
+        }
+        let taken = popped.drained_entries();
+        let claimed = {
+            let _gate = self.agent_queue_persist_gate.lock().await;
+            self.claim_taken_locked(agent_id, &taken).await
+        };
+        match claimed {
+            Ok(lost) => {
+                let kept = taken
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .filter(|id| !lost.contains(id))
+                    .collect();
+                let guard = popped.draining_guard();
+                guard.release(&lost);
+                guard.hold_claim(&self.store, &self.agent_queues, kept);
+                Ok(lost)
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "queue claim write failed; putting the entries back");
+                self.schedule_queue_claim_retry(agent_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Start queue claim retries after `base` (doubling), each parked at
+    /// `park` before its drain (tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub(crate) fn with_queue_claim_retry_park(
+        self,
+        base: std::time::Duration,
+        park: Arc<crate::CompletionClassifyPark>,
+    ) -> Self {
+        let _ = self.delivery_guards.queue_claim_retry_base.set(base);
+        let _ = self.delivery_guards.queue_claim_retry_park.set(park);
+        self
+    }
+
+    /// Resolves once a queue claim retry ran its drain (tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) async fn queue_claim_retried(&self) {
+        self.delivery_guards.queue_claim_retried.notified().await;
+    }
+
+    /// After a failed claim write the entries stay queued, but no new
+    /// trigger may come: re-kick the agent's drain after a backoff
+    /// ([`QUEUE_CLAIM_RETRY_BASE`] doubling per attempt), at most
+    /// [`QUEUE_CLAIM_RETRY_LIMIT`] times until a claim write succeeds again.
+    pub(crate) fn schedule_queue_claim_retry(&self, agent_id: &AgentId) {
+        let attempt = {
+            let mut retries = self.delivery_guards.queue_claim_retries.lock().unwrap();
+            let attempts = retries.entry(agent_id.clone()).or_insert(0);
+            if *attempts >= QUEUE_CLAIM_RETRY_LIMIT {
+                tracing::warn!(agent = %agent_id, "queue claim retries exhausted; the entries wait for the next drain trigger");
+                return;
+            }
+            *attempts += 1;
+            *attempts
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let base = self
+            .delivery_guards
+            .queue_claim_retry_base
+            .get()
+            .copied()
+            .unwrap_or(QUEUE_CLAIM_RETRY_BASE);
+        let delay = base.saturating_mul(1 << (attempt - 1));
+        let services = self.clone();
+        let agent_id = agent_id.clone();
+        intent_core::spawn_daemon(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(park) = services.delivery_guards.queue_claim_retry_park.get() {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+            if let Some(manager) = services.agent_manager() {
+                match services.store.get_agent_session_summary(&agent_id).await {
+                    Ok(session) => {
+                        // A parked recovery send first (its marker is put
+                        // back with the entry), then the ordinary drain.
+                        manager
+                            .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
+                            .await;
+                        manager
+                            .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(agent = %agent_id, error = %e, "queue claim retry: agent session lookup failed");
+                    }
+                }
+            }
+            services.delivery_guards.queue_claim_retried.notify_one();
+        });
     }
 
     /// Put back `popped`, the entries a failed claim took, as popped (their
@@ -21096,8 +21512,7 @@ impl Services {
             }
         }
         if let Some(order) = next.iter().map(|m| m.submission_order).max() {
-            self.queue_submission_order
-                .fetch_max(order, std::sync::atomic::Ordering::Relaxed);
+            self.observe_submission_order(order);
         }
         if next.is_empty() {
             queues.remove(agent_id);
@@ -21275,8 +21690,7 @@ impl Services {
             .filter_map(|row| row.payload.get("submissionOrder").and_then(Value::as_u64))
             .max()
             .unwrap_or(0);
-        self.queue_submission_order
-            .fetch_max(max_order, std::sync::atomic::Ordering::Relaxed);
+        self.observe_submission_order(max_order);
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
         let mut recover = HashSet::new();
         for row in rows {
@@ -21297,10 +21711,7 @@ impl Services {
                 Ok(mut message) => {
                     message.correlation_order_known = order_known;
                     if message.submission_order == 0 {
-                        message.submission_order = self
-                            .queue_submission_order
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
+                        message.submission_order = self.next_submission_order();
                     }
                     message.editing = false;
                     message.editing_message_id = None;
@@ -21700,47 +22111,66 @@ impl Services {
             }
             drained
         };
-        let migrated = drained.len();
-        if migrated > 0 {
+        let mut migrated = drained.len();
+        let mut target_changed = migrated > 0;
+        // On a store other processes share the stored queue may hold entries
+        // this process never saw, so the move runs even with none here.
+        if migrated > 0 || self.store.agent_queues_shared() {
             // Atomic durable hand-off: one transaction clears BOTH agents'
             // persisted rows and inserts the target snapshot. (The migrated
             // entries keep their ids and `agent_queue.id` is a GLOBAL
             // primary key, so a non-atomic clear-then-replace pair risks a
             // crash window with the messages on NEITHER queue.) The snapshot
             // is taken inside the persist gate, same ordering contract as
-            // `persist_queue_snapshot`.
+            // `persist_queue_snapshot`. On a shared store the move merges
+            // with other processes' changes: entries one of them removed
+            // first are lost (not moved), and its own entries move too.
             let rows = self.queue_rows(target_id);
+            let moved_ids: Vec<String> = drained.iter().map(|m| m.id.clone()).collect();
             let moved = self
                 .store
-                .move_agent_queue(poisoned_id, target_id, &rows)
+                .move_agent_queue(poisoned_id, target_id, &rows, &moved_ids, &|row| {
+                    reset_migrated_payload(&mut row.payload);
+                })
                 .await;
-            if let Err(e) = moved {
-                // Roll back the in-memory drain and skip GC: the messages
-                // remain durable on the poisoned queue (rows untouched) and
-                // in its in-memory queue, so the caller can retry. The
-                // restore SPLICES the drained entries back at the front of
-                // any existing entry rather than overwriting it — a
-                // quarantined send racing this window may have re-created
-                // the poisoned entry with new messages, which must survive.
-                let migrated_ids: HashSet<&str> = drained.iter().map(|m| m.id.as_str()).collect();
-                let mut guard = self
-                    .agent_queues
-                    .lock()
-                    .expect("agent queue registry poisoned");
-                if let Some(queue) = guard.get_mut(target_id) {
-                    queue.retain(|m| !migrated_ids.contains(m.id.as_str()));
+            match moved {
+                Ok(sync) => {
+                    migrated -= sync.lost.len();
+                    if let Some(merged) = sync.merged {
+                        self.adopt_stored_queue(target_id, &rows, merged);
+                        target_changed = true;
+                    }
                 }
-                guard
-                    .entry(poisoned_id.clone())
-                    .or_default()
-                    .splice(0..0, drained);
-                return Err(e);
+                Err(e) => {
+                    // Roll back the in-memory drain and skip GC: the
+                    // messages remain durable on the poisoned queue (rows
+                    // untouched) and in its in-memory queue, so the caller
+                    // can retry. The restore SPLICES the drained entries
+                    // back at the front of any existing entry rather than
+                    // overwriting it — a quarantined send racing this
+                    // window may have re-created the poisoned entry with
+                    // new messages, which must survive.
+                    let migrated_ids: HashSet<&str> =
+                        drained.iter().map(|m| m.id.as_str()).collect();
+                    let mut guard = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    if let Some(queue) = guard.get_mut(target_id) {
+                        queue.retain(|m| !migrated_ids.contains(m.id.as_str()));
+                    }
+                    guard
+                        .entry(poisoned_id.clone())
+                        .or_default()
+                        .splice(0..0, drained);
+                    return Err(e);
+                }
             }
         }
         // Released before the publish and the poisoned agent's delete,
         // which persist queues themselves.
         drop(gate);
-        if migrated > 0 {
+        if target_changed {
             // Re-arm release timers for migrated held entries against the
             // TARGET agent (mirrors the boot-rehydration re-arm): the timer
             // armed at enqueue time captured the poisoned agent id, so left

@@ -185,13 +185,57 @@ impl Services {
         &self,
         agent_id: &AgentId,
     ) -> Option<(String, Vec<String>)> {
-        self.claim_queue_pop(
-            agent_id,
-            || self.dequeue_message_draining(agent_id),
-            |(next, _)| vec![next.clone()],
-        )
-        .await
-        .map(|((next, _draining), lost)| (next.id, lost))
+        self.claim_queue_pop(agent_id, || self.dequeue_message_draining(agent_id))
+            .await
+            .map(|((next, _draining), lost)| (next.id, lost))
+    }
+
+    /// Test seam: [`Self::claim_next_queued_message_for_test`] that keeps
+    /// the draining guard (opaque): the claim ends when it drops, and never
+    /// when it is leaked (a crash before the delivery).
+    pub async fn claim_next_queued_message_held_for_test(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(String, Vec<String>, impl Sized)> {
+        self.claim_queue_pop(agent_id, || self.dequeue_message_draining(agent_id))
+            .await
+            .map(|((next, draining), lost)| (next.id, lost, draining))
+    }
+
+    /// Test seam: `agent_remove_queued_message_op`.
+    pub async fn agent_remove_queued_message_op_for_test(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        self.agent_remove_queued_message_op(agent_id, message_id)
+            .await
+    }
+
+    /// Test seam: `agent_remove_queued_message_owned_op`.
+    pub async fn agent_remove_queued_message_owned_op_for_test(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        caller_agent_id: AgentId,
+    ) -> Result<Value> {
+        self.agent_remove_queued_message_owned_op(agent_id, message_id, caller_agent_id)
+            .await
+    }
+
+    /// Test seam: `with_queue_claim_retry_park`.
+    #[must_use]
+    pub fn with_queue_claim_retry_park_for_test(
+        self,
+        base: std::time::Duration,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.with_queue_claim_retry_park(base, park)
+    }
+
+    /// Test seam: resolves once a queue claim retry ran its drain.
+    pub async fn queue_claim_retried_for_test(&self) {
+        self.queue_claim_retried().await;
     }
 
     /// Test seam: the flush drain's claimed batch pop (`claim_queue_pop`
@@ -205,14 +249,10 @@ impl Services {
         min_ready: usize,
         before_pop: impl FnOnce(),
     ) -> Option<(Vec<String>, Vec<String>)> {
-        self.claim_queue_pop(
-            agent_id,
-            || {
-                before_pop();
-                self.dequeue_ready_batch_draining(agent_id, false, min_ready)
-            },
-            |(batch, _)| batch.clone(),
-        )
+        self.claim_queue_pop(agent_id, || {
+            before_pop();
+            self.dequeue_ready_batch_draining(agent_id, false, min_ready)
+        })
         .await
         .map(|((batch, _draining), lost)| (batch.into_iter().map(|m| m.id).collect(), lost))
     }

@@ -62,7 +62,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::{
-    new_message_id, user_message_blocks, DrainingGuard, QueuedMessage, RecoverySendClaim,
+    new_message_id, user_message_blocks, DrainingGuard, QueuePop, QueuedMessage, RecoverySendClaim,
     MAX_MESSAGE_ID_LEN,
 };
 use crate::agent_session::{
@@ -8660,7 +8660,28 @@ impl AgentManager {
             }
         });
         match claimed {
-            Ok(popped) => {
+            Ok((mut popped, claim)) => {
+                // On a store other processes share, the entry is claimed in
+                // the store before any turn-start side effect: one another
+                // process delivered or removed first is not delivered, and a
+                // failed claim write puts it back, marker and all.
+                match boxed_await(|| self.services.claim_drained(agent_id, &mut popped)).await {
+                    Ok(lost) if lost.is_empty() => {}
+                    Ok(_) => {
+                        self.release_slot_sync(agent_id, claim.hand_off());
+                        return None;
+                    }
+                    Err(_) => {
+                        self.release_slot_sync(agent_id, claim.hand_off());
+                        let (message, draining) = popped;
+                        let id = message.id.clone();
+                        self.services.requeue_front(agent_id, message);
+                        self.services.mark_parked_recovery_send(agent_id, id);
+                        drop(draining);
+                        return None;
+                    }
+                }
+                let popped = (popped, claim);
                 if boxed_await(|| {
                     self.begin_turn_side_effects(
                         agent_id,
@@ -9690,11 +9711,7 @@ impl AgentManager {
             }
         }
         if options.queued_submission_order == 0 {
-            options.queued_submission_order = self
-                .services
-                .queue_submission_order
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
+            options.queued_submission_order = self.services.next_submission_order();
             options.queued_correlation_order_known = true;
         }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
@@ -10627,14 +10644,10 @@ impl AgentManager {
             // process drained or removed first are released, not delivered.
             let flush = self
                 .services
-                .claim_queue_pop(
-                    &agent_id,
-                    || {
-                        self.services
-                            .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
-                    },
-                    |(batch, _)| batch.clone(),
-                )
+                .claim_queue_pop(&agent_id, || {
+                    self.services
+                        .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
+                })
                 .await
                 .and_then(|((mut batch, mut draining), lost)| {
                     if !lost.is_empty() {
@@ -10667,18 +10680,14 @@ impl AgentManager {
                 return;
             }
             self.services
-                .claim_queue_pop(
-                    &agent_id,
-                    || {
-                        if archived_drain {
-                            self.services
-                                .dequeue_user_origin_message_draining(&agent_id)
-                        } else {
-                            self.services.dequeue_message_draining(&agent_id)
-                        }
-                    },
-                    |(next, _)| vec![next.clone()],
-                )
+                .claim_queue_pop(&agent_id, || {
+                    if archived_drain {
+                        self.services
+                            .dequeue_user_origin_message_draining(&agent_id)
+                    } else {
+                        self.services.dequeue_message_draining(&agent_id)
+                    }
+                })
                 .await
                 // Lost: another process drained or removed it first.
                 .filter(|(_, lost)| lost.is_empty())
@@ -10910,15 +10919,13 @@ impl AgentManager {
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining_gated(
+            .take_queued_message_for_send(
                 &agent_id,
                 &message_id,
                 gate.as_ref(),
                 destination_owner.as_ref(),
-            )?
-            .ok_or_else(|| {
-                Error::InvalidParams(format!("queued message not found: {message_id}"))
-            })?;
+            )
+            .await?;
         drop(destination_owner);
         // Stale-redrive parity with the drain paths (#576): a delegated
         // agent's entry that predates the delivered completion report is
@@ -11136,17 +11143,62 @@ impl AgentManager {
         let gate = self.services.queue_entry_gate(&agent_id, false).await?;
         self.services.park_queue_mutation_gate(gate.as_ref()).await;
         let quarantined = self.services.session_poisoned(&session);
-        let (mut entries, draining) = self.services.take_queued_messages_draining_gated(
-            &agent_id,
-            &message_ids,
-            gate.as_ref(),
-            !quarantined,
-        )?;
-        let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
         if quarantined {
+            let (entries, _) = self.services.take_queued_messages_draining_gated(
+                &agent_id,
+                &message_ids,
+                gate.as_ref(),
+                false,
+            )?;
+            let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
             return Ok(json!({"success":true,"queued":true,"quarantined":true,"messageIds":ids}));
         }
-        let draining = draining.expect("a non-quarantined selection owns its draining guard");
+        // On a shared store the selection is a claimed pop: read from the
+        // store first, and never sent by two processes.
+        let mut refused = None;
+        let outcome = self
+            .services
+            .claim_queue_pop_outcome(&agent_id, || {
+                match self.services.take_queued_messages_draining_gated(
+                    &agent_id,
+                    &message_ids,
+                    gate.as_ref(),
+                    true,
+                ) {
+                    Ok((entries, draining)) => draining.map(|draining| (entries, draining)),
+                    Err(e) => {
+                        refused = Some(e);
+                        None
+                    }
+                }
+            })
+            .await;
+        let (mut entries, draining) = match outcome {
+            QueuePop::Claimed(popped, lost) if lost.is_empty() => popped,
+            QueuePop::Claimed((entries, mut draining), lost) => {
+                // Another process sent or removed part of the selection
+                // first: send none of it, and put the rest back.
+                draining.release(&lost);
+                let kept: Vec<_> = entries
+                    .into_iter()
+                    .filter(|m| !lost.contains(&m.id))
+                    .collect();
+                self.services.requeue_front_batch(&agent_id, kept);
+                drop(draining);
+                self.services.publish_queue_updated(&agent_id).await;
+                return Err(Error::InvalidParams("queued message not found".into()));
+            }
+            QueuePop::Empty => {
+                return Err(refused
+                    .unwrap_or_else(|| Error::InvalidParams("queued message not found".into())));
+            }
+            QueuePop::ClaimFailed => {
+                return Err(Error::StoreBusy(
+                    "the queued messages could not be claimed; retry".into(),
+                ));
+            }
+        };
+        let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
         let mut interrupt = TurnOptions {
             origin: intent_core::MessageOrigin::User,
             interrupt_priority: true,
@@ -17758,10 +17810,31 @@ async fn run_message_worker(
         // combined provider turn; otherwise the single-entry arm below runs
         // unchanged.
         {
-            if let Some((batch, draining)) = mgr
-                .services
-                .dequeue_ready_batch_draining(&agent_id, false, 2)
+            // On a shared store the pop is also a claim: entries another
+            // process drained or removed first are released, not delivered.
+            let flush = match boxed_await(|| {
+                mgr.services.claim_queue_pop_outcome(&agent_id, || {
+                    mgr.services
+                        .dequeue_ready_batch_draining(&agent_id, false, 2)
+                })
+            })
+            .await
             {
+                QueuePop::Claimed((mut batch, mut draining), lost) => {
+                    if !lost.is_empty() {
+                        draining.release(&lost);
+                        batch.retain(|m| !lost.contains(&m.id));
+                    }
+                    (!batch.is_empty()).then_some((batch, draining))
+                }
+                QueuePop::Empty => None,
+                // The entries stay queued; a drain retry is scheduled.
+                QueuePop::ClaimFailed => {
+                    boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
+                    break 'outer;
+                }
+            };
+            if let Some((batch, draining)) = flush {
                 mgr.clear_turn_settled(&agent_id);
                 match boxed_await(|| {
                     prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining)
@@ -17787,7 +17860,22 @@ async fn run_message_worker(
                 }
             }
         }
-        if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
+        let single = match boxed_await(|| {
+            mgr.services.claim_queue_pop_outcome(&agent_id, || {
+                mgr.services.dequeue_message_draining(&agent_id)
+            })
+        })
+        .await
+        {
+            QueuePop::Claimed(popped, lost) if lost.is_empty() => Some(popped),
+            // Lost: another process drained or removed it first.
+            QueuePop::Claimed(..) | QueuePop::Empty => None,
+            QueuePop::ClaimFailed => {
+                boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
+                break 'outer;
+            }
+        };
+        if let Some((mut next, draining)) = single {
             mgr.clear_turn_settled(&agent_id);
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
@@ -17996,10 +18084,32 @@ async fn run_message_worker(
                     }
                 }
             }
+            // The raced pop preceded the slot re-claim; claim it in the
+            // store now that the delivery goes ahead (a shared store).
+            let mut popped = (
+                std::mem::take(&mut raced),
+                raced_draining.take().expect("raced batch guard"),
+            );
+            let claimed = boxed_await(|| mgr.services.claim_drained(&agent_id, &mut popped)).await;
+            let Ok(lost) = claimed else {
+                // Put it back; a drain retry is scheduled.
+                let (entries, draining) = popped;
+                mgr.services.requeue_front_batch(&agent_id, entries);
+                drop(draining);
+                boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
+                break 'outer;
+            };
+            popped.0.retain(|m| !lost.contains(&m.id));
+            let (mut raced, mut draining) = popped;
+            if raced.is_empty() {
+                // Another process delivered or removed it first.
+                drop(draining);
+                boxed_await(|| mgr.end_turn(&agent_id, admission)).await;
+                break 'outer;
+            }
             mgr.services
                 .commit_provisional_queue_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
-            let mut draining = raced_draining.take().expect("raced batch guard");
             // The first entry was popped before re-claiming the slot.
             // Fold any further ready entries into the same provider turn.
             let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next);

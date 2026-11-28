@@ -45,11 +45,7 @@ async fn a_claimed_pop_on_an_unshared_store_is_the_plain_pop() {
     // The store row of a popped entry is still there: on SQLite the caller
     // persists the shrink, as before.
     let ((popped, draining), lost) = svc
-        .claim_queue_pop(
-            &agent,
-            || svc.dequeue_message_draining(&agent),
-            |(next, _)| vec![next.clone()],
-        )
+        .claim_queue_pop(&agent, || svc.dequeue_message_draining(&agent))
         .await
         .expect("the head pops");
     assert_eq!(popped.id, "m1");
