@@ -12,8 +12,11 @@ feature defaults) in the new module:
    new version, and its test asserts it (the not-admitted sample moves on).
 3. intent-services context_budget.rs: PREVIOUS is the version being replaced.
 4. intent-services harness/mod.rs: the module line and the REGISTRY row.
-5. harness/v<FROM>.rs: its test no longer pins FROM as the current version.
-6. harness/v<TO>.rs (new): reuses every FROM surface; its test pins TO as current.
+5. harness/v<FROM>.rs: its test no longer pins FROM as the current or latest
+   version (the CURRENT_HARNESS_VERSION pair and the latest_entry() check).
+6. harness/v<TO>.rs (new): reuses every FROM surface; its test pins TO's own
+   version string. Only harness/mod.rs tests which version is current, so the
+   next bump has no copy of that check to miss.
 
 The admissions in 1 and 2 keep FROM's: FROM must already be admitted. A
 version that should drop repository guidance or the prompt breakdown is not a
@@ -173,14 +176,36 @@ def edit_harness_mod(text, old, new):
                     f"{HARNESS_MOD}: REGISTRY ending with &{module(old)}::ENTRY")
 
 
+# A per-version module referring to any of these claims its version is the
+# current, staged or latest one, which stops being true at the next bump.
+CURRENT_PIN = re.compile(r"\b(?:CURRENT_HARNESS_VERSION|STAGED_HARNESS_VERSION|NEWEST_HARNESS_VERSION"
+                         r"|LATEST_VERSION|latest_entry)\b|\blatest\(\)")
+
+
+def current_pins(text):
+    """The code lines (not comments) that pin the current or latest version."""
+    return [line.strip() for line in text.split("\n")
+            if not line.lstrip().startswith("//") and CURRENT_PIN.search(line)]
+
+
 def edit_previous_module(text, old):
-    """The FROM module's test stops claiming FROM is current."""
-    pattern = (r"assert_eq!\((\w+)\.version, intent_core::CURRENT_HARNESS_VERSION\);\n"
-               r"\s*assert_eq!\(intent_core::STAGED_HARNESS_VERSION, None\);")
-    new, count = re.subn(pattern, rf"assert_eq!(\g<1>.version, {quoted(old)});", text)
-    if count == 0 and "CURRENT_HARNESS_VERSION" in text:
-        raise Mismatch(f"{module(old)}.rs mentions CURRENT_HARNESS_VERSION but not in the expected test lines")
-    return new
+    """The FROM module's test stops claiming FROM is current or latest."""
+    own = rf"assert_eq!(\g<1>.version, {quoted(old)});"
+    text = re.sub(r"assert_eq!\((\w+)\.version, intent_core::CURRENT_HARNESS_VERSION\);\n"
+                  r"\s*assert_eq!\(intent_core::STAGED_HARNESS_VERSION, None\);", own, text)
+    latest = r"(?:(?:crate::harness|super(?:::super)*)::)?latest_entry\(\)"
+    for pattern in (rf"assert!\(std::ptr::eq\({latest}, &?(\w+)\)\);",
+                    rf"assert!\(std::ptr::eq\(&?(\w+), {latest}\)\);"):
+        text = re.sub(pattern, own, text)
+    # The pair and the latest_entry() check usually sit together: keep one.
+    version = re.escape(quoted(old))
+    text = re.sub(rf"^( *assert_eq!\((\w+)\.version, {version}\);\n)(?: *assert_eq!\(\2\.version, {version}\);\n)+",
+                  r"\g<1>", text, flags=re.M)
+    left = current_pins(text)
+    if left:
+        raise Mismatch(f"{module(old)}.rs still pins it as the current or latest version in `{left[0]}`; "
+                       f"assert its own version string ({quoted(old)}) instead")
+    return text
 
 
 def entry_field(text, old, field):
@@ -224,8 +249,7 @@ mod tests {{
     fn {module(new)}_is_{module(old).removeprefix("v")}_unchanged() {{
         let current = super::super::resolve_entry({quoted(new)});
         let prior = super::super::resolve_entry({quoted(old)});
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, {quoted(new)});
         assert!(std::ptr::addr_eq(current.harness, prior.harness));
         assert!(std::ptr::eq(current.doctrine, prior.doctrine));
         assert!(std::ptr::eq(current.context, prior.context));

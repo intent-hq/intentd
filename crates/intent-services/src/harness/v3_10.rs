@@ -89,10 +89,6 @@ mod tests {
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
-        // Registered (old eval sessions resolve it) but never stamped: 3.12
-        // releases its surfaces.
-        assert_ne!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
     }
 
     fn sha256_hex(content: &str) -> String {
