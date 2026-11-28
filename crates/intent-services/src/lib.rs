@@ -24793,6 +24793,21 @@ impl WorkspaceApi for Services {
                             })
                             .await;
                         let remote_view = plan.remote.clone();
+                        // A host member's initial prompt gets the same sender
+                        // preamble as their later sends (the owner's stays
+                        // byte-identical). Resolved before the agent row is
+                        // persisted so a lookup failure cannot strand it.
+                        let sender_preamble = match boxed_await(|| {
+                            services.collaborator_sender_preamble(&ws.id)
+                        })
+                        .await
+                        {
+                            Ok(preamble) => preamble,
+                            Err(e) => {
+                                record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                                return Err(e);
+                            }
+                        };
                         // On that infrastructure failure the create returns
                         // before the setup task below is scheduled, so the
                         // already-inserted row would otherwise read `pending`
@@ -24863,7 +24878,7 @@ impl WorkspaceApi for Services {
                                 || created_image_blocks.is_some()
                                 || created_file_blocks.is_some());
                         if has_content {
-                            let prompt_text = prompt.unwrap_or_default();
+                            let mut prompt_text = prompt.unwrap_or_default();
                             // Principal stamp (multiplayer w2): the initial
                             // prompt is the creating human's first message,
                             // stamped with the bound wire caller exactly like
@@ -24872,6 +24887,12 @@ impl WorkspaceApi for Services {
                             // cannot fail, so this never strands the row
                             // persisted above; the setup record is settled
                             // defensively all the same.
+                            if let Some(preamble) = sender_preamble.as_deref() {
+                                crate::principal_ops::prepend_collaborator_preamble(
+                                    &mut prompt_text,
+                                    preamble,
+                                );
+                            }
                             let message_metadata =
                                 match crate::principal_ops::stamp_principal_attribution(None) {
                                     Ok(metadata) => metadata,
