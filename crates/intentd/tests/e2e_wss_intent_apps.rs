@@ -123,7 +123,18 @@ async fn rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
 }
 
 async fn ok(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
-    let v = rpc(ws, id, method, params).await;
+    ok_seen(ws, id, method, params, &mut Vec::new()).await
+}
+
+/// [`ok`] that keeps the notifications seen on the way, like [`rpc_seen`].
+async fn ok_seen(
+    ws: &mut PlainWs,
+    id: i64,
+    method: &str,
+    params: Value,
+    seen: &mut Vec<Value>,
+) -> Value {
+    let v = rpc_seen(ws, id, method, params, seen).await;
     assert_eq!(v["jsonrpc"], "2.0", "{v}");
     assert!(v.get("error").is_none(), "{method} errored: {v}");
     v["result"].clone()
@@ -233,21 +244,23 @@ async fn app_library_session_allowlist_and_reapproval_over_wss() {
     let hash1 = app["bundleHash"].as_str().unwrap().to_owned();
     assert!(hash1.starts_with("sha256:") && hash1.len() == 71, "{hash1}");
 
-    let exists = rpc(
+    let exists = rpc_seen(
         &mut admin,
         5,
         "app.install",
         json!({ "workspaceId": WS_ID, "path": "apps/notes" }),
+        &mut seen,
     )
     .await;
     assert_eq!(exists["error"]["code"], -32602, "{exists}");
     assert_eq!(exists["error"]["data"]["code"], "app-exists");
 
-    let not_approved = rpc(
+    let not_approved = rpc_seen(
         &mut admin,
         6,
         "app.session.open",
         json!({ "appId": "quick-notes" }),
+        &mut seen,
     )
     .await;
     assert_eq!(
@@ -255,21 +268,23 @@ async fn app_library_session_allowlist_and_reapproval_over_wss() {
         "{not_approved}"
     );
 
-    let approved = ok(
+    let approved = ok_seen(
         &mut admin,
         7,
         "app.approve",
         json!({ "appId": "quick-notes", "bundleHash": hash1, "level": 1, "features": [] }),
+        &mut seen,
     )
     .await;
     assert_eq!(approved["app"]["approval"]["status"], "approved");
     assert_eq!(approved["app"]["approval"]["bundleHash"], json!(hash1));
 
-    let session = ok(
+    let session = ok_seen(
         &mut admin,
         8,
         "app.session.open",
         json!({ "appId": "quick-notes" }),
+        &mut seen,
     )
     .await;
     let token = session["token"].as_str().unwrap().to_owned();
@@ -337,20 +352,26 @@ async fn app_library_session_allowlist_and_reapproval_over_wss() {
     }
 
     // The library shows it open; the admin sees no token anywhere.
-    let got = ok(&mut admin, 9, "app.get", json!({ "appId": "quick-notes" })).await;
+    let got = ok_seen(
+        &mut admin,
+        9,
+        "app.get",
+        json!({ "appId": "quick-notes" }),
+        &mut seen,
+    )
+    .await;
     assert_eq!(got["app"]["open"], true);
     assert!(!got.to_string().contains(&token));
 
     // Edit one file and reinstall: a new hash, approval reset, and the app
     // connection is closed with 1008.
     write_bundle(&fx.checkout, "v2");
-    let mut seen2 = Vec::new();
     let replaced = rpc_seen(
         &mut admin,
         10,
         "app.install",
         json!({ "workspaceId": WS_ID, "path": "apps/notes", "replace": true }),
-        &mut seen2,
+        &mut seen,
     )
     .await;
     assert_eq!(replaced["result"]["replaced"], true, "{replaced}");
@@ -392,39 +413,40 @@ async fn app_library_session_allowlist_and_reapproval_over_wss() {
     assert!(expect_close(&mut late).await.is_some());
 
     // Re-approval is needed; the old hash cannot be replayed.
-    let replay = rpc(
+    let replay = rpc_seen(
         &mut admin,
         11,
         "app.approve",
         json!({ "appId": "quick-notes", "bundleHash": hash1, "level": 1, "features": [] }),
+        &mut seen,
     )
     .await;
     assert_eq!(replay["error"]["data"]["code"], "hash-mismatch", "{replay}");
     assert_eq!(replay["error"]["data"]["bundleHash"], json!(hash2));
-    let open = rpc(
+    let open = rpc_seen(
         &mut admin,
         12,
         "app.session.open",
         json!({ "appId": "quick-notes" }),
+        &mut seen,
     )
     .await;
     assert_eq!(open["error"]["data"]["code"], "not-approved");
 
     // Uninstall publishes app:removed.
-    let mut seen3 = Vec::new();
     let removed = rpc_seen(
         &mut admin,
         13,
         "app.uninstall",
         json!({ "appId": "quick-notes" }),
-        &mut seen3,
+        &mut seen,
     )
     .await;
     assert_eq!(removed["result"]["removed"], true, "{removed}");
 
     // Events: installed, installed (replace) + approval-changed (approve and
     // reset), removed. Collect anything still in flight.
-    let mut events: Vec<Value> = seen.into_iter().chain(seen2).chain(seen3).collect();
+    let mut events = seen;
     let _ = timeout(
         intentd_test_support::test_timeout(std::time::Duration::from_millis(500)),
         async {
