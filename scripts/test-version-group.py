@@ -21,6 +21,13 @@ Checks, per group:
              member: it inherits the root [workspace.dependencies] entry with
              `workspace = true`, so a release rewrites one root line per crate
              instead of member lines that feature PRs also edit (intentd#3524).
+  package    every non-dev path dependency of any crate (direct, [target.*] or
+             inherited) has a version requirement and targets a crate without
+             `publish = false`: release-plz runs `cargo package --workspace`,
+             which rejects the first and cannot resolve the second (intentd#3867
+             added an optional test-hooks dependency on intentd-test-support and
+             broke every release-pr run). Path-only dev-dependencies are fine:
+             cargo package strips them.
 
 Run:  python3 -S scripts/test-version-group.py [-v]       # unit tests + this tree
       python3 -S scripts/test-version-group.py --rev REV  # check a commit
@@ -38,8 +45,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKS = ("lockstep", "precision", "inherit")
+CHECKS = ("lockstep", "precision", "inherit", "package")
 DEPENDENCY_KEYS = ("dependencies", "dev-dependencies", "build-dependencies")
+PACKAGED_KEYS = ("dependencies", "build-dependencies")
 GIT_ENV = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
 
 
@@ -88,6 +96,24 @@ def path_dependencies(doc, inherited=None):
                     yield f"[{prefix}{key}]", spec.get("package", name), spec["version"], False
                 elif isinstance(spec, dict) and spec.get("workspace") is True and name in inherited:
                     yield f"[{prefix}{key}]", *inherited[name], True
+
+
+def packaged_path_dependencies(doc, workspace):
+    """(table label, package name, spec) for each non-dev path dependency, inherited ones resolved."""
+    root = workspace.get("workspace", {}).get("dependencies", {})
+    sections = [("", doc), *((f"target.{t}.", s) for t, s in doc.get("target", {}).items())]
+    for prefix, section in sections:
+        for key in PACKAGED_KEYS:
+            for name, spec in section.get(key, {}).items():
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    spec = root.get(name)
+                if isinstance(spec, dict) and "path" in spec:
+                    yield f"[{prefix}{key}]", spec.get("package", name), spec
+
+
+def unpublishable(doc):
+    """`publish = false` (or `publish = []`): cargo package --workspace cannot resolve a dependency on it."""
+    return doc.get("package", {}).get("publish", True) in (False, [])
 
 
 def bare(requirement):
@@ -152,6 +178,18 @@ def version_group_errors(tree, only=CHECKS):
                     errors.append(f"{group}: {path} requires {dep} \"{requirement}\" in {table}; use "
                                   f"major-only (\"{major}\") so its releases do not bump this member "
                                   "outside the group (intent-hq/intentd#2461)")
+    if "package" in only:
+        for name, (path, doc) in sorted(crates.items()):
+            for table, dep, spec in packaged_path_dependencies(doc, workspace):
+                if "version" not in spec:
+                    errors.append(f"{path} has a path dependency {dep} in {table} without a version; release-plz's "
+                                  f"`cargo package` rejects it, so add version = \"<{dep}'s version>\" "
+                                  "(intent-hq/intentd#3867)")
+                if dep in crates and unpublishable(crates[dep][1]):
+                    errors.append(f"{path} depends on {dep} in {table}, but {dep} sets `publish = false`, so "
+                                  "release-plz's `cargo package --workspace` cannot resolve it; drop `publish = "
+                                  "false` (release-plz.toml already publishes nothing) or make it a dev-dependency "
+                                  "(intent-hq/intentd#3867)")
     return errors
 
 
@@ -160,13 +198,14 @@ class VersionGroupTests(unittest.TestCase):
         self.assertEqual(version_group_errors(Tree(ROOT)), [])
 
     def fixture(self, versions, pin="1.0.0", sitter_req="0", extra="", workspace_release=False,
-                member_pin=False, sitter_inherited=False):
+                member_pin=False, sitter_inherited=False, shared_extra=""):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         shared = f'core = {{ path = "crates/core", version = "{pin}" }}\n'
         if sitter_inherited:
             shared += f'sitter = {{ path = "crates/sitter", version = "{sitter_req}" }}\n'
+        shared += shared_extra
         (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/*"]\n\n'
                                          '[workspace.package]\nversion = "1.0.0"\n\n'
                                          f'[workspace.dependencies]\n{shared}')
@@ -184,7 +223,7 @@ class VersionGroupTests(unittest.TestCase):
                           else f'{{ path = "../sitter", version = "{sitter_req}" }}')
                 deps = (f'[dependencies]\ncore = {core}\nsitter = {sitter}\n'
                         'voice = { path = "../voice", version = "0.4.1" }\n'
-                        'test-support = { path = "../test-support" }\n' + extra)
+                        '[dev-dependencies]\ntest-support = { path = "../test-support" }\n' + extra)
             version = "{ workspace = true }" if version == "workspace" else f'"{version}"'
             (crate / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = {version}\n{deps}')
         return Tree(root)
@@ -252,6 +291,50 @@ class VersionGroupTests(unittest.TestCase):
         errors = version_group_errors(self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, workspace_release=True))
         self.assertEqual(len(errors), 1, errors)
         self.assertIn('requires voice "0.4.1"', errors[0])
+
+    def test_unversioned_packaged_path_dependency_is_reported(self):
+        # intentd#3867: an optional test-hooks dependency without a version failed release-plz's cargo package.
+        cases = {
+            "[dependencies]": ('[dependencies.helper]\npath = "../helper"\noptional = true\n', ""),
+            "[target.cfg(unix).build-dependencies]": ("[target.'cfg(unix)'.build-dependencies]\n"
+                                                      'helper = { path = "../helper" }\n', ""),
+            "[dependencies] (inherited)": ('[dependencies.helper]\nworkspace = true\noptional = true\n',
+                                           'helper = { path = "crates/helper" }\n'),
+        }
+        for table, (extra, shared_extra) in cases.items():
+            with self.subTest(table=table):
+                tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, extra=extra, shared_extra=shared_extra)
+                errors = version_group_errors(tree)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"crates/daemon/Cargo.toml has a path dependency helper in {table.split(' ')[0]} "
+                              "without a version", errors[0])
+
+    def test_packaged_dependency_on_unpublishable_crate_is_reported(self):
+        extra = '[dependencies.helper]\npath = "../helper"\nversion = "0.0.0"\noptional = true\n'
+        for publish in ("false", "[]"):
+            with self.subTest(publish=publish):
+                tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, extra=extra)
+                (tree.root / "crates/helper").mkdir()
+                (tree.root / "crates/helper/Cargo.toml").write_text(
+                    f'[package]\nname = "helper"\nversion = "0.0.0"\npublish = {publish}\n')
+                errors = version_group_errors(tree)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("crates/daemon/Cargo.toml depends on helper in [dependencies], but helper sets "
+                              "`publish = false`", errors[0])
+                manifest = tree.root / "crates/test-support"
+                manifest.mkdir()
+                (manifest / "Cargo.toml").write_text('[package]\nname = "test-support"\nversion = "0.0.0"\n'
+                                                     'publish = false\n')
+                self.assertEqual(len(version_group_errors(tree)), 1, "a dev-dependency may be unpublishable")
+
+    def test_versioned_packaged_and_path_only_dev_dependencies_pass(self):
+        for extra, shared_extra in (('[dependencies.helper]\npath = "../helper"\nversion = "0.0.0"\n', ""),
+                                    ('[dependencies.helper]\nworkspace = true\n',
+                                     'helper = { path = "crates/helper", version = "0.0.0" }\n'),
+                                    ('[target.\'cfg(unix)\'.dev-dependencies]\nhelper = { path = "../helper" }\n', "")):
+            with self.subTest(extra=extra):
+                tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"}, extra=extra, shared_extra=shared_extra)
+                self.assertEqual(version_group_errors(tree), [])
 
     def test_group_member_without_a_crate_is_reported(self):
         tree = self.fixture({"daemon": "1.0.0", "core": "1.0.0"})
