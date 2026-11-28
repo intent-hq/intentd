@@ -22,7 +22,7 @@ test-hooks = ["dep:async-trait", "dep:intentd-test-support"]
 # Only for test-hooks (see [features]); a dev-dependency below as well.
 async-trait = { version = "0.1", optional = true }
 # Only for test-hooks (see [features]); a dev-dependency below as well.
-intentd-test-support = { path = "../intentd-test-support", optional = true }
+intentd-test-support = { path = "../intentd-test-support", version = "0.0.0", optional = true }
 intent-core = { workspace = true }
 intent-store = { workspace = true }
 intent-git = { workspace = true }
