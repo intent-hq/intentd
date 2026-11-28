@@ -6,37 +6,15 @@ use super::*;
 use crate::mcp_server::request_context::{McpRequestContext, McpRequestScope};
 use crate::mcp_server::WorkspaceMcpServer;
 use intent_core::{AgentId, Caller, TurnAttachmentRegistry, Workspace, WorkspaceApi, WorkspaceId};
+use intentd_test_support::PausePoint;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 pub(crate) fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))
 }
 pub(crate) const SECRET: &str = "private-fixture-payload";
 tokio::task_local! { static HOST: McpHostCall; }
-
-pub(crate) struct Gate {
-    pub(crate) entered: Notify,
-    pub(crate) release: Semaphore,
-}
-
-impl Gate {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: Semaphore::new(0),
-        })
-    }
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-    }
-    pub(crate) async fn reached(&self) {
-        tokio::time::timeout(wait(), self.entered.notified())
-            .await
-            .unwrap();
-    }
-}
 
 struct Evidence {
     target: usize,
@@ -46,7 +24,7 @@ struct Evidence {
 pub(crate) struct Policy {
     pub(crate) live: Arc<AtomicBool>,
     pub(crate) events: Mutex<Vec<(McpPrivateBoundaryKind, Vec<usize>)>>,
-    pub(crate) hold: Mutex<Option<(McpPrivateBoundaryKind, bool, Arc<Gate>)>>,
+    pub(crate) hold: Mutex<Option<(McpPrivateBoundaryKind, bool, Arc<PausePoint>)>>,
     pub(crate) retire_after: Mutex<Option<McpPrivateBoundaryKind>>,
     panic: AtomicU8,
     captures: AtomicUsize,
@@ -67,8 +45,8 @@ impl Policy {
             stolen: Mutex::new(None),
         })
     }
-    pub(crate) fn pause(&self, kind: McpPrivateBoundaryKind, after: bool) -> Arc<Gate> {
-        let gate = Gate::new();
+    pub(crate) fn pause(&self, kind: McpPrivateBoundaryKind, after: bool) -> Arc<PausePoint> {
+        let gate = PausePoint::new("policy admission");
         *self.hold.lock().unwrap() = Some((kind, after, gate.clone()));
         gate
     }
@@ -120,7 +98,7 @@ impl McpPrivatePolicy for Policy {
                 .clone()
                 .filter(|(kind, _, _)| *kind == boundary.kind());
             if let Some((_, false, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             assert_ne!(
                 self.panic.load(Ordering::SeqCst),
@@ -151,7 +129,7 @@ impl McpPrivatePolicy for Policy {
                 self.retire();
             }
             if let Some((_, true, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             result
         })
@@ -180,10 +158,10 @@ pub(crate) struct Api {
     pub(crate) outcome: Mutex<Result<Value, String>>,
     pub(crate) reads: AtomicUsize,
     unbound: AtomicBool,
-    pub(crate) settings_gate: Mutex<Option<Arc<Gate>>>,
-    permission_gate: Mutex<Option<Arc<Gate>>>,
-    host_gate: Mutex<Option<Arc<Gate>>>,
-    all_host_gate: Mutex<Option<Arc<Gate>>>,
+    pub(crate) settings_gate: Mutex<Option<Arc<PausePoint>>>,
+    permission_gate: Mutex<Option<Arc<PausePoint>>>,
+    host_gate: Mutex<Option<Arc<PausePoint>>>,
+    all_host_gate: Mutex<Option<Arc<PausePoint>>>,
     panic_host: bool,
     mutations: Mutex<Vec<String>>,
     pub(crate) checkout: Option<String>,
@@ -225,7 +203,7 @@ impl WorkspaceApi for Api {
             HOST.try_with(|_| ()).unwrap();
             let gate = self.permission_gate.lock().unwrap().take();
             if let Some(gate) = gate {
-                gate.wait().await;
+                gate.pause().await;
             }
             false
         })
@@ -250,12 +228,12 @@ impl WorkspaceApi for Api {
                 let gate = self.host_gate.lock().unwrap().clone();
                 if number == 0 {
                     if let Some(gate) = gate {
-                        gate.wait().await;
+                        gate.pause().await;
                     }
                 }
                 let all_gate = self.all_host_gate.lock().unwrap().clone();
                 if let Some(gate) = all_gate {
-                    gate.wait().await;
+                    gate.pause().await;
                 }
             }
             assert!(!self.panic_host, "fixture host future panic");
@@ -272,7 +250,7 @@ impl WorkspaceApi for Api {
             self.ordinary.fetch_add(1, Ordering::SeqCst);
             let gate = self.settings_gate.lock().unwrap().take();
             if let Some(gate) = gate {
-                gate.wait().await;
+                gate.pause().await;
             }
             Ok(json!({"value":match path.as_str() {
                 "workspaceApi.toonOutput" => json!(self.toon),
@@ -343,9 +321,9 @@ async fn host_retirement_refuses_success_and_private_error_without_retry() {
                 .await
                 .unwrap()
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         policy.retire();
-        gate.release.add_permits(1);
+        gate.release();
         refused(&task.await.unwrap());
         assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
     }
@@ -387,16 +365,16 @@ async fn transferred_host_waits_for_guard_release_before_js_continues() {
             .await
             .unwrap()
     });
-    gate.reached().await;
+    gate.wait_reached().await;
     assert_eq!(api.ordinary.load(Ordering::SeqCst), 0);
-    gate.release.add_permits(1);
+    gate.release();
     assert_eq!(task.await.unwrap()["result"]["isError"], false);
 }
 
 #[tokio::test]
 async fn permission_pause_keeps_original_policy_when_public_ids_are_reused() {
     let old = Policy::new();
-    let gate = Gate::new();
+    let gate = PausePoint::new("permission");
     let api = Arc::new(Api {
         permission_gate: Mutex::new(Some(gate.clone())),
         ..Api::new()
@@ -408,7 +386,7 @@ async fn permission_pause_keeps_original_policy_when_public_ids_are_reused() {
             .await
             .unwrap()
     });
-    gate.reached().await;
+    gate.wait_reached().await;
     assert_eq!(old.captures.load(Ordering::SeqCst), 1);
     assert_eq!(api.acquired.load(Ordering::SeqCst), 0);
     old.retire();
@@ -418,7 +396,7 @@ async fn permission_pause_keeps_original_policy_when_public_ids_are_reused() {
         .await
         .unwrap();
     assert!(next.to_string().contains(SECRET));
-    gate.release.add_permits(1);
+    gate.release();
     refused(&pending.await.unwrap());
     assert_eq!(old.captures.load(Ordering::SeqCst), 1);
     assert_eq!(replacement.captures.load(Ordering::SeqCst), 1);
@@ -487,14 +465,14 @@ async fn completed_ordinary_mutation_survives_private_refusal_and_delivery_timeo
                 "await ws.git.listRoots(); return await ws.workspace.setStatusMessage('committed once');"
             )).await.unwrap()
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert_eq!(*api.mutations.lock().unwrap(), vec!["committed once"]);
         if expiry {
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(121)).await;
         } else {
             policy.retire();
-            gate.release.add_permits(1);
+            gate.release();
         }
         let result = pending.await.unwrap();
         if expiry {
@@ -519,7 +497,7 @@ async fn parallel_equal_arguments_and_subreads_retain_every_original_owner() {
     let task = tokio::spawn(async move {
         server.handle_message(&call(1,"await Promise.all([ws.git.listRoots(),ws.git.listRoots(),ws.git.listRoots()]); return 7;")).await.unwrap()
     });
-    gate.reached().await;
+    gate.wait_reached().await;
     let events = policy.events.lock().unwrap().clone();
     assert_eq!(events.last().unwrap().1.len(), 6);
     assert_eq!(
@@ -530,7 +508,7 @@ async fn parallel_equal_arguments_and_subreads_retain_every_original_owner() {
         3
     );
     api.owners[0].store(false, Ordering::SeqCst);
-    gate.release.add_permits(1);
+    gate.release();
     refused(&task.await.unwrap());
 }
 
@@ -586,7 +564,7 @@ async fn reservation_cap_precedes_acquisition_and_never_counts_ordinary_calls() 
 #[tokio::test]
 async fn unfinished_reservations_count_towards_the_bound_before_any_host_finishes() {
     let policy = Policy::new();
-    let gate = Gate::new();
+    let gate = PausePoint::new("every host call");
     let api = Arc::new(Api {
         all_host_gate: Mutex::new(Some(gate.clone())),
         ..Api::new()
@@ -597,10 +575,12 @@ async fn unfinished_reservations_count_towards_the_bound_before_any_host_finishe
         "await Promise.allSettled(Array.from({length:65},()=>ws.git.listRoots())); return 'caught';")).await.unwrap()
     });
     while api.acquired.load(Ordering::SeqCst) < 64 {
-        gate.reached().await;
+        gate.wait_reached().await;
     }
     assert!(!task.is_finished());
-    gate.release.add_permits(64);
+    for _ in 0..64 {
+        gate.release();
+    }
     refused(&task.await.unwrap());
     assert_eq!(api.acquired.load(Ordering::SeqCst), 64);
 }
@@ -708,7 +688,7 @@ async fn unfinished_or_unbound_qualified_reads_cannot_seal() {
     );
     let policy = Policy::new();
     let api = Arc::new(Api::new());
-    *api.host_gate.lock().unwrap() = Some(Gate::new());
+    *api.host_gate.lock().unwrap() = Some(PausePoint::new("first host call"));
     let value = server(api.clone(), policy)
         .with_workspace_api_timeout(Duration::from_millis(30))
         .handle_message(&call(
@@ -724,7 +704,7 @@ async fn unfinished_or_unbound_qualified_reads_cannot_seal() {
 #[tokio::test]
 async fn settings_pause_retirement_prevents_spill_and_private_projection() {
     let dir = tempfile::tempdir().unwrap();
-    let gate = Gate::new();
+    let gate = PausePoint::new("settings");
     let policy = Policy::new();
     let api = Arc::new(Api {
         checkout: Some(dir.path().join("checkout").to_string_lossy().into_owned()),
@@ -739,9 +719,9 @@ async fn settings_pause_retirement_prevents_spill_and_private_projection() {
             .await
             .unwrap()
     });
-    gate.reached().await;
+    gate.wait_reached().await;
     policy.retire();
-    gate.release.add_permits(1);
+    gate.release();
     refused(&task.await.unwrap());
     assert!(!dir.path().join("tool-outputs").exists());
 }
@@ -764,13 +744,13 @@ async fn artifact_start_orders_are_distinct_from_response_admission() {
                 .await
                 .unwrap()
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert!(
             !dir.path().join("tool-outputs").exists(),
             "no I/O while admission holds its guards"
         );
         policy.retire();
-        gate.release.add_permits(1);
+        gate.release();
         refused(&task.await.unwrap());
         let folder = dir.path().join("tool-outputs");
         assert_eq!(folder.exists(), admitted);
@@ -812,7 +792,7 @@ async fn cancelling_before_or_after_start_keeps_distinct_original_job_accounting
                 .handle_message_for_delivery(&call(1, "return await ws.git.listRoots();"), context)
                 .await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         task.abort();
         assert!(matches!(task.await,Err(error) if error.is_cancelled()));
         assert_eq!(
@@ -824,7 +804,7 @@ async fn cancelling_before_or_after_start_keeps_distinct_original_job_accounting
             }
         );
         assert!(!dir.path().join("tool-outputs").exists());
-        gate.release.add_permits(1);
+        gate.release();
     }
 }
 
@@ -932,13 +912,13 @@ async fn arbitrary_attachment_batch_is_private_until_its_own_admission() {
         let task = tokio::spawn(async move {
             server.handle_message(&call(1,"await ws.git.listRoots(); return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:'{\"value\":\"private-fixture-payload\"}'}},{type:'text',text:'arbitrary'}]};")).await.unwrap()
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert_eq!(
             registry.pending_count_by_mime(&"agent-1".into(), "application/json"),
             0
         );
         policy.retire();
-        gate.release.add_permits(1);
+        gate.release();
         refused(&task.await.unwrap());
         assert_eq!(
             registry.pending_count_by_mime(&"agent-1".into(), "application/json"),
@@ -993,10 +973,10 @@ async fn cancelled_and_unpolled_calls_never_retry_or_detach() {
     assert_eq!(policy.captures.load(Ordering::SeqCst), 0);
     let gate = policy.pause(McpPrivateBoundaryKind::HostPromise, false);
     let task = tokio::spawn(async move { server.handle_message(&message).await });
-    gate.reached().await;
+    gate.wait_reached().await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    gate.release.add_permits(1);
+    gate.release();
     assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
     assert_eq!(policy.events.lock().unwrap().len(), 1);
 }
@@ -1031,7 +1011,7 @@ async fn expired_delivery_budget_is_not_an_operation_timeout() {
         .unwrap();
     let gate = policy.pause(McpPrivateBoundaryKind::DirectResponse, false);
     let task = tokio::spawn(response.into_direct());
-    gate.reached().await;
+    gate.wait_reached().await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(121)).await;
     let result = task.await.unwrap();
@@ -1039,7 +1019,7 @@ async fn expired_delivery_budget_is_not_an_operation_timeout() {
     refused(&result.value);
     assert!(!result.value.to_string().contains("timed out"));
     assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
-    gate.release.add_permits(1);
+    gate.release();
 }
 
 /// Explicit neutral policy fixtures. These locks/identities do not implement
@@ -1073,8 +1053,8 @@ pub(crate) mod optional {
         pub(crate) capture_enabled: AtomicBool,
         pub(crate) mode: AtomicU8,
         pub(crate) admission_mode: AtomicU8,
-        pub(crate) gate: Mutex<Option<Arc<Gate>>>,
-        pub(crate) admission_gate: Mutex<Option<(bool, Arc<Gate>)>>,
+        pub(crate) gate: Mutex<Option<Arc<PausePoint>>>,
+        pub(crate) admission_gate: Mutex<Option<(bool, Arc<PausePoint>)>>,
         pub(crate) lease: Mutex<Option<GuidanceLease>>,
         captured_invocation: Mutex<Option<std::sync::Weak<Invocation>>>,
         stolen: Mutex<Option<McpTransferReceipt>>,
@@ -1110,13 +1090,13 @@ pub(crate) mod optional {
                 in_transfer: Arc::new(AtomicBool::new(false)),
             })
         }
-        pub(crate) fn pause_source(&self) -> Arc<Gate> {
-            let gate = Gate::new();
+        pub(crate) fn pause_source(&self) -> Arc<PausePoint> {
+            let gate = PausePoint::new("guidance source");
             *self.gate.lock().unwrap() = Some(gate.clone());
             gate
         }
-        pub(crate) fn pause_admission(&self, after: bool) -> Arc<Gate> {
-            let gate = Gate::new();
+        pub(crate) fn pause_admission(&self, after: bool) -> Arc<PausePoint> {
+            let gate = PausePoint::new("guidance admission");
             *self.admission_gate.lock().unwrap() = Some((after, gate.clone()));
             gate
         }
@@ -1197,7 +1177,7 @@ pub(crate) mod optional {
                 );
                 let gate = self.0.gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
-                    gate.wait().await;
+                    gate.pause().await;
                 }
                 let mode = self.0.mode.load(Ordering::SeqCst);
                 if mode == 7 {
@@ -1315,7 +1295,7 @@ pub(crate) mod optional {
                 );
                 let hold = self.0.admission_gate.lock().unwrap().clone();
                 if let Some((false, gate)) = &hold {
-                    gate.wait().await;
+                    gate.pause().await;
                 }
                 let mode = self.0.admission_mode.load(Ordering::SeqCst);
                 assert_ne!(mode, 1, "combined admission panic before consumption");
@@ -1365,7 +1345,7 @@ pub(crate) mod optional {
                     return McpPrivateAdmission::Refused;
                 }
                 if let Some((true, gate)) = &hold {
-                    gate.wait().await;
+                    gate.pause().await;
                 }
                 result
             })
@@ -1526,7 +1506,7 @@ pub(crate) mod optional {
         let server = server(Arc::new(Api::new()), state.clone(), false);
         let response = response(&server, READ).await;
         let task = tokio::spawn(deliver(response));
-        gate.reached().await;
+        gate.wait_reached().await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(2)).await;
         let (outcome, value) = task.await.unwrap();
@@ -1537,7 +1517,7 @@ pub(crate) mod optional {
         assert!(state.required.live.load(Ordering::SeqCst));
         assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
         assert_eq!(state.scope_runs.load(Ordering::SeqCst), 2);
-        gate.release.add_permits(1);
+        gate.release();
         assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
     }
 
@@ -1624,9 +1604,9 @@ pub(crate) mod optional {
         let server = server(api.clone(), state.clone(), false);
         let response=response(&server,"try {await ws.git.listRoots();} catch(_){} await ws.workspace.setStatusMessage('completed'); return 'constant';").await;
         let task = tokio::spawn(deliver(response));
-        gate.reached().await;
+        gate.wait_reached().await;
         state.required.retire();
-        gate.release.add_permits(1);
+        gate.release();
         let (outcome, value) = task.await.unwrap();
         assert_eq!(outcome, DeliveryOutcome::Refused);
         refused(&value);
@@ -1726,7 +1706,7 @@ pub(crate) mod optional {
         let server = server(Arc::new(Api::new()), state.clone(), false);
         let response = response(&server, READ).await;
         let task = tokio::spawn(response.response.prepare_guidance());
-        gate.reached().await;
+        gate.wait_reached().await;
         task.abort();
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         tokio::time::timeout(wait(), state.leaf_dropped.notified())
@@ -1736,7 +1716,7 @@ pub(crate) mod optional {
         assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
         assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
         assert_eq!(state.optional_calls.load(Ordering::SeqCst), 0);
-        gate.release.add_permits(1);
+        gate.release();
         assert_eq!(state.polls.load(Ordering::SeqCst), 1);
     }
 
@@ -2034,7 +2014,7 @@ mod captured_scope_lifetime {
                 let token = lifetime.token();
                 let mut delivery = Box::pin(response.enqueue(tx, &token));
                 tokio::select! {
-                    () = gate.reached() => {},
+                    () = gate.wait_reached() => {},
                     result = &mut delivery => panic!("held admission completed: {result:?}"),
                 }
                 assert!(probe.alive());
@@ -2043,7 +2023,7 @@ mod captured_scope_lifetime {
                 if cancel {
                     drop(delivery);
                 } else {
-                    gate.release.add_permits(1);
+                    gate.release();
                     assert_eq!(delivery.await, DeliveryOutcome::Admitted);
                 }
                 probe.released();
@@ -2067,12 +2047,12 @@ mod captured_scope_lifetime {
         let response = ready(&server, &probe).await;
         let mut delivery = Box::pin(optional::deliver(response));
         tokio::select! {
-            () = gate.reached() => {},
+            () = gate.wait_reached() => {},
             _ = &mut delivery => panic!("held admission completed"),
         }
         assert!(probe.alive());
         state.required.retire();
-        gate.release.add_permits(1);
+        gate.release();
         let (outcome, value) = delivery.await;
         assert_eq!(outcome, DeliveryOutcome::Admitted);
         assert!(!optional::has_guidance(&value));
@@ -2124,7 +2104,7 @@ mod captured_scope_lifetime {
             let response = ready(&server, &probe).await;
             let mut delivery = Box::pin(optional::deliver(response));
             tokio::select! {
-                () = gate.reached() => {},
+                () = gate.wait_reached() => {},
                 _ = &mut delivery => panic!("held preparation completed"),
             }
             assert!(probe.alive());
@@ -2146,7 +2126,7 @@ mod captured_scope_lifetime {
             assert_eq!(probe.final_calls.load(Ordering::SeqCst), 0);
             assert_eq!(state.constructor.load(Ordering::SeqCst), 1);
             assert_eq!(state.scope_runs.load(Ordering::SeqCst), 1);
-            gate.release.add_permits(1);
+            gate.release();
             assert_eq!(state.leaves_dropped.load(Ordering::SeqCst), 1);
         }
     }

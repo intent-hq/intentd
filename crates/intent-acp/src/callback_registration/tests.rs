@@ -3,8 +3,9 @@ use std::future::{pending, ready};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use intent_core::{BoxFuture, WorkspaceApi};
+use intentd_test_support::PausePoint;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::handshake::handshake_with_callbacks;
@@ -598,16 +599,14 @@ impl NodePeer {
 
 struct McpApi {
     hold: AtomicBool,
-    entered: Notify,
-    release: Notify,
+    pause: Arc<PausePoint>,
 }
 
 impl WorkspaceApi for McpApi {
     fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
         Box::pin(async move {
             if self.hold.swap(false, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
             }
             Ok(json!({"path":path,"value":match path.as_str() {
                 "workspaceApi.toonOutput" => json!(false),
@@ -621,8 +620,7 @@ impl WorkspaceApi for McpApi {
 async fn mcp() -> (crate::McpBridge, Arc<McpApi>) {
     let api = Arc::new(McpApi {
         hold: AtomicBool::new(false),
-        entered: Notify::new(),
-        release: Notify::new(),
+        pause: PausePoint::new("workspace-mcp settings_get"),
     });
     let server = crate::WorkspaceMcpServer::new(api.clone(), "fixture-workspace".into());
     let bridge = crate::serve_workspace_mcp_tcp(Arc::new(server))
@@ -685,7 +683,7 @@ async fn actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_ol
     // The old operation has reached post-operation settings; its response is held.
     old_api.hold.store(true, Ordering::SeqCst);
     let conn = Arc::clone(&f.connection);
-    let held = tokio::spawn(async move {
+    let mut held = tokio::spawn(async move {
         conn.request_timeout(
             "fixture/call",
             json!({"name":"workspace-mcp","code":"return 'old ordinary result';"}),
@@ -694,7 +692,7 @@ async fn actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_ol
         .await
         .unwrap()
     });
-    timeout(wait(), old_api.entered.notified()).await.unwrap();
+    old_api.pause.reached(&mut held).await;
     let (fresh, _) = mcp().await;
     let outcome = bridge_registration(opened.query.unwrap(), &fresh)
         .run(pending())
@@ -710,7 +708,7 @@ async fn actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_ol
         outcome.result.as_ref().unwrap().added,
         std::slice::from_ref(&outcome.server_name)
     );
-    old_api.release.notify_one();
+    old_api.pause.release();
     assert!(held
         .await
         .unwrap()

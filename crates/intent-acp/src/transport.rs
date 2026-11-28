@@ -1769,7 +1769,6 @@ mod prompt_transfer_tests {
         Hold,
     }
 
-    #[derive(Default)]
     struct Observation {
         calls: AtomicUsize,
         polls: AtomicUsize,
@@ -1777,8 +1776,21 @@ mod prompt_transfer_tests {
         owner_drops: AtomicUsize,
         currency: AtomicBool,
         boundaries: Mutex<Vec<Arc<()>>>,
-        entered: Notify,
-        release: Notify,
+        hold: intentd_test_support::PausePoint,
+    }
+
+    impl Default for Observation {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::default(),
+                polls: AtomicUsize::default(),
+                future_drops: AtomicUsize::default(),
+                owner_drops: AtomicUsize::default(),
+                currency: AtomicBool::default(),
+                boundaries: Mutex::default(),
+                hold: intentd_test_support::PausePoint::unshared("prompt admission hold"),
+            }
+        }
     }
 
     struct Policy {
@@ -1824,7 +1836,6 @@ mod prompt_transfer_tests {
             Box::pin(async move {
                 let _cleanup = cleanup;
                 self.seen.polls.fetch_add(1, Ordering::SeqCst);
-                self.seen.entered.notify_one();
                 match self.mode {
                     Mode::Refuse | Mode::DropPanic => AcpPromptAdmissionOutcome::OmitOptional,
                     Mode::PollPanic => panic!("injected poll panic"),
@@ -1849,7 +1860,7 @@ mod prompt_transfer_tests {
                         AcpPromptAdmissionOutcome::Transferred(AcpPromptReceipt(Arc::new(())))
                     }
                     Mode::Hold => {
-                        self.seen.release.notified().await;
+                        self.seen.hold.pause().await;
                         let variant = if self.seen.currency.load(Ordering::SeqCst) {
                             PromptVariant::WithGuidance
                         } else {
@@ -2046,7 +2057,7 @@ mod prompt_transfer_tests {
             assert_eq!(seen.calls.load(Ordering::SeqCst), usize::from(held_policy));
             seen.currency.store(false, Ordering::SeqCst);
             if held_policy {
-                seen.release.notify_one();
+                seen.hold.release();
             } else {
                 drop(reserved.pop());
             }
@@ -2270,7 +2281,7 @@ mod prompt_transfer_tests {
         reply(&mut second_writer, &second_frame["id"]).await;
         assert!(second_request.await.is_ok());
         assert_eq!(first.pending_len(), 1);
-        seen.release.notify_one();
+        seen.hold.release();
         let first_frame = read_frame(&mut first_reader, first_request.as_mut()).await;
         assert_eq!(first_frame["id"], second_frame["id"]);
         assert_eq!(

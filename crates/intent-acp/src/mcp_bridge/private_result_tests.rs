@@ -44,7 +44,7 @@ async fn retired_bridge_refusal(optional: bool) {
         .write_all(format!("{message}\n").as_bytes())
         .await
         .unwrap();
-    gate.reached().await;
+    gate.wait_reached().await;
     policy.retire();
     drop(bridge);
     tokio::time::timeout(wait(), async {
@@ -54,7 +54,7 @@ async fn retired_bridge_refusal(optional: bool) {
     })
     .await
     .unwrap();
-    gate.release.add_permits(1);
+    gate.release();
     let line = tokio::time::timeout(wait(), lines.next_line())
         .await
         .unwrap()
@@ -101,9 +101,9 @@ async fn tcp_final_admission_retirement_orders_and_completed_effects() {
             .write_all(format!("{message}\n").as_bytes())
             .await
             .unwrap();
-        gate.reached().await;
+        gate.wait_reached().await;
         policy.retire();
-        gate.release.add_permits(1);
+        gate.release();
         let line = tokio::time::timeout(wait(), lines.next_line())
             .await
             .unwrap()
@@ -243,11 +243,11 @@ async fn cancelled_queue_admission_never_publishes_partial_or_replacement_packet
     let lifetime = ConnectionLifetime::new();
     let connection = lifetime.token();
     let task = tokio::spawn(async move { response.enqueue(sender, &connection).await });
-    gate.reached().await;
+    gate.wait_reached().await;
     assert!(receiver.try_recv().is_err());
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    gate.release.add_permits(1);
+    gate.release();
     assert!(receiver.recv().await.is_none());
 }
 
@@ -267,8 +267,8 @@ async fn optional_full_queue_rechecks_required_and_optional_at_one_original_perm
         let life = ConnectionLifetime::new();
         let token = life.token();
         let task = tokio::spawn(async move { response.enqueue(tx, &token).await });
-        gate.reached().await;
-        gate.release.add_permits(1);
+        gate.wait_reached().await;
+        gate.release();
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -318,8 +318,8 @@ async fn optional_queue_budget_expiry_preserves_same_refusal_slot_and_empty_base
         let life = ConnectionLifetime::new();
         let token = life.token();
         let task = tokio::spawn(async move { response.enqueue(tx, &token).await });
-        gate.reached().await;
-        gate.release.add_permits(1);
+        gate.wait_reached().await;
+        gate.release();
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -362,13 +362,13 @@ async fn optional_closed_consumer_and_cancel_before_or_after_transfer_dispose_on
         let life = ConnectionLifetime::new();
         let token = life.token();
         let task = tokio::spawn(async move { response.enqueue(tx, &token).await });
-        gate.reached().await;
+        gate.wait_reached().await;
         if !after {
             assert!(rx.try_recv().is_err());
         }
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        gate.release.add_permits(1);
+        gate.release();
         if after {
             assert!(rx
                 .recv()

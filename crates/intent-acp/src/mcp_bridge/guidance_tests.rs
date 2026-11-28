@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use intent_core::{BoxFuture, Caller, Result, Workspace, WorkspaceApi, WorkspaceId};
+use intentd_test_support::PausePoint;
 use tokio::io::AsyncReadExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
@@ -315,8 +316,7 @@ async fn actual_writer_rechecks_already_queued_sidecars_after_revision_and_conne
 struct RacingDispatch {
     fence: RepositoryGuidanceFence,
     lease: GuidanceLease,
-    entered: Notify,
-    release: Notify,
+    pause: Arc<PausePoint>,
     replace_epoch: bool,
 }
 
@@ -327,8 +327,7 @@ impl RacingDispatch {
         Arc::new(Self {
             fence,
             lease,
-            entered: Notify::new(),
-            release: Notify::new(),
+            pause: PausePoint::new("racing dispatch id 1"),
             replace_epoch,
         })
     }
@@ -355,8 +354,7 @@ impl BridgeDispatch for RacingDispatch {
                 let candidate =
                     self.lease
                         .current_candidate(scope(), revision(1), "old guidance".into());
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
                 candidate
             } else if self.replace_epoch {
                 let next =
@@ -387,13 +385,13 @@ async fn real_tcp_late_results_cannot_regress_revision_or_epoch_across_connectio
         let (mut old_reader, mut old_write) = connect(&bridge).await;
         let (mut new_reader, mut new_write) = connect(&bridge).await;
         send(&mut old_write, &json!({"id":1,"method":"slow"})).await;
-        timeout(wait(), dispatch.entered.notified()).await.unwrap();
+        dispatch.pause.wait_reached().await;
         send(&mut old_write, &json!({"id":99,"method":"ping"})).await;
         assert_eq!(read(&mut old_reader).await["id"], 99);
         send(&mut new_write, &json!({"id":2,"method":"new"})).await;
         let current = read(&mut new_reader).await;
         assert_eq!(current["result"]["content"][1]["text"], "new guidance");
-        dispatch.release.notify_one();
+        dispatch.pause.release();
         let old = read(&mut old_reader).await;
         assert_eq!(old, operation_result(1));
     }
@@ -412,12 +410,12 @@ async fn retired_endpoint_preserves_pending_operation_without_guidance() {
     let bridge = serve_mcp_tcp(dispatch.clone()).await.unwrap();
     let (mut reader, mut write) = connect(&bridge).await;
     send(&mut write, &json!({"id":1,"method":"slow"})).await;
-    timeout(wait(), dispatch.entered.notified()).await.unwrap();
+    dispatch.pause.wait_reached().await;
 
     // The existing connection retains its ordinary response behavior when the
     // endpoint handle drops. Its prepared guidance must retire with the owner.
     drop(bridge);
-    dispatch.release.notify_one();
+    dispatch.pause.release();
     assert_eq!(read(&mut reader).await, operation_result(1));
 }
 
@@ -554,13 +552,13 @@ async fn qualified_optional_tcp_admission_orders_keep_results_effects_and_one_wh
                 ),
             )
             .await;
-            gate.reached().await;
+            gate.wait_reached().await;
             if required {
                 state.required.retire();
             } else {
                 state.live.store(false, Ordering::SeqCst);
             }
-            gate.release.add_permits(1);
+            gate.release();
             let value = read(&mut reader).await;
             if required && !after {
                 crate::mcp_server::private_results::tests::refused(&value);
@@ -627,7 +625,7 @@ async fn qualified_optional_pending_preparation_does_not_block_ping_or_lose_comp
         .unwrap();
     let (mut reader, mut writer) = connect(&bridge).await;
     send(&mut writer, &call(1, o::READ)).await;
-    gate.reached().await;
+    gate.wait_reached().await;
     send(
         &mut writer,
         &json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
