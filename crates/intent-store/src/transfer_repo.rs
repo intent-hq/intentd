@@ -111,12 +111,34 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("pull_request_workspace", "workspace_id = ?1"),
 ];
 
+/// `agent_session_prompt` (0205) columns that ride the archive inside each
+/// `agent_session` row, under their pre-0205 names: export joins them in,
+/// import splits them back out, so archives keep one format across the move
+/// and old archives import unchanged.
+pub(crate) const AGENT_SESSION_PROMPT_COLUMNS: [&str; 2] = ["system_prompt", "prompt_breakdown"];
+
+/// The export `SELECT` for one [`TRANSFER_TABLES`] entry.
+fn export_select(table: &str, predicate: &str) -> String {
+    if table == "agent_session" {
+        let prompt = AGENT_SESSION_PROMPT_COLUMNS
+            .map(|c| format!(", agent_session_prompt.{c}"))
+            .concat();
+        format!(
+            "SELECT agent_session.*{prompt} FROM {} WHERE {predicate}",
+            crate::agent_repo::SESSION_FROM
+        )
+    } else {
+        format!("SELECT * FROM \"{table}\" WHERE {predicate}")
+    }
+}
+
 /// Tables deliberately **excluded** from a transfer, each with the rationale.
 /// Together with [`TRANSFER_TABLES`] this must cover the entire live schema
 /// (enforced by `every_live_table_has_an_explicit_transfer_decision`), so a
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("agent_session_prompt", "rides inside the agent_session rows (AGENT_SESSION_PROMPT_COLUMNS): export joins it in, import splits it out"),
     ("agent_dismissal_notice", "notice dedupe receipts of the source daemon; an imported agent's persisted dismissal marker still guards its latest id"),
     ("agent_browser_sender", "connection-bound device receipts belong to the source daemon; imported agents must not inherit its client identities"),
     ("invite_nonce", "short-lived invite.challenge nonces bound to this daemon's invites; never transferred"),
@@ -535,7 +557,7 @@ impl crate::SqliteStore {
             .iter()
             .enumerate()
             .map(|(i, (table, predicate))| {
-                let size_expr = match columns.get(*table) {
+                let mut size_expr = match columns.get(*table) {
                     Some(cols) if !cols.is_empty() => cols
                         .iter()
                         // The argument must stay a bare column: any wrapper
@@ -545,6 +567,16 @@ impl crate::SqliteStore {
                         .join(" + "),
                     _ => "0".to_string(),
                 };
+                if *table == "agent_session" {
+                    // The stored prompt rides each exported session row.
+                    let prompt = AGENT_SESSION_PROMPT_COLUMNS
+                        .map(|c| format!("COALESCE(OCTET_LENGTH(p.\"{c}\"), 0)"))
+                        .join(" + ");
+                    size_expr = format!(
+                        "{size_expr} + COALESCE((SELECT {prompt} FROM agent_session_prompt p \
+                         WHERE p.agent_id = agent_session.id), 0)"
+                    );
+                }
                 format!(
                     "SELECT {i} AS i, COUNT(*) AS n, COALESCE(SUM({size_expr}), 0) AS b \
                      FROM \"{table}\" WHERE {predicate}"
@@ -600,7 +632,7 @@ impl crate::SqliteStore {
             .map_err(|e| Error::Internal(format!("transfer export begin failed: {e}")))?;
         let mut out = Vec::with_capacity(TRANSFER_TABLES.len());
         for (table, predicate) in TRANSFER_TABLES {
-            let sql = format!("SELECT * FROM \"{table}\" WHERE {predicate}");
+            let sql = export_select(table, predicate);
             let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&workspace_id.0)
                 .fetch_all(&mut *tx)
@@ -776,8 +808,13 @@ impl crate::SqliteStore {
                     None
                 };
                 let map = monitor_map.as_ref().unwrap_or(map);
+                // `agent_session` rows carry the 0205 side-table columns;
+                // they are inserted into `agent_session_prompt` below.
+                let session_prompt_key = |key: &str| {
+                    *table == "agent_session" && AGENT_SESSION_PROMPT_COLUMNS.contains(&key)
+                };
                 let mut columns = Vec::with_capacity(map.len());
-                for key in map.keys() {
+                for key in map.keys().filter(|key| !session_prompt_key(key.as_str())) {
                     if !schema.contains(key) {
                         return Err(Error::InvalidParams(format!(
                             "transfer import: {table} has no column {key}"
@@ -800,7 +837,10 @@ impl crate::SqliteStore {
                 );
                 let empty_activity = serde_json::json!("[]");
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                for (key, value) in map {
+                for (key, value) in map
+                    .iter()
+                    .filter(|(key, _)| !session_prompt_key(key.as_str()))
+                {
                     query = bind_json_value(
                         query,
                         table,
@@ -867,6 +907,9 @@ impl crate::SqliteStore {
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                if *table == "agent_session" {
+                    import_session_prompt(&mut tx, map).await?;
+                }
                 if let Some(metadata) = history_metadata {
                     sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
                         .bind(metadata)
@@ -1085,6 +1128,34 @@ async fn reclaim_imported_metadata(
 
 /// Serialize one `SQLite` row to a JSON object keyed by column name (see
 /// [`Store::transfer_export_rows`] for the storage-class mapping).
+/// Insert an imported `agent_session` row's [`AGENT_SESSION_PROMPT_COLUMNS`]
+/// into `agent_session_prompt`, after the session row. A row with neither
+/// value stores nothing, as a fresh session does.
+async fn import_session_prompt(
+    tx: &mut sqlx::SqliteConnection,
+    session: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let values =
+        AGENT_SESSION_PROMPT_COLUMNS.map(|c| session.get(c).unwrap_or(&serde_json::Value::Null));
+    if values.iter().all(|v| v.is_null()) {
+        return Ok(());
+    }
+    let mut query = sqlx::query(
+        "INSERT INTO agent_session_prompt (agent_id, system_prompt, prompt_breakdown) \
+         VALUES (?, ?, ?)",
+    )
+    .bind(session.get("id").and_then(serde_json::Value::as_str));
+    for (column, value) in AGENT_SESSION_PROMPT_COLUMNS.iter().zip(values) {
+        query = bind_json_value(query, "agent_session_prompt", column, value)?;
+    }
+    query.execute(tx).await.map_err(|e| {
+        Error::Internal(format!(
+            "transfer import insert into agent_session_prompt failed: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
     let mut object = serde_json::Map::with_capacity(row.columns().len());
     for (i, column) in row.columns().iter().enumerate() {
@@ -2193,7 +2264,7 @@ discussion_participant: conversation_id, workspace_id, source_principal_id, prin
 workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json, principal_mentions_json
 discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto, pinned, prompt_breakdown, permission_policy, goal, goal_set_by
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto, pinned, permission_policy, goal, goal_set_by, system_prompt, prompt_breakdown
 script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
 script_notification_job: wake_id, workspace_id, agent_id, script_id, run_id, metadata, body, phase, created_at
 agent_queue_admission: id, agent_id, workspace_id, turn_id, payload, created_at, phase
@@ -2235,6 +2306,20 @@ pull_request_workspace: pr_key, workspace_id, source, linked_at";
             .fetch_all(store.read_pool())
             .await
             .expect("table_info");
+            let mut cols = cols;
+            if *table == "agent_session" {
+                // The archive's session rows also carry the side table's
+                // columns; any other side-table column fails here.
+                let side: Vec<String> = sqlx::query_scalar(
+                    "SELECT name FROM pragma_table_info('agent_session_prompt') \
+                     WHERE name != 'agent_id' ORDER BY cid",
+                )
+                .fetch_all(store.read_pool())
+                .await
+                .expect("table_info");
+                assert_eq!(side, super::AGENT_SESSION_PROMPT_COLUMNS);
+                cols.extend(side);
+            }
             let _ = writeln!(actual, "{table}: {}", cols.join(", "));
         }
         let actual = actual.trim_end();

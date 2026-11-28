@@ -36,6 +36,7 @@ mod note_search;
 mod note_write_lock;
 mod pull_request_workspace;
 mod sandbox_removal;
+mod session_prompt_table;
 mod workspace_pr_settled;
 mod write_acquire_retry;
 
