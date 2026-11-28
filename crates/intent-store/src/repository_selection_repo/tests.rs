@@ -679,8 +679,7 @@ async fn admitted_selection_initial_authority_and_foreign_domain_refuse_before_e
     );
 }
 struct SelectionDrain {
-    entered: tokio::sync::Notify,
-    released: (std::sync::Mutex<bool>, std::sync::Condvar),
+    pause: intentd_test_support::PausePoint,
     panic_settlement: bool,
 }
 impl crate::RepositoryLifecycleObserver for SelectionDrain {
@@ -692,16 +691,7 @@ impl crate::RepositoryLifecycleObserver for SelectionDrain {
             .iter()
             .any(|k| matches!(k, crate::RepositoryLifecycleKey::Selection { .. }));
         if selected && !self.panic_settlement {
-            self.entered.notify_one();
-            let (ready, signal) = &self.released;
-            let waited = signal
-                .wait_timeout_while(
-                    ready.lock().unwrap(),
-                    intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-                    |ready| !*ready,
-                )
-                .unwrap();
-            assert!(*waited.0, "original selection drain never released");
+            self.pause.pause_blocking();
         }
         Ok(Box::new(SelectionSettled {
             panic: selected && self.panic_settlement,
@@ -727,8 +717,7 @@ async fn admitted_selection_final_transaction_rechecks_authority_after_real_drai
     let authority = selection_authority(&f, Some("drain-fixture")).await;
     let before = f.read().await;
     let drain = Arc::new(SelectionDrain {
-        entered: tokio::sync::Notify::new(),
-        released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        pause: intentd_test_support::PausePoint::unshared("selection drain"),
         panic_settlement: false,
     });
     f.store
@@ -746,18 +735,12 @@ async fn admitted_selection_final_transaction_rechecks_authority_after_real_drai
             || panic!("changed authority reached UPDATE"),
         ))
     });
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-        drain.entered.notified(),
-    )
-    .await
-    .unwrap();
+    drain.pause.wait_reached().await;
     f.store
         .revoke_principal_credential("drain-fixture")
         .await
         .unwrap();
-    *drain.released.0.lock().unwrap() = true;
-    drain.released.1.notify_all();
+    drain.pause.release();
     let result = worker.await.unwrap();
     assert_eq!(result.persistence, RepositorySelectionPersistence::NoEffect);
     assert!(result.result.is_err());
@@ -772,8 +755,7 @@ async fn admitted_selection_commit_survives_settlement_failure_and_abort_stays_u
     let before = f.read().await;
     let authority = selection_authority(&f, None).await;
     let observer = Arc::new(SelectionDrain {
-        entered: tokio::sync::Notify::new(),
-        released: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        pause: intentd_test_support::PausePoint::unshared("selection drain"),
         panic_settlement: true,
     });
     f.store
@@ -819,8 +801,7 @@ async fn admitted_selection_commit_survives_settlement_failure_and_abort_stays_u
 }
 
 struct AsyncSelectionSettlement {
-    entered: Arc<tokio::sync::Notify>,
-    released: Arc<tokio::sync::Notify>,
+    pause: Arc<intentd_test_support::PausePoint>,
     settled: Arc<std::sync::atomic::AtomicBool>,
 }
 impl crate::RepositoryLifecycleObserver for AsyncSelectionSettlement {
@@ -829,8 +810,7 @@ impl crate::RepositoryLifecycleObserver for AsyncSelectionSettlement {
         _: &[crate::RepositoryLifecycleKey],
     ) -> Result<Box<dyn crate::RepositoryLifecycleMutationTicket>> {
         Ok(Box::new(Self {
-            entered: self.entered.clone(),
-            released: self.released.clone(),
+            pause: self.pause.clone(),
             settled: self.settled.clone(),
         }))
     }
@@ -844,8 +824,7 @@ impl crate::RepositoryLifecycleMutationTicket for AsyncSelectionSettlement {
         self: Box<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
-            self.entered.notify_one();
-            self.released.notified().await;
+            self.pause.pause().await;
             self.settle_confirmed();
             Ok(())
         })
@@ -856,8 +835,7 @@ async fn selection_waits_for_original_completion(cancel: bool) {
     let f = Fixture::new().await;
     let original = f.read().await;
     let observer = Arc::new(AsyncSelectionSettlement {
-        entered: Arc::new(tokio::sync::Notify::new()),
-        released: Arc::new(tokio::sync::Notify::new()),
+        pause: intentd_test_support::PausePoint::new("original selection retirement"),
         settled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     f.store
@@ -869,9 +847,8 @@ async fn selection_waits_for_original_completion(cancel: bool) {
             .write_repository_selection(&original, remote("selected")),
     );
     tokio::select! {
-        () = observer.entered.notified() => {},
+        () = observer.pause.wait_reached() => {},
         _ = &mut write => panic!("selection completed before original retirement"),
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("selection did not start original retirement"),
     }
     assert!(!observer.settled.load(std::sync::atomic::Ordering::SeqCst));
     let stored = tokio::time::timeout(
@@ -888,7 +865,7 @@ async fn selection_waits_for_original_completion(cancel: bool) {
     );
     if cancel {
         drop(write);
-        observer.released.notify_one();
+        observer.pause.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             async {
@@ -900,7 +877,7 @@ async fn selection_waits_for_original_completion(cancel: bool) {
         .await
         .expect("cancelled selection waiter abandoned completion");
     } else {
-        observer.released.notify_one();
+        observer.pause.release();
         let outcome = write.await;
         assert!(matches!(
             outcome.persistence,

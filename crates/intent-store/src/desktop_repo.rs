@@ -79,13 +79,6 @@ impl DesktopWrites {
     }
 }
 
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct DeleteBarrier {
-    pub entered: tokio::sync::Notify,
-    pub release: tokio::sync::Notify,
-}
-
 const PREFIX: &str = "desktop.v1/";
 // Result::map_err supplies its owned SQL error to this shared adapter.
 #[expect(clippy::needless_pass_by_value)]

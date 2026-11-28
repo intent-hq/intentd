@@ -19,7 +19,7 @@ use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, S
 tokio::task_local! {
     /// Test-only seam: entered just before the workspace desktop cleanup
     /// transaction, so a test can saturate the writer at exactly that step.
-    pub(crate) static DESKTOP_CLEANUP_ENTRY: std::sync::Arc<crate::desktop_repo::DeleteBarrier>;
+    pub(crate) static DESKTOP_CLEANUP_ENTRY: std::sync::Arc<intentd_test_support::PausePoint>;
 }
 
 pub(crate) const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
@@ -1648,8 +1648,7 @@ impl crate::SqliteStore {
         // early but cannot leave authority attached to a deleted agent.
         #[cfg(test)]
         if let Ok(barrier) = DESKTOP_CLEANUP_ENTRY.try_with(std::sync::Arc::clone) {
-            barrier.entered.notify_one();
-            barrier.release.notified().await;
+            barrier.pause().await;
         }
         // A busy or saturated writer retries the whole idempotent cleanup
         // transaction, so it cannot fail the delete half-way (intent-hq/intent#7705).
@@ -1674,8 +1673,7 @@ impl crate::SqliteStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(barrier) = barrier {
-                barrier.entered.notify_one();
-                barrier.release.notified().await;
+                barrier.pause().await;
             }
         }
 

@@ -688,7 +688,7 @@ pub(crate) struct SqliteStore {
     desktop_writes: desktop_repo::DesktopWrites,
     #[cfg(test)]
     desktop_delete_barrier:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_repo::DeleteBarrier>>>>,
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<intentd_test_support::PausePoint>>>>,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-note content-write locks; see `note_write_lock`.
@@ -696,9 +696,8 @@ pub(crate) struct SqliteStore {
     /// This process's leases; see `lease_repo`.
     leases: lease_repo::LocalLeases,
     #[cfg(test)]
-    export_author_barrier: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
-    >,
+    export_author_barrier:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<intentd_test_support::PausePoint>>>>,
 }
 
 /// Exclusive database ownership prepared without opening `SQLite`.

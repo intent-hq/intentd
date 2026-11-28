@@ -430,7 +430,7 @@ async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() 
         "desktop state seeded"
     );
 
-    let barrier = Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    let barrier = intentd_test_support::PausePoint::new("desktop delete");
     let observed = Arc::new(AtomicUsize::new(0));
     let deleting = {
         let store = store.clone();
@@ -445,7 +445,7 @@ async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() 
             ),
         )
     };
-    tokio::time::timeout(watchdog(), barrier.entered.notified())
+    tokio::time::timeout(watchdog(), barrier.wait_reached())
         .await
         .expect("delete reaches the desktop cleanup");
     // Saturate the single writer exactly as the desktop cleanup begins.
@@ -454,7 +454,7 @@ async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() 
         .acquire()
         .await
         .expect("hold write connection");
-    barrier.release.notify_one();
+    barrier.release();
     let deadline = tokio::time::Instant::now() + watchdog();
     while observed.load(Ordering::SeqCst) == 0
         && !deleting.is_finished()

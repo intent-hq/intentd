@@ -12,13 +12,6 @@ use crate::principal_repo::{map_principal_row, PRINCIPAL_COLUMNS};
 
 type Rows = [(String, Vec<Value>)];
 
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct ExportAuthorBarrier {
-    pub entered: tokio::sync::Notify,
-    pub release: tokio::sync::Notify,
-}
-
 fn decode(value: Option<&Value>) -> Result<Option<Value>> {
     match value {
         None | Some(Value::Null) => Ok(None),

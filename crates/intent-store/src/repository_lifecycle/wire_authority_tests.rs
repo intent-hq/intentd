@@ -1004,8 +1004,7 @@ async fn failed_invite_transaction_rolls_back_without_claiming_owner_settlement(
 // completion is held; they do not claim an actual native peer was joined.
 #[derive(Clone)]
 struct HeldPrincipalCompletion {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
+    pause: Arc<intentd_test_support::PausePoint>,
     settled: Arc<AtomicBool>,
 }
 impl RepositoryLifecycleObserver for HeldPrincipalCompletion {
@@ -1024,8 +1023,7 @@ impl RepositoryLifecycleMutationTicket for HeldPrincipalCompletion {
         self: Box<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
-            self.entered.notify_one();
-            self.release.notified().await;
+            self.pause.pause().await;
             self.settle_confirmed();
             Ok(())
         })
@@ -1045,8 +1043,7 @@ async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
         .await
         .unwrap();
     let observer = Arc::new(HeldPrincipalCompletion {
-        entered: Arc::new(tokio::sync::Notify::new()),
-        release: Arc::new(tokio::sync::Notify::new()),
+        pause: intentd_test_support::PausePoint::new("principal retirement settlement"),
         settled: Arc::new(AtomicBool::new(false)),
     });
     store
@@ -1066,11 +1063,7 @@ async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
         }
         Ok::<_, intent_core::Error>(())
     });
-    tokio::select! {
-        () = observer.entered.notified() => {},
-        result = &mut operation => panic!("principal completed before retained settlement: {result:?}"),
-        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("principal did not reach settlement"),
-    }
+    observer.pause.reached(&mut operation).await;
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
@@ -1109,9 +1102,9 @@ async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
     assert!(!observer.settled.load(Ordering::SeqCst));
     if cancelled {
         drop(operation);
-        observer.release.notify_one();
+        observer.pause.release();
     } else {
-        observer.release.notify_one();
+        observer.pause.release();
         operation.await.unwrap();
     }
     timeout(

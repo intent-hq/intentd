@@ -159,12 +159,12 @@ async fn transfer_human_profiles_share_the_rows_wal_snapshot() {
             .await
             .unwrap();
     }
-    let barrier = Arc::new(crate::transfer_authorship::ExportAuthorBarrier::default());
+    let barrier = intentd_test_support::PausePoint::new("transfer export authorship");
     *store.sqlite().export_author_barrier.lock().unwrap() = Some(barrier.clone());
     let exporter = store.clone();
     let export_ws = ws.clone();
     let export = tokio::spawn(async move { exporter.transfer_export_rows(&export_ws).await });
-    barrier.entered.notified().await;
+    barrier.wait_reached().await;
     owner.login = Some("changed-after-rows".into());
     owner.identity = Some(PrincipalIdentity {
         provider: "gitlab".into(),
@@ -184,7 +184,7 @@ async fn transfer_human_profiles_share_the_rows_wal_snapshot() {
         )
         .await
         .unwrap();
-    barrier.release.notify_one();
+    barrier.release();
     let rows = export.await.unwrap().unwrap();
     let messages = &rows.iter().find(|(t, _)| t == "agent_message").unwrap().1;
     assert_eq!(messages.len(), 3);

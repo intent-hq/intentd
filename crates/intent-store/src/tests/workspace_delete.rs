@@ -20,10 +20,9 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
     };
     use std::sync::Arc;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct Retirement {
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
+        pause: Arc<intentd_test_support::PausePoint>,
     }
     impl RepositoryLifecycleObserver for Retirement {
         fn begin_mutation(
@@ -42,8 +41,7 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send>>
         {
             Box::pin(async move {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
                 Ok(())
             })
         }
@@ -58,7 +56,9 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
             .insert_agent_session(&sample_agent_session(&agent, &workspace))
             .await
             .unwrap();
-        let observer = Arc::new(Retirement::default());
+        let observer = Arc::new(Retirement {
+            pause: intentd_test_support::PausePoint::new("repository retirement"),
+        });
         store
             .install_repository_lifecycle_observer(observer.clone())
             .await
@@ -76,17 +76,7 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
             }
         };
         tokio::pin!(operation);
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            async {
-                tokio::select! {
-                    result = &mut operation => panic!("completed before retirement: {result:?}"),
-                    () = observer.entered.notified() => {}
-                }
-            },
-        )
-        .await
-        .expect("agent deletion reaches retirement");
+        observer.pause.reached(&mut operation).await;
         assert!(
             matches!(
                 store.get_agent_session_with_transcript(&agent).await,
@@ -104,7 +94,7 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
         .unwrap()
         .unwrap();
         drop(writer);
-        observer.release.notify_one();
+        observer.pause.release();
         assert!(tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             operation
@@ -915,7 +905,7 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         .unwrap();
     sqlx::query("CREATE TRIGGER fail_desktop_final_delete BEFORE DELETE ON workspace BEGIN SELECT RAISE(ABORT,'late workspace failure'); END")
         .execute(store.write_pool()).await.unwrap();
-    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    let barrier = intentd_test_support::PausePoint::new("desktop delete");
     *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
     let deleting = {
         let store = store.clone();
@@ -924,7 +914,7 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
     };
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        barrier.entered.notified(),
+        barrier.wait_reached(),
     )
     .await
     .unwrap();
@@ -959,7 +949,7 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
     .await
     .unwrap()
     .expect("unrelated workspace remains writable");
-    barrier.release.notify_one();
+    barrier.release();
     assert!(deleting.await.unwrap().is_err());
     assert!(store.get_agent_session_summary(&agent).await.is_err());
     let orphan_count:i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*' AND json_extract(value,'$.agentId')=?")
@@ -1011,7 +1001,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
         .unwrap();
     let keeper = seed_workspace(&store, "desktop-unrelated-workspace").await;
     let kept_agent = AgentId::from("desktop-unrelated-agent");
-    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    let barrier = intentd_test_support::PausePoint::new("desktop delete");
     *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
 
     // The first deletion owns the desktop guard, has released lifecycle
@@ -1021,7 +1011,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             tokio::select! {
-                () = barrier.entered.notified() => {},
+                () = barrier.wait_reached() => {},
                 result = &mut first => panic!("deletion finished before the barrier: {result:?}"),
             }
         },
@@ -1046,7 +1036,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     .expect("same-workspace delete waiter must not block unrelated lifecycle writers")
     .unwrap();
 
-    barrier.release.notify_one();
+    barrier.release();
     let (first_result, second_result) = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async { tokio::join!(first, second) },
@@ -1078,14 +1068,14 @@ async fn cancelled_desktop_workspace_delete_releases_gate_and_retry_drains_state
         .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
         .await
         .unwrap();
-    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    let barrier = intentd_test_support::PausePoint::new("desktop delete");
     *store.sqlite().desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
     let mut deleting = Box::pin(store.delete_workspace(&workspace));
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             tokio::select! {
-                () = barrier.entered.notified() => {},
+                () = barrier.wait_reached() => {},
                 result = &mut deleting => panic!("deletion finished before cancellation: {result:?}"),
             }
         },
