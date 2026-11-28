@@ -24863,26 +24863,28 @@ impl WorkspaceApi for Services {
                                 || created_image_blocks.is_some()
                                 || created_file_blocks.is_some());
                         if has_content {
-                            let prompt_text = prompt.unwrap_or_default();
+                            let mut prompt_text = prompt.unwrap_or_default();
                             // Principal stamp (multiplayer w2): the initial
                             // prompt is the creating human's first message,
                             // stamped with the bound wire caller exactly like
                             // `agent.sendMessage` (an agent / daemon caller
-                            // stamps nothing). Stamping an absent payload
-                            // cannot fail, so this never strands the row
-                            // persisted above; the setup record is settled
-                            // defensively all the same.
-                            let message_metadata =
-                                match crate::principal_ops::stamp_principal_attribution(None) {
-                                    Ok(metadata) => metadata,
-                                    Err(e) => {
-                                        record_setup_skipped(
-                                            &services.workspace_setup_states,
-                                            &ws.id,
-                                        );
-                                        return Err(e);
-                                    }
-                                };
+                            // stamps nothing), and a host member's prompt
+                            // gets the same sender preamble as their later
+                            // sends (the owner's stays byte-identical).
+                            // Neither may strand the row persisted above, so
+                            // the setup record is settled on failure.
+                            let attributed = boxed_await(|| {
+                                services.annotate_collaborator_sender(&ws.id, &mut prompt_text)
+                            })
+                            .await
+                            .and_then(|()| crate::principal_ops::stamp_principal_attribution(None));
+                            let message_metadata = match attributed {
+                                Ok(metadata) => metadata,
+                                Err(e) => {
+                                    record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                                    return Err(e);
+                                }
+                            };
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),

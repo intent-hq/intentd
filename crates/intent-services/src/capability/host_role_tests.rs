@@ -129,6 +129,61 @@ async fn member_sender_preamble_uses_bound_person_without_an_explicit_workspace_
     .await;
 }
 
+/// The initial prompt of a member-created workspace is that member's first
+/// message, so it carries the same sender preamble as their later sends.
+#[tokio::test]
+async fn member_created_workspace_initial_prompt_carries_sender_preamble() {
+    let tmp = TempDb::new();
+    let (svc, owner, member) = fixture(&tmp).await;
+    let create = |caller: Caller, prompt: &'static str| {
+        let svc = svc.clone();
+        with_caller(caller, async move {
+            let created = svc
+                .create_workspace(
+                    WorkspaceCreate {
+                        skip_isolation: Some(true),
+                        initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                            prompt: Some(prompt.into()),
+                            provider: Some("auggie".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let ws = created.workspace.id.clone();
+            let preamble = svc.collaborator_sender_preamble(&ws).await.unwrap();
+            let agent = AgentId::from(created.initial_agent.unwrap()["id"].as_str().unwrap());
+            let session = svc
+                .store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .unwrap();
+            let first = session
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .expect("initial user row");
+            (preamble, crate::search_ops::message_text(&first.content))
+        })
+    };
+
+    let (preamble, text) = create(caller(&member), "member kickoff").await;
+    let preamble = preamble.expect("member sender preamble");
+    assert!(preamble.contains(member.as_str()), "{preamble}");
+    assert_eq!(text, format!("{preamble}\n\nmember kickoff"));
+
+    let owner_caller = Caller::Wire {
+        principal_id: owner,
+        host_role: HostRole::Owner,
+    };
+    let (preamble, text) = create(owner_caller, "owner kickoff").await;
+    assert_eq!(preamble, None);
+    assert_eq!(text, "owner kickoff");
+}
+
 #[tokio::test]
 async fn member_file_access_cannot_fall_back_from_a_missing_workspace() {
     let tmp = TempDb::new();
