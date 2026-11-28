@@ -1101,12 +1101,10 @@ impl PtyHost {
     /// empty (monorepo#1300). The session stays registered so its scrollback
     /// and latched exit status remain readable. No-op when the session is
     /// unknown, the child is still running (the group is legitimately
-    /// alive), or the group is already empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
-    pub async fn reap_group_stragglers(&self, id: PtyId) {
+    /// alive), or the group is already empty. Callers get this through
+    /// [`ExitWait::reap_group`].
+    #[cfg(test)]
+    pub(crate) async fn reap_group_stragglers(&self, id: PtyId) {
         if let Ok(session) = self.get(id) {
             reap_stragglers(&session).await;
         }
@@ -1466,6 +1464,10 @@ fn read_loop(
     sink: Option<OutputSink>,
     #[cfg(windows)] writer: &Arc<Mutex<Box<dyn Write + Send>>>,
 ) {
+    // Declared before `sink` so it drops after it: EOF is signalled once
+    // the sink is released, on a panic too.
+    let _eof = SignalEof(fanout);
+    let sink = sink;
     let publish = |bytes: &[u8]| {
         if let Some(sink) = &sink {
             sink.write(bytes);
@@ -1503,10 +1505,20 @@ fn read_loop(
     }
     #[cfg(windows)]
     publish(&handshake.finish());
-    drop(sink);
-    let mut fanout = fanout.lock().unwrap();
-    fanout.eof = true;
-    fanout.eof_notify.notify_waiters();
+}
+
+/// Marks the reader's output ended when dropped.
+struct SignalEof<'a>(&'a Arc<Mutex<Fanout>>);
+
+impl Drop for SignalEof<'_> {
+    fn drop(&mut self) {
+        let mut fanout = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fanout.eof = true;
+        fanout.eof_notify.notify_waiters();
+    }
 }
 
 fn publish_output(fanout: &Arc<Mutex<Fanout>>, bytes: &[u8]) {
@@ -2178,6 +2190,64 @@ mod tests {
         .expect("wait() settles instead of spinning")
         .unwrap();
         assert_eq!(waited, exit);
+
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
+    /// Stand-in for a child that `try_wait` always reports running.
+    #[derive(Debug)]
+    struct NeverExits;
+
+    impl ChildKiller for NeverExits {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NeverExits)
+        }
+    }
+
+    impl Child for NeverExits {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A child whose pid no longer exists while `try_wait` still reports it
+    /// running is latched as an unobservable exit, so no wait hangs on it.
+    #[tokio::test]
+    async fn try_exit_latches_unobservable_exit_when_the_pid_is_gone() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "sleep");
+        spec.args = vec!["30".into()];
+        let id = host.spawn(spec).unwrap();
+        let session = host.get(id).unwrap();
+        let mut real = std::mem::replace(
+            &mut *session.child.lock().unwrap(),
+            Box::new(NeverExits) as Box<dyn Child + Send + Sync>,
+        );
+        assert_eq!(host.try_exit(id).unwrap(), None, "pid still exists");
+        real.kill().unwrap();
+        real.wait().unwrap();
+
+        let exit = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            host.wait(id),
+        )
+        .await
+        .expect("wait() settles once the pid is gone")
+        .unwrap();
+        assert_eq!(exit, PtyExit::unobservable());
 
         host.kill(id).await;
         assert_eq!(host.count(), 0);

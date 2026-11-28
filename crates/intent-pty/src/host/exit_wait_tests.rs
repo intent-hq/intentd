@@ -136,6 +136,30 @@ async fn wait_exit_ends_on_kill_and_on_an_unknown_id() {
     assert!(gone.exit.is_none() && gone.output.is_empty());
 }
 
+/// A reader that panics still ends the output, so even an unbounded wait
+/// ends with it.
+#[tokio::test]
+async fn a_panicking_reader_still_ends_the_output() {
+    let host = PtyHost::new();
+    let mut spec = SpawnSpec::new("s", "echo");
+    spec.args = vec!["boom".into()];
+    spec.output_sink = Some(OutputSink::new(|_| panic!("test: the sink panicked")));
+    let id = host.spawn(spec).unwrap();
+    let until_eof = ExitWait {
+        output_eof: None,
+        reap_group: true,
+    };
+    let tail = tokio::time::timeout(
+        scaled(Duration::from_secs(10)),
+        host.wait_exit(id, until_eof, None),
+    )
+    .await
+    .expect("the wait ends after a reader panic");
+    assert!(tail.exit.is_some());
+    assert!(host.output_eof(id).unwrap());
+    host.kill(id).await;
+}
+
 fn process_exists(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;

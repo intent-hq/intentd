@@ -680,10 +680,11 @@ async fn spawn_and_wait(
         .timeout_secs
         .map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     // The run ends once nothing the script started is left and its output
-    // has reached the sink; the timeout covers that end too.
+    // has reached the sink. A script that exited before the timeout keeps
+    // its result: the kill below ends what it left and drains the output.
     let exit = tokio::select! {
         tail = pty.wait_exit(pty_id, ExitWait::SCRIPT, None) => Some(tail.exit),
-        () = tokio::time::sleep(timeout) => None,
+        () = tokio::time::sleep(timeout) => pty.try_exit(pty_id).ok().flatten().map(Some),
         _ = &mut *stop => {
             pty.kill(pty_id).await;
             return Ran::Stopped;
@@ -1060,6 +1061,49 @@ mod tests {
         assert!(body.lines().any(|line| line == "/second-run"), "{body}");
         assert!(!body.lines().any(|line| line == "/agent-file"), "{body}");
         assert_eq!(body.matches("# Created by").count(), 1, "{body}");
+    }
+
+    /// A script that exits before its timeout keeps its own result, even
+    /// when ending a straggler it left carries the run past the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exit_before_the_timeout_is_not_a_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let work = repo(root.path());
+        let tmp = root.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let command = SetupCommand {
+            script: "(trap '' TERM HUP; sleep 30) &\nexit 0\n".to_owned(),
+            branch_name: "b".to_owned(),
+            source_branch: "main".to_owned(),
+            timeout_secs: Some(2),
+        };
+        let pty = PtyHost::new();
+        let output = SetupOutput::new(intent_core::AgentId::from("a1"), HeadLink::default());
+        let (_stop_tx, mut stop) = oneshot::channel();
+        let ran = run(
+            &pty,
+            SetupRun {
+                command: &command,
+                worktree: &work,
+                tmp: &tmp,
+                main_checkout: &work,
+                pins: &[],
+                retry: false,
+            },
+            &output,
+            intent_core::now_iso(),
+            &mut stop,
+        )
+        .await;
+        let Ran::Finished(status) = ran else {
+            panic!("the run was not stopped");
+        };
+        assert_eq!(
+            (status.state, status.exit_code),
+            (Recorded::Completed, Some(0)),
+            "{status:?}"
+        );
     }
 
     #[test]

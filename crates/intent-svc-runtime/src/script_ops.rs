@@ -3033,12 +3033,9 @@ impl ScriptManager {
                 mgr.run_one(&ws_task, &sid, generation, pty_id, false).await;
                 false
             };
-            // Group-keyed liveness (monorepo#1300): before the
-            // exit is recorded, reap group members that outlived the shell
-            // (a descendant trapping TERM+HUP) so `exited` means the whole
-            // group is gone. No-op after the timeout kill (session gone) or
-            // when the group is already empty.
-            mgr.pty.reap_group_stragglers(pty_id).await;
+            // Group-keyed liveness (monorepo#1300): `run_one`'s
+            // `wait_exit` (or the timeout kill) has ended every group member
+            // that outlived the shell, so `exited` means the whole group is gone.
             let exit = mgr.pty.try_exit(pty_id).ok().flatten();
             mgr.mark_exited(&ws_task, &sid, generation, exit.clone(), timed_out)
                 .await;
@@ -3149,12 +3146,11 @@ impl ScriptManager {
             // run_one captures leader exit before output/straggler teardown;
             // TERM grace must not inflate a quick exit past the floor.
             let ran_for = ended_at.saturating_duration_since(started);
-            // Group-keyed liveness (monorepo#1300): reap group
-            // members that outlived the shell (a descendant trapping
-            // TERM+HUP) before the exit is recorded, so `exited` means the
-            // whole group is gone — the script can never sit `running` (or
-            // flip to `exited`) while trapped survivors linger.
-            self.pty.reap_group_stragglers(pty_id).await;
+            // Group-keyed liveness (monorepo#1300): `run_one`'s `wait_exit`
+            // has ended every group member that outlived the shell (a
+            // descendant trapping TERM+HUP), so `exited` means the whole
+            // group is gone — the script can never sit `running` (or flip to
+            // `exited`) while trapped survivors linger.
             let Some((stopped_by_user, restart_count)) = self
                 .mark_exited(&ws, &script_id, generation, exit, false)
                 .await
