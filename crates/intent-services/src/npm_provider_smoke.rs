@@ -97,6 +97,12 @@ async fn adapter_handshake(
                 .map_err(String::from)?;
             cmd.prepare_with_context(context).await?
         }
+        // Never fall back to a CLI on the host: the result would not be Intent's bundled one.
+        None if intent_providers::installed_cli::InstalledCli::for_provider(provider.id)
+            .is_some() =>
+        {
+            return Err("skipped: Intent's bundled CLI did not install".to_owned());
+        }
         None => cmd,
     };
     let mut adapter = crate::acp_adapter::spawn_adapter(&cmd, download_budget())
