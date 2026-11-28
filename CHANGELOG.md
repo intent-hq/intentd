@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.319] - 2026-11-28
+
+### 🐛 Bug Fixes
+
+- *(store)* Rebuild intent-store when a migration is added or renamed ([#3876](https://github.com/intent-hq/intentd/pull/3876))
+- *(services)* Restore stack headroom on the workspace.create path ([#3874](https://github.com/intent-hq/intentd/pull/3874))
+- *(terminal)* Stream trailing output before terminal:exit ([#3856](https://github.com/intent-hq/intentd/pull/3856))
+
+### 📚 Documentation
+
+- *(guide)* Describe set-aside workspaces in the HUD and Dock ([#3873](https://github.com/intent-hq/intentd/pull/3873))
+- *(app-guide)* State the 30 MB image limits for one message ([#3870](https://github.com/intent-hq/intentd/pull/3870))
+
+### ⚡ Performance
+
+- *(workspace)* Scope paged workspace.list reads to the page ([#3872](https://github.com/intent-hq/intentd/pull/3872))
+
+### 🧪 Testing
+
+- *(intent-acp)* Move hand-rolled test pause points to PausePoint ([#3849](https://github.com/intent-hq/intentd/pull/3849))
+
+### ⚙️ Miscellaneous Tasks
+
+- Smoke-test the pinned ACP adapters over npx ([#3875](https://github.com/intent-hq/intentd/pull/3875))
+
+
 ## [0.11.318] - 2026-11-28
 
 ### 🚀 Features
