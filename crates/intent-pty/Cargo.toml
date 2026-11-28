@@ -1,6 +1,6 @@
 [package]
 name = "intent-pty"
-version = "0.11.319"
+version = "0.11.320"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
