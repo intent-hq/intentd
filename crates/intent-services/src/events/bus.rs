@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use super::filter::{event_matches, SubscriptionFilter};
 use super::monitor_delivery::{BroadcastEvent, MonitorEvent, PrivateEventDelivery, Recipient};
+use crate::stack_frame::boxed_await;
 
 mod fabric;
 pub(crate) use fabric::{EventFabric, LocalFabric};
@@ -288,13 +289,14 @@ impl EventBus {
                 | intent_core::events::TASK_CREATED
                 | intent_core::events::TASK_STATUS_CHANGED
         ) {
-            // Keep projection futures off the deeply nested agent delivery stack.
-            return Box::pin(self.publish_note_and_task_changes(ev)).await;
+            // Keep projection futures off the deeply nested agent delivery
+            // and `workspace.create` stacks (see `crate::stack_frame`).
+            return boxed_await(|| self.publish_note_and_task_changes(ev)).await;
         }
         if ev.event_type == intent_core::events::WORKSPACE_DELETED {
             self.task_event_baselines.remove(&ev.workspace_id);
         }
-        self.publish_raw(ev).await
+        boxed_await(|| self.publish_raw(ev)).await
     }
 
     async fn publish_raw(&self, ev: &NewEvent) -> Result<Event> {

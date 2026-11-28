@@ -25,10 +25,13 @@ use crate::test_support::stub_forge::StubForge;
 use crate::{EventBus, Services};
 
 /// Stack for the guard thread on `x86_64` Linux, where CI runs it. The
-/// scenario needs about 324 KB there (debug, rustc 1.96) with the create
+/// scenario needs about 316 KB there (debug, rustc 1.96) with the create
 /// path's large awaits built off-frame by [`crate::stack_frame::boxed_await`];
 /// before that it needed ~540 KB, mostly the create op's own 280 KB poll
-/// frame. The ~36 KB of headroom is enough for run-to-run noise and small
+/// frame. Its deepest point is the spec note's `note:created` publish
+/// (`ensure_spec_note` → `EventBus::publish` → the task projection's store
+/// reads), whose awaits are boxed too: inline, they had drifted the need to
+/// ~352 KB. The ~36 KB of headroom is enough for run-to-run noise and small
 /// toolchain or dependency drift, but not for one large future awaited inline
 /// again (re-inlining the initial agent's `send_message` adds ~42 KB). Other
 /// targets lay frames out differently, so they get a loose budget that only
