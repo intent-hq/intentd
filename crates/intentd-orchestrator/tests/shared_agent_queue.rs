@@ -146,39 +146,61 @@ async fn two_processes_share_one_agent_queue_and_drain_each_entry_once() {
     }
 }
 
+/// Runs `sql` on `pool`, again while Postgres reports a deadlock: tests in
+/// other processes add and drop their own fault triggers on the same table.
+async fn ddl(pool: &PgPool, sql: String, what: &str) {
+    for _ in 0..20 {
+        match sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone()))
+            .execute(pool)
+            .await
+        {
+            Ok(_) => return,
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("40P01") => {}
+            Err(e) => panic!("{what}: {e:?}"),
+        }
+    }
+    panic!("{what}: deadlocked 20 times");
+}
+
 /// Makes every agent queue write of `tenant` fail (the queue version row is
 /// written by every sync), until the returned name is passed to `heal`.
 async fn break_queue_writes(pool: &PgPool, tenant: &str) -> String {
     let name = format!("fail_queue_write_{}", uuid::Uuid::new_v4().simple());
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
-         IF NEW.tenant_id = '{tenant}' THEN RAISE EXCEPTION 'injected queue write failure'; END IF; \
-         RETURN NEW; END $$"
-    )))
-    .execute(pool)
-    .await
-    .expect("create the fault function");
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON agent_queue_version \
-         FOR EACH ROW EXECUTE FUNCTION {name}()"
-    )))
-    .execute(pool)
-    .await
-    .expect("create the fault trigger");
+    ddl(
+        pool,
+        format!(
+            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             IF NEW.tenant_id = '{tenant}' THEN RAISE EXCEPTION 'injected queue write failure'; END IF; \
+             RETURN NEW; END $$"
+        ),
+        "create the fault function",
+    )
+    .await;
+    ddl(
+        pool,
+        format!(
+            "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON agent_queue_version \
+             FOR EACH ROW EXECUTE FUNCTION {name}()"
+        ),
+        "create the fault trigger",
+    )
+    .await;
     name
 }
 
 async fn heal(pool: &PgPool, name: &str) {
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER {name} ON agent_queue_version"
-    )))
-    .execute(pool)
-    .await
-    .expect("drop the fault trigger");
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP FUNCTION {name}()")))
-        .execute(pool)
-        .await
-        .expect("drop the fault function");
+    ddl(
+        pool,
+        format!("DROP TRIGGER {name} ON agent_queue_version"),
+        "drop the fault trigger",
+    )
+    .await;
+    ddl(
+        pool,
+        format!("DROP FUNCTION {name}()"),
+        "drop the fault function",
+    )
+    .await;
 }
 
 /// A drain whose claim write fails delivers nothing: the entry stays queued

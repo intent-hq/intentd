@@ -38,7 +38,7 @@ const GIN_EXCEPTIONS: &[&str] = &["agent_message_search_tsv", "note_search_tsv"]
 /// Tables keyed by the tenant alone (`PRIMARY KEY (tenant_id)`): one row
 /// per tenant (`tenant_config`: the tenant's one settings document).
 /// Every other table's key leads with `tenant_id` and has more.
-const ONE_ROW_PER_TENANT: &[&str] = &["tenant_config", "tenant_writer"];
+const ONE_ROW_PER_TENANT: &[&str] = &["queue_order_tag", "tenant_config", "tenant_writer"];
 
 fn store_dir() -> PathBuf {
     intentd_test_support::source_lint::package_dir()
