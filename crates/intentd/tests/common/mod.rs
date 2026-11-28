@@ -227,7 +227,11 @@ const RETAINED_LOG_TAIL_LINES: usize = 200;
 /// `catch_unwind`-guarded handler panics on a current-thread runtime) hold a
 /// [`suppress_failure_retention`] guard across that window or they leave a
 /// `failed-*` dir behind on every passing run.
+///
+/// A test killed for running too long never reaches the hook, so `dir` is
+/// also listed for `make test-stress` ([`intentd_test_support::record_test_tempdir`]).
 pub fn register_for_failure_retention(dir: &Path) {
+    intentd_test_support::record_test_tempdir(dir);
     RETENTION_HOOK.call_once(install_retention_panic_hook);
     if let Ok(mut registry) = RETENTION_REGISTRY.lock() {
         registry.retain(|(_, path)| path.exists());

@@ -3,8 +3,10 @@
 //!
 //! Every test that needs a scratch path goes through these so the directory is
 //! swept on drop (including on panic) and `INTENTD_TEST_KEEP_TMP` opts out of
-//! the sweep for debugging. Put `SQLite` files *inside* the returned dir
-//! (`dir.path().join("x.db")`) so the `-wal` / `-shm` sidecars are swept too.
+//! the sweep for debugging. Each dir is also listed for `make test-stress`,
+//! which prints it when nextest kills a test for running too long. Put
+//! `SQLite` files *inside* the returned dir (`dir.path().join("x.db")`) so the
+//! `-wal` / `-shm` sidecars are swept too.
 
 fn keep_tmp() -> bool {
     std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty())
@@ -22,6 +24,7 @@ pub fn test_tempdir(prefix: &str) -> tempfile::TempDir {
     if keep_tmp() {
         dir.disable_cleanup(true);
     }
+    intentd_test_support::record_test_tempdir(dir.path());
     dir
 }
 
@@ -38,5 +41,6 @@ pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
     if keep_tmp() {
         dir.disable_cleanup(true);
     }
+    intentd_test_support::record_test_tempdir(dir.path());
     dir
 }
