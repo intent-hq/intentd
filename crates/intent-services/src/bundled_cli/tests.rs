@@ -79,12 +79,15 @@ async fn first_use_installs_the_exact_spec_and_later_uses_skip_npm() {
     // A user npm config that skips install scripts or optional packages
     // leaves Claude Code's stub `claude` ("native binary not installed").
     assert!(
-        recorded[0].contains("--ignore-scripts=false --include=optional"),
+        recorded[0].contains(&intent_providers::NPM_INSTALL_ARGS.join(" ")),
         "{recorded:?}"
     );
     // npm 12 runs dependency install scripts only for allowed packages, and
     // only through `package.json` on this project-scoped install.
-    assert!(!recorded[0].contains("--allow-scripts"), "{recorded:?}");
+    assert!(
+        !recorded[0].contains(intent_providers::NPM_ALLOW_SCRIPTS_ARG),
+        "{recorded:?}"
+    );
     let manifest: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(version_dir(&root, &pin).join("package.json")).unwrap(),
     )

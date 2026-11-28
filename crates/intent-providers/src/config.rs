@@ -90,6 +90,10 @@ pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.34";
 /// and, for a project-scoped install, an `allowScripts` `package.json` entry.
 pub const NPM_INSTALL_ARGS: [&str; 2] = ["--ignore-scripts=false", "--include=optional"];
 
+/// npm 12's flag naming the packages whose install scripts may run; see
+/// [`npx_install_args`].
+pub const NPM_ALLOW_SCRIPTS_ARG: &str = "--allow-scripts";
+
 /// [`NPM_INSTALL_ARGS`] plus npm 12's `--allow-scripts=<package>` for an npx
 /// run of the exact pinned `package`. Older npm ignores `allow-scripts`; npm
 /// 12 rejects it on a project-scoped `npm install`.
@@ -98,7 +102,7 @@ pub fn npx_install_args(package: &str) -> [String; 3] {
     [
         NPM_INSTALL_ARGS[0].to_owned(),
         NPM_INSTALL_ARGS[1].to_owned(),
-        format!("--allow-scripts={package}"),
+        format!("{NPM_ALLOW_SCRIPTS_ARG}={package}"),
     ]
 }
 

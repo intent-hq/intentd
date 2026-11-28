@@ -1142,6 +1142,7 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
         NPX_NO_WORKSPACES_ARG.into(),
         "--yes".into(),
         "--ignore-scripts".into(),
+        // npx-launch-flags: allow — preparation skips install scripts on purpose, so it cannot reuse NPM_INSTALL_ARGS
         "--include=optional".into(),
         format!("--package={package}"),
         "--".into(),
