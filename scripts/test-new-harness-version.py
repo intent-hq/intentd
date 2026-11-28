@@ -87,8 +87,39 @@ class RealTree(unittest.TestCase):
         self.assertIn(f"super::{bump.module(self.old)}::ENTRY.doctrine", created)
         self.assertNotIn("ENTRY.default_features", created)
         self.assertNotIn("ENTRY.feature_labels", created)
-        self.assertIn("assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);", created)
+        self.assertIn(f"assert_eq!(current.version, {new});", created)
+        self.assertEqual(bump.current_pins(created), [])
         self.assertTrue(all(len(line) <= bump.MAX_WIDTH for line in created.split("\n")))
+
+    def test_a_scaffolded_module_survives_the_next_bump(self):
+        newer = bump.next_minor(self.new)
+        self.assertEqual(self.run_script("--from", self.old, "--to", self.new).returncode, 0)
+        result = self.run_script("--from", self.new, "--to", newer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for version in (self.old, self.new, newer):
+            text = self.read(f"{bump.HARNESS_DIR}/{bump.module(version)}.rs")
+            self.assertEqual(bump.current_pins(text), [], version)
+
+    def test_rewrites_a_latest_entry_check_in_the_previous_module(self):
+        path = self.root / bump.HARNESS_DIR / f"{bump.module(self.old)}.rs"
+        path.write_text(path.read_text() + LEGACY_TEST)
+        result = self.run_script("--from", self.old, "--to", self.new)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        previous = path.read_text()
+        self.assertEqual(bump.current_pins(previous), [])
+        self.assertIn(f'        let current = &ENTRY;\n        assert_eq!(current.version, "{self.old}");\n    }}\n}}\n',
+                      previous)
+
+    def test_refuses_a_previous_module_that_still_pins_the_latest_version(self):
+        path = self.root / bump.HARNESS_DIR / f"{bump.module(self.old)}.rs"
+        path.write_text(path.read_text() + LEGACY_TEST.replace(
+            "assert!(std::ptr::eq(crate::harness::latest_entry(), current));",
+            "assert_eq!(super::super::latest_entry().version, current.version);"))
+        before = self.snapshot()
+        result = self.run_script("--from", self.old, "--to", self.new)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("latest_entry().version, current.version", result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_writes_nothing_when_an_anchor_is_missing(self):
         before = self.snapshot()
@@ -109,6 +140,46 @@ class RealTree(unittest.TestCase):
         result = self.run_script("--from", self.old, "--to", self.new)
         self.assertEqual(result.returncode, 1)
         self.assertIn("already exists", result.stderr)
+
+
+# The 3.17 test that failed after the 3.18 bump (fixed by hand in intentd#3847).
+LEGACY_TEST = """
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+
+    #[test]
+    fn older_harnesses_have_no_goal_surface_and_this_is_current() {
+        let current = &ENTRY;
+        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
+        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert!(std::ptr::eq(crate::harness::latest_entry(), current));
+    }
+}
+"""
+
+
+class PerVersionModules(unittest.TestCase):
+    def test_no_module_pins_the_current_version(self):
+        """Only harness/mod.rs checks which version is current, so a bump has
+        no per-version copy of that check to rewrite."""
+        modules = sorted((REPO / bump.HARNESS_DIR).glob("v*.rs"))
+        self.assertTrue(modules)
+        for path in modules:
+            self.assertEqual(bump.current_pins(path.read_text()), [], path.name)
+
+    def test_latest_entry_shapes(self):
+        for check in ("assert!(std::ptr::eq(crate::harness::latest_entry(), current));",
+                      "assert!(std::ptr::eq(current, super::super::latest_entry()));",
+                      "assert!(std::ptr::eq(super::latest_entry(), &ENTRY));"):
+            text = f"    fn t() {{\n        let current = &ENTRY;\n        {check}\n    }}\n"
+            out = bump.edit_previous_module(text, "3.17")
+            self.assertEqual(bump.current_pins(out), [], check)
+            self.assertRegex(out, r'assert_eq!\((current|ENTRY)\.version, "3\.17"\);')
+        with self.assertRaises(bump.Mismatch):
+            bump.edit_previous_module("    assert_eq!(LATEST_VERSION, ENTRY.version);\n", "3.17")
+        doc = "/// it was `CURRENT_HARNESS_VERSION` when it shipped.\n"
+        self.assertEqual(bump.edit_previous_module(doc, "3.17"), doc)
 
 
 SAMPLES = '        for version in [\n            "3.9", "garbage",\n        ] {\n'
