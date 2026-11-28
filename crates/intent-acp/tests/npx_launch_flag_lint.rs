@@ -19,7 +19,7 @@
 //!
 //! The flags are read from the constants, so the lint follows a flag change;
 //! a text holding any of them as a substring (`--allow-scripts=pkg`) counts.
-//! The builders and the one pin test
+//! The builder constants and the one pin test
 //! (`intent_acp::fake_npx::tests::production_npx_argv_is_pinned`) are
 //! allowed by item, see [`ALLOWED_ITEMS`]; an allowed item that no longer
 //! exists fails the lint.
