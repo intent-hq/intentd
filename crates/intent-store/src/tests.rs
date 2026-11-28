@@ -7168,7 +7168,7 @@ async fn agent_queue_move_is_atomic_hand_off() {
         })
         .collect();
     store
-        .move_agent_queue(&poisoned, &target, &moved)
+        .move_agent_queue(&poisoned, &target, &moved, &[], &|_| {})
         .await
         .expect("move queue");
 
@@ -7186,7 +7186,7 @@ async fn agent_queue_move_is_atomic_hand_off() {
     // touching either queue.
     let bad = vec![queue_row(&poisoned, 0, "wrong-owner")];
     assert!(store
-        .move_agent_queue(&poisoned, &target, &bad)
+        .move_agent_queue(&poisoned, &target, &bad, &[], &|_| {})
         .await
         .is_err());
     let loaded = store.load_all_agent_queues().await.expect("load queues");
@@ -7195,7 +7195,7 @@ async fn agent_queue_move_is_atomic_hand_off() {
 
     // An empty move just clears both queues.
     store
-        .move_agent_queue(&target, &poisoned, &[])
+        .move_agent_queue(&target, &poisoned, &[], &[], &|_| {})
         .await
         .expect("empty move");
     assert!(store

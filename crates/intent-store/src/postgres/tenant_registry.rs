@@ -60,6 +60,10 @@ pub(crate) struct TenantState {
     /// Set once this process cleared the claims other processes left on the
     /// tenant (`completion_watches::clear_foreign_claims`).
     pub(crate) foreign_claims_cleared: AtomicBool,
+    /// This process's queue order tag, taken from the tenant's
+    /// `queue_order_tag` counter on its first open; see
+    /// `agents::allocate_queue_order_tag_once`.
+    pub(crate) queue_order_tag: std::sync::OnceLock<u64>,
 }
 
 static TENANTS: OnceLock<Mutex<HashMap<String, Weak<TenantState>>>> = OnceLock::new();

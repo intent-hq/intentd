@@ -798,6 +798,7 @@ impl crate::Store {
         // while closing it) left it refusing every write.
         store.move_state(TenantState::Open).await?;
         store.provision().await?;
+        store.allocate_queue_order_tag_once().await?;
         Ok(Ok((
             Self {
                 backend: crate::Backend::Postgres(Box::new(store)),

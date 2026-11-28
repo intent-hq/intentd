@@ -165,7 +165,7 @@ impl TenantId {
 }
 
 /// How a Postgres store runs its transactions.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PostgresOptions {
     /// Set `intent.tenant_id` in every transaction, for the row-level
     /// security guard the store tests install. Production stores leave it
@@ -174,6 +174,27 @@ pub struct PostgresOptions {
     /// How long writers wait for the tenant writer lock, and the limits a
     /// writer transaction runs under.
     pub writer: WriterLimits,
+    /// How long a drain's claim on an agent queue row lasts (database
+    /// clock) before other processes count the entry as queued again: the
+    /// claimer is presumed dead. A claim is held from the pop to the end of
+    /// the delivery (the user row write), so this bounds how long a crash
+    /// delays the entry on a tenant no process reopens unleased. A slower
+    /// delivery than this can be delivered twice. See
+    /// [`DEFAULT_AGENT_QUEUE_CLAIM_TTL`].
+    pub agent_queue_claim_ttl: Duration,
+}
+
+/// The default [`PostgresOptions::agent_queue_claim_ttl`]: five minutes.
+pub const DEFAULT_AGENT_QUEUE_CLAIM_TTL: Duration = Duration::from_secs(300);
+
+impl Default for PostgresOptions {
+    fn default() -> Self {
+        Self {
+            rls_guard: false,
+            writer: WriterLimits::default(),
+            agent_queue_claim_ttl: DEFAULT_AGENT_QUEUE_CLAIM_TTL,
+        }
+    }
 }
 
 /// Bounds on a writer: its wait for the tenant writer lock and the
@@ -1865,6 +1886,7 @@ impl crate::Store {
         if role == WriteRole::Unclaimed {
             open(store.clear_foreign_claims_once().await)?;
         }
+        open(store.allocate_queue_order_tag_once().await)?;
         Ok(Self {
             backend: crate::Backend::Postgres(Box::new(store)),
         })

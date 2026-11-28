@@ -93,6 +93,11 @@ pub struct AgentQueueRow {
     pub turn_id: String,
 }
 
+/// How many low bits of a queue submission order hold the assigning
+/// process's tag on a shared store ([`Store::queue_order_tag`]); the
+/// process's own count sits above them.
+pub const QUEUE_ORDER_TAG_BITS: u32 = 20;
+
 /// The outcome of [`Store::sync_agent_queue`].
 #[derive(Debug, Clone, Default)]
 pub struct AgentQueueSync {
@@ -144,7 +149,15 @@ impl Store {
     /// `claims` are ids the caller removed from `rows` to deliver them (a
     /// drain). Any of them another process removed from the stored queue
     /// first comes back in [`AgentQueueSync::lost`]; exactly one of two
-    /// processes draining one entry keeps it.
+    /// processes draining one entry keeps it. On Postgres the kept ones are
+    /// not deleted but claimed: their rows stay stored, out of every
+    /// process's queue, until [`Store::finish_agent_queue_claims`] once the
+    /// delivery is done. A claim another process left behind (it died) is
+    /// queued again when that process's claims are cleared (an unleased
+    /// open) or after the claim TTL
+    /// (`PostgresOptions::agent_queue_claim_ttl`). An id in `rows` that
+    /// this process had claimed is a delivery put back: its row is a plain
+    /// queue row again.
     ///
     /// `SQLite` has one writer, so this is [`Store::replace_agent_queue`]:
     /// never merged, nothing lost.
@@ -169,6 +182,37 @@ impl Store {
             crate::Backend::Postgres(backend) => {
                 crate::postgres::boxed_call(|| backend.sync_agent_queue(agent_id, rows, claims))
                     .await
+            }
+        }
+    }
+
+    /// [`Store::sync_agent_queue`] for a removal (a cancel): `removed` are
+    /// ids the caller took out of `rows` to drop them. Those another process
+    /// removed first (drained, cancelled) come back in
+    /// [`AgentQueueSync::lost`]: this removal did not take them. The rest
+    /// are deleted, not claimed. `SQLite` replaces the queue.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::sync_agent_queue`].
+    pub async fn remove_from_agent_queue(
+        &self,
+        agent_id: &AgentId,
+        rows: &[AgentQueueRow],
+        removed: &[String],
+    ) -> Result<AgentQueueSync> {
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                let _ = removed;
+                backend.replace_agent_queue(agent_id, rows).await?;
+                Ok(AgentQueueSync::default())
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                crate::postgres::boxed_call(|| {
+                    backend.remove_from_agent_queue(agent_id, rows, removed)
+                })
+                .await
             }
         }
     }
@@ -262,21 +306,96 @@ impl Store {
     /// non-atomic clear-then-replace pair risks either a PK-conflict
     /// rollback or a crash window where the messages are durable on
     /// NEITHER queue — this op commits the hand-off as a single unit.
-    /// Every row must belong to `to`; a mismatch fails fast. On Postgres
-    /// both queues are compared and swapped as in
-    /// [`Store::replace_agent_queue`].
+    /// Every row must belong to `to`; a mismatch fails fast.
+    ///
+    /// On Postgres the move merges with other processes' changes, under
+    /// the tenant writer lock, as [`Store::sync_agent_queue`] does: `moved`
+    /// are the ids this process moves from `from`; any another process
+    /// removed from the stored `from` queue first come back in
+    /// [`AgentQueueSync::lost`] and are not moved. Entries only the stored
+    /// `from` queue holds (another process's enqueues) move too, after
+    /// `prepare` (which resets their per-session flags). A `to` queue
+    /// another process changed is merged with `rows`. The written `to`
+    /// queue comes back in [`AgentQueueSync::merged`] when it differs from
+    /// `rows`. Claimed rows (deliveries in progress) stay where they are.
+    /// `SQLite` (one writer) moves `rows` as given.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Conflict` (Postgres) for an out-of-date queue, and
-    /// `Error::Internal` if the database operation fails.
+    /// Returns `Error::Internal` if the database operation fails; nothing
+    /// is moved then.
     pub async fn move_agent_queue(
         &self,
         from: &AgentId,
         to: &AgentId,
         rows: &[AgentQueueRow],
+        moved: &[String],
+        prepare: &(dyn Fn(&mut AgentQueueRow) + Send + Sync),
+    ) -> Result<AgentQueueSync> {
+        match &self.backend {
+            crate::Backend::Sqlite(backend) => {
+                let _ = (moved, prepare);
+                backend.move_agent_queue(from, to, rows).await?;
+                Ok(AgentQueueSync::default())
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                crate::postgres::boxed_call(|| {
+                    backend.move_agent_queue(from, to, rows, moved, prepare)
+                })
+                .await
+            }
+        }
+    }
+
+    /// Delete this process's claimed queue rows `ids` of `agent_id` once
+    /// their delivery is done (Postgres; see [`Store::sync_agent_queue`]).
+    /// A row whose claim lapsed and that another process claimed since is
+    /// left to that process. `SQLite` keeps no claimed rows: a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; the rows
+    /// stay claimed until a later finish, a rewrite of the entry, or the
+    /// claim lapses.
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(
+            clippy::unused_async,
+            reason = "only the Postgres backend awaits; the signature is shared"
+        )
+    )]
+    pub async fn finish_agent_queue_claims(
+        &self,
+        agent_id: &AgentId,
+        ids: &[String],
     ) -> Result<()> {
-        dispatch!(self, backend => backend.move_agent_queue(from, to, rows).await)
+        match &self.backend {
+            crate::Backend::Sqlite(_) => {
+                let _ = (agent_id, ids);
+                Ok(())
+            }
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => {
+                crate::postgres::boxed_call(|| backend.finish_agent_queue_claims(agent_id, ids))
+                    .await
+            }
+        }
+    }
+
+    /// This process's queue order tag on a store other processes share
+    /// (Postgres): a number below `1 << QUEUE_ORDER_TAG_BITS` no other
+    /// live process of the tenant holds, for the low bits of the queue
+    /// submission orders it assigns. `None` on `SQLite` (one process: a
+    /// plain counter is unique), and on a Postgres store opened while its
+    /// tenant was closed (no tag could be taken).
+    #[must_use]
+    pub fn queue_order_tag(&self) -> Option<u64> {
+        match &self.backend {
+            crate::Backend::Sqlite(_) => None,
+            #[cfg(feature = "postgres")]
+            crate::Backend::Postgres(backend) => backend.queue_order_tag(),
+        }
     }
 
     /// Load every persisted queue entry, ordered by agent then queue position,

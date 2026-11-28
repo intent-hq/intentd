@@ -543,12 +543,24 @@ const CLEAR_FOREIGN_RESERVATIONS_SQL: &str = "DELETE FROM idempotency_key \
 const CLEAR_FOREIGN_GRACE_CLAIMS_SQL: &str = "UPDATE delete_grace \
      SET claim_epoch = NULL, claim_token = NULL \
      WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2";
+/// Puts back the agent queue rows other processes claimed to deliver ($1
+/// tenant, $2 process token): their deliveries never finished, so the
+/// entries are queued again. Each agent whose rows came back gets a new
+/// queue version (write id $3), so a process holding an older view of the
+/// queue merges them in on its next write instead of overwriting them.
+const CLEAR_FOREIGN_QUEUE_CLAIMS_SQL: &str = "WITH cleared AS (UPDATE agent_queue \
+     SET claim_token = NULL, claim_expires_at = NULL \
+     WHERE tenant_id = $1 AND claim_token IS NOT NULL AND claim_token <> $2 \
+     RETURNING agent_id) \
+     UPDATE agent_queue_version SET version = version + 1, write_id = $3 \
+     WHERE tenant_id = $1 AND agent_id IN (SELECT agent_id FROM cleared)";
 
 impl PgStore {
     /// On this process's first open of the tenant, drops the idempotency
-    /// reservations and delete grace claims other processes left (a crashed
-    /// or stopped daemon): a process that opens the tenant anew takes over
-    /// their keyed operations and deletes, as a takeover's newer epoch does.
+    /// reservations, delete grace claims and agent queue claims other
+    /// processes left (a crashed or stopped daemon): a process that opens
+    /// the tenant anew takes over their keyed operations, deletes and queue
+    /// deliveries, as a takeover's newer epoch does.
     /// Without it a claim left at an unchanged epoch (a tenant never leased)
     /// would block its row for good. Later opens in the same process share
     /// its token and clear nothing. Delivery claims are leases and lapse by
@@ -580,6 +592,13 @@ impl PgStore {
                     .await
                     .map_err(|e| Error::Internal(format!("clear foreign claims failed: {e}")))?;
             }
+            sqlx::query(CLEAR_FOREIGN_QUEUE_CLAIMS_SQL)
+                .bind(self.tenant())
+                .bind(self.process_token())
+                .bind(uuid::Uuid::new_v4().to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("clear foreign queue claims failed: {e}")))?;
             tx.commit().await.map_err(db)
         }
         .await;
