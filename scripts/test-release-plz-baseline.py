@@ -351,6 +351,120 @@ class BaselineTests(unittest.TestCase):
         self.assertIn("tool: release-plz@0.3.162", ci)
         self.assertIn("python3 -S scripts/test-release-plz-baseline.py", ci)
 
+    def unpackageable_release(self):
+        """The v0.11.321 shape (intentd#3867): the tag ships an optional path-only
+        dependency on a publish = false crate, so `cargo package --workspace` at the
+        tag fails; main then fixes the manifests. Returns (tag commit, fix commit)."""
+        self.put("crates/helper/Cargo.toml", '[package]\nname = "helper"\nversion = "0.0.0"\n'
+                 'edition = "2021"\nlicense = "MIT"\ndescription = "Release baseline fixture"\n'
+                 'publish = false\n')
+        self.put("crates/helper/src/lib.rs", "pub fn pause() {}\n")
+        for name, version in (("intentd", "0.9.114"), ("intent-nodes", "0.9.113")):
+            path = self.repo / f"crates/{name}/Cargo.toml"
+            path.write_text(path.read_text().replace(f'version = "{version}"', 'version = "0.9.115"'))
+        manifest = (self.repo / "crates/intentd/Cargo.toml").read_text()
+        self.put("crates/intentd/Cargo.toml", manifest + '[features]\nhooks = ["dep:helper"]\n'
+                 '[dependencies]\nhelper = { path = "../helper", optional = true }\n')
+        self.run_ok("cargo", "generate-lockfile")
+        self.commit("feat: add test hooks")
+        self.run_ok("git", "tag", "v0.9.115")
+        broken = self.run_ok("git", "rev-parse", "HEAD").strip()
+        self.put("crates/intentd/src/lib.rs", "pub fn value() {}\npub fn earlier() {}\n")
+        self.commit("feat: work before the fix")
+        self.put("crates/intentd/Cargo.toml", manifest + '[features]\nhooks = ["dep:helper"]\n'
+                 '[dependencies]\nhelper = { path = "../helper", version = "0.0.0", optional = true }\n')
+        helper = (self.repo / "crates/helper/Cargo.toml").read_text()
+        self.put("crates/helper/Cargo.toml", helper.replace("publish = false\n", ""))
+        self.commit("fix: make test hooks packageable")
+        fix = self.run_ok("git", "rev-parse", "HEAD").strip()
+        self.put("crates/intentd/src/lib.rs", "pub fn value() {}\npub fn earlier() {}\npub fn later() {}\n")
+        self.commit("feat: later work")
+        return broken, fix
+
+    def record_repair(self, tag, commit, fix):
+        self.put("scripts/release-plz-baseline-repairs.toml",
+                 f'[[repair]]\ntag = "{tag}"\ncommit = "{commit}"\nfix = "{fix}"\n'
+                 'reason = "fixture: optional path-only dependency on a publish = false crate"\n')
+        self.commit("chore: record baseline repair")
+
+    def test_unmodified_tool_cannot_package_broken_baseline(self):
+        self.unpackageable_release()
+        self.prepare()
+        result = self.update(success=False)
+        self.assertIn("does not specify a version", result.stdout + result.stderr)
+
+    def test_recorded_repair_packages_baseline_and_keeps_history_window(self):
+        broken, fix = self.unpackageable_release()
+        self.record_repair("v0.9.115", broken, fix)
+        result = self.prepare()
+        self.assertIn(f"Repaired baseline v0.9.115: {broken} + {fix}", result.stderr)
+        repaired = self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip()
+        self.assertNotEqual(repaired, broken)
+        self.assertEqual(self.run_ok("git", "rev-parse", f"{repaired}^").strip(), broken)
+        self.assertEqual(self.run_ok("git", "show", f"{repaired}:crates/helper/Cargo.toml"),
+                         self.run_ok("git", "show", f"{fix}:crates/helper/Cargo.toml"))
+        self.assertEqual(tomllib.loads(self.output.read_text()), tomllib.loads(CONFIG))
+        self.update()
+        self.assertEqual(self.version("intentd"), "0.9.116")
+        changelog = (self.repo / "crates/intentd/CHANGELOG.md").read_text().lower()
+        for entry in ("work before the fix", "make test hooks packageable", "later work"):
+            self.assertIn(entry, changelog)
+        self.assertNotIn("add test hooks", changelog, "the walk went past the released tag")
+        # The retry path re-runs preparation against the already repaired tag.
+        self.output.unlink()
+        self.prepare()
+        self.assertEqual(self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip(), repaired)
+
+    def test_repair_ignores_commit_signing_config(self):
+        # A signed repaired commit would change SHA per run and break the retry path.
+        broken, fix = self.unpackageable_release()
+        self.record_repair("v0.9.115", broken, fix)
+        self.env.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "commit.gpgSign",
+                         "GIT_CONFIG_VALUE_0": "true", "GIT_CONFIG_KEY_1": "gpg.program",
+                         "GIT_CONFIG_VALUE_1": "false"})
+        self.prepare()
+        repaired = self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip()
+        self.assertNotIn("gpgsig", self.run_ok("git", "cat-file", "commit", repaired))
+        self.output.unlink()
+        self.prepare()
+
+    def test_repair_retires_once_a_newer_tag_exists(self):
+        broken, fix = self.unpackageable_release()
+        self.record_repair("v0.9.115", broken, fix)
+        self.run_ok("git", "tag", "v0.9.116")
+        self.assertNotIn("Repaired baseline", self.prepare().stderr)
+        self.assertEqual(self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip(), broken)
+
+    def test_repair_refuses_a_moved_tag(self):
+        broken, fix = self.unpackageable_release()
+        self.record_repair("v0.9.115", fix, fix)
+        self.assertIn("not the recorded", self.prepare(success=False).stderr)
+        self.assertEqual(self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip(), broken)
+
+    def test_repair_refuses_a_fix_outside_the_branch(self):
+        broken, fix = self.unpackageable_release()
+        self.run_ok("git", "checkout", "-q", "--detach", broken)
+        self.put("crates/intentd/src/lib.rs", "pub fn value() {}\npub fn other() {}\n")
+        self.commit("feat: unrelated branch")
+        self.record_repair("v0.9.115", broken, fix)
+        self.assertIn("not in the history", self.prepare(success=False).stderr)
+        self.assertEqual(self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip(), broken)
+
+    def test_repair_refuses_a_fix_that_does_not_apply(self):
+        broken, _ = self.unpackageable_release()
+        self.put("crates/intentd/src/lib.rs", "pub fn value() {}\npub fn again() {}\n")
+        self.commit("feat: more work")
+        # This diff edits lines ("earlier", "later") that the tag does not have.
+        self.record_repair("v0.9.115", broken, self.run_ok("git", "rev-parse", "HEAD").strip())
+        self.assertIn("does not apply", self.prepare(success=False).stderr)
+
+    def test_malformed_repair_record_fails(self):
+        broken, fix = self.unpackageable_release()
+        self.put("scripts/release-plz-baseline-repairs.toml",
+                 f'[[repair]]\ntag = "v0.9.115"\ncommit = "{broken[:12]}"\nfix = "{fix}"\nreason = "x"\n')
+        self.commit("chore: short sha")
+        self.assertIn("repair", self.prepare(success=False).stderr)
+
     def test_malformed_configuration_fails(self):
         self.put("release-plz.toml", "[broken")
         self.prepare(success=False)

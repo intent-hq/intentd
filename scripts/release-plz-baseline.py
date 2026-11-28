@@ -10,6 +10,15 @@ else missing (intentd itself, a non-member, a different policy) fails closed.
 Once the shared baseline contains every package, copy the original bytes.
 Never use this configuration for `release`: the publication job stays unchanged.
 
+release-plz also runs `cargo package --workspace` at the latest tag, so a tag
+whose manifests cargo rejects blocks every release-pr run until a newer tag
+exists (v0.11.321 shipped intentd#3867's unversioned optional dependency).
+A tag recorded in REPAIRS, while it is the latest, has its LOCAL ref pointed at
+a deterministic child commit: the tagged tree plus the recorded fix commit's
+diff. Commits up to the tag stay "too old" for the history walk, release-pr
+pushes only its branch, and the record retires once a newer tag exists. A moved
+tag, a fix outside HEAD's history or a diff that does not apply fails closed.
+
 Tag selection mirrors that pinned version's release_regex.rs and
 command/release_pr/git.rs: anchored v<major>.<minor>.<patch>, valid Rust semver
 (u64 components, no leading zeroes), highest version across ALL local tags.
@@ -18,6 +27,7 @@ The workflow must fetch full history and tags before running this script.
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -37,6 +47,9 @@ LIBRARY = {"release": True, "git_only": True, "publish": False,
 # the override never duplicates an explicit key (it inherits SHARED instead).
 ALLOWED_KEYS = {"name"} | set(LIBRARY) - {"git_tag_name"}
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+REPAIRS = "scripts/release-plz-baseline-repairs.toml"
+REPAIR_KEYS = {"tag", "commit", "fix", "reason"}
+SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def run(repo, *args):
@@ -52,6 +65,68 @@ def latest_tag(tags):
             if all(part <= 2**64 - 1 for part in version):
                 candidates.append((version, tag))
     return max(candidates)[1] if candidates else None
+
+
+def git(repo, *args, env=None, stdin=None):
+    """git with an exit-status result instead of an exception, for expected refusals."""
+    return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, input=stdin,
+                          env={**os.environ, **(env or {})})
+
+
+def repairs(repo):
+    path = repo / REPAIRS
+    if not path.exists():
+        return {}
+    records = {}
+    for record in tomllib.loads(path.read_text()).get("repair", []):
+        if set(record) != REPAIR_KEYS or not all(SHA.fullmatch(record[k]) for k in ("commit", "fix")) \
+                or not VERSION.fullmatch(record["tag"]) or record["tag"] in records:
+            raise ValueError(f"malformed baseline repair record in {REPAIRS}: {record}")
+        records[record["tag"]] = record
+    return records
+
+
+def repaired_commit(repo, record):
+    """The tagged tree plus the fix diff, as a child of the tag commit; same inputs, same SHA."""
+    date = run(repo, "git", "show", "-s", "--format=%cI", record["commit"]).strip()
+    with tempfile.TemporaryDirectory(prefix="release-plz-repair-") as temp:
+        env = {"GIT_INDEX_FILE": str(Path(temp) / "index"),
+               "GIT_AUTHOR_NAME": "release-plz baseline repair", "GIT_AUTHOR_DATE": date,
+               "GIT_AUTHOR_EMAIL": "release-plz-baseline@invalid",
+               "GIT_COMMITTER_NAME": "release-plz baseline repair", "GIT_COMMITTER_DATE": date,
+               "GIT_COMMITTER_EMAIL": "release-plz-baseline@invalid"}
+        if git(repo, "read-tree", record["commit"], env=env).returncode:
+            raise ValueError(f"cannot read {record['tag']} commit {record['commit']}")
+        patch = run(repo, "git", "diff", "--binary", f"{record['fix']}^", record["fix"])
+        applied = git(repo, "apply", "--cached", env=env, stdin=patch)
+        if applied.returncode:
+            raise ValueError(f"fix {record['fix']} does not apply to {record['tag']}: {applied.stderr.strip()}")
+        tree = git(repo, "write-tree", env=env).stdout.strip()
+        message = f"Local release-plz baseline: {record['tag']} + {record['fix']}\n\n{record['reason']}\n"
+        made = git(repo, "commit-tree", "--no-gpg-sign", tree, "-p", record["commit"], env=env, stdin=message)
+        if made.returncode or not SHA.fullmatch(made.stdout.strip()):
+            raise ValueError(f"cannot create the repaired {record['tag']} commit: {made.stderr.strip()}")
+        return made.stdout.strip()
+
+
+def repair_baseline(repo, baseline, commit):
+    """Point the local `baseline` tag at its repaired commit when REPAIRS records it."""
+    record = repairs(repo).get(baseline)
+    if record is None:
+        return commit
+    # An earlier preparation (the retry path) may already have moved the local tag.
+    parent = git(repo, "rev-parse", "--verify", f"{commit}^").stdout.strip()
+    if record["commit"] not in (commit, parent):
+        raise ValueError(f"{baseline} points at {commit}, not the recorded {record['commit']}")
+    if git(repo, "merge-base", "--is-ancestor", record["fix"], "HEAD").returncode:
+        raise ValueError(f"repair fix {record['fix']} for {baseline} is not in the history of HEAD")
+    repaired = repaired_commit(repo, record)
+    if commit not in (record["commit"], repaired):
+        raise ValueError(f"{baseline} points at {commit}, not the recorded {record['commit']}")
+    run(repo, "git", "update-ref", f"refs/tags/{baseline}", repaired)
+    print(f"Repaired baseline {baseline}: {record['commit']} + {record['fix']} -> {repaired} "
+          "(local tag only)", file=sys.stderr)
+    return repaired
 
 
 def members(repo):
@@ -87,6 +162,7 @@ def prepare(repo):
     if baseline is None:
         return original
     commit = run(repo, "git", "rev-parse", "--verify", f"refs/tags/{baseline}^{{commit}}").strip()
+    commit = repair_baseline(repo, baseline, commit)
     with tempfile.TemporaryDirectory(prefix="release-plz-baseline-") as temp:
         tree = Path(temp) / "baseline"
         run(repo, "git", "worktree", "add", "--detach", str(tree), commit)

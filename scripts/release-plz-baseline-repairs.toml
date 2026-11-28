@@ -1,0 +1,10 @@
+# Release tags whose manifests `cargo package --workspace` rejects, which
+# release-plz 0.3.162 packages as its baseline. scripts/release-plz-baseline.py
+# points the LOCAL tag at `commit` plus the diff of `fix` (never pushed) while
+# the tag is the latest; a record is inert once a newer tag exists.
+
+[[repair]]
+tag = "v0.11.321"
+commit = "b36f26331f30780345d4f3b9238a2df2d59beacb"
+fix = "3229c9a8670fc2e59077eaeffefe077297a14fa1"
+reason = "intentd#3867 gave intent-services an unversioned optional dependency on publish = false intentd-test-support; intentd#3884 fixed main"
