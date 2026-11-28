@@ -3597,6 +3597,18 @@ impl PgStore {
         {
             sync.merged = Some(kept);
         }
+        // A taken id another process holds a live claim on is that
+        // process's delivery, whatever this process's view of the queue
+        // says (a merge of its own may have dropped the id from the base,
+        // so the base comparison above cannot see it): lost here.
+        if !claims.is_empty() {
+            let foreign = self.foreign_claimed_queue_ids(&mut tx, agent_id).await?;
+            for id in claims {
+                if foreign.contains(id) && !sync.lost.contains(id) {
+                    sync.lost.push(id.clone());
+                }
+            }
+        }
         if removed == Removed::Claimed {
             let claimed: Vec<&str> = claims
                 .iter()

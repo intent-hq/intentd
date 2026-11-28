@@ -679,3 +679,38 @@ async fn a_write_between_a_pop_and_its_claim_keeps_the_entry_stored() {
     assert_eq!(from_a, (x.clone(), vec![x]), "so A's late claim is lost");
     assert_eq!(queue_contents(&a, &agent).await, ["y"]);
 }
+
+/// The other order of the window above: B claims x (and is still
+/// delivering it) before A writes the queue. A's write merges x away and
+/// moves A's view of the queue past B's claim, so A's late claim can no
+/// longer see the claim through its own base; it must still lose x.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_claim_loses_an_entry_another_process_claimed_before_a_write() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant_name("late-claim-held");
+    let agent = AgentId("agent-late-claim-held".into());
+    let store_a = open(&pool, &tenant, "process-a").await;
+    seed_agent(&store_a, &agent).await;
+    let a = Services::new_isolated(store_a);
+    let b = Services::new_isolated(open(&pool, &tenant, "process-b").await);
+    let x = enqueue(&a, &agent, "x", None).await;
+
+    let mut held = None;
+    let from_a = a
+        .pop_then_claim_for_test(&agent, async {
+            let (claimed, lost, draining) = b
+                .claim_next_queued_message_held_for_test(&agent)
+                .await
+                .expect("B claims x");
+            assert_eq!((claimed.as_str(), lost.len()), (x.as_str(), 0));
+            held = Some(draining);
+            // A writes the queue while B is still delivering x.
+            enqueue(&a, &agent, "y", None).await;
+        })
+        .await
+        .expect("A pops x");
+    assert_eq!(from_a, (x.clone(), vec![x]), "A's late claim of x is lost");
+    drop(held);
+    assert_eq!(queue_contents(&a, &agent).await, ["y"]);
+    assert_eq!(queue_contents(&b, &agent).await, ["y"]);
+}

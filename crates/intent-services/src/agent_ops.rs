@@ -2554,6 +2554,25 @@ impl DrainingGuard {
         }
     }
 
+    /// Drop what [`Services::note_lost_pops`] remembered about `ids`.
+    fn forget_lost(&self, ids: &[String]) {
+        let Some(guards) = self.unclaimed.as_ref() else {
+            return;
+        };
+        let mut lost = guards
+            .lost_pops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(set) = lost.get_mut(&self.agent_id) {
+            for id in ids {
+                set.remove(id);
+            }
+            if set.is_empty() {
+                lost.remove(&self.agent_id);
+            }
+        }
+    }
+
     /// Record the store claim a claim write made on `ids` of this guard's
     /// entries, to end when the guard drops.
     fn hold_claim(
@@ -2595,6 +2614,7 @@ impl Drop for DrainingGuard {
         }
         drop(overlay);
         self.mark_claimed(&self.ids);
+        self.forget_lost(&self.ids);
         let Some(claim) = self.claim.take() else {
             return;
         };
@@ -20903,6 +20923,16 @@ impl Services {
         gate: Option<&QueueEntryGate>,
         destination_owner: Option<&DestinationOwnerQueueAuthorization>,
     ) -> Result<(QueuedMessage, DrainingGuard)> {
+        // A guarded enqueue holds the persist gate until its write settles,
+        // so refuse its pending entry now instead of waiting on the gate.
+        if self
+            .find_queued_message(agent_id, message_id)
+            .is_some_and(|m| m.write_pending)
+        {
+            return Err(Error::StoreBusy(
+                "the queued message is still being written; retry".into(),
+            ));
+        }
         let mut refused = None;
         let outcome = self
             .claim_queue_pop_outcome(agent_id, || {
@@ -21331,7 +21361,22 @@ impl Services {
         taken: &[QueuedMessage],
     ) -> Result<Vec<String>> {
         let claims: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
-        let lost = self.sync_queue_locked(agent_id, &claims).await?;
+        let mut lost = self.sync_queue_locked(agent_id, &claims).await?;
+        // Entries an earlier write of this process saw another process take
+        // while they waited for this claim.
+        {
+            let mut lost_pops = self.delivery_guards.lost_pops.lock().unwrap();
+            if let Some(gone) = lost_pops.get_mut(agent_id) {
+                for id in &claims {
+                    if gone.remove(id) && !lost.contains(id) {
+                        lost.push(id.clone());
+                    }
+                }
+                if gone.is_empty() {
+                    lost_pops.remove(agent_id);
+                }
+            }
+        }
         if !lost.is_empty() {
             tracing::info!(agent = %agent_id, lost = ?lost, "queue entries were drained or removed by another process; not delivering them");
         }
@@ -21520,6 +21565,38 @@ impl Services {
         }
     }
 
+    /// A popped entry still waiting for its claim that a write wrote out
+    /// (`from`) but the store's merge dropped (`merged`) was removed or
+    /// claimed by another process meanwhile. Remember it: the late claim
+    /// reports it lost, since this write moved the base and version past
+    /// the removal, where the claim's own write can no longer see it.
+    fn note_lost_pops(
+        &self,
+        agent_id: &AgentId,
+        from: &[intent_store::AgentQueueRow],
+        merged: &[intent_store::AgentQueueRow],
+    ) {
+        let gone: Vec<String> = {
+            let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
+            let Some(held) = unclaimed.get(agent_id) else {
+                return;
+            };
+            from.iter()
+                .filter(|row| held.contains(&row.id) && !merged.iter().any(|m| m.id == row.id))
+                .map(|row| row.id.clone())
+                .collect()
+        };
+        if !gone.is_empty() {
+            self.delivery_guards
+                .lost_pops
+                .lock()
+                .unwrap()
+                .entry(agent_id.clone())
+                .or_default()
+                .extend(gone);
+        }
+    }
+
     /// Replace the in-memory queue with `merged`, the store's queue, after a
     /// sync or refresh that started from `from` (this process's rows then).
     /// A mutation that landed in memory meanwhile is merged on top, so it is
@@ -21532,6 +21609,7 @@ impl Services {
         from: &[intent_store::AgentQueueRow],
         merged: Vec<intent_store::AgentQueueRow>,
     ) {
+        self.note_lost_pops(agent_id, from, &merged);
         if self
             .draining_shutdown
             .load(std::sync::atomic::Ordering::Relaxed)

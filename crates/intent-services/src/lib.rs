@@ -524,6 +524,9 @@ pub(crate) struct DeliveryGuards {
     /// them meanwhile, so the claim finds their rows. Lock order: after
     /// `draining_queue_entries` and `agent_queues`.
     pub(crate) unclaimed_pops: Mutex<HashMap<AgentId, HashSet<String>>>,
+    /// Of `unclaimed_pops`, entries a write of this process saw another
+    /// process remove or claim first: their late claim reports them lost.
+    pub(crate) lost_pops: Mutex<HashMap<AgentId, HashSet<String>>>,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.

@@ -11153,6 +11153,17 @@ impl AgentManager {
             let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
             return Ok(json!({"success":true,"queued":true,"quarantined":true,"messageIds":ids}));
         }
+        // A guarded enqueue holds the persist gate until its write settles:
+        // refuse its pending entry now instead of waiting on the gate.
+        if message_ids.iter().any(|id| {
+            self.services
+                .find_queued_message(&agent_id, id)
+                .is_some_and(|m| m.write_pending)
+        }) {
+            return Err(Error::InvalidParams(
+                "queued message is not ready to send".into(),
+            ));
+        }
         // On a shared store the selection is a claimed pop: read from the
         // store first, and never sent by two processes.
         let mut refused = None;
