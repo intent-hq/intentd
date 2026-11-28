@@ -298,7 +298,11 @@ async fn one_shot_npx_launch_runs_outside_the_catalog_workspace_but_keeps_it_as_
         process_cwd.display()
     );
     let entries: Vec<String> = serde_json::from_value(reply["entries"].clone()).unwrap();
-    assert_eq!(entries, ["package.json"], "{reply}");
+    assert_eq!(
+        entries,
+        [intent_acp::spawn::NPX_ENV_PRELOAD_FILE, "package.json"],
+        "{reply}"
+    );
     let manifest = &reply["manifest"];
     assert_eq!(manifest["private"], json!(true), "{reply}");
     assert!(

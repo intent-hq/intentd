@@ -820,15 +820,15 @@ async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, Vec<S
 }
 
 /// The launch dir holds exactly the private sentinel `package.json` that makes
-/// it npm's nearest project root and nothing else. (The sentinel alone does
+/// it npm's nearest project root, and Intent's npm-env preload. (The sentinel alone does
 /// not stop npm consulting an ancestor: `--workspaces=false` on the argv does
 /// — see `spawn_provider_real_npx_*`.)
 #[cfg(unix)]
 fn assert_neutral_launch_dir(npx_cwd: &std::path::Path, entries: &[String]) {
     assert_eq!(
         entries,
-        ["package.json"],
-        "npx launch dir {} must hold only the sentinel manifest",
+        [crate::spawn::NPX_ENV_PRELOAD_FILE, "package.json"],
+        "npx launch dir {} must hold only the sentinel manifest and the preload",
         npx_cwd.display()
     );
     let sentinel: serde_json::Value =
