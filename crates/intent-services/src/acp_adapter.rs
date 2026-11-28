@@ -2014,8 +2014,9 @@ exit 0
     /// as an ephemeral npx adapter, with the user npm settings `user_npm` and
     /// `NODE_OPTIONS=--max-old-space-size=4096`; assert the environment the
     /// adapter writes to `$ADAPTER_REPORT` (`env` from a shell it starts, or
-    /// its own) holds exactly those npm settings and none of Intent's npx
-    /// variables, and return it. Offline, with private user/global npmrc and
+    /// its own) holds exactly those npm settings — no other `npm_*`,
+    /// `INIT_CWD` or `NODE` variable npm sets for its run — and none of
+    /// Intent's npx variables, and return it. Offline, with private user/global npmrc and
     /// cache; `None` without `npx`.
     async fn real_npx_adapter_env(
         test: &str,
@@ -2065,9 +2066,14 @@ exit 0
         {
             expected.insert(k.to_owned(), v.to_owned());
         }
+        let is_npm_var = |key: &str| {
+            key.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("npm_"))
+                || key == "INIT_CWD"
+                || key == "NODE"
+        };
         for (key, _) in std::env::vars_os() {
             let key = key.to_string_lossy().into_owned();
-            if key.to_ascii_lowercase().starts_with("npm_config_") && !expected.contains_key(&key) {
+            if is_npm_var(&key) && !expected.contains_key(&key) {
                 cmd = cmd.env_remove(key);
             }
         }
@@ -2103,14 +2109,14 @@ exit 0
             .filter_map(|line| line.split_once('='))
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        let npm_settings: BTreeMap<String, String> = vars
+        let npm_vars: BTreeMap<String, String> = vars
             .iter()
-            .filter(|(k, _)| k.to_ascii_lowercase().starts_with("npm_config_"))
+            .filter(|(k, _)| is_npm_var(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(
-            npm_settings, expected,
-            "the adapter's shells see exactly the launch's npm settings"
+            npm_vars, expected,
+            "the adapter's shells see exactly the launch's npm variables, none of npx's"
         );
         assert!(
             !vars.keys().any(|k| k.starts_with("INTENTD_NPX_")),

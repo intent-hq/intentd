@@ -342,14 +342,17 @@ pub const NPX_ENV_PRELOAD_ENV: &str = "INTENTD_NPX_ENV_PRELOAD";
 /// (`@npmcli/config` `setEnvs`: `yes`, `allow-scripts`, the npx project root,
 /// every CLI flag), so the adapter, its provider CLI and every shell an agent
 /// starts would inherit them (intent-hq/intentd#3840: `EALLOWSCRIPTS` from an
-/// agent's `npm install`). npm's own process loads this file through
-/// `NODE_OPTIONS` before it exports anything. The file records the
-/// `npm_config_*` variables npx was launched with, takes itself out of the
-/// environment npm's children inherit, and wraps `child_process.spawn` so
-/// the npx run (npm's `npx` lifecycle event) starts with exactly those npm
-/// settings — whatever program the adapter is, and whatever `NODE_OPTIONS`
-/// a user's npm `node-options` setting gives it. Other npm children (install
-/// scripts) keep npm's environment.
+/// agent's `npm install`), along with npm's run variables (`INIT_CWD` and
+/// `npm_package_json` into the launch dir, `npm_lifecycle_event`,
+/// `npm_execpath`, `NODE`, …). npm's own process loads this file through
+/// `NODE_OPTIONS` before it exports anything. The file records the npm
+/// variables (`npm_*`, `INIT_CWD`, `NODE`) npx was launched with, takes
+/// itself out of the environment npm's children inherit, and wraps
+/// `child_process.spawn` so the npx run (npm's `npx` lifecycle event, which
+/// npm always spawns with an explicit env) starts with exactly those —
+/// whatever program the adapter is, and whatever `NODE_OPTIONS` a user's npm
+/// `node-options` setting gives it. Other npm children (install scripts)
+/// keep npm's environment.
 const NPX_ENV_PRELOAD_SCRIPT: &str = r"'use strict';
 (() => {
   const env = process.env;
@@ -365,17 +368,18 @@ const NPX_ENV_PRELOAD_SCRIPT: &str = r"'use strict';
     else delete vars.NODE_OPTIONS;
   };
   withoutPreload(env);
-  const isNpmConfig = (key) => key.slice(0, 11).toLowerCase() === 'npm_config_';
-  const launched = Object.entries(env).filter(([key]) => isNpmConfig(key));
+  const isNpmVar = (key) =>
+    key.slice(0, 4).toLowerCase() === 'npm_' || key === 'INIT_CWD' || key === 'NODE';
+  const launched = Object.entries(env).filter(([key]) => isNpmVar(key));
   const childProcess = require('child_process');
   const spawn = childProcess.spawn;
   childProcess.spawn = function (file, args, options) {
     const withArgs = Array.isArray(args);
     const opts = (withArgs ? options : args) || {};
-    const vars = opts.env || process.env;
-    if (vars.npm_lifecycle_event !== 'npx') return spawn.apply(this, arguments);
+    const vars = opts.env;
+    if (!vars || vars.npm_lifecycle_event !== 'npx') return spawn.apply(this, arguments);
     const clean = {};
-    for (const [key, value] of Object.entries(vars)) if (!isNpmConfig(key)) clean[key] = value;
+    for (const [key, value] of Object.entries(vars)) if (!isNpmVar(key)) clean[key] = value;
     for (const [key, value] of launched) clean[key] = value;
     withoutPreload(clean);
     const next = { ...opts, env: clean };
@@ -385,8 +389,8 @@ const NPX_ENV_PRELOAD_SCRIPT: &str = r"'use strict';
 ";
 
 /// Load [`NPX_ENV_PRELOAD_FILE`] from `launch_dir` in npm's own process for
-/// the npx launch `cmd`, so the adapter starts with only the `npm_config_*`
-/// variables npx itself was given. Apply after every other env merge.
+/// the npx launch `cmd`, so the adapter starts with only the npm variables
+/// npx itself was given. Apply after every other env merge.
 /// `inherits_env` is whether `cmd` inherits the daemon's environment (it has
 /// not been `env_clear`ed): the preload is appended to the effective
 /// `NODE_OPTIONS`, which npm's children get back unchanged.

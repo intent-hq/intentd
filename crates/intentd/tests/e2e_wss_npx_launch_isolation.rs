@@ -96,14 +96,10 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env("DD_TRACE_ENABLED", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // npm settings exported by the shell running the tests (an agent shell
+    // npm variables exported by the shell running the tests (an agent shell
     // started through npx carries several) are not the fixture's.
     for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("npm_config_")
-        {
+        if is_npm_var(&key.to_string_lossy()) {
             cmd.env_remove(key);
         }
     }
@@ -112,6 +108,14 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+/// A variable npm sets for the package it runs: `npm_*` in any case (its
+/// settings and run metadata), `INIT_CWD` and `NODE`.
+fn is_npm_var(key: &str) -> bool {
+    key.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("npm_"))
+        || key == "INIT_CWD"
+        || key == "NODE"
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -406,8 +410,9 @@ exec '__NODE__' '__NPM__' '__SCRIPT__' "$@"
 /// npm's own Node process under the fake `npx` (argv: the mock script, then
 /// the npx argv). Like `@npmcli/config` `setEnvs` it exports its settings —
 /// `--yes`, the project root, `--allow-scripts` and, overriding a value the
-/// user set, `--ignore-scripts=false` — then runs the adapter through `sh` as
-/// the `npx` lifecycle event, as `libnpmexec` does.
+/// user set, `--ignore-scripts=false` — plus its run variables, then runs the
+/// adapter through `sh` as the `npx` lifecycle event with an explicit env,
+/// as `libnpmexec` / `@npmcli/run-script` do.
 const FAKE_NPM_SCRIPT: &str = r#"const { spawn } = require('node:child_process');
 const [script, ...npxArgs] = process.argv.slice(2);
 const allow = npxArgs.find((a) => a.startsWith('--allow-scripts='));
@@ -416,10 +421,20 @@ Object.assign(process.env, {
   npm_config_local_prefix: process.cwd(),
   npm_config_ignore_scripts: 'false',
   npm_config_user_agent: `npm/10.9.2 node/${process.version}`,
-  npm_lifecycle_event: 'npx',
+  npm_command: 'exec',
+  npm_execpath: __filename,
+  npm_node_execpath: process.execPath,
+  NODE: process.execPath,
+  INIT_CWD: process.cwd(),
   ...(allow ? { npm_config_allow_scripts: allow.slice('--allow-scripts='.length) } : {}),
 });
-const child = spawn('/bin/sh', ['-c', 'exec "$0" "$1"', process.execPath, script], { stdio: 'inherit' });
+const env = {
+  ...process.env,
+  npm_lifecycle_event: 'npx',
+  npm_lifecycle_script: 'claude-agent-acp',
+  npm_package_json: `${process.cwd()}/package.json`,
+};
+const child = spawn('/bin/sh', ['-c', 'exec "$0" "$1"', process.execPath, script], { stdio: 'inherit', env });
 child.on('exit', (code) => process.exit(code ?? 1));
 "#;
 
@@ -723,9 +738,10 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
 /// it runs, and a shell or tool the agent starts would inherit them — an
 /// `npm install` there failed with `EALLOWSCRIPTS` and npx prompts were
 /// silently accepted (intent-hq/intentd#3840). A shell the npx-launched
-/// agent starts sees only the npm settings the daemon had before launch,
+/// agent starts sees only the npm variables the daemon had before launch,
 /// with the user's values (`ignore-scripts=true` even though npx ran with
-/// `--ignore-scripts=false`), and none of Intent's own launch plumbing.
+/// `--ignore-scripts=false`), none of npm's run variables (`INIT_CWD`,
+/// `npm_lifecycle_event`, …), and none of Intent's own launch plumbing.
 #[tokio::test]
 async fn npx_launch_keeps_npx_settings_out_of_agent_shells() {
     let Some(script) = gate("WSS npx settings scrub E2E") else {
@@ -844,15 +860,15 @@ async fn npx_launch_keeps_npx_settings_out_of_agent_shells() {
         .as_object()
         .cloned()
         .expect("agent reported its shell's npm env");
-    let npm_settings: std::collections::BTreeMap<&str, &str> = shell_env
+    let npm_vars: std::collections::BTreeMap<&str, &str> = shell_env
         .iter()
-        .filter(|(k, _)| k.to_ascii_lowercase().starts_with("npm_config_"))
+        .filter(|(k, _)| is_npm_var(k))
         .map(|(k, v)| (k.as_str(), v.as_str().unwrap_or_default()))
         .collect();
     assert_eq!(
-        npm_settings,
+        npm_vars,
         user_npm.into_iter().collect(),
-        "agent shells see exactly the user's npm settings, none added by npx"
+        "agent shells see exactly the user's npm variables, none added by npx"
     );
     let launch_vars: Vec<&String> = shell_env
         .keys()
