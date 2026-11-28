@@ -1518,6 +1518,7 @@ mod reap_tests {
 pub(crate) mod npx_launch_tests {
     use super::*;
     use crate::test_support::test_tempdir;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     /// A workspace fixture reproducing the intent-hq/intent#5738 failure mode:
@@ -2009,18 +2010,21 @@ exit 0
         spawned.child.reap().await;
     }
 
-    /// intent-hq/intentd#3840 against the REAL npm CLI: npm exports its own
-    /// settings (`npm_config_yes`, `npm_config_allow_scripts`, the npx project
-    /// root, every CLI flag) into the package it runs. A shell the npx-run
-    /// adapter starts must see exactly the npm settings the launch had —
-    /// including the user's `ignore-scripts=true` that npx ran with
-    /// `--ignore-scripts=false` — and none of Intent's preload plumbing.
-    /// Offline, with private user/global npmrc and cache; skips without `npx`.
-    #[tokio::test]
-    async fn real_npx_adapter_keeps_npx_settings_out_of_its_shells() {
+    /// Run the local package `bin` (body `bin_body`) through the REAL npm CLI
+    /// as an ephemeral npx adapter, with the user npm settings `user_npm` and
+    /// `NODE_OPTIONS=--max-old-space-size=4096`; assert the environment the
+    /// adapter writes to `$ADAPTER_REPORT` (`env` from a shell it starts, or
+    /// its own) holds exactly those npm settings and none of Intent's npx
+    /// variables, and return it. Offline, with private user/global npmrc and
+    /// cache; `None` without `npx`.
+    async fn real_npx_adapter_env(
+        test: &str,
+        bin_body: &str,
+        user_npm: &[(&str, &str)],
+    ) -> Option<BTreeMap<String, String>> {
         let Some(npx) = intent_providers::resolve_on_path("npx") else {
-            eprintln!("skipping real-npx settings scrub regression: npx not on PATH");
-            return;
+            eprintln!("skipping {test}: npx not on PATH");
+            return None;
         };
         let tmp = test_tempdir("intent-adapter-npx-real-env-");
         let home = tmp.path().join("clean-home");
@@ -2031,19 +2035,10 @@ exit 0
         std::fs::create_dir_all(&adapter).unwrap();
         std::fs::write(
             adapter.join("package.json"),
-            r#"{"name":"intentd-test-env-adapter","version":"1.0.0","bin":{"intentd-test-env-adapter":"cli.js"}}"#,
+            r#"{"name":"intentd-test-env-adapter","version":"1.0.0","bin":{"intentd-test-env-adapter":"cli"}}"#,
         )
         .unwrap();
-        std::fs::write(
-            adapter.join("cli.js"),
-            "#!/usr/bin/env node\n\
-             const fs = require('fs');\n\
-             const out = require('child_process').execFileSync('sh', ['-c', 'env'], { encoding: 'utf8' });\n\
-             fs.writeFileSync(process.env.ADAPTER_REPORT + '.tmp', out);\n\
-             fs.renameSync(process.env.ADAPTER_REPORT + '.tmp', process.env.ADAPTER_REPORT);\n\
-             process.stdin.resume();\n",
-        )
-        .unwrap();
+        std::fs::write(adapter.join("cli"), bin_body).unwrap();
         let report = tmp.path().join("adapter-report");
 
         let mut cmd = AcpAdapterCommand::npx(npx, adapter.to_str().unwrap())
@@ -2052,25 +2047,32 @@ exit 0
             .env("DD_TRACE_ENABLED", "false")
             .env("NODE_OPTIONS", "--max-old-space-size=4096")
             .env("HOME", home.as_os_str());
-        let user_npm: [(&str, PathBuf); 7] = [
+        let mut expected: BTreeMap<String, String> = [
             ("npm_config_userconfig", home.join("user.npmrc")),
             ("npm_config_globalconfig", home.join("global.npmrc")),
             ("npm_config_cache", tmp.path().join("npm-cache")),
-            ("npm_config_offline", "true".into()),
-            ("npm_config_update_notifier", "false".into()),
-            ("npm_config_loglevel", "error".into()),
-            ("npm_config_ignore_scripts", "true".into()),
-        ];
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned()))
+        .collect();
+        for (k, v) in [
+            ("npm_config_offline", "true"),
+            ("npm_config_update_notifier", "false"),
+            ("npm_config_loglevel", "error"),
+        ]
+        .into_iter()
+        .chain(user_npm.iter().copied())
+        {
+            expected.insert(k.to_owned(), v.to_owned());
+        }
         for (key, _) in std::env::vars_os() {
             let key = key.to_string_lossy().into_owned();
-            if key.to_ascii_lowercase().starts_with("npm_config_")
-                && !user_npm.iter().any(|(k, _)| *k == key)
-            {
+            if key.to_ascii_lowercase().starts_with("npm_config_") && !expected.contains_key(&key) {
                 cmd = cmd.env_remove(key);
             }
         }
-        for (k, v) in &user_npm {
-            cmd = cmd.env(*k, v.as_os_str());
+        for (k, v) in &expected {
+            cmd = cmd.env(k.clone(), v);
         }
 
         let slots = AdapterSlots::new(1);
@@ -2096,32 +2098,79 @@ exit 0
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         spawned.child.reap().await;
-
-        let vars: std::collections::BTreeMap<&str, &str> = shell_env
+        let vars: BTreeMap<String, String> = shell_env
             .lines()
             .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        let npm_settings: std::collections::BTreeMap<&str, &str> = vars
+        let npm_settings: BTreeMap<String, String> = vars
             .iter()
             .filter(|(k, _)| k.to_ascii_lowercase().starts_with("npm_config_"))
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        let expected: std::collections::BTreeMap<&str, &str> = user_npm
-            .iter()
-            .map(|(k, v)| (*k, v.to_str().unwrap()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(
             npm_settings, expected,
             "the adapter's shells see exactly the launch's npm settings"
         );
-        assert_eq!(
-            vars.get("NODE_OPTIONS").copied(),
-            Some("--max-old-space-size=4096"),
-            "NODE_OPTIONS comes back without the preload"
-        );
         assert!(
             !vars.keys().any(|k| k.starts_with("INTENTD_NPX_")),
             "Intent's npx plumbing leaked: {vars:?}"
+        );
+        Some(vars)
+    }
+
+    /// intent-hq/intentd#3840 against the REAL npm CLI: npm exports its own
+    /// settings (`npm_config_yes`, `npm_config_allow_scripts`, the npx project
+    /// root, every CLI flag) into the package it runs. A shell the npx-run
+    /// Node adapter starts must see exactly the npm settings the launch had —
+    /// including the user's `ignore-scripts=true` that npx ran with
+    /// `--ignore-scripts=false` — and the launch's `NODE_OPTIONS` without
+    /// Intent's preload.
+    #[tokio::test]
+    async fn real_npx_adapter_keeps_npx_settings_out_of_its_shells() {
+        let Some(vars) = real_npx_adapter_env(
+            "real-npx settings scrub regression",
+            "#!/usr/bin/env node\n\
+             const fs = require('fs');\n\
+             const out = require('child_process').execFileSync('sh', ['-c', 'env'], { encoding: 'utf8' });\n\
+             fs.writeFileSync(process.env.ADAPTER_REPORT + '.tmp', out);\n\
+             fs.renameSync(process.env.ADAPTER_REPORT + '.tmp', process.env.ADAPTER_REPORT);\n\
+             process.stdin.resume();\n",
+            &[("npm_config_ignore_scripts", "true")],
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            vars.get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096"),
+            "NODE_OPTIONS comes back without the preload"
+        );
+    }
+
+    /// The scrub cannot depend on the adapter being a Node program or on
+    /// `NODE_OPTIONS` reaching it: a shell-script bin gets a clean
+    /// environment too, and a user's npm `node-options` setting (which npm
+    /// puts in the adapter's `NODE_OPTIONS` in place of the launch's) is
+    /// honoured as npm intends.
+    #[tokio::test]
+    async fn real_npx_shell_adapter_with_npm_node_options_gets_no_npx_settings() {
+        let Some(vars) = real_npx_adapter_env(
+            "real-npx shell adapter settings scrub regression",
+            "#!/bin/sh\n\
+             env > \"$ADAPTER_REPORT.tmp\" && mv \"$ADAPTER_REPORT.tmp\" \"$ADAPTER_REPORT\"\n\
+             exec cat > /dev/null\n",
+            &[("npm_config_node_options", "--no-warnings")],
+        )
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            vars.get("NODE_OPTIONS").map(String::as_str),
+            Some("--no-warnings"),
+            "npm's node-options setting reaches the adapter, without the preload"
         );
     }
 
