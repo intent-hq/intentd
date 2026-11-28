@@ -21577,14 +21577,24 @@ impl Services {
         merged: &[intent_store::AgentQueueRow],
     ) {
         let gone: Vec<String> = {
-            let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
-            let Some(held) = unclaimed.get(agent_id) else {
+            let mut unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
+            let Some(held) = unclaimed.get_mut(agent_id) else {
                 return;
             };
-            from.iter()
+            let gone: Vec<String> = from
+                .iter()
                 .filter(|row| held.contains(&row.id) && !merged.iter().any(|m| m.id == row.id))
                 .map(|row| row.id.clone())
-                .collect()
+                .collect();
+            // No longer this process's to keep stored: a later write must
+            // not write it back for the other process to deliver again.
+            for id in &gone {
+                held.remove(id);
+            }
+            if held.is_empty() {
+                unclaimed.remove(agent_id);
+            }
+            gone
         };
         if !gone.is_empty() {
             self.delivery_guards
@@ -21621,7 +21631,15 @@ impl Services {
         let live = queues.get(agent_id).cloned().unwrap_or_default();
         let now = {
             let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
-            Self::rows_of(&draining, &live, false, unclaimed.get(agent_id), agent_id)
+            let lost = self.delivery_guards.lost_pops.lock().unwrap();
+            Self::rows_of(
+                &draining,
+                &live,
+                false,
+                unclaimed.get(agent_id),
+                lost.get(agent_id),
+                agent_id,
+            )
         };
         // Entries being drained stay out of the live queue even when the
         // stored queue still lists them (their claim is still to come).
@@ -21686,7 +21704,15 @@ impl Services {
             .draining_shutdown
             .load(std::sync::atomic::Ordering::Relaxed);
         let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
-        Self::rows_of(&draining, live, frozen, unclaimed.get(agent_id), agent_id)
+        let lost = self.delivery_guards.lost_pops.lock().unwrap();
+        Self::rows_of(
+            &draining,
+            live,
+            frozen,
+            unclaimed.get(agent_id),
+            lost.get(agent_id),
+            agent_id,
+        )
     }
 
     /// [`Services::queue_rows`] over already-locked maps.
@@ -21699,6 +21725,7 @@ impl Services {
         live: &[QueuedMessage],
         frozen: bool,
         unclaimed: Option<&HashSet<String>>,
+        lost: Option<&HashSet<String>>,
         agent_id: &AgentId,
     ) -> Vec<intent_store::AgentQueueRow> {
         let retained: Vec<_> = draining
@@ -21706,6 +21733,9 @@ impl Services {
             .into_iter()
             .flatten()
             .filter(|d| frozen || unclaimed.is_some_and(|ids| ids.contains(&d.id)))
+            // Popped entries another process is known to have taken are
+            // never written back, the shutdown recovery included.
+            .filter(|d| !lost.is_some_and(|ids| ids.contains(&d.id)))
             .collect();
         let mut seen_ids = HashSet::new();
         // Frozen order is authoritative even when a partially persisted batch

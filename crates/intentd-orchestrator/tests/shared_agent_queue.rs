@@ -714,3 +714,48 @@ async fn a_late_claim_loses_an_entry_another_process_claimed_before_a_write() {
     assert_eq!(queue_contents(&a, &agent).await, ["y"]);
     assert_eq!(queue_contents(&b, &agent).await, ["y"]);
 }
+
+/// Two writes in the window: after A's first write learns that B took x
+/// (B claimed it), B finishes x (its row is gone), and a second write of A
+/// must not write x back as a queued row that B would deliver again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pop_known_lost_is_not_written_back_by_a_later_write() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant_name("late-claim-twice");
+    let agent = AgentId("agent-late-claim-twice".into());
+    let store_a = open(&pool, &tenant, "process-a").await;
+    seed_agent(&store_a, &agent).await;
+    let store_b = open(&pool, &tenant, "process-b").await;
+    let a = Services::new_isolated(store_a);
+    let b = Services::new_isolated(store_b.clone());
+    let x = enqueue(&a, &agent, "x", None).await;
+
+    let from_a = a
+        .pop_then_claim_for_test(&agent, async {
+            let (claimed, _, draining) = b
+                .claim_next_queued_message_held_for_test(&agent)
+                .await
+                .expect("B claims x");
+            assert_eq!(claimed, x);
+            enqueue(&a, &agent, "y", None).await;
+            // B's delivery ends: its claimed row is deleted.
+            std::mem::forget(draining);
+            store_b
+                .finish_agent_queue_claims(&agent, std::slice::from_ref(&x))
+                .await
+                .expect("B finishes x");
+            enqueue(&a, &agent, "z", None).await;
+            // A fresh process reads only what is stored (B's own snapshot
+            // still lists x as being delivered: its guard was leaked).
+            let fresh = Services::new_isolated(open(&pool, &tenant, "process-c").await);
+            assert_eq!(
+                queue_contents(&fresh, &agent).await,
+                ["y", "z"],
+                "x is not written back"
+            );
+        })
+        .await
+        .expect("A pops x");
+    assert_eq!(from_a, (x.clone(), vec![x]), "A's late claim of x is lost");
+    assert_eq!(queue_contents(&a, &agent).await, ["y", "z"]);
+}
