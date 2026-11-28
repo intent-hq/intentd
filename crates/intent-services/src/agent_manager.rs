@@ -8675,8 +8675,16 @@ impl AgentManager {
                         self.release_slot_sync(agent_id, claim.hand_off());
                         let (message, draining) = popped;
                         let id = message.id.clone();
-                        self.services.requeue_front(agent_id, message);
-                        self.services.mark_parked_recovery_send(agent_id, id);
+                        // An entry another process is known to have taken
+                        // is not this process's to put back.
+                        if !self
+                            .services
+                            .without_known_lost(agent_id, vec![message.clone()])
+                            .is_empty()
+                        {
+                            self.services.requeue_front(agent_id, message);
+                            self.services.mark_parked_recovery_send(agent_id, id);
+                        }
                         drop(draining);
                         return None;
                     }
@@ -18122,6 +18130,7 @@ async fn run_message_worker(
             let Ok(lost) = claimed else {
                 // Put it back; a drain retry is scheduled.
                 let (entries, draining) = popped;
+                let entries = mgr.services.without_known_lost(&agent_id, entries);
                 mgr.services.requeue_front_batch(&agent_id, entries);
                 drop(draining);
                 boxed_await(|| mgr.end_turn(&agent_id, admission)).await;

@@ -759,3 +759,47 @@ async fn a_pop_known_lost_is_not_written_back_by_a_later_write() {
     assert_eq!(from_a, (x.clone(), vec![x]), "A's late claim of x is lost");
     assert_eq!(queue_contents(&a, &agent).await, ["y", "z"]);
 }
+
+/// As above, but A's late claim write fails: its handback must not put x
+/// (known to be B's) back in A's live queue, where A's next write would
+/// store it again for B to deliver a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_late_claim_does_not_hand_back_a_pop_known_lost() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant_name("late-claim-fails");
+    let agent = AgentId("agent-late-claim-fails".into());
+    let store_a = open(&pool, &tenant, "process-a").await;
+    seed_agent(&store_a, &agent).await;
+    let store_b = open(&pool, &tenant, "process-b").await;
+    let a = Services::new_isolated(store_a);
+    let b = Services::new_isolated(store_b.clone());
+    let x = enqueue(&a, &agent, "x", None).await;
+
+    let mut fault = None;
+    let from_a = a
+        .pop_then_claim_for_test(&agent, async {
+            let (claimed, _, draining) = b
+                .claim_next_queued_message_held_for_test(&agent)
+                .await
+                .expect("B claims x");
+            assert_eq!(claimed, x);
+            enqueue(&a, &agent, "y", None).await;
+            std::mem::forget(draining);
+            store_b
+                .finish_agent_queue_claims(&agent, std::slice::from_ref(&x))
+                .await
+                .expect("B finishes x");
+            fault = Some(break_queue_writes(&pool, &tenant).await);
+        })
+        .await;
+    heal(&pool, &fault.expect("writes were broken")).await;
+    assert_eq!(from_a, None, "A's late claim write failed");
+    enqueue(&a, &agent, "z", None).await;
+    let fresh = Services::new_isolated(open(&pool, &tenant, "process-c").await);
+    assert_eq!(
+        queue_contents(&fresh, &agent).await,
+        ["y", "z"],
+        "x is not handed back and stored again"
+    );
+    assert_eq!(queue_contents(&a, &agent).await, ["y", "z"]);
+}

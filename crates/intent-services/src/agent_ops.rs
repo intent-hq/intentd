@@ -21345,6 +21345,7 @@ impl Services {
                 tracing::warn!(agent = %agent_id, error = %e, "queue claim write failed; leaving the entries queued");
                 // Retire the draining overlay first, then put the entries back.
                 drop(popped);
+                let taken = self.without_known_lost(agent_id, taken);
                 self.restore_unclaimed(agent_id, &before, &taken);
                 self.schedule_queue_claim_retry(agent_id);
                 QueuePop::ClaimFailed
@@ -21461,7 +21462,15 @@ impl Services {
     ) -> Option<(String, Vec<String>)> {
         let mut popped = self.dequeue_message_draining_provisional(agent_id)?;
         between.await;
-        let lost = self.claim_drained(agent_id, &mut popped).await.ok()?;
+        let claimed = self.claim_drained(agent_id, &mut popped).await;
+        let Ok(lost) = claimed else {
+            // The worker's raced-pop handback.
+            let (entry, draining) = popped;
+            let back = self.without_known_lost(agent_id, vec![entry]);
+            self.requeue_front_batch(agent_id, back);
+            drop(draining);
+            return None;
+        };
         Some((popped.0.id.clone(), lost))
     }
 
@@ -21563,6 +21572,23 @@ impl Services {
         if queue.is_empty() {
             queues.remove(agent_id);
         }
+    }
+
+    /// `entries` without those a write of this process saw another process
+    /// take while they waited for their claim (see
+    /// [`Services::note_lost_pops`]): a failed claim must not hand them back
+    /// to the live queue, where the next write would store them again for
+    /// the other process to deliver a second time.
+    pub(crate) fn without_known_lost(
+        &self,
+        agent_id: &AgentId,
+        mut entries: Vec<QueuedMessage>,
+    ) -> Vec<QueuedMessage> {
+        let lost = self.delivery_guards.lost_pops.lock().unwrap();
+        if let Some(gone) = lost.get(agent_id) {
+            entries.retain(|m| !gone.contains(&m.id));
+        }
+        entries
     }
 
     /// A popped entry still waiting for its claim that a write wrote out
