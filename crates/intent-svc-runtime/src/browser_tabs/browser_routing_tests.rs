@@ -661,11 +661,10 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
     use std::sync::{Arc, Mutex};
 
     use intent_core::{AgentReverseDispatch, BoxFuture, ResolvedClient, ReverseDispatchError};
-    use tokio::sync::Notify;
+    use intentd_test_support::PausePoint;
 
     struct HeldClaim {
-        started: Arc<Notify>,
-        release: Arc<Notify>,
+        pause: Arc<PausePoint>,
         targets: Mutex<Vec<ReverseTarget>>,
     }
     impl AgentReverseDispatch for HeldClaim {
@@ -702,8 +701,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
                 })
                 .collect();
             Box::pin(async move {
-                self.started.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
                 Ok(json!({ "success": true, "results": results }))
             })
         }
@@ -730,8 +728,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
     }
     let bus = EventBus::new(store.clone());
     let dispatch = Arc::new(HeldClaim {
-        started: Arc::new(Notify::new()),
-        release: Arc::new(Notify::new()),
+        pause: PausePoint::new("claimTab reply"),
         targets: Mutex::new(Vec::new()),
     });
     let svc = Arc::new(
@@ -750,7 +747,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
     let mut events = subscribe_tab_events(&bus, &ws);
 
     // The claim dispatches to the pinned client and its reply is held.
-    let claim = intent_core::spawn_daemon({
+    let mut claim = intent_core::spawn_daemon({
         let svc = svc.clone();
         let ws = ws.clone();
         async move {
@@ -766,12 +763,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
             .await
         }
     });
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(2)),
-        dispatch.started.notified(),
-    )
-    .await
-    .expect("claim dispatched");
+    dispatch.pause.reached(&mut claim).await;
     assert_eq!(
         dispatch.targets.lock().unwrap().as_slice(),
         [ReverseTarget::Pinned(ClientId::from_string("desktop-a"))]
@@ -790,7 +782,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
 
     // The held reply lands: both rows commit to the *current* driving
     // client (desktop-b), not the executor (desktop-a).
-    dispatch.release.notify_one();
+    dispatch.pause.release();
     let out = claim.await.unwrap().expect("claim");
     assert_eq!(out["results"].as_array().map(Vec::len), Some(2));
     assert_eq!(out["results"][0]["success"], true);
