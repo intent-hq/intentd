@@ -25,7 +25,7 @@ use intent_core::node_link::{
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
-use intent_pty::{OutputSink, PtyHost, PtyId, SpawnSpec};
+use intent_pty::{ExitWait, OutputSink, PtyHost, PtyId, SpawnSpec};
 use intent_services::feature_api::shell::{
     default_shell, saved_script_env_overlay, scrubbed_env_vars_except, shell_args,
 };
@@ -41,17 +41,15 @@ const NOT_RUNNING: &str = "node-script-not-running";
 /// to the backend, which keeps the run's log; this only backs the PTY.
 const SCROLLBACK_BYTES: usize = 64 * 1024;
 
-/// How long the reaper waits for the terminal's output to end after the
-/// process group is reaped.
-const OUTPUT_EOF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Slack on top of the teardown and reap timings in [`reap_wait`].
 const REAP_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`reap_wait`] outside tests, as a constant so the machine's shutdown
 /// budget can be checked at compile time.
 pub(super) const REAP_WAIT: std::time::Duration = std::time::Duration::from_secs(
-    intent_pty::TERM_GRACE.as_secs() * 2 + OUTPUT_EOF_WAIT.as_secs() + REAP_MARGIN.as_secs(),
+    intent_pty::TERM_GRACE.as_secs() * 2
+        + intent_pty::OUTPUT_EOF_WAIT.as_secs()
+        + REAP_MARGIN.as_secs(),
 );
 
 /// Longest a stop waits for the processes it kills to be reaped: the kill's
@@ -335,15 +333,12 @@ impl ScriptProcesses {
             !lock(&PANIC_REAPS).contains(&key.0),
             "test: the reaper panicked"
         );
-        let exit = self.pty.wait(pty_id).await;
-        // A descendant can outlive the direct child and keep the terminal
-        // open: reap the group first, as a local saved script does, so the
-        // output can reach EOF and no process outlives the run.
-        self.pty.reap_group_stragglers(pty_id).await;
-        // Let the reader deliver the last output before the exit, bounded:
-        // a copy of the terminal that survives the reap must not hold up
-        // the exit report.
-        let _ = tokio::time::timeout(OUTPUT_EOF_WAIT, self.pty.wait_output_eof(pty_id)).await;
+        // The output sink has the last output before the exit is reported.
+        let exit = self
+            .pty
+            .wait_exit(pty_id, ExitWait::SCRIPT, None)
+            .await
+            .exit;
         // Release the session and reap any group member it left behind.
         self.pty.kill(pty_id).await;
         {
@@ -358,7 +353,7 @@ impl ScriptProcesses {
         // Output loss is always reported, and before the exit.
         finish_output(&link, &stream).await;
         let frame = match exit {
-            Ok(exit) if exit.observed => {
+            Some(exit) if exit.observed => {
                 let mut frame = exited(
                     &key,
                     Some(i32::try_from(exit.exit_code).unwrap_or(-1)),

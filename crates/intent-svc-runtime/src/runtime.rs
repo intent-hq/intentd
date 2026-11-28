@@ -1695,14 +1695,18 @@ impl RuntimePort for RuntimeFeature {
                             pty_id,
                             terminal_id,
                         );
-                        // Wait for the script to actually complete before cleanup
-                        let exit = pty_for_setup.wait(pty_id).await;
+                        // Wait for the script and its output to end before
+                        // cleanup, so setup completes after its last output.
+                        let exit = pty_for_setup
+                            .wait_exit(pty_id, intent_pty::ExitWait::TERMINAL, None)
+                            .await
+                            .exit;
                         // Best-effort cleanup of the script + wrapper files (after exit)
                         let _ = tokio::fs::remove_file(&script_path).await;
                         if let Some(w) = &wrapper_path {
                             let _ = tokio::fs::remove_file(w).await;
                         }
-                        (true, exit.ok().filter(|e| e.observed).map(|e| e.exit_code))
+                        (true, exit.filter(|e| e.observed).map(|e| e.exit_code))
                     }
                     Err(e) => {
                         tracing::warn!(

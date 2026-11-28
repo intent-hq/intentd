@@ -30,7 +30,7 @@ pub mod host;
 pub mod scrollback;
 
 pub use host::{
-    Attachment, OutputSink, PtyExit, PtyHost, PtyId, PtyProcess, PtySize, RemotePty, RemoteSpec,
-    SpawnSpec, TERM_GRACE,
+    Attachment, ExitTail, ExitWait, OutputSink, PtyExit, PtyHost, PtyId, PtyProcess, PtySize,
+    RemotePty, RemoteSpec, SpawnSpec, TailOutput, OUTPUT_EOF_WAIT, TERM_GRACE,
 };
 pub use scrollback::{LineSnapshot, OutputChunk, Scrollback};

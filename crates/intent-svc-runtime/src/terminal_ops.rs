@@ -24,13 +24,14 @@ use intent_core::ansi::strip_ansi;
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT, TERMINAL_PROCESS};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
 use intent_pty::{
-    LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtyProcess, PtySize, SpawnSpec,
+    ExitWait, LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtyProcess, PtySize, SpawnSpec,
+    TailOutput,
 };
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::broadcast::error::RecvError;
 
 use intent_services::feature_api::events::EventBus;
 use intent_services::feature_api::execution_call::expose_git_credential;
@@ -49,15 +50,6 @@ use intent_services::feature_api::{
 /// — without a `terminal.kill` — never closes the live channel; polling the
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
-
-/// Upper bound on waiting for the reader to reach EOF after the child is
-/// reaped. A background grandchild holding the PTY open keeps the reader alive,
-/// so the bound keeps `terminal:exit` from waiting on it (same as scripts).
-const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
-
-/// Cap on chunks flushed after the EOF wait, so a grandchild that keeps
-/// writing cannot hold back `terminal:exit` (same cap as scripts).
-const EXIT_DRAIN_MAX_CHUNKS: usize = 4096;
 
 /// Delay after output before re-reading the foreground program. A program
 /// start or exit almost always prints (the echoed Enter, a new prompt), so
@@ -696,75 +688,21 @@ pub(crate) fn spawn_output_stream(
                 }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
-                        // Reaped, but the reader can still hold the child's last
-                        // output: stream it before `terminal:exit`.
-                        stream_until_output_eof(&mut live, &pty, pty_id, bus.as_ref(), &workspace_id, &terminal_id).await;
                         break;
                     }
                 }
             }
         }
-        let exit = pty.try_exit(pty_id).ok().flatten();
-        emit_exit(bus.as_ref(), &workspace_id, &terminal_id, exit).await;
-    });
-}
-
-/// Emit live output until the reader reaches EOF (bounded by
-/// [`OUTPUT_EOF_WAIT`]), then flush what is left on the channel. The child can
-/// be reaped before the reader has published its final chunks; stopping at the
-/// reap dropped them from the live stream. Unix only: a `ConPTY` reader reaches
-/// EOF only at teardown, so on Windows the wait would always time out.
-async fn stream_until_output_eof(
-    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
-    pty: &PtyHost,
-    pty_id: PtyId,
-    bus: Option<&EventBus>,
-    workspace_id: &WorkspaceId,
-    terminal_id: &str,
-) {
-    if cfg!(unix) {
-        // Checked after each chunk too: a channel that never empties keeps
-        // `recv` ready, and the coop budget can then starve the timer.
-        let deadline = tokio::time::Instant::now() + OUTPUT_EOF_WAIT;
-        let eof = pty.wait_output_eof(pty_id);
-        tokio::pin!(eof);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut eof => break,
-                () = tokio::time::sleep_until(deadline) => break,
-                recv = live.recv() => match recv {
-                    Ok(chunk) => {
-                        emit_data(bus, workspace_id, terminal_id, pty.daemon_boot_id(), &chunk);
-                        if tokio::time::Instant::now() >= deadline {
-                            break;
-                        }
-                    }
-                    Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => return,
-                },
+        // Reaped, but the reader can still hold the child's last output:
+        // stream it before `terminal:exit`.
+        let tail = pty.wait_exit(pty_id, ExitWait::TERMINAL, Some(&mut live)).await;
+        for item in &tail.output {
+            if let TailOutput::Chunk(chunk) = item {
+                emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), chunk);
             }
         }
-    }
-    drain_pending(live, bus, workspace_id, terminal_id, pty.daemon_boot_id());
-}
-
-/// Flush any output buffered on the live channel without blocking (used once the
-/// child has exited so trailing output still streams before `terminal:exit`).
-fn drain_pending(
-    live: &mut tokio::sync::broadcast::Receiver<Arc<OutputChunk>>,
-    bus: Option<&EventBus>,
-    workspace_id: &WorkspaceId,
-    terminal_id: &str,
-    daemon_boot_id: &str,
-) {
-    for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
-        match live.try_recv() {
-            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, daemon_boot_id, &chunk),
-            Err(TryRecvError::Lagged(_)) => {}
-            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-        }
-    }
+        emit_exit(bus.as_ref(), &workspace_id, &terminal_id, tail.exit).await;
+    });
 }
 
 /// Broadcast a `terminal:data` event carrying a base64 output `chunk`.
@@ -954,10 +892,12 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         Box::pin(async move {
             let id = acp_resolve(&terminal_id)?;
+            // The agent reads the output next: return only once it is all in.
             let exit = pty
-                .wait(id)
+                .wait_exit(id, ExitWait::TERMINAL, None)
                 .await
-                .map_err(|e: intent_core::Error| acp_err(&e))?;
+                .exit
+                .ok_or_else(|| acp_err(&intent_core::Error::NotFound(terminal_id.clone())))?;
             Ok(to_exit_info(&exit))
         })
     }
@@ -2705,7 +2645,10 @@ mod tests {
             "printf '\x1b[31mone\x1b[0m\\ntwo\\nthree'".to_string(),
         ];
         let id = pty.spawn(spec).unwrap();
-        pty.wait(id).await.unwrap();
+        pty.wait_exit(id, ExitWait::TERMINAL, None)
+            .await
+            .exit
+            .unwrap();
 
         let text = poll_until(
             || {

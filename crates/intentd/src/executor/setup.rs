@@ -20,7 +20,7 @@ use intent_core::node_link::{
     CheckoutOwner, SetupCommand, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
     PREPARED_CHECKOUT_PROTOCOL,
 };
-use intent_pty::{OutputSink, PtyHost, SpawnSpec};
+use intent_pty::{ExitWait, OutputSink, PtyHost, SpawnSpec};
 use intent_services::feature_api::shell::{saved_script_env_overlay, scrubbed_env_vars_except};
 use intent_transport::node_link::NodeLink;
 
@@ -45,10 +45,6 @@ const OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 /// The output a failure notice and a retry's result quote.
 pub(super) const NOTICE_TAIL_BYTES: usize = 4 * 1024;
-
-/// How long the run waits for the terminal's output to end after the
-/// script's process group is reaped.
-const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
 
 /// The PTY's own scrollback; the output itself is kept by [`SetupOutput`].
 const SCROLLBACK_BYTES: usize = 64 * 1024;
@@ -683,23 +679,16 @@ async fn spawn_and_wait(
         .command
         .timeout_secs
         .map_or(DEFAULT_TIMEOUT, Duration::from_secs);
+    // The run ends once nothing the script started is left and its output
+    // has reached the sink; the timeout covers that end too.
     let exit = tokio::select! {
-        exit = pty.wait(pty_id) => Some(exit),
+        tail = pty.wait_exit(pty_id, ExitWait::SCRIPT, None) => Some(tail.exit),
         () = tokio::time::sleep(timeout) => None,
         _ = &mut *stop => {
             pty.kill(pty_id).await;
             return Ran::Stopped;
         }
     };
-    // Reap the group first so the output can reach EOF and nothing the
-    // script started outlives the run.
-    match exit {
-        Some(_) => pty.reap_group_stragglers(pty_id).await,
-        None => {
-            pty.kill(pty_id).await;
-        }
-    }
-    let _ = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id)).await;
     pty.kill(pty_id).await;
     let finished_at = Some(intent_core::now_iso());
     Ran::Finished(match exit {
@@ -711,7 +700,7 @@ async fn spawn_and_wait(
                 timeout.as_secs()
             ),
         ),
-        Some(Ok(exit)) if exit.observed => {
+        Some(Some(exit)) if exit.observed => {
             let code = i32::try_from(exit.exit_code).unwrap_or(-1);
             SetupStatus {
                 state: if code == 0 {
