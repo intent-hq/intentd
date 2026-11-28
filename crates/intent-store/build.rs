@@ -20,7 +20,8 @@ use std::path::Path;
 
 const MIGRATION_DIRS: [&str; 2] = ["migrations", "postgres/migrations"];
 
-/// Feeds the sorted file names and contents of `dir` into `hasher`.
+/// Feeds the sorted file names and contents of `dir` into `hasher`
+/// (`sqlx::migrate!` reads only the files directly in `dir`).
 fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
     let mut paths: Vec<_> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -29,6 +30,7 @@ fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
                 .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
                 .path()
         })
+        .filter(|path| path.is_file())
         .collect();
     paths.sort();
     for path in paths {
