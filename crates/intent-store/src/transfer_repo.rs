@@ -115,7 +115,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// `agent_session` row, under their pre-0205 names: export joins them in,
 /// import splits them back out, so archives keep one format across the move
 /// and old archives import unchanged.
-pub(crate) const AGENT_SESSION_PROMPT_COLUMNS: [&str; 2] = ["system_prompt", "prompt_breakdown"];
+pub const AGENT_SESSION_PROMPT_COLUMNS: [&str; 2] = ["system_prompt", "prompt_breakdown"];
 
 /// The export `SELECT` for one [`TRANSFER_TABLES`] entry.
 fn export_select(table: &str, predicate: &str) -> String {

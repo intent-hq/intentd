@@ -279,7 +279,7 @@ pub use repository_selection_repo::{
 };
 pub use subscription_agent_repo::SubscriptionAgentProjection;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
-pub use transfer_repo::TRANSFER_TABLES;
+pub use transfer_repo::{AGENT_SESSION_PROMPT_COLUMNS, TRANSFER_TABLES};
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 pub use workspace_repo::{
