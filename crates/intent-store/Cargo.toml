@@ -81,7 +81,7 @@ sqlparser = { version = "0.64", default-features = false, features = ["std", "vi
 # (tests/support/sql_uses.rs). Pure Rust; `span-locations` gives line numbers.
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 quote = { version = "1", default-features = false }
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
