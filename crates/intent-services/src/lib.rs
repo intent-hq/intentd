@@ -24793,6 +24793,21 @@ impl WorkspaceApi for Services {
                             })
                             .await;
                         let remote_view = plan.remote.clone();
+                        // A host member's initial prompt gets the same sender
+                        // preamble as their later sends (the owner's stays
+                        // byte-identical). Resolved before the agent row is
+                        // persisted so a lookup failure cannot strand it.
+                        let sender_preamble = match boxed_await(|| {
+                            services.collaborator_sender_preamble(&ws.id)
+                        })
+                        .await
+                        {
+                            Ok(preamble) => preamble,
+                            Err(e) => {
+                                record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                                return Err(e);
+                            }
+                        };
                         // On that infrastructure failure the create returns
                         // before the setup task below is scheduled, so the
                         // already-inserted row would otherwise read `pending`
@@ -24868,23 +24883,27 @@ impl WorkspaceApi for Services {
                             // prompt is the creating human's first message,
                             // stamped with the bound wire caller exactly like
                             // `agent.sendMessage` (an agent / daemon caller
-                            // stamps nothing), and a host member's prompt
-                            // gets the same sender preamble as their later
-                            // sends (the owner's stays byte-identical).
-                            // Neither may strand the row persisted above, so
-                            // the setup record is settled on failure.
-                            let attributed = boxed_await(|| {
-                                services.annotate_collaborator_sender(&ws.id, &mut prompt_text)
-                            })
-                            .await
-                            .and_then(|()| crate::principal_ops::stamp_principal_attribution(None));
-                            let message_metadata = match attributed {
-                                Ok(metadata) => metadata,
-                                Err(e) => {
-                                    record_setup_skipped(&services.workspace_setup_states, &ws.id);
-                                    return Err(e);
-                                }
-                            };
+                            // stamps nothing). Stamping an absent payload
+                            // cannot fail, so this never strands the row
+                            // persisted above; the setup record is settled
+                            // defensively all the same.
+                            if let Some(preamble) = sender_preamble.as_deref() {
+                                crate::principal_ops::prepend_collaborator_preamble(
+                                    &mut prompt_text,
+                                    preamble,
+                                );
+                            }
+                            let message_metadata =
+                                match crate::principal_ops::stamp_principal_attribution(None) {
+                                    Ok(metadata) => metadata,
+                                    Err(e) => {
+                                        record_setup_skipped(
+                                            &services.workspace_setup_states,
+                                            &ws.id,
+                                        );
+                                        return Err(e);
+                                    }
+                                };
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),
