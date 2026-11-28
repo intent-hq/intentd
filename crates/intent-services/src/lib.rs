@@ -21802,6 +21802,27 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_app_package_upload_begin(
+        &self,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Agent { .. })
+            ) {
+                return Err(Error::Forbidden(
+                    intent_core::apps::forbidden::USER_ONLY.into(),
+                ));
+            }
+            Self::require_administrator("file.attachmentUpload.begin with purpose app-package")?;
+            self.file_app_package_upload_begin_op(file_name, size_bytes, sha256)
+                .await
+        })
+    }
+
     fn file_attachment_upload_chunk(
         &self,
         upload_id: String,
@@ -21832,6 +21853,11 @@ impl WorkspaceApi for Services {
         upload_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Any other caller sees an app-package upload as unknown.
+            if self.is_app_package_upload(&upload_id) && !attachment_upload::app_package_caller_ok()
+            {
+                return Ok(serde_json::json!({ "uploadId": upload_id, "aborted": false }));
+            }
             self.require_upload_member(&upload_id).await?;
             self.file_attachment_upload_abort_op(upload_id).await
         })

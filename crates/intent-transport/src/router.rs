@@ -6258,6 +6258,35 @@ async fn file_methods(
             }
         }
         "file.attachmentUpload.begin" => {
+            // `purpose: "app-package"` (PROTOCOL §5.60 "Package upload"):
+            // an Intent app package with no workspace, consumed by
+            // `app.install { uploadId }` instead of `commit`.
+            match params.get("purpose") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(p)) if p == "attachment" => {}
+                Some(Value::String(p)) if p == "app-package" => {
+                    if params.contains_key("workspaceId") {
+                        return Err(invalid_params("an app-package upload has no workspaceId"));
+                    }
+                    if params.contains_key("idempotencyKey") {
+                        return Err(invalid_params(
+                            "an app-package upload takes no idempotencyKey",
+                        ));
+                    }
+                    let file_name = require_str_param(params, "fileName")?;
+                    let size_bytes = require_u64(params, "sizeBytes")?;
+                    let sha256 = require_str_param(params, "sha256")?;
+                    return api
+                        .file_app_package_upload_begin(file_name, size_bytes, sha256)
+                        .await
+                        .map_err(domain_to_rpc);
+                }
+                Some(_) => {
+                    return Err(invalid_params(
+                        "purpose must be \"attachment\" or \"app-package\"",
+                    ));
+                }
+            }
             let ws = require_ws_note(params)?;
             let file_name = require_str_param(params, "fileName")?;
             let size_bytes = require_u64(params, "sizeBytes")?;

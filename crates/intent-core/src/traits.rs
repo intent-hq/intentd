@@ -9362,6 +9362,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.attachmentUpload.begin { purpose: "app-package" }`: open a
+    /// staged upload of an Intent app package (PROTOCOL §5.60 "Package
+    /// upload"). No workspace; administrator user only (an agent is
+    /// `forbidden` / `user-only`); `app.install { uploadId }` consumes it in
+    /// place of `commit`. Returns `{ uploadId, maxChunkBytes }`.
+    fn file_app_package_upload_begin(
+        &self,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (file_name, size_bytes, sha256);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_app_package_upload_begin not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file.attachmentUpload.chunk`: stage one seq-numbered base64 slice of
     /// the payload; retrying a seq is idempotent and chunks may arrive in
     /// any order (PROTOCOL §5.9). Returns `{ uploadId, seq, receivedBytes }`.

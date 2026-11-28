@@ -16,6 +16,9 @@
 //! only for an app approved for its installed hash.
 
 pub(crate) mod bundle;
+pub(crate) mod package;
+#[cfg(test)]
+mod package_tests;
 #[cfg(test)]
 mod tests;
 
@@ -347,6 +350,31 @@ fn opt_u64(params: &Map<String, Value>, key: &str) -> Result<Option<u64>> {
     }
 }
 
+fn upload_invalid(detail: &str) -> Error {
+    AppError::params(
+        "upload-invalid",
+        format!("upload invalid: {detail}"),
+        json!({ "detail": detail }),
+    )
+    .into_error()
+}
+
+/// A read bundle with its parsed manifest and signature.
+type ValidatedBundle = (bundle::Bundle, Manifest, Option<Signature>);
+
+/// Read `dir` as a bundle and parse its manifest and signature; the same
+/// validation for a workspace directory and an unpacked package.
+fn read_validated_bundle(dir: &Path) -> Result<ValidatedBundle> {
+    let bundle = bundle::read_bundle_dir(dir)?;
+    let manifest = bundle::parse_manifest(&bundle)?;
+    let signature = bundle
+        .signature
+        .as_deref()
+        .map(bundle::parse_signature)
+        .transpose()?;
+    Ok((bundle, manifest, signature))
+}
+
 fn app_not_found() -> Error {
     app_refusal("app-not-found", "app not found")
 }
@@ -585,26 +613,89 @@ impl Services {
 
     async fn app_install(&self, params: &Map<String, Value>) -> Result<Value> {
         require_library_caller("app.install")?;
-        let workspace_id = req_str(params, "workspaceId")?.to_owned();
-        let path = req_str(params, "path")?.to_owned();
         let replace = opt_bool(params, "replace")?;
         let dry_run = opt_bool(params, "dryRun")?;
+        let present = |key: &str| params.get(key).is_some_and(|v| !v.is_null());
+        if present("uploadId") {
+            if present("workspaceId") || present("path") {
+                return Err(app_invalid_params(
+                    "give exactly one source: workspaceId and path, or uploadId",
+                ));
+            }
+            let upload_id = req_str(params, "uploadId")?.to_owned();
+            return self.app_install_package(&upload_id, replace, dry_run).await;
+        }
+        if present("path") && !present("workspaceId") {
+            return Err(app_invalid_params("path needs workspaceId"));
+        }
+        let workspace_id = req_str(params, "workspaceId")?.to_owned();
+        let path = req_str(params, "path")?.to_owned();
 
         let dir = self.install_source(&workspace_id, &path).await?;
-        let read = tokio::task::spawn_blocking(
-            move || -> Result<(bundle::Bundle, Manifest, Option<Signature>)> {
-                let bundle = bundle::read_bundle_dir(&dir)?;
-                let manifest = bundle::parse_manifest(&bundle)?;
-                let signature = bundle
-                    .signature
-                    .as_deref()
-                    .map(bundle::parse_signature)
-                    .transpose()?;
-                Ok((bundle, manifest, signature))
-            },
-        )
+        let read = tokio::task::spawn_blocking(move || read_validated_bundle(&dir))
+            .await
+            .map_err(|e| Error::Internal(format!("bundle read task failed: {e}")))??;
+        let source = Source { workspace_id, path };
+        self.install_bundle(read, Some(source), replace, dry_run)
+            .await
+    }
+
+    /// `app.install { uploadId }` (§5.60 "App packages"): user-only. Claims
+    /// and verifies the `app-package` upload, unpacks it into a private
+    /// scratch directory, and runs the same install as a workspace source.
+    /// A successful install that is not `dryRun` ends the upload; a
+    /// `dryRun` and every failure keep it for another try or an abort.
+    async fn app_install_package(
+        &self,
+        upload_id: &str,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
+        require_user("app.install")?;
+        let claim = self
+            .app_package_upload_claim(upload_id)
+            .await
+            .map_err(|detail| upload_invalid(&detail))?;
+        let crate::attachment_upload::AppPackageClaim {
+            package: package_path,
+            claim,
+        } = claim;
+        // The claim rides the unpack worker and comes back with its result,
+        // so a cancelled request releases it only when the worker ends.
+        let unpacked = tokio::task::spawn_blocking(move || {
+            let read = (|| -> Result<ValidatedBundle> {
+                // `tempdir` is created 0700 and deleted on drop, on every path.
+                let scratch = tempfile::Builder::new()
+                    .prefix("intent-app-package-")
+                    .tempdir()
+                    .map_err(|e| Error::Internal(format!("app package scratch dir failed: {e}")))?;
+                package::unpack_package(&package_path, scratch.path())?;
+                read_validated_bundle(scratch.path())
+            })();
+            (claim, read)
+        })
         .await
-        .map_err(|e| Error::Internal(format!("bundle read task failed: {e}")))??;
+        .map_err(|e| Error::Internal(format!("app package task failed: {e}")))?;
+        let (_claim, read) = unpacked;
+        let result = match read {
+            Ok(read) => self.install_bundle(read, None, replace, dry_run).await,
+            Err(e) => Err(e),
+        };
+        if result.is_ok() && !dry_run {
+            self.app_package_upload_finish(upload_id).await;
+        }
+        result
+    }
+
+    /// The shared install path of both sources: library checks, record,
+    /// files, sessions and events.
+    async fn install_bundle(
+        &self,
+        read: ValidatedBundle,
+        source: Option<Source>,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
         let (bundle, manifest, signature) = read;
         if manifest.level == 3 {
             return Err(level_unavailable());
@@ -642,10 +733,7 @@ impl Services {
             },
             window: manifest.window.clone(),
             approval,
-            source: Some(Source {
-                workspace_id: workspace_id.clone(),
-                path: path.clone(),
-            }),
+            source,
             installed_at: existing
                 .as_ref()
                 .map_or_else(|| now.clone(), |old| old.installed_at.clone()),
