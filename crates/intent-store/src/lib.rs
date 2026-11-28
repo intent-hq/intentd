@@ -519,12 +519,29 @@ mod tests;
 /// (hooks, PR monitors, agent queues) is rehydrated from imported rows on the
 /// target.
 ///
-/// `sqlx::migrate!` embeds `migrations/` at compile time, and the CI compile
-/// cache (sccache) keys on Rust sources only: a change that renames or
-/// renumbers a migration without touching a `.rs` file of this crate can be
-/// served a stale build (intentd#3861 renumbered 0203 to 0204 and got the
-/// old, duplicated embedding back).
+/// `sqlx::migrate!` embeds `migrations/` at compile time. `build.rs` makes
+/// the directory a tracked input (see [`MIGRATIONS_DIGEST`]), so cargo and
+/// the CI compile cache (sccache) rebuild on any add, rename or edit of a
+/// migration; `tests/embedded_migrations.rs` fails on a stale build.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// Digest of the migration file names and contents, computed by `build.rs`.
+/// Reading it with `env!` records an `env-dep` line in this crate's dep-info,
+/// which cargo and sccache both hash. sccache otherwise keys on the contents
+/// of the embedded files but not their names, so a rename or renumber alone
+/// was served the previous build (intentd#3861 renumbered 0203 to 0204 and
+/// got the old, duplicated embedding back).
+const MIGRATIONS_DIGEST: &str = env!("INTENT_STORE_MIGRATIONS_DIGEST");
+const _: () = assert!(!MIGRATIONS_DIGEST.is_empty());
+
+/// The `SQLite` migrations embedded in this build, for
+/// `tests/embedded_migrations.rs`, which checks them against the files.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[must_use]
+pub fn embedded_migrator() -> &'static sqlx::migrate::Migrator {
+    &MIGRATOR
+}
 
 /// Persistence handle: the one storage API the rest of the daemon uses.
 /// Cheaply cloneable. Every method dispatches to the backend the handle was
