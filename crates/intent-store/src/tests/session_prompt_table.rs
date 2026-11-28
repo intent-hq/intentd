@@ -317,3 +317,36 @@ async fn transfer_rows_carry_the_prompt_and_import_old_archives() {
         Some("archived prompt")
     );
 }
+
+/// A hostile or corrupt archive whose session row carries a prompt but no
+/// text `id` is a params error, not an internal one, and imports nothing.
+#[tokio::test]
+async fn transfer_import_rejects_a_prompt_on_a_session_without_a_text_id() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    for id in [serde_json::Value::Null, json!(7)] {
+        let archive = vec![
+            (
+                "workspace".to_string(),
+                vec![json!({"id": "ws-bad-id", "title": "Bad", "branch": "main",
+                            "created_at": "c", "updated_at": "u"})],
+            ),
+            (
+                "agent_session".to_string(),
+                vec![json!({"id": id, "workspace_id": "ws-bad-id", "name": "Bad",
+                           "status": "idle", "created_at": "c", "updated_at": "u",
+                           "system_prompt": "orphan prompt"})],
+            ),
+        ];
+        let result = store.transfer_import_rows(&archive).await;
+        assert!(
+            matches!(result, Err(Error::InvalidParams(_))),
+            "id {id}: {result:?}"
+        );
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_session")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0, "id {id}: the whole batch rolls back");
+    }
+}

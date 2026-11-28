@@ -1126,8 +1126,6 @@ async fn reclaim_imported_metadata(
     Ok(())
 }
 
-/// Serialize one `SQLite` row to a JSON object keyed by column name (see
-/// [`Store::transfer_export_rows`] for the storage-class mapping).
 /// Insert an imported `agent_session` row's [`AGENT_SESSION_PROMPT_COLUMNS`]
 /// into `agent_session_prompt`, after the session row. A row with neither
 /// value stores nothing, as a fresh session does.
@@ -1140,11 +1138,16 @@ async fn import_session_prompt(
     if values.iter().all(|v| v.is_null()) {
         return Ok(());
     }
+    let Some(agent_id) = session.get("id").and_then(serde_json::Value::as_str) else {
+        return Err(Error::InvalidParams(
+            "transfer import: an agent_session row with a stored prompt needs a text id".into(),
+        ));
+    };
     let mut query = sqlx::query(
         "INSERT INTO agent_session_prompt (agent_id, system_prompt, prompt_breakdown) \
          VALUES (?, ?, ?)",
     )
-    .bind(session.get("id").and_then(serde_json::Value::as_str));
+    .bind(agent_id);
     for (column, value) in AGENT_SESSION_PROMPT_COLUMNS.iter().zip(values) {
         query = bind_json_value(query, "agent_session_prompt", column, value)?;
     }
@@ -1156,6 +1159,8 @@ async fn import_session_prompt(
     Ok(())
 }
 
+/// Serialize one `SQLite` row to a JSON object keyed by column name (see
+/// [`Store::transfer_export_rows`] for the storage-class mapping).
 fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
     let mut object = serde_json::Map::with_capacity(row.columns().len());
     for (i, column) in row.columns().iter().enumerate() {
