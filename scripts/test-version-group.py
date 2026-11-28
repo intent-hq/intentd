@@ -24,7 +24,8 @@ Checks, per group:
   package    every crate's [dependencies] / [build-dependencies] path entry
              (any [target.*] table, optional ones included, direct or inherited
              with `workspace = true`) carries a version and names a crate
-             without `publish = false`: release-pr runs `cargo package
+             cargo can publish (no `publish = false` / `[]`, direct or
+             inherited): release-pr runs `cargo package
              --workspace`, which rejects the first and cannot resolve the
              second, so no intentd release can be cut (intentd#3867 blocked
              three runs). [dev-dependencies] are exempt (cargo package drops
@@ -117,6 +118,15 @@ def packaged_path_dependencies(doc, workspace):
                     yield f"[{prefix}{key}]", name, spec, inherited
 
 
+def unpublishable(doc, workspace):
+    """Whether cargo treats the crate as unpublishable: `publish = false` or `publish = []`, direct or
+    inherited with `publish.workspace = true` from the root [workspace.package]."""
+    publish = doc.get("package", {}).get("publish", True)
+    if isinstance(publish, dict) and publish.get("workspace") is True:
+        publish = workspace.get("workspace", {}).get("package", {}).get("publish", True)
+    return publish is False or publish == []
+
+
 def bare(requirement):
     """The version of a single "1.2.3" / "^1.2.3" / "=1.2.3" requirement, else None."""
     requirement = requirement.strip()
@@ -188,9 +198,10 @@ def version_group_errors(tree, only=CHECKS):
                                   "`cargo package --workspace` rejects it and no intentd release can be cut "
                                   "(intentd#3867): add the dependency's version")
                 base = "" if inherited else os.path.dirname(path)
-                target = by_dir.get(os.path.normpath(os.path.join(base, spec["path"])), {})
-                if target.get("package", {}).get("publish") is False:
-                    errors.append(f"{path} depends on {dep} in {table}, which sets publish = false; "
+                target = by_dir.get(os.path.normpath(os.path.join(base, spec["path"])))
+                if target is not None and unpublishable(target, workspace):
+                    errors.append(f"{path} depends on {dep} in {table}, which cannot be published "
+                                  "(publish = false or []); "
                                   "`cargo package --workspace` leaves unpublishable crates out of its local "
                                   "registry, so release-pr cannot resolve it (intentd#3867): make it a "
                                   "dev-dependency or drop publish = false (release-plz.toml already keeps "
@@ -338,13 +349,20 @@ class VersionGroupTests(unittest.TestCase):
                             extra='hooks = { path = "../hooks", version = "0.0.0", optional = true }\n')
         hooks = tree.root / "crates" / "hooks"
         hooks.mkdir()
-        (hooks / "Cargo.toml").write_text('[package]\nname = "hooks"\nversion = "0.0.0"\npublish = false\n')
-        errors = version_group_errors(tree, only=("package",))
-        self.assertEqual(len(errors), 1, errors)
-        self.assertIn("crates/daemon/Cargo.toml depends on hooks in [dependencies], which sets publish = false",
-                      errors[0])
-        (hooks / "Cargo.toml").write_text('[package]\nname = "hooks"\nversion = "0.0.0"\n')
-        self.assertEqual(version_group_errors(tree, only=("package",)), [])
+        root = tree.root / "Cargo.toml"
+        root.write_text(root.read_text().replace('[workspace.package]\nversion = "1.0.0"\n',
+                                                 '[workspace.package]\nversion = "1.0.0"\npublish = false\n'))
+        for publish in ("publish = false", "publish = []", "publish.workspace = true"):
+            with self.subTest(publish=publish):
+                (hooks / "Cargo.toml").write_text(f'[package]\nname = "hooks"\nversion = "0.0.0"\n{publish}\n')
+                errors = version_group_errors(tree, only=("package",))
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("crates/daemon/Cargo.toml depends on hooks in [dependencies], which cannot be "
+                              "published", errors[0])
+        for publish in ("", 'publish = ["crates-io"]', "publish = true"):
+            with self.subTest(publish=publish):
+                (hooks / "Cargo.toml").write_text(f'[package]\nname = "hooks"\nversion = "0.0.0"\n{publish}\n')
+                self.assertEqual(version_group_errors(tree, only=("package",)), [])
 
     def test_rev_mode_reads_the_commit_not_the_working_tree(self):
         tree = self.fixture({"daemon": "1.0.1", "core": "1.0.0"}, pin="1.0.1")
