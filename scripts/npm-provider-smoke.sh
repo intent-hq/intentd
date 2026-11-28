@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Run every pinned npm provider package the way Intent runs it, on one npm
-# version and from an empty npm cache: the ignored test
+# Run every pinned npm provider package and ACP adapter the way Intent runs
+# it, on one npm version and from an empty npm cache: the ignored test
 # intent-services npm_provider_smoke (see its module docs).
 #
 #   scripts/npm-provider-smoke.sh <latest|oldest|VERSION> [OUT_DIR]

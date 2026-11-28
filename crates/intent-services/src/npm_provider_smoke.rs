@@ -1,5 +1,5 @@
-//! Nightly smoke test of every pinned npm provider package, run the way
-//! Intent runs it, on a real npm from an empty npm cache
+//! Nightly smoke test of every pinned npm provider package and ACP adapter,
+//! run the way Intent runs it, on a real npm from an empty npm cache
 //! (`scripts/npm-provider-smoke.sh`, `.github/workflows/nightly-npm-provider-smoke.yml`).
 //! npm 12 stopped running install scripts by default and broke npm-run
 //! providers for alpha users (intentd#3827); nothing caught it before a user
@@ -75,6 +75,53 @@ fn verdict(run: Result<Run, String>, npm_version: &str) -> Result<String, String
     Ok(run.stdout.lines().next().unwrap_or_default().to_owned())
 }
 
+/// Launch `provider`'s pinned ACP adapter the way a one-shot Intent call
+/// does ([`crate::complete_ops::one_shot_launch`], with Intent's bundled CLI
+/// as its installed CLI when it has one) and complete the `initialize`
+/// handshake, which needs no sign-in.
+async fn adapter_handshake(
+    provider: &'static intent_providers::ProviderConfig,
+    runtime: Option<intent_providers::installed_cli::InstalledCliRuntime>,
+) -> Result<String, String> {
+    let npx = if provider.id == "codex" {
+        intent_providers::find_codex_npx()
+    } else {
+        intent_providers::find_npx()
+    };
+    let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
+        .ok_or("Intent built no adapter launch")?;
+    cmd.check_npx_version().await.map_err(|e| e.to_string())?;
+    let cmd = match runtime {
+        Some(runtime) => {
+            let context = crate::installed_cli::InstalledContext::classify(Ok(runtime))
+                .map_err(String::from)?;
+            cmd.prepare_with_context(context).await?
+        }
+        None => cmd,
+    };
+    let mut adapter = crate::acp_adapter::spawn_adapter(&cmd, download_budget())
+        .await
+        .map_err(|e| format!("could not start: {e:?}"))?;
+    let reply = adapter
+        .conn
+        .request_timeout(
+            "initialize",
+            crate::acp_adapter::initialize_params(),
+            download_budget(),
+        )
+        .await;
+    let stderr = adapter.conn.recent_stderr();
+    adapter.child.reap().await;
+    let reply = reply.map_err(|e| {
+        let tail = &stderr[stderr.len().saturating_sub(8)..];
+        format!("{e}\n    {}", tail.join("\n    "))
+    })?;
+    match reply.get("protocolVersion") {
+        Some(version) => Ok(format!("protocolVersion {version}")),
+        None => Err(format!("initialize returned no protocolVersion: {reply}")),
+    }
+}
+
 fn npm_version_of(tool: &Path) -> String {
     let output = std::process::Command::new(tool)
         .arg("--version")
@@ -117,6 +164,7 @@ async fn pinned_npm_provider_packages_run_from_an_empty_npm_cache() {
     }
 
     let bundled_root = tempfile::tempdir().unwrap();
+    let mut bundled_runtimes = std::collections::HashMap::new();
     let mut results = Vec::new();
     for provider in intent_providers::ACP_PROVIDERS {
         let bundled = intent_providers::adapter_cli::missing_fallback(provider.id);
@@ -168,9 +216,19 @@ async fn pinned_npm_provider_packages_run_from_an_empty_npm_cache() {
             Ok(runtime) => {
                 let mut command = tokio::process::Command::new(runtime.path());
                 command.arg("--version");
+                bundled_runtimes.insert(provider.id, runtime);
                 verdict(run(command, download_budget()).await, &npm_version)
             }
         };
+        results.push((label, outcome));
+    }
+
+    for provider in intent_providers::ACP_PROVIDERS {
+        let Some(package) = provider.npx_only_package else {
+            continue;
+        };
+        let label = format!("npx -y {package} (ACP adapter) initialize");
+        let outcome = adapter_handshake(provider, bundled_runtimes.get(provider.id).cloned()).await;
         results.push((label, outcome));
     }
 
@@ -185,10 +243,13 @@ async fn pinned_npm_provider_packages_run_from_an_empty_npm_cache() {
         }
     }
     assert!(
-        results
-            .iter()
-            .any(|(label, _)| label.contains(intent_providers::OPENCODE_NPX_PACKAGE)),
-        "the registry yielded no OpenCode npx launch: {results:?}",
+        [
+            intent_providers::OPENCODE_NPX_PACKAGE,
+            intent_providers::PI_ACP_NPX_PACKAGE
+        ]
+        .iter()
+        .all(|package| results.iter().any(|(label, _)| label.contains(package))),
+        "the registry yielded no OpenCode or pi adapter launch: {results:?}",
         results = results.iter().map(|(label, _)| label).collect::<Vec<_>>()
     );
     assert!(

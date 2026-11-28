@@ -1,7 +1,8 @@
 name: Nightly npm Provider Smoke
 
 # Runs every pinned npm provider package (OpenCode, Auggie, Grok, Droid and
-# Intent's bundled Claude Code / Codex CLIs) the way Intent launches it, from
+# Intent's bundled Claude Code / Codex CLIs) and ACP adapter (claude-agent-acp,
+# codex-acp, pi-acp: the `initialize` handshake) the way Intent launches it, from
 # an empty npm cache, on npm latest and on the oldest npm Intent accepts
 # (NPX_MIN_NPM_VERSION): scripts/npm-provider-smoke.sh. npm 12 skipping
 # install scripts broke npm-run providers for alpha users (intentd#3827) and
