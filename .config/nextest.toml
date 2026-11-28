@@ -168,6 +168,13 @@ slow-timeout = { period = "180s", terminate-after = 3 }
 filter = 'binary_id(=intent-store::postgres_backend)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# intentd-test-support's hanging fixture hangs on purpose under
+# INTENTD_TEST_HANG_FIXTURE=1 (and passes at once otherwise), so a stress run
+# of it shows the TIMEOUT report of make test-stress within seconds.
+[[profile.default.overrides]]
+filter = 'binary_id(=intentd-test-support::hanging_fixture) & test(=hanging_fixture)'
+slow-timeout = { period = "5s", terminate-after = 2 }
+
 # Long wall-clock tests (>= 20s under coverage): the installer's literal 60s
 # crash-window replay (66s), a hook scheduled at the 60s delayMs minimum (68s),
 # a ~30s watch-retention wait, and two 20s screenshot outer-deadline timeouts.

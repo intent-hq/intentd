@@ -42,6 +42,9 @@
 //! - [`block_test_egress`] / [`apply_test_egress`]: route a test binary and
 //!   the daemons it spawns through a dead local proxy, so a forgotten fake
 //!   forge server fails at once instead of reaching GitHub or GitLab.
+//! - [`record_test_tempdir`]: list a test temp folder for `make test-stress`,
+//!   which prints it with its log tails when nextest kills the test for
+//!   running too long (no in-process hook runs then).
 //!
 //! # The reaped-pid caveat
 //!
@@ -71,6 +74,7 @@ mod pause_point;
 #[cfg(unix)]
 mod process_group;
 pub mod source_lint;
+mod tempdir_record;
 mod timeout;
 
 pub use barrier::{Barrier, DEFAULT_HOLD_DEADLINE};
@@ -84,6 +88,7 @@ pub use link_protocol::assert_link_supports;
 pub use pause_point::{PausePoint, DEFAULT_HOLD_TIMEOUT, DEFAULT_REACH_TIMEOUT};
 #[cfg(unix)]
 pub use process_group::{is_running, ProcessGroup};
+pub use tempdir_record::{record_test_tempdir, TEMPDIR_RECORD_ENV};
 pub use timeout::{
     scale_test_timeout, test_timeout, test_timeout_multiplier, timeout_multiplier,
     MAX_TIMEOUT_MULTIPLIER, TIMEOUT_MULTIPLIER_ENV,
