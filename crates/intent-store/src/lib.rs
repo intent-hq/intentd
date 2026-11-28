@@ -222,7 +222,7 @@ pub use agent_queue_merge::{
     agent_queue_base, agent_queue_row_digest, lost_agent_queue_claims, merge_agent_queue,
     AgentQueueBase,
 };
-pub use agent_queue_repo::{AgentQueueRow, AgentQueueSync};
+pub use agent_queue_repo::{AgentQueueRow, AgentQueueSync, QUEUE_ORDER_TAG_BITS};
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, project_user_message_index_metadata, AgentTurnEffort,

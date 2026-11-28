@@ -506,6 +506,27 @@ pub(crate) struct DeliveryGuards {
     /// path's reduced-stack guard has no room for that.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) identity: IdentityParks,
+    /// Drain retries already made per agent after failed queue claim writes
+    /// (`Services::schedule_queue_claim_retry`); a successful claim clears
+    /// the agent's count.
+    pub(crate) queue_claim_retries: Mutex<HashMap<AgentId, u32>>,
+    /// Test seam: the first queue claim retry delay. Unset in production
+    /// (`agent_ops::QUEUE_CLAIM_RETRY_BASE`).
+    pub(crate) queue_claim_retry_base: OnceLock<std::time::Duration>,
+    /// Notified after each queue claim retry ran its drain.
+    pub(crate) queue_claim_retried: tokio::sync::Notify,
+    /// Test seam: parks a queue claim retry after its backoff, right before
+    /// its drain. Unset in production.
+    pub(crate) queue_claim_retry_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// On a shared store: entries popped to drain whose store claim is
+    /// still to come (the recovery-send redrive and the worker's raced pop
+    /// claim after the in-flight slot). This process's queue writes keep
+    /// them meanwhile, so the claim finds their rows. Lock order: after
+    /// `draining_queue_entries` and `agent_queues`.
+    pub(crate) unclaimed_pops: Mutex<HashMap<AgentId, HashSet<String>>>,
+    /// Of `unclaimed_pops`, entries a write of this process saw another
+    /// process remove or claim first: their late claim reports them lost.
+    pub(crate) lost_pops: Mutex<HashMap<AgentId, HashSet<String>>>,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.

@@ -1183,11 +1183,6 @@ parity_test!(
             matches!(stale, Err(Error::Conflict { .. })),
             "an out-of-date snapshot conflicts: {stale:?}"
         );
-        let moved = b.move_agent_queue(&agent, &aid("agent-b"), &[]).await;
-        assert!(
-            matches!(moved, Err(Error::Conflict { .. })),
-            "an out-of-date move conflicts: {moved:?}"
-        );
         let ids =
             |rows: Vec<AgentQueueRow>| -> Vec<String> { rows.into_iter().map(|r| r.id).collect() };
         assert_eq!(
@@ -1331,6 +1326,438 @@ parity_test!(
     }
 );
 
+/// `store`'s process opened again as `process`, with a claim TTL of `ttl`.
+async fn open_with_claim_ttl(
+    db: &TestDb,
+    tenant: &str,
+    process: &str,
+    ttl: std::time::Duration,
+) -> Store {
+    Store::open_postgres_as_process(
+        db.app.clone(),
+        intent_store::postgres::TenantId::new(tenant).unwrap(),
+        intent_store::postgres::PostgresOptions {
+            rls_guard: true,
+            agent_queue_claim_ttl: ttl,
+            ..intent_store::postgres::PostgresOptions::default()
+        },
+        process,
+        intent_store::OrchestratorOnly::for_tests(),
+    )
+    .await
+    .expect("open tenant store as another process")
+}
+
+/// The ids of `agent`'s queue as `store`'s process sees it.
+async fn queue_ids(store: &Store, agent: &str) -> Vec<String> {
+    store
+        .load_all_agent_queues()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.agent_id.0 == agent)
+        .map(|r| r.id)
+        .collect()
+}
+
+// A drain's claim keeps the row stored until the delivery finishes: a
+// process that dies between its claim and its delivery leaves the entry to
+// the process that opens the tenant next (an unleased open puts other
+// processes' claims back), and that entry is then delivered once.
+parity_test!(
+    a_claimed_queue_row_outlives_a_dead_claimer_and_drains_once,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let agent = aid("agent-a");
+        let row = |id: &str| queue_row(id, "agent-a", 0, tenant);
+        let Some(test_db) = db else {
+            // One process: a claim is the plain shrink, and nothing is kept.
+            store
+                .sync_agent_queue(&agent, &[row("q1"), row("q2")], &[])
+                .await
+                .unwrap();
+            store
+                .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+                .await
+                .unwrap();
+            store
+                .finish_agent_queue_claims(&agent, &["q1".into()])
+                .await
+                .unwrap();
+            assert_eq!(queue_ids(&store, "agent-a").await, ["q2"]);
+            assert_eq!(store.queue_order_tag(), None);
+            return;
+        };
+        let survivor = crate::harness::open_as_process(test_db, tenant, "survivor").await;
+        survivor.load_all_agent_queues().await.unwrap();
+        {
+            let dying = crate::harness::open_as_process(test_db, tenant, "dying").await;
+            dying.load_all_agent_queues().await.unwrap();
+            dying
+                .sync_agent_queue(&agent, &[row("q1"), row("q2")], &[])
+                .await
+                .unwrap();
+            // The claim: q1 leaves every process's queue, but stays stored.
+            let claim = dying
+                .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+                .await
+                .unwrap();
+            assert!(claim.lost.is_empty(), "{claim:?}");
+            assert_eq!(queue_ids(&dying, "agent-a").await, ["q2"]);
+            assert_eq!(queue_ids(&survivor, "agent-a").await, ["q2"]);
+            assert_eq!(
+                count(
+                    &store,
+                    db,
+                    tenant,
+                    "agent_queue",
+                    "id = 'q1' AND claim_token IS NOT NULL"
+                )
+                .await,
+                1,
+                "the claimed row is kept"
+            );
+            // `dying` dies here, before its delivery finished the claim.
+        }
+        // The next unleased open puts the claim back: q1 is queued again,
+        // ahead of q2 as before.
+        let next = crate::harness::open_as_process(test_db, tenant, "next").await;
+        assert_eq!(queue_ids(&next, "agent-a").await, ["q1", "q2"]);
+        // The survivor's view is out of date; its next write merges q1 in
+        // rather than writing it away.
+        let sync = survivor
+            .sync_agent_queue(&agent, &[row("q2")], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            sync.merged
+                .map(|rows| rows.into_iter().map(|r| r.id).collect::<Vec<_>>()),
+            Some(vec!["q1".to_owned(), "q2".to_owned()])
+        );
+        // Both drain q1: exactly one keeps it.
+        let first = next
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        let second = survivor
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        assert!(first.lost.is_empty(), "{first:?}");
+        assert_eq!(second.lost, ["q1"], "delivered once");
+        next.finish_agent_queue_claims(&agent, &["q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, db, tenant, "agent_queue", "id = 'q1'").await,
+            0,
+            "a finished claim deletes its row"
+        );
+        let later = crate::harness::open_as_process(test_db, tenant, "later").await;
+        assert_eq!(queue_ids(&later, "agent-a").await, ["q2"]);
+    }
+);
+
+// A claim lasts its TTL by the database clock. While it lives no other
+// process sees the entry; once it expired (the claimer presumed dead) the
+// entry is queued again for the others, though no version moved, and the
+// first of them to claim it keeps it. The late claimer's finish then leaves
+// the new claim alone. A delivery put back rewrites its claimed row.
+parity_test!(
+    a_lapsed_queue_claim_is_queued_again_for_other_processes,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let agent = aid("agent-a");
+        let row = |id: &str| queue_row(id, "agent-a", 0, tenant);
+        let Some(test_db) = db else {
+            return;
+        };
+        let patient = open_with_claim_ttl(
+            test_db,
+            tenant,
+            "patient",
+            intent_store::postgres::DEFAULT_AGENT_QUEUE_CLAIM_TTL,
+        )
+        .await;
+        let hasty = open_with_claim_ttl(test_db, tenant, "hasty", std::time::Duration::ZERO).await;
+        let other = crate::harness::open_as_process(test_db, tenant, "other").await;
+        for store in [&patient, &hasty, &other] {
+            store.load_all_agent_queues().await.unwrap();
+        }
+        patient
+            .sync_agent_queue(&agent, &[row("q1"), row("q2")], &[])
+            .await
+            .unwrap();
+        other.refresh_agent_queue(&agent, &[]).await.unwrap();
+
+        // A live claim: the others never see q1.
+        patient
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        let refreshed = other
+            .refresh_agent_queue(&agent, &[row("q1"), row("q2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.map(|rows| rows.into_iter().map(|r| r.id).collect::<Vec<_>>()),
+            Some(vec!["q2".to_owned()])
+        );
+        assert_eq!(queue_ids(&other, "agent-a").await, ["q2"]);
+
+        // A delivery put back: its claimed row is a plain row again.
+        patient
+            .sync_agent_queue(&agent, &[row("q1"), row("q2")], &[])
+            .await
+            .unwrap();
+        assert_eq!(queue_ids(&other, "agent-a").await, ["q1", "q2"]);
+
+        // A claim that lapses at once: the claimer never sees its own entry
+        // queued, the others do, with no version change to tell them.
+        hasty.refresh_agent_queue(&agent, &[]).await.unwrap();
+        hasty
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(queue_ids(&hasty, "agent-a").await, ["q2"]);
+        assert_eq!(queue_ids(&other, "agent-a").await, ["q1", "q2"]);
+        let refreshed = other
+            .refresh_agent_queue(&agent, &[row("q2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.map(|rows| rows.into_iter().map(|r| r.id).collect::<Vec<_>>()),
+            Some(vec!["q1".to_owned(), "q2".to_owned()]),
+            "a lapsed claim reads as a change"
+        );
+        // A version-equal write keeps the lapsed entry instead of deleting
+        // it: it takes the merge path (the rows are read again).
+        let kept = other
+            .sync_agent_queue(&agent, &[row("q1"), row("q2")], &[])
+            .await
+            .unwrap();
+        assert!(kept.merged.is_some(), "{kept:?}");
+        assert_eq!(queue_ids(&other, "agent-a").await, ["q1", "q2"]);
+        // Another process claims it (with a live claim); the lapsed
+        // claimer's finish leaves that claim alone.
+        let claim = other
+            .sync_agent_queue(&agent, &[row("q2")], &["q1".into()])
+            .await
+            .unwrap();
+        assert!(claim.lost.is_empty(), "{claim:?}");
+        hasty
+            .finish_agent_queue_claims(&agent, &["q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, db, tenant, "agent_queue", "id = 'q1'").await,
+            1,
+            "the live claim stays"
+        );
+        assert_eq!(queue_ids(&patient, "agent-a").await, ["q2"]);
+        other
+            .finish_agent_queue_claims(&agent, &["q1".into()])
+            .await
+            .unwrap();
+        assert_eq!(queue_ids(&patient, "agent-a").await, ["q2"]);
+    }
+);
+
+// Stateless replicas groundwork: the poisoned-session queue move merges
+// with other processes' changes instead of failing on a stale version. An
+// entry another process enqueued to the source moves too (prepared), one it
+// removed first is lost and not moved, and the target keeps the entries
+// another process added to it.
+parity_test!(
+    queue_moves_from_an_out_of_date_process_merge,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let (from, to) = (aid("agent-a"), aid("agent-b"));
+        let row = |id: &str, agent: &str| queue_row(id, agent, 0, tenant);
+        let Some(test_db) = db else {
+            let moved = store
+                .move_agent_queue(&from, &to, &[row("q1", "agent-b")], &["q1".into()], &|_| {})
+                .await
+                .unwrap();
+            assert!(moved.merged.is_none() && moved.lost.is_empty());
+            return;
+        };
+        let other = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        let (a, b) = (&store, &other);
+        a.load_all_agent_queues().await.unwrap();
+        b.load_all_agent_queues().await.unwrap();
+        a.sync_agent_queue(&from, &[row("q1", "agent-a"), row("q3", "agent-a")], &[])
+            .await
+            .unwrap();
+        a.sync_agent_queue(&to, &[row("t1", "agent-b")], &[])
+            .await
+            .unwrap();
+        // B, which saw none of that: enqueues q2 to the source, drains q3
+        // from it, and enqueues t2 to the target.
+        b.sync_agent_queue(&from, &[row("q2", "agent-a")], &[])
+            .await
+            .unwrap();
+        let drained = b
+            .sync_agent_queue(
+                &from,
+                &[row("q1", "agent-a"), row("q2", "agent-a")],
+                &["q3".into()],
+            )
+            .await
+            .unwrap();
+        assert!(drained.lost.is_empty(), "{drained:?}");
+        b.sync_agent_queue(&to, &[row("t2", "agent-b")], &[])
+            .await
+            .unwrap();
+
+        // A, out of date on both queues, moves what it holds: q1 and q3.
+        let local = [
+            row("t1", "agent-b"),
+            row("q1", "agent-b"),
+            row("q3", "agent-b"),
+        ];
+        let moved = a
+            .move_agent_queue(&from, &to, &local, &["q1".into(), "q3".into()], &|row| {
+                row.payload["moved"] = json!(true);
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved.lost, ["q3"], "B delivered q3 first");
+        let written: Vec<String> = moved
+            .merged
+            .expect("the target differs from what A wrote")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(written, ["t1", "t2", "q1", "q2"]);
+        assert_eq!(queue_ids(b, "agent-b").await, ["t1", "t2", "q1", "q2"]);
+        assert!(queue_ids(b, "agent-a").await.is_empty());
+        let rows = b.load_all_agent_queues().await.unwrap();
+        let q2 = rows.iter().find(|r| r.id == "q2").unwrap();
+        assert_eq!(q2.payload["moved"], json!(true), "B's entry was prepared");
+        // A third process (fresh) sees the same.
+        let fresh = crate::harness::open_as_process(test_db, tenant, "process-c").await;
+        assert_eq!(queue_ids(&fresh, "agent-b").await, ["t1", "t2", "q1", "q2"]);
+    }
+);
+
+// Each process of a tenant takes its own queue order tag on its first open
+// (the low bits of the submission orders it assigns); every open in one
+// process shares it.
+parity_test!(
+    processes_take_distinct_queue_order_tags,
+    |store, tenant, db| {
+        let Some(test_db) = db else {
+            assert_eq!(store.queue_order_tag(), None);
+            return;
+        };
+        let a = crate::harness::open_as_process(test_db, tenant, "process-a").await;
+        let a_again = crate::harness::open_as_process(test_db, tenant, "process-a").await;
+        let b = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        let (ta, tb) = (a.queue_order_tag().unwrap(), b.queue_order_tag().unwrap());
+        assert_ne!(ta, tb);
+        assert_eq!(a_again.queue_order_tag(), Some(ta));
+        assert!(ta < 1 << intent_store::QUEUE_ORDER_TAG_BITS);
+        assert!(store.queue_order_tag().is_some());
+    }
+);
+
+// No write stores a done entry again, from any process and whatever its
+// memory holds: a delivered entry (its claim finished) and a cancelled one
+// are recorded as done in the transaction that deletes them, every queue
+// write skips them (sync at an equal or out-of-date version, replace, move)
+// and returns what it stored so memory follows, and a claim of one is lost.
+parity_test!(
+    a_done_queue_entry_is_never_stored_or_claimed_again,
+    |store, tenant, db| {
+        seed_sessions(&store, tenant).await;
+        let (agent, other) = (aid("agent-a"), aid("agent-b"));
+        let row = |id: &str| queue_row(id, "agent-a", 0, tenant);
+        let Some(test_db) = db else {
+            return;
+        };
+        let a = crate::harness::open_as_process(test_db, tenant, "process-a").await;
+        let b = crate::harness::open_as_process(test_db, tenant, "process-b").await;
+        for store in [&a, &b] {
+            store.load_all_agent_queues().await.unwrap();
+        }
+        a.sync_agent_queue(&agent, &[row("d1"), row("c1"), row("q1")], &[])
+            .await
+            .unwrap();
+        // B delivers d1 (claim, then finish) and cancels c1.
+        b.refresh_agent_queue(&agent, &[]).await.unwrap();
+        b.sync_agent_queue(&agent, &[row("c1"), row("q1")], &["d1".into()])
+            .await
+            .unwrap();
+        b.finish_agent_queue_claims(&agent, &["d1".into()])
+            .await
+            .unwrap();
+        b.remove_from_agent_queue(&agent, &[row("q1")], &["c1".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, db, tenant, "agent_queue_done", "id IN ('d1', 'c1')").await,
+            2
+        );
+
+        // A, out of date, writes both back: neither is stored, and A is
+        // told so.
+        let sync = a
+            .sync_agent_queue(&agent, &[row("d1"), row("c1"), row("q1")], &[])
+            .await
+            .unwrap();
+        let ids = |rows: Vec<AgentQueueRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(sync.merged.map(ids), Some(vec!["q1".to_owned()]));
+        // Now at the current version (the plain write path), again.
+        let sync = a
+            .sync_agent_queue(&agent, &[row("d1"), row("q1"), row("q2")], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            sync.merged.map(ids),
+            Some(vec!["q1".to_owned(), "q2".to_owned()])
+        );
+        // A replace and a move skip them too.
+        a.load_all_agent_queues().await.unwrap();
+        let _ = a
+            .replace_agent_queue(&agent, &[row("c1"), row("q1"), row("q2")])
+            .await;
+        assert_eq!(queue_ids(&b, "agent-a").await, ["q1", "q2"]);
+        let moved = a
+            .move_agent_queue(
+                &agent,
+                &other,
+                &[
+                    queue_row("d1", "agent-b", 0, tenant),
+                    queue_row("q1", "agent-b", 0, tenant),
+                ],
+                &["d1".into(), "q1".into()],
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!queue_ids(&b, "agent-b").await.contains(&"d1".to_owned()));
+        assert!(moved
+            .merged
+            .is_none_or(|rows| rows.iter().all(|r| r.id != "d1")));
+        // An edit of an entry nobody claimed still lands (the write
+        // rewrites its own rows; only live foreign claims and done entries
+        // are skipped).
+        let mut edited = queue_row("q2", "agent-a", 0, tenant);
+        edited.payload = json!({ "text": "edited" });
+        a.sync_agent_queue(&agent, &[edited], &[]).await.unwrap();
+        let rows = b.load_all_agent_queues().await.unwrap();
+        let q2 = rows.iter().find(|r| r.id == "q2").expect("q2 stored");
+        assert_eq!(q2.payload, json!({ "text": "edited" }));
+        // A claim of a done entry is lost.
+        let claim = b
+            .sync_agent_queue(&other, &[], &["d1".into()])
+            .await
+            .unwrap();
+        assert_eq!(claim.lost, ["d1"]);
+    }
+);
+
 parity_test!(agent_queues_round_trip, |store, tenant| {
     assert!(store.load_all_agent_queues().await.unwrap().is_empty());
     seed_sessions(&store, tenant).await;
@@ -1369,7 +1796,13 @@ parity_test!(agent_queues_round_trip, |store, tenant| {
         .await
         .is_err());
     store
-        .move_agent_queue(&a, &b, &[queue_row("q1", "agent-b", 0, tenant)])
+        .move_agent_queue(
+            &a,
+            &b,
+            &[queue_row("q1", "agent-b", 0, tenant)],
+            &["q1".into(), "q2".into()],
+            &|_| {},
+        )
         .await
         .unwrap();
     let got: Vec<(String, String)> = store
@@ -1381,7 +1814,13 @@ parity_test!(agent_queues_round_trip, |store, tenant| {
         .collect();
     assert_eq!(got, [("agent-b".to_owned(), "q1".to_owned())]);
     assert!(store
-        .move_agent_queue(&a, &b, &[queue_row("qy", "agent-a", 0, tenant)])
+        .move_agent_queue(
+            &a,
+            &b,
+            &[queue_row("qy", "agent-a", 0, tenant)],
+            &[],
+            &|_| {}
+        )
         .await
         .is_err());
     store.replace_agent_queue(&a, &[]).await.unwrap();

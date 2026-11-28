@@ -72,10 +72,7 @@ impl Services {
                     // the retry caller or ambient task-local caller.
                     metadata["fromPrincipalId"] = json!(principal);
                 }
-                let order = self
-                    .queue_submission_order
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
+                let order = self.next_submission_order();
                 let payload = json!({"id":id,"turnId":id,"content":content,"imageBlocks":null,"fileBlocks":null,"queuedAt":queued_at,"messageMetadata":metadata,"userOrigin":m.author.principal_id.is_some(),"submissionOrder":order,"correlationOrderKnown":true});
                 let queued: QueuedMessage = serde_json::from_value(payload.clone())
                     .map_err(|e| Error::Internal(e.to_string()))?;
