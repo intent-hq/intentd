@@ -1723,7 +1723,7 @@ not hide the workspace for collaborators or mark its work complete.
 
 The HUD also leaves set-aside workspaces out of its grid, counters, attention list and
 event feed. To include them, open its status filter and turn on **Show set aside** (the
-row appears only while something is set aside), or choose **Show N set aside** when the
+row appears while something is set aside or the option is on), or choose **Show N set aside** when the
 grid is empty. The HUD remembers this choice. The Dock's workspace list always leaves them out. Workspace
 tabs keep their status badges either way. Older versions may show set-aside workspaces
 in the HUD and Dock.
