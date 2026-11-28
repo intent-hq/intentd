@@ -1491,13 +1491,9 @@ async fn a_default_with_saved_overrides_ignores_the_bare_verdict() {
 async fn a_write_admitted_before_uninstall_never_lands_after_it() {
     let f = Arc::new(fx().await);
     let app = level1_app(&f, "race-app").await;
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    *f.svc.apps.storage_write_pause.lock().unwrap() = Some(super::StorageWritePause {
-        entered: entered.clone(),
-        release: release.clone(),
-    });
-    let writer = {
+    let pause = intentd_test_support::PausePoint::new("app storage write");
+    *f.svc.apps.storage_write_pause.lock().unwrap() = Some(pause.clone());
+    let mut writer = {
         let f = f.clone();
         tokio::spawn(with_caller(Caller::Daemon, async move {
             f.call_as(
@@ -1508,10 +1504,10 @@ async fn a_write_admitted_before_uninstall_never_lands_after_it() {
             .await
         }))
     };
-    entered.notified().await;
+    pause.reached(&mut writer).await;
     f.call("app.uninstall", json!({ "appId": "race-app" }))
         .await;
-    release.notify_one();
+    pause.release();
     let written = writer.await.unwrap();
     assert!(matches!(written, Err(Error::Forbidden(_))), "{written:?}");
     let again = level1_app(&f, "race-app").await;

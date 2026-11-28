@@ -115,8 +115,8 @@ async fn two_processes_never_refresh_one_workspace_at_once() {
     let (run_a, run_b) = (refresh(a), refresh(b));
     // Whoever took the lease is parked in its forge read.
     let a_won = tokio::select! {
-        () = park_a.entered.notified() => true,
-        () = park_b.entered.notified() => false,
+        () = park_a.pause.wait_reached() => true,
+        () = park_b.pause.wait_reached() => false,
     };
     let (winner, loser, winner_park, loser_forge) = if a_won {
         (run_a, run_b, park_a, &forge_b)
@@ -129,7 +129,7 @@ async fn two_processes_never_refresh_one_workspace_at_once() {
         "the other process skips while the refresh runs"
     );
     assert_eq!(get_pr_calls(loser_forge), 0, "and never calls the forge");
-    winner_park.release.notify_one();
+    winner_park.pause.release();
     assert_ne!(winner.await.unwrap().unwrap(), "skipped");
     assert_eq!(get_pr_calls(&forge_a) + get_pr_calls(&forge_b), 1);
 }
@@ -159,7 +159,7 @@ async fn a_refresh_that_lost_its_lease_writes_nothing_late() {
         let ws = ws.clone();
         async move { a.refresh_workspace_pr_automatically_for_test(&ws).await }
     });
-    park.entered.notified().await;
+    park.pause.wait_reached().await;
     // A's holder stops renewing long enough for the lease to lapse.
     sqlx::query(
         "UPDATE lease SET expires_at = clock_timestamp() \
@@ -174,7 +174,7 @@ async fn a_refresh_that_lost_its_lease_writes_nothing_late() {
     assert_ne!(fresh.unwrap(), "skipped", "B takes the lapsed lease");
     let after_b = store_b.get_workspace(&ws).await.unwrap();
 
-    park.release.notify_one();
+    park.pause.release();
     let late = stale.await.unwrap();
     assert!(
         matches!(late, Err(intent_core::Error::LeaseLost(_))),
@@ -230,8 +230,8 @@ async fn two_processes_never_poll_one_monitor_at_once() {
     };
     let (run_a, run_b) = (sweep(a), sweep(b));
     let a_won = tokio::select! {
-        () = park_a.entered.notified() => true,
-        () = park_b.entered.notified() => false,
+        () = park_a.pause.wait_reached() => true,
+        () = park_b.pause.wait_reached() => false,
     };
     let (winner, loser, winner_park, loser_forge) = if a_won {
         (run_a, run_b, park_a, &forge_b)
@@ -244,7 +244,7 @@ async fn two_processes_never_poll_one_monitor_at_once() {
         0,
         "the other process's sweep leaves the monitor being polled"
     );
-    winner_park.release.notify_one();
+    winner_park.pause.release();
     winner.await.unwrap();
     assert_eq!(get_pr_calls(&forge_a) + get_pr_calls(&forge_b), 1);
 }

@@ -500,16 +500,14 @@ mod tests {
     async fn shutdown_finishes_admitted_branch_refresh_before_store_close() {
         struct HeldApi {
             workspace: Workspace,
-            entered: tokio::sync::Notify,
-            release: tokio::sync::Notify,
+            pause: intentd_test_support::PausePoint,
             calls: std::sync::atomic::AtomicUsize,
         }
         impl WorkspaceApi for HeldApi {
             fn get_workspace(&self, _: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
                 Box::pin(async move {
                     self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    self.entered.notify_one();
-                    self.release.notified().await;
+                    self.pause.pause().await;
                     Ok(self.workspace.clone())
                 })
             }
@@ -541,19 +539,13 @@ mod tests {
         let bus = EventBus::new(store.clone());
         let api = Arc::new(HeldApi {
             workspace: ws.clone(),
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            pause: intentd_test_support::PausePoint::unshared("branch refresh get_workspace"),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let refresher =
             GitStatusRefresher::start(bus.clone(), api.clone(), Arc::new(GitStatusCache::new()));
         refresher.trigger(ws.id.clone());
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(10)),
-            api.entered.notified(),
-        )
-        .await
-        .unwrap();
+        api.pause.wait_reached().await;
         let late_trigger = refresher.trigger_tx.clone();
         let shutdown = refresher.shutdown();
         tokio::pin!(shutdown);
@@ -565,7 +557,7 @@ mod tests {
         // Queue another trigger after shutdown admission closes. It must never
         // reach get_workspace, even while the first admitted refresh settles.
         let _ = late_trigger.send(ws.id.clone());
-        api.release.notify_one();
+        api.pause.release();
         if !escaped {
             timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(10)),

@@ -61,18 +61,18 @@ async fn old_startup_reservation_cannot_replace_a_new_intent_after_await() {
         .writers
         .reserve(RepositoryMutationKind::Replace)
         .unwrap();
-    let pause = Pause::new();
+    let pause = PausePoint::new("credential writer secret read");
     let wait = pause.clone();
     let original_owner = tokio::spawn(async move {
-        wait.wait().await;
+        wait.pause().await;
         old.begin(|| Ok(RepositoryWriterPreflight::Change))
     });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     let new = test
         .writers
         .reserve(RepositoryMutationKind::Replace)
         .unwrap();
-    pause.release.add_permits(1);
+    pause.release();
     assert!(matches!(
         original_owner.await.unwrap(),
         Err(RepositoryCredentialError::StaleMutation)
@@ -123,18 +123,18 @@ fn final_owner_check_rejects_foreign_account_or_descriptor_without_effects() {
 async fn waiting_old_acquisition_cannot_escape_first_persistence_fence() {
     let test = Arc::new(Test::new());
     let admission = test.native();
-    let pause = Pause::new();
+    let pause = PausePoint::new("credential writer secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let reader = test.clone();
     let old = tokio::spawn(async move { reader.acquire(&admission).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     let mutation = test.begin(RepositoryMutationKind::Replace);
     assert_eq!(
         test.directory.binding().unwrap_err(),
         RepositoryCredentialError::Mutating
     );
     test.secrets.persist("replacement-token");
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         old.await.unwrap().unwrap_err(),
         RepositoryCredentialError::Retired
@@ -199,17 +199,17 @@ async fn actual_callback_reacquires_only_after_verified_refresh_settles() {
 async fn refresh_rejects_secret_loaded_before_revision_change() {
     let test = Arc::new(Test::new());
     let admission = test.native();
-    let pause = Pause::new();
+    let pause = PausePoint::new("credential writer secret read");
     *test.secrets.pause.lock().unwrap() = Some(pause.clone());
     let reader = test.clone();
     let old = tokio::spawn(async move { reader.acquire(&admission).await });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     let mutation = test.begin(RepositoryMutationKind::Refresh);
     test.secrets.persist("refreshed-token");
     mutation
         .complete(SettledCredentialState::Verified(test.verified.clone()))
         .unwrap();
-    pause.release.add_permits(1);
+    pause.release();
     assert_eq!(
         old.await.unwrap().unwrap_err(),
         RepositoryCredentialError::SecretMismatch
@@ -326,17 +326,17 @@ async fn detached_owner_can_settle_after_timeout_but_cannot_overwrite_a_new_comp
     let mutation = test.begin(RepositoryMutationKind::Replace);
     let completion = mutation.completion();
     let late = completion.clone();
-    let pause = Pause::new();
+    let pause = PausePoint::new("credential writer secret read");
     let writer = test.clone();
     let wait = pause.clone();
     let job = tokio::spawn(async move {
-        wait.wait().await;
+        wait.pause().await;
         writer.secrets.persist("late-actual-write");
         completion
             .complete(SettledCredentialState::Verified(writer.verified.clone()))
             .unwrap();
     });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     drop(mutation);
     assert_eq!(
         test.directory.binding().unwrap_err(),
@@ -346,7 +346,7 @@ async fn detached_owner_can_settle_after_timeout_but_cannot_overwrite_a_new_comp
         test.writers.reserve(RepositoryMutationKind::Replace),
         Err(RepositoryCredentialError::Indeterminate)
     ));
-    pause.release.add_permits(1);
+    pause.release();
     job.await.unwrap();
     let newer = test
         .begin(RepositoryMutationKind::Replace)
@@ -366,13 +366,13 @@ async fn cancelled_started_task_is_indeterminate_until_original_owner_proves_set
     let test = Test::new();
     let mutation = test.begin(RepositoryMutationKind::Replace);
     let completion = mutation.completion();
-    let pause = Pause::new();
+    let pause = PausePoint::new("credential writer secret read");
     let wait = pause.clone();
     let job = tokio::spawn(async move {
         let _mutation = mutation;
-        wait.wait().await;
+        wait.pause().await;
     });
-    pause.entered.notified().await;
+    pause.wait_reached().await;
     job.abort();
     assert!(job.await.unwrap_err().is_cancelled());
     assert_eq!(

@@ -17,6 +17,20 @@ async fn reached<F: Future>(operation: &mut Pin<Box<F>>, entered: &Notify) {
     .expect("original authority fence was not reached");
 }
 
+async fn reached_hold<F: Future>(
+    operation: &mut Pin<Box<F>>,
+    pause: &intentd_test_support::PausePoint,
+) {
+    timeout(BUDGET, async {
+        tokio::select! {
+            () = pause.wait_reached() => {},
+            _ = operation => panic!("HTTP completed before the required original authority fence"),
+        }
+    })
+    .await
+    .expect("original authority fence was not reached");
+}
+
 async fn hold_final<F: Future>(operation: &mut Pin<Box<F>>, entered: &Notify, release: &Notify) {
     reached(operation, entered).await;
     release.notify_one(); // Consume the first, token-release fence.
@@ -317,7 +331,7 @@ async fn admitted_success_survives_original_retirement_but_cannot_send_again() {
                 server.entered().await;
                 assert_eq!(project_calls(server), 1);
                 f.owner.retirement().retire();
-                server.control.release.notify_one();
+                server.control.hold.release();
             };
             let (result, ()) = tokio::join!(call, retirement);
             assert_eq!(result.unwrap().name, "project");
@@ -343,8 +357,7 @@ struct Replies {
     project_status: std::sync::atomic::AtomicU16,
     post_status: std::sync::atomic::AtomicU16,
     pause: std::sync::atomic::AtomicU8,
-    entered: Notify,
-    release: Notify,
+    hold: intentd_test_support::PausePoint,
 }
 
 struct EffectServer {
@@ -355,7 +368,7 @@ struct EffectServer {
 
 impl Drop for EffectServer {
     fn drop(&mut self) {
-        self.replies.release.notify_waiters();
+        self.replies.hold.release();
         self.task.abort();
     }
 }
@@ -380,8 +393,7 @@ impl EffectServer {
             project_status: std::sync::atomic::AtomicU16::new(200),
             post_status: std::sync::atomic::AtomicU16::new(201),
             pause: std::sync::atomic::AtomicU8::new(0),
-            entered: Notify::new(),
-            release: Notify::new(),
+            hold: intentd_test_support::PausePoint::unshared("held provider effect"),
         });
         let control = replies.clone();
         let task = tokio::spawn(async move {
@@ -435,8 +447,7 @@ impl EffectServer {
                             .compare_exchange(should_pause, 0, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                     {
-                        control.entered.notify_one();
-                        control.release.notified().await;
+                        control.hold.pause().await;
                     }
                     let (status, body) = if path == "/api/v4/user" {
                         (
@@ -622,16 +633,16 @@ async fn admitted_create_preserves_actual_success_uncertainty_and_completed_git_
                 let mut call = Box::pin(provider.create_same_project(&repo, intent_sourcecontrol::model::NewPullRequest {
                     title: "submitted title".into(), body: None, source_branch: "main".into(), target_branch: "target".into(), draft: false,
                 }, &source, &target));
-                reached(&mut call, &server.replies.entered).await;
+                reached_hold(&mut call, &server.replies.hold).await;
                 assert_eq!(server.calls("POST"), 1);
                 f.owner.retirement().retire();
                 let receipt = if status == 0 {
                     drop(call);
-                    server.replies.release.notify_one();
+                    server.replies.hold.release();
                     drop(stamp);
                     admission.execution().unwrap()
                 } else {
-                    server.replies.release.notify_one();
+                    server.replies.hold.release();
                     let result = call.await;
                     if status == 201 {
                         let created = result.unwrap();
@@ -678,11 +689,11 @@ async fn admitted_response_receipts_keep_actual_rejection_or_quota_on_original_b
                 let provider = f.callback(&stamp).into_provider().unwrap();
                 let original = f.auth.request().binding;
                 let mut call = Box::pin(provider.get_repo("group", "project"));
-                reached(&mut call, &server.replies.entered).await;
+                reached_hold(&mut call, &server.replies.hold).await;
                 if replacement {
                     f.auth.service.gitlab_connect_pat(server.fixture.host.clone(), "pat-second".into()).await.unwrap();
                 }
-                server.replies.release.notify_one();
+                server.replies.hold.release();
                 let result = call.await;
                 if status == 401 {
                     assert!(matches!(result, Err(intent_sourcecontrol::Error::Provider(failure)) if failure.kind == intent_sourcecontrol::error::ProviderFailureKind::CredentialRejected));

@@ -100,7 +100,7 @@ struct Feed {
 }
 pub(super) struct ConnectionState {
     #[cfg(test)]
-    after_store: Mutex<Option<Arc<tests::WorkerGate>>>,
+    after_store: Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
     feed: Mutex<Feed>,
     notify: Notify,
     permits: Arc<Semaphore>,
@@ -1245,7 +1245,7 @@ async fn run_write(request: &Request, op: &Operation) -> Receipt {
     {
         let gate = c.selection.after_store.lock().unwrap().clone();
         if let Some(gate) = gate {
-            gate.wait().await;
+            gate.pause().await;
         }
     }
     projection(result)

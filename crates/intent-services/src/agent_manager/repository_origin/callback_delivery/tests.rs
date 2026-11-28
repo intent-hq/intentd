@@ -14,6 +14,7 @@ use intent_acp::mcp_server::request_context::{McpRequestContext, McpRequestScope
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
 use intent_core::{BoxFuture, Caller, WorkspaceApi};
 use intent_store::{RepositoryLifecycleKey, Store};
+use intentd_test_support::PausePoint;
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -39,13 +40,11 @@ struct ProbeApi {
     reads: Mutex<Vec<ReadObservation>>,
     retire_operation: AtomicBool,
     hold: AtomicBool,
-    entered: Notify,
-    release: Notify,
+    pause: PausePoint,
     block_pending: AtomicBool,
-    pending_entered: AtomicUsize,
+    pending: PausePoint,
     pending_captured: AtomicUsize,
     pending_changed: Notify,
-    pending_release: Notify,
 }
 
 impl WorkspaceApi for ProbeApi {
@@ -106,18 +105,10 @@ impl WorkspaceApi for ProbeApi {
                 );
             }
             if !admitted && self.block_pending.load(Ordering::SeqCst) {
-                let released = self.pending_release.notified();
-                tokio::pin!(released);
-                released.as_mut().enable();
-                self.pending_entered.fetch_add(1, Ordering::SeqCst);
-                self.pending_changed.notify_waiters();
-                if self.block_pending.load(Ordering::SeqCst) {
-                    released.await;
-                }
+                self.pending.pause().await;
             }
             if self.hold.swap(false, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
             }
             Ok(
                 json!({"path":path,"definition":{"path":path},"value":match path.as_str() {
@@ -182,26 +173,34 @@ impl intent_acp::mcp_server::repository_guidance::RepositoryGuidanceSource for P
     }
 }
 
-#[derive(Default)]
+type HeldWrite = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Holds the peer's stdin writes while blocked: the first blocked write
+/// arrives at the pause point and every write waits until `resume`.
 struct PeerWriterGate {
     blocked: AtomicBool,
-    entered: Notify,
-    waker: Mutex<Option<std::task::Waker>>,
+    pause: Arc<PausePoint>,
+    held: Mutex<Option<HeldWrite>>,
+}
+impl Default for PeerWriterGate {
+    fn default() -> Self {
+        Self {
+            blocked: AtomicBool::new(false),
+            pause: PausePoint::new("peer stdin write"),
+            held: Mutex::new(None),
+        }
+    }
 }
 impl PeerWriterGate {
     fn block(&self) {
         self.blocked.store(true, Ordering::SeqCst);
     }
     async fn reached(&self) {
-        tokio::time::timeout(fixture_wait(), self.entered.notified())
-            .await
-            .unwrap();
+        self.pause.wait_reached().await;
     }
     fn resume(&self) {
         self.blocked.store(false, Ordering::SeqCst);
-        if let Some(waker) = self.waker.lock().unwrap().take() {
-            waker.wake();
-        }
+        self.pause.release();
     }
 }
 struct PeerWriter {
@@ -215,11 +214,15 @@ impl tokio::io::AsyncWrite for PeerWriter {
         data: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         {
-            let mut waker = self.gate.waker.lock().unwrap();
-            if self.gate.blocked.load(Ordering::SeqCst) {
-                *waker = Some(cx.waker().clone());
-                self.gate.entered.notify_one();
-                return std::task::Poll::Pending;
+            let mut held = self.gate.held.lock().unwrap();
+            if held.is_some() || self.gate.blocked.load(Ordering::SeqCst) {
+                let pause = self.gate.pause.clone();
+                let write =
+                    held.get_or_insert_with(|| Box::pin(async move { pause.pause().await }));
+                if std::future::Future::poll(write.as_mut(), cx).is_pending() {
+                    return std::task::Poll::Pending;
+                }
+                *held = None;
             }
         }
         std::pin::Pin::new(&mut self.stdin).poll_write(cx, data)
@@ -469,13 +472,11 @@ impl Harness {
             reads: Mutex::new(Vec::new()),
             retire_operation: AtomicBool::new(false),
             hold: AtomicBool::new(false),
-            entered: Notify::new(),
-            release: Notify::new(),
+            pause: PausePoint::unshared("held settings read"),
             block_pending: AtomicBool::new(false),
-            pending_entered: AtomicUsize::new(0),
+            pending: PausePoint::unshared("pending request settings read"),
             pending_captured: AtomicUsize::new(0),
             pending_changed: Notify::new(),
-            pending_release: Notify::new(),
         });
         let blueprint = {
             let api = probe.clone();
@@ -995,7 +996,7 @@ async fn held_old_completed_response_survives_distinct_registration() {
     tokio::pin!(old_call);
     tokio::select! {
         result = &mut old_call => panic!("old response bypassed the real settings await: {result}"),
-        () = h.probe.entered.notified() => {},
+        () = h.probe.pause.wait_reached() => {},
     }
     h.node.call("fixture/release", json!({})).await;
     let id = start.await.unwrap().unwrap();
@@ -1004,7 +1005,7 @@ async fn held_old_completed_response_survives_distinct_registration() {
         Some(id.as_str())
     );
     assert_eq!(h.aliases(0).await.len(), 1);
-    h.probe.release.notify_one();
+    h.probe.pause.release();
     assert!(old_call
         .await
         .to_string()
@@ -1072,14 +1073,16 @@ async fn pending_request_queued_before_permit_never_adopts_new_endpoint_authorit
                 .unwrap()
         }));
     }
-    wait_count(&h.probe.pending_entered, &h.probe.pending_changed, 16).await;
+    for _ in 0..16 {
+        h.probe.pending.wait_reached().await;
+    }
     wait_count(
         &h.probe.pending_captured,
         &h.probe.pending_changed,
         original_captures + 17,
     )
     .await;
-    assert_eq!(h.probe.pending_entered.load(Ordering::SeqCst), 16);
+    assert_eq!(h.probe.pending.arrivals(), 16);
     h.node.call("fixture/release", json!({})).await;
     start.await.unwrap().unwrap();
     let alias = h.aliases(0).await.pop().unwrap();
@@ -1097,7 +1100,9 @@ async fn pending_request_queued_before_permit_never_adopts_new_endpoint_authorit
     h.probe.observations.lock().unwrap().clear();
     h.probe.reads.lock().unwrap().clear();
     h.probe.block_pending.store(false, Ordering::SeqCst);
-    h.probe.pending_release.notify_waiters();
+    for _ in 0..16 {
+        h.probe.pending.release();
+    }
     for request in requests {
         assert!(request.await.unwrap().to_string().contains("queued-"));
     }
@@ -1796,7 +1801,7 @@ async fn confirmed_endpoint_retains_one_read_scope_through_preparation_and_retir
     tokio::pin!(held);
     tokio::select! {
         result = &mut held => panic!("ordinary settings barrier bypassed: {result}"),
-        () = h.probe.entered.notified() => {},
+        () = h.probe.pause.wait_reached() => {},
     }
     let held_observations = std::mem::take(&mut *h.probe.reads.lock().unwrap());
     let held_read = held_observations[0].read.as_ref().unwrap().clone();
@@ -1845,7 +1850,7 @@ async fn confirmed_endpoint_retains_one_read_scope_through_preparation_and_retir
         }
     })
     .await;
-    h.probe.release.notify_one();
+    h.probe.pause.release();
     assert!(held.await.to_string().contains("held ordinary result"));
     intent_core::with_caller(h.f.caller(), async {
         assert_eq!(held_read.check_current(), Err(AdmissionError::Retired));
@@ -1938,34 +1943,18 @@ use intent_acp::mcp_server::private_results::{
 };
 use intent_acp::mcp_server::request_context::McpContextFuture;
 
-struct NativeHold {
-    entered: Notify,
-    release: tokio::sync::Semaphore,
-}
+/// The test's view of the actual original scopes while they are blocked.
+struct ScopePause(PausePoint);
 
-impl NativeHold {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: tokio::sync::Semaphore::new(0),
-        })
-    }
-
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-    }
-
-    async fn reached(&self) {
-        tokio::time::timeout(fixture_wait(), self.entered.notified())
-            .await
-            .unwrap();
+impl Default for ScopePause {
+    fn default() -> Self {
+        Self(PausePoint::unshared("blocked original scope"))
     }
 }
 
 #[derive(Default)]
 struct NativeControl {
-    hold: Mutex<Option<(Boundary, bool, Arc<NativeHold>)>>,
+    hold: Mutex<Option<(Boundary, bool, Arc<PausePoint>)>>,
     events: Mutex<Vec<(Boundary, usize)>>,
     reads: Mutex<Vec<ReadObservation>>,
     records: Mutex<Vec<Arc<crate::repository_read_source::ReadRecord>>>,
@@ -1973,11 +1962,10 @@ struct NativeControl {
     captures: AtomicUsize,
     optional_captures: AtomicUsize,
     optional_events: Mutex<Vec<(Boundary, usize)>>,
-    entered: AtomicUsize,
     changed: Notify,
     blocked: AtomicBool,
-    release: Notify,
-    completed_body: Mutex<Option<Arc<NativeHold>>>,
+    scopes: ScopePause,
+    completed_body: Mutex<Option<Arc<PausePoint>>>,
     budget_hosts: Option<Arc<BudgetHosts>>,
 }
 
@@ -2039,8 +2027,8 @@ impl Drop for BudgetRequestTrace<'_> {
 }
 
 impl NativeControl {
-    fn at(&self, boundary: Boundary, after: bool) -> Arc<NativeHold> {
-        let gate = NativeHold::new();
+    fn at(&self, boundary: Boundary, after: bool) -> Arc<PausePoint> {
+        let gate = PausePoint::new("native hold");
         assert!(self
             .hold
             .lock()
@@ -2093,18 +2081,13 @@ impl McpRequestScope for NativeScope {
                 read: current_read_request(),
                 source: current_source_lifetime().ok(),
             });
-            let release = self.control.release.notified();
-            tokio::pin!(release);
-            release.as_mut().enable();
-            self.control.entered.fetch_add(1, Ordering::SeqCst);
-            self.control.changed.notify_waiters();
             if self.control.blocked.load(Ordering::SeqCst) {
-                release.await;
+                self.control.scopes.0.pause().await;
             }
             body.await;
             let held = self.control.completed_body.lock().unwrap().take();
             if let Some(held) = held {
-                held.wait().await;
+                held.pause().await;
             }
         }))
     }
@@ -2166,7 +2149,7 @@ impl McpPrivatePolicy for NativePolicy {
                 }
             };
             if let Some((_, false, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             // Delegate the same successful seal, optional evidence, boundary,
             // one-use packet and resulting receipt. No fixture authority.
@@ -2184,7 +2167,7 @@ impl McpPrivatePolicy for NativePolicy {
                 *observed.admission.lock().unwrap() = Some((boundary.kind(), result));
             }
             if let Some((_, true, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             actual
         })
@@ -2235,7 +2218,7 @@ impl McpPrivatePolicy for NativePolicy {
                 }
             };
             if let Some((_, false, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             let actual = self.original.admit(boundary, records, packet).await;
             if let Some(observed) = &self.control.budget_hosts {
@@ -2248,7 +2231,7 @@ impl McpPrivatePolicy for NativePolicy {
                 *observed.admission.lock().unwrap() = Some((boundary.kind(), result));
             }
             if let Some((_, true, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             actual
         })
@@ -2880,7 +2863,6 @@ async fn confirmed_read_seventeenth_pending_capture_cannot_upgrade_after_registr
     h.node.call("fixture/entered", json!({})).await;
     pending.blocked.store(true, Ordering::SeqCst);
     let before_capture = pending.captures.load(Ordering::SeqCst);
-    let before_entered = pending.entered.load(Ordering::SeqCst);
     let mut tasks = Vec::new();
     for i in 0..17 {
         tasks.push(h.call_task(
@@ -2891,9 +2873,11 @@ async fn confirmed_read_seventeenth_pending_capture_cannot_upgrade_after_registr
             ),
         ));
     }
-    wait_count(&pending.entered, &pending.changed, before_entered + 16).await;
+    for _ in 0..16 {
+        pending.scopes.0.wait_reached().await;
+    }
     wait_count(&pending.captures, &pending.changed, before_capture + 17).await;
-    assert_eq!(pending.entered.load(Ordering::SeqCst), before_entered + 16);
+    assert_eq!(pending.scopes.0.arrivals(), 16);
     h.node.call("fixture/release", json!({})).await;
     start.await.unwrap().unwrap();
     let fresh = h
@@ -2902,7 +2886,9 @@ async fn confirmed_read_seventeenth_pending_capture_cannot_upgrade_after_registr
     assert!(fresh.to_string().contains("actual review"), "{fresh}");
     let reads = h.http.count();
     pending.blocked.store(false, Ordering::SeqCst);
-    pending.release.notify_waiters();
+    for _ in 0..16 {
+        pending.scopes.0.release();
+    }
     for task in tasks {
         let denied = task.await.unwrap();
         assert!(denied.to_string().contains("queued-"), "{denied}");
@@ -2935,7 +2921,7 @@ async fn confirmed_read_escaped_handles_retire_only_after_their_original_scope()
     control.reads.lock().unwrap().clear();
     let gate = control.at(Boundary::TcpResponse, false);
     let first = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
-    gate.reached().await;
+    gate.wait_reached().await;
     let (read, source) = {
         let mut observed = control.reads.lock().unwrap();
         let r = observed.iter_mut().find(|r| r.read.is_ok()).unwrap();
@@ -2956,7 +2942,7 @@ async fn confirmed_read_escaped_handles_retire_only_after_their_original_scope()
             .is_ok()
     );
     drop(cloned);
-    gate.release.add_permits(1);
+    gate.release();
     assert!(first.await.unwrap().to_string().contains("actual review"));
     tokio::time::timeout(fixture_wait(), async {
         while source.retirement().check_current().is_ok() {
@@ -2994,13 +2980,13 @@ async fn confirmed_read_host_and_tcp_boundary_keep_original_transfer_and_soft_in
         let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
         let gate = control.at(boundary, after);
         let task = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
-        gate.reached().await;
+        gate.wait_reached().await;
         assert!(h.f.manager.interrupt(&h.f.row.id).await);
         assert!(Arc::ptr_eq(
             &endpoint,
             h.origin.state.lock().unwrap().endpoint.as_ref().unwrap()
         ));
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         // A TCP transfer already consumed the original packet before retirement.
         let committed = boundary == Boundary::TcpResponse && after;
@@ -3038,7 +3024,7 @@ async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_origi
         h.start().await;
         let gate = control.at(Boundary::TcpResponse, false);
         let task = h.call_task(0, &h.confirmed(0).await, code);
-        gate.reached().await;
+        gate.wait_reached().await;
         assert!(control
             .events
             .lock()
@@ -3046,7 +3032,7 @@ async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_origi
             .iter()
             .any(|(b, n)| *b == Boundary::TcpResponse && *n >= 3));
         assert!(h.f.manager.interrupt(&h.f.row.id).await);
-        gate.release.add_permits(1);
+        gate.release();
         assert!(task
             .await
             .unwrap()
@@ -3098,12 +3084,12 @@ async fn confirmed_read_mixed_live_requests_never_borrow_sibling_evidence() {
     let name = h.confirmed(0).await;
     let gate = control.at(Boundary::TcpResponse, false);
     let first = h.call_task(0, &name, "return await ws.pr.snapshot(4);");
-    gate.reached().await;
+    gate.wait_reached().await;
     *control.foreign.lock().unwrap() = control.records.lock().unwrap().clone();
     let second = h.call(0, &name, "return await ws.pr.snapshot(4);").await;
     assert!(second.to_string().contains("actual review"), "{second}");
     control.foreign.lock().unwrap().clear();
-    gate.release.add_permits(1);
+    gate.release();
     assert!(first.await.unwrap().to_string().contains("actual review"));
     h.finish().await;
 }
@@ -3120,7 +3106,7 @@ async fn confirmed_read_original_source_and_credential_changes_fence_cached_fina
             &h.confirmed(0).await,
             "await ws.pr.snapshot(4); await ws.pr.snapshot(4); return 'constant';",
         );
-        gate.reached().await;
+        gate.wait_reached().await;
         match change {
             "head" => {
                 h.git.git(
@@ -3163,7 +3149,7 @@ async fn confirmed_read_original_source_and_credential_changes_fence_cached_fina
                 .unwrap();
             }
         }
-        gate.release.add_permits(1);
+        gate.release();
         assert!(
             task.await
                 .unwrap()
@@ -3217,7 +3203,7 @@ async fn confirmed_read_original_deletion_schedule_cancel_preserves_fresh_endpoi
         let name = h.confirmed(0).await;
         let gate = control.at(Boundary::TcpResponse, false);
         let task = h.call_task(0, &name, "await ws.pr.snapshot(4); return 'constant';");
-        gate.reached().await;
+        gate.wait_reached().await;
         intent_core::with_caller(Caller::Daemon, async {
             if agent {
                 h.original
@@ -3246,7 +3232,7 @@ async fn confirmed_read_original_deletion_schedule_cancel_preserves_fresh_endpoi
             }
         })
         .await;
-        gate.release.add_permits(1);
+        gate.release();
         assert!(task
             .await
             .unwrap()
@@ -3275,7 +3261,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
         &h.confirmed(0).await,
         "await ws.pr.snapshot(4); return 'constant';",
     );
-    gate.reached().await;
+    gate.wait_reached().await;
     intent_core::with_caller(Caller::Daemon, async {
         h.original
             .schedule_workspace_delete(h.git.workspace.id.clone(), 0)
@@ -3313,7 +3299,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
     })
     .await
     .unwrap();
-    gate.release.add_permits(1);
+    gate.release();
     let reply = task.await.unwrap();
     assert!(
         reply
@@ -3366,7 +3352,7 @@ async fn confirmed_read_artifact_and_attachment_start_preserve_actual_effects() 
             "const p=await ws.pr.snapshot(4); return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:JSON.stringify({title:p.title})}}]};"
         };
         let task = h.call_task(0, &h.confirmed(0).await, code);
-        gate.reached().await;
+        gate.wait_reached().await;
         let folder = h.git.dir.path().join("tool-outputs");
         assert!(!folder.exists());
         assert_eq!(
@@ -3376,7 +3362,7 @@ async fn confirmed_read_artifact_and_attachment_start_preserve_actual_effects() 
             0
         );
         assert!(h.f.manager.interrupt(&h.f.row.id).await);
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert!(
             reply
@@ -3762,14 +3748,14 @@ async fn confirmed_read_pending_completed_response_survives_distinct_registratio
     h.node.call("fixture/next", json!({"hold":true})).await;
     let start = h.start_task();
     h.node.call("fixture/entered", json!({})).await;
-    let held = NativeHold::new();
+    let held = PausePoint::new("native hold");
     *pending.completed_body.lock().unwrap() = Some(held.clone());
     let ordinary = h.call_task(
         0,
         "workspace-mcp",
         "return 'already completed original response';",
     );
-    held.reached().await;
+    held.wait_reached().await;
     h.node.call("fixture/release", json!({})).await;
     start.await.unwrap().unwrap();
     assert!(h
@@ -3777,7 +3763,7 @@ async fn confirmed_read_pending_completed_response_survives_distinct_registratio
         .await
         .to_string()
         .contains("actual review"));
-    held.release.add_permits(1);
+    held.release();
     assert!(ordinary
         .await
         .unwrap()
@@ -3815,9 +3801,9 @@ async fn confirmed_read_direct_companion_uses_same_original_policy_as_delivered_
             crate::repository_read_source::tests::run(&server, "return await ws.pr.snapshot(4);")
                 .await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert!(h.f.manager.interrupt(&h.f.row.id).await);
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert_eq!(
             reply.to_string().contains("actual review"),
@@ -4187,10 +4173,10 @@ async fn confirmed_read_cache_hit_keeps_original_ledger_without_second_provider_
         &h.confirmed(0).await,
         "await ws.pr.snapshot(4); return await ws.pr.snapshot(4);",
     );
-    gate.reached().await;
+    gate.wait_reached().await;
     let first = h.http.count();
     assert!(first > 0);
-    gate.release.add_permits(1);
+    gate.release();
     let reply = task.await.unwrap();
     assert!(reply.to_string().contains("actual review"), "{reply}");
     assert_eq!(
@@ -4330,9 +4316,9 @@ mod confirmed_aliases {
                     .map(|control| control.at(Boundary::HostPromise, true));
                 let task = h.call_task(0, &name, &code);
                 if let Some(gate) = &gate {
-                    gate.reached().await;
+                    gate.wait_reached().await;
                     assert_eq!(h.http.count(), 4, "one complete original fetch");
-                    gate.release.add_permits(1);
+                    gate.release();
                 }
                 let reply = task.await.unwrap();
                 let value = json_result(&reply);
@@ -4469,7 +4455,7 @@ mod confirmed_aliases {
             );
             let gate = control.at(boundary, after);
             let task = h.call_task(0, &name, &code);
-            gate.reached().await;
+            gate.wait_reached().await;
             let requests_before_retirement = h.http.count();
             assert!(
                 requests_before_retirement > 4,
@@ -4505,7 +4491,7 @@ mod confirmed_aliases {
             } else {
                 assert!(h.f.manager.interrupt(&h.f.row.id).await);
             }
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             if boundary == Boundary::TcpResponse && after {
                 assert_eq!(reply["isError"], false, "{reply}");
@@ -4583,10 +4569,10 @@ mod confirmed_aliases {
             );
             let gate = control.at(Boundary::HostPromise, true);
             let task = h.call_task(0, &h.confirmed(0).await, &code);
-            gate.reached().await;
+            gate.wait_reached().await;
             // MR, project, approvals; original quota prevents discussions.
             assert_eq!(h.http.count(), 3);
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             let value = json_result(&reply);
             let snapshot = &value["first"];
@@ -5208,7 +5194,7 @@ mod live_context {
             h.start().await;
             let gate = c.at(Boundary::TcpResponse, false);
             let task=h.call_task(0,&h.confirmed(0).await,"await ws.workspace.setStatusMessage('completed context effect'); await ws.pr.snapshot(4); return 'original context result';");
-            gate.reached().await;
+            gate.wait_reached().await;
             assert!(c
                 .optional_events
                 .lock()
@@ -5229,7 +5215,7 @@ mod live_context {
                     .await
                     .unwrap();
             }
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             assert_eq!(
                 h.original
@@ -5294,7 +5280,7 @@ mod live_context {
                 &h.confirmed(0).await,
                 "await ws.pr.snapshot(4);return 'completed required provider result';",
             );
-            gate.reached().await;
+            gate.wait_reached().await;
             let services = h.original.clone();
             let host = h.http.fixture.host.clone();
             daemon(&h,async move {
@@ -5311,7 +5297,7 @@ mod live_context {
                 assert_eq!(initial.binding, now.binding);
                 assert!(now.secret_revision > initial.secret_revision);
             }
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             assert!(!reply.to_string().contains(FACTS), "{mode}: {reply}");
             assert_eq!(
@@ -5453,21 +5439,23 @@ mod live_context {
         let h = selected(None).await;
         let id = h.start().await;
         let original_owner = owner(&h);
-        let gate = NativeHold::new();
+        let gate = PausePoint::new("native hold");
         let held = gate.clone();
         let path = h.git.path.clone();
         let locks = h.original.worktree_locks.clone();
         let holder = tokio::spawn(async move {
-            locks.with_lock(&path, || async { held.wait().await }).await;
+            locks
+                .with_lock(&path, || async { held.pause().await })
+                .await;
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         dispatch(&h, &id, capture(&h).await, "ordinary despite busy Git")
             .await
             .unwrap();
         assert!(!prompts(&h).await[0].to_string().contains(FACTS));
         // Optional Git lock contention omits immediately; no queued read exists.
         original_owner.drain_jobs().await;
-        gate.release.add_permits(1);
+        gate.release();
         holder.await.unwrap();
 
         // The existing settings fixture holds the actual snapshot writer lock.
@@ -9056,7 +9044,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             let task = tokio::spawn(async move {
                 conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),fixture_wait()).await.unwrap()
             });
-            gate.reached().await;
+            gate.wait_reached().await;
             if required {
                 h.select(RepositorySelectionChange::ExplicitRemote {
                     remote_name: "gone-now".into(),
@@ -9068,7 +9056,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     .apply(&[("git.autoCommit".into(), json!(false))])
                     .unwrap();
             }
-            gate.release.add_permits(1);
+            gate.release();
             let result = task.await.unwrap();
             assert!(!result.to_string().contains(FACTS), "{result}");
             assert_eq!(

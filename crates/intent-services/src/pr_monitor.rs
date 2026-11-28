@@ -6687,7 +6687,7 @@ mod tests {
                 .pending_changes
                 .is_empty());
         }
-        let (rx, release) = hold(&svc, "monitor");
+        let commit = hold(&svc, "monitor");
         let service = svc.clone();
         let workspace = ws.clone();
         let id = monitor.monitor_id.clone();
@@ -6698,7 +6698,7 @@ mod tests {
                 service.pr_monitor_flush(&workspace, &id).await.unwrap();
             }
         });
-        entered(rx).await;
+        entered(&commit).await;
         let row = svc
             .store()
             .get_pr_monitor(&monitor.monitor_id)
@@ -6730,7 +6730,7 @@ mod tests {
         });
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        drain_held(&svc, release).await;
+        drain_held(&svc, &commit).await;
         if let Some(manager) = manager {
             manager.shutdown().await;
         }
@@ -6788,12 +6788,14 @@ mod tests {
         workspace.branch = "definitely-other-branch".into();
         workspace.pr_number = Some(42);
         svc.store().update_workspace(&workspace).await.unwrap();
-        let (rx, release) = hold(&svc, "pr");
+        let commit = hold(&svc, "pr");
         let task = svc.spawn_pr_refresh_loop(Duration::from_millis(1));
-        entered(rx).await;
+        entered(&commit).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
+        // The held commit still owns its clone of the pause point: a fetch
+        // deadline that cancelled the publication would have dropped it.
         assert!(
-            !release.is_closed(),
+            std::sync::Arc::strong_count(&commit) > 1,
             "fetch deadline cancelled committed publication"
         );
         assert!(svc
@@ -6805,7 +6807,7 @@ mod tests {
             .is_none());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        drain_held(&svc, release).await;
+        drain_held(&svc, &commit).await;
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store().close().await;
         let reopened = Store::open(&db.path).await.unwrap();

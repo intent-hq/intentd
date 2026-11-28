@@ -1047,8 +1047,7 @@ mod tests {
     }
 
     struct PreparedRuntimeHook {
-        entered: tokio::sync::Notify,
-        release: tokio::sync::Semaphore,
+        pause: intentd_test_support::PausePoint,
         calls: std::sync::atomic::AtomicUsize,
     }
     impl intent_core::ServerControl for PreparedRuntimeHook {
@@ -1060,8 +1059,7 @@ mod tests {
             Box::pin(async move {
                 assert!(owns_admitted_callback(), "hook execution stays admitted");
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.entered.notify_one();
-                self.release.acquire().await.unwrap().forget();
+                self.pause.pause().await;
                 Ok(8787)
             })
         }
@@ -1087,8 +1085,7 @@ mod tests {
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let control = Arc::new(PreparedRuntimeHook {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Semaphore::new(0),
+            pause: intentd_test_support::PausePoint::unshared("wsApi runtime hook"),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         services.attach_server_control(control.clone());
@@ -1115,7 +1112,7 @@ mod tests {
         .unwrap();
         assert!(watcher.ready().await);
         std::fs::write(registry.config_path(), "[server.wsApi]\nenabled = true\n").unwrap();
-        tokio::time::timeout(crate::events::LIVENESS, control.entered.notified())
+        tokio::time::timeout(crate::events::LIVENESS, control.pause.wait_reached())
             .await
             .unwrap();
         assert_eq!(registry.get("server.wsApi.enabled"), Some(json!(true)));
@@ -1126,7 +1123,7 @@ mod tests {
         let shutdown = watcher.shutdown();
         tokio::pin!(shutdown);
         let escaped = tokio::select! { biased; () = &mut shutdown => true, () = std::future::ready(()) => false };
-        control.release.add_permits(1);
+        control.pause.release();
         tokio::time::timeout(crate::events::LIVENESS, &mut shutdown)
             .await
             .unwrap();

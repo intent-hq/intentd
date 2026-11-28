@@ -478,7 +478,7 @@ async fn sharing_cached_presence_role_read_cannot_undo_a_committed_upgrade() {
     )
     .await
     .unwrap();
-    let pause = std::sync::Arc::new(crate::presence::ProfileFetchPause::default());
+    let pause = intentd_test_support::PausePoint::new("profile fetch");
     *f.svc.presence.profile_fetch_pause.lock().unwrap() = Some(pause.clone());
     let svc = f.svc.clone();
     let ws = f.ws.clone();
@@ -496,7 +496,7 @@ async fn sharing_cached_presence_role_read_cannot_undo_a_committed_upgrade() {
         .await
         .unwrap()
     });
-    pause.fetched.notified().await;
+    pause.wait_reached().await;
     sqlx::query("INSERT INTO host_member VALUES (?,?)")
         .bind(f.guest.id.as_str())
         .bind(now_iso())
@@ -504,7 +504,7 @@ async fn sharing_cached_presence_role_read_cannot_undo_a_committed_upgrade() {
         .await
         .unwrap();
     f.svc.presence_profile_changed(&f.guest).await;
-    pause.resume.notify_one();
+    pause.release();
     let viewers = pending.await.unwrap();
     assert_eq!(viewers["viewers"][0]["hostRole"], "member");
     // The snapshot uses durable rows; the joined event also must carry the

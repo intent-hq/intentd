@@ -4,6 +4,7 @@ use super::{test_registry_with_default_provider, workspace, TempDb, WorkspacesRo
 use crate::{EventBus, Services};
 use intent_core::{AgentId, Error, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
+use intentd_test_support::PausePoint;
 use serde_json::json;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,39 +53,32 @@ impl TranscriptMutation {
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct DeleteGate(Arc<Mutex<Option<DeletePause>>>);
+/// The workspace whose next delete pauses, and where it pauses.
+type ArmedDelete = (WorkspaceId, Arc<PausePoint>);
 
-struct DeletePause {
-    workspace_id: WorkspaceId,
-    reached: Arc<Notify>,
-    resume: Arc<Notify>,
-}
+/// Holds the next delete of one workspace at a pause point.
+// pause-point: allow — holds a PausePoint through `ArmedDelete`
+#[derive(Clone, Default)]
+pub(crate) struct DeleteGate(Arc<Mutex<Option<ArmedDelete>>>);
 
 impl DeleteGate {
-    pub(crate) fn arm(&self, ws: WorkspaceId) -> (Arc<Notify>, Arc<Notify>) {
-        let reached = Arc::new(Notify::new());
-        let resume = Arc::new(Notify::new());
-        *self.0.lock().unwrap() = Some(DeletePause {
-            workspace_id: ws,
-            reached: reached.clone(),
-            resume: resume.clone(),
-        });
-        (reached, resume)
+    pub(crate) fn arm(&self, ws: WorkspaceId) -> Arc<PausePoint> {
+        let pause = PausePoint::new(format!("workspace delete {ws}"));
+        *self.0.lock().unwrap() = Some((ws, pause.clone()));
+        pause
     }
 
     pub(crate) async fn pause(&self, ws: &WorkspaceId) {
         let gate = {
             let mut gate = self.0.lock().unwrap();
-            if gate.as_ref().is_some_and(|g| &g.workspace_id == ws) {
+            if gate.as_ref().is_some_and(|(id, _)| id == ws) {
                 gate.take()
             } else {
                 None
             }
         };
-        if let Some(gate) = gate {
-            gate.reached.notify_one();
-            gate.resume.notified().await;
+        if let Some((_, pause)) = gate {
+            pause.pause().await;
         }
     }
 }
@@ -183,12 +177,12 @@ impl Harness {
 async fn incremental_delete_refuses_new_agents_after_session_snapshot() {
     let h = Harness::new().await;
     let (ws, _) = h.workspace("deleting", 3).await;
-    let (reached, _) = h.svc.workspace_delete_test_gate.arm(ws.clone());
+    let reached = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
     tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
-            () = reached.notified() => {}
+            () = reached.wait_reached() => {}
         }
     }).await.unwrap();
     let created = h.create(&ws, "late agent").await;
@@ -211,12 +205,12 @@ async fn incremental_delete_refuses_new_agents_after_session_snapshot() {
 async fn incremental_delete_refuses_messages_after_runtime_sweep() {
     let h = Harness::new().await;
     let (ws, agents) = h.workspace("deleting", 3).await;
-    let (reached, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
+    let reached = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
     tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
-            () = reached.notified() => {}
+            () = reached.wait_reached() => {}
         }
     }).await.unwrap();
     for agent in agents {
@@ -226,7 +220,7 @@ async fn incremental_delete_refuses_messages_after_runtime_sweep() {
             .await;
         assert!(sent.is_err(), "message accepted after teardown: {sent:?}");
     }
-    resume.notify_one();
+    reached.release();
     deleting.await.unwrap();
 }
 
@@ -234,12 +228,12 @@ async fn incremental_delete_refuses_messages_after_runtime_sweep() {
 async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
     let h = Harness::new().await;
     let (ws, agents) = h.workspace("deleting", 3).await;
-    let (reached, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
+    let reached = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
     tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
-            () = reached.notified() => {}
+            () = reached.wait_reached() => {}
         }
     }).await.unwrap();
     let note = h
@@ -320,7 +314,7 @@ async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
         .ok();
     let notes = h.svc.list_notes(&ws).await.unwrap();
     assert!(!notes.iter().any(|n| n.id.0 == "spec"));
-    resume.notify_one();
+    reached.release();
     deleting.await.unwrap();
 }
 
@@ -1221,7 +1215,7 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
         () = reached.notified() => {},
         result = &mut writing => panic!("mutation missed insert gate: {result:?}"),
     }
-    let (snapshot, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
+    let snapshot = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
     assert!(
         std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
@@ -1242,7 +1236,7 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
     };
     let delete = async {
         tokio::select! {
-            () = snapshot.notified() => {},
+            () = snapshot.wait_reached() => {},
             result = &mut deleting => panic!("deletion missed snapshot gate: {result:?}"),
         }
         assert!(
@@ -1266,7 +1260,7 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
             count, expected,
             "entire transcript mutation precedes the sweep"
         );
-        resume.notify_one();
+        snapshot.release();
         deleting.await.unwrap();
     };
     tokio::time::timeout(
@@ -1531,11 +1525,11 @@ async fn member_removal_overlaps_one_workspace_deletion_without_reopening_or_sto
             .insert_principal_credential(&person, "member-removal-delete-test")
             .await
             .unwrap();
-        let (reached, release) = h.svc.workspace_delete_test_gate.arm(deleting_ws.clone());
+        let reached = h.svc.workspace_delete_test_gate.arm(deleting_ws.clone());
         let mut deletion = h.svc.delete_workspace(deleting_ws.clone());
         if deletion_first {
             tokio::select! {
-                () = reached.notified() => {},
+                () = reached.wait_reached() => {},
                 result = &mut deletion => panic!("delete escaped barrier: {result:?}"),
             }
         }
@@ -1556,7 +1550,7 @@ async fn member_removal_overlaps_one_workspace_deletion_without_reopening_or_sto
         )
         .await
         .is_err());
-        release.notify_one();
+        reached.release();
         deletion.await.unwrap();
         assert!(h.store.get_workspace(&deleting_ws).await.is_err());
         assert!(h.store.get_workspace(&kept_ws).await.is_ok());

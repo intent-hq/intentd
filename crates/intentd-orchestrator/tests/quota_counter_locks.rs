@@ -122,7 +122,7 @@ async fn active_monitors(store: &Store, agent: &AgentId) -> usize {
 async fn parked(park: &GetPrPark) {
     tokio::time::timeout(
         test_timeout(Duration::from_secs(30)),
-        park.entered.notified(),
+        park.pause.wait_reached(),
     )
     .await
     .expect("the registration reaches its forge read");
@@ -174,8 +174,8 @@ async fn two_processes_never_register_past_the_agent_cap() {
     // Both passed the early count and wait in their forge read.
     parked(&park_a).await;
     parked(&park_b).await;
-    park_a.release.notify_one();
-    park_b.release.notify_one();
+    park_a.pause.release();
+    park_b.pause.release();
     assert_one_admitted(run_a.await.unwrap(), run_b.await.unwrap());
     assert_eq!(active_monitors(&store_b, &owner).await, 1);
 }
@@ -207,8 +207,8 @@ async fn two_processes_registering_one_pr_at_the_cap_share_its_monitor() {
     });
     parked(&park_a).await;
     parked(&park_b).await;
-    park_a.release.notify_one();
-    park_b.release.notify_one();
+    park_a.pause.release();
+    park_b.pause.release();
     let (left, right) = (run_a.await.unwrap(), run_b.await.unwrap());
     let (left, right) = (
         left.expect("process A registers"),
@@ -293,8 +293,8 @@ async fn an_adoption_and_a_registration_never_pass_the_agent_cap() {
     });
     parked(&park_a).await;
     parked(&park_b).await;
-    park_a.release.notify_one();
-    park_b.release.notify_one();
+    park_a.pause.release();
+    park_b.pause.release();
     assert_one_admitted(adopt.await.unwrap(), register.await.unwrap());
     assert_eq!(active_monitors(&store_b, &owner).await, 1);
 }

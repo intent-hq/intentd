@@ -213,7 +213,7 @@ pub(crate) struct AppsState {
     storage_gate: tokio::sync::RwLock<()>,
     /// Test seam: parks a storage write after admission, before the gate.
     #[cfg(test)]
-    storage_write_pause: Mutex<Option<StorageWritePause>>,
+    storage_write_pause: Mutex<Option<Arc<intentd_test_support::PausePoint>>>,
     sessions: Mutex<Sessions>,
     notify: Mutex<HashMap<String, VecDeque<Instant>>>,
     in_flight: Mutex<HashMap<String, usize>>,
@@ -250,14 +250,6 @@ impl AppsState {
     fn is_open(&self, app_id: &str) -> bool {
         self.sessions().apps_open.contains_key(app_id)
     }
-}
-
-/// Test seam for [`AppsState::storage_write_pause`]: the write signals
-/// `entered`, then waits for `release`.
-#[cfg(test)]
-pub(crate) struct StorageWritePause {
-    pub(crate) entered: Arc<tokio::sync::Notify>,
-    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 /// Releases one `app.complete` in-flight slot on drop.
@@ -1096,8 +1088,7 @@ impl Services {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some(pause) = pause {
-                pause.entered.notify_one();
-                pause.release.notified().await;
+                pause.pause().await;
             }
         }
         let guard = self.apps.storage_gate.read().await;

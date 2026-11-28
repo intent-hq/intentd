@@ -10,6 +10,7 @@ use crate::Services;
 use intent_core::caller::Caller;
 use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceId};
 use intent_store::{RepositoryLifecycleKey, Store};
+use intentd_test_support::PausePoint;
 use std::sync::Arc;
 
 struct Harness {
@@ -125,19 +126,19 @@ async fn agent_schedule_cancel_retires_original_requests() {
 #[intent_test_macros::daemon_test]
 async fn timer_claim_keeps_barrier_before_first_delete_sql() {
     let h = Harness::new().await;
-    let (reached, resume) = h.services.workspace_delete_test_gate.arm(h.ws.clone());
+    let reached = h.services.workspace_delete_test_gate.arm(h.ws.clone());
     h.services
         .schedule_workspace_delete(h.ws.clone(), 0)
         .await
         .unwrap();
     tokio::time::timeout(
         intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
-        reached.notified(),
+        reached.wait_reached(),
     )
     .await
     .unwrap();
     let blocked = h.request(false).is_err();
-    resume.notify_one();
+    reached.release();
     assert!(
         blocked,
         "removing the pending marker cannot admit a fresh request before SQL"
@@ -145,34 +146,26 @@ async fn timer_claim_keeps_barrier_before_first_delete_sql() {
 }
 
 // Scheduling-only probes. Every paused path resumes the actual SQL/filesystem code.
+// pause-point: allow — a registry of PausePoints keyed by phase, not one itself
 #[derive(Clone, Default)]
 pub(crate) struct DeletionGates(Arc<std::sync::Mutex<GateState>>);
 #[derive(Default)]
 struct GateState {
-    pauses: std::collections::HashMap<
-        (String, String),
-        (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>),
-    >,
-    workers: std::collections::HashMap<
-        String,
-        (Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>),
-    >,
+    pauses: std::collections::HashMap<(String, String), Arc<PausePoint>>,
+    workers: std::collections::HashMap<String, Arc<PausePoint>>,
     finished: std::collections::HashMap<String, Arc<tokio::sync::Notify>>,
     worker_finished: std::collections::HashMap<String, Arc<tokio::sync::Notify>>,
     aborts: std::collections::HashMap<String, tokio::task::AbortHandle>,
 }
 impl DeletionGates {
-    fn arm(&self, phase: &str, key: &str) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let pair = (
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(tokio::sync::Notify::new()),
-        );
+    fn arm(&self, phase: &str, key: &str) -> Arc<PausePoint> {
+        let pause = PausePoint::new(format!("pending delete {phase}"));
         self.0
             .lock()
             .unwrap()
             .pauses
-            .insert((phase.into(), key.into()), pair.clone());
-        pair
+            .insert((phase.into(), key.into()), pause.clone());
+        pause
     }
     pub(crate) async fn pause(&self, phase: &str, key: &str) {
         let pair = self
@@ -181,32 +174,22 @@ impl DeletionGates {
             .unwrap()
             .pauses
             .remove(&(phase.into(), key.into()));
-        if let Some((reached, resume)) = pair {
-            reached.notify_one();
-            resume.notified().await;
+        if let Some(pause) = pair {
+            pause.pause().await;
         }
     }
-    fn arm_worker(
-        &self,
-        key: &str,
-    ) -> (
-        Arc<tokio::sync::Notify>,
-        std::sync::mpsc::Sender<()>,
-        Arc<tokio::sync::Notify>,
-    ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let reached = Arc::new(tokio::sync::Notify::new());
+    fn arm_worker(&self, key: &str) -> (Arc<PausePoint>, Arc<tokio::sync::Notify>) {
+        let pause = PausePoint::new("pending delete worker");
         let done = Arc::new(tokio::sync::Notify::new());
         let mut state = self.0.lock().unwrap();
-        state.workers.insert(key.into(), (reached.clone(), rx));
+        state.workers.insert(key.into(), pause.clone());
         state.worker_finished.insert(key.into(), done.clone());
-        (reached, tx, done)
+        (pause, done)
     }
     pub(crate) fn pause_worker(&self, key: &str) {
         let pair = self.0.lock().unwrap().workers.remove(key);
-        if let Some((reached, resume)) = pair {
-            reached.notify_one();
-            resume.recv().unwrap();
+        if let Some(pause) = pair {
+            pause.pause_blocking();
         }
     }
     pub(crate) fn worker_finished(&self, key: &str) {
@@ -409,7 +392,7 @@ async fn real_dispatch_holds_every_scheduling_waiter_and_writer_first_rejects_de
 #[intent_test_macros::daemon_test]
 async fn agent_zero_delay_claim_survives_cancel_and_store_failure() {
     let h = Harness::new().await;
-    let (pause, resume) = h
+    let pause = h
         .services
         .pending_delete_test_gate
         .arm("agent-sql", &h.agent.0);
@@ -419,14 +402,14 @@ async fn agent_zero_delay_claim_survives_cancel_and_store_failure() {
         .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
         .await
         .unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     assert!(h.request(true).is_err());
     assert!(!h
         .services
         .agent_cancel_delete_op(h.agent.clone(), Some(h.ws.clone()))
         .await
         .unwrap());
-    resume.notify_one();
+    pause.release();
     reached(&finished).await;
     h.services
         .store
@@ -444,12 +427,12 @@ async fn cascade_transfers_agent_claim_until_background_completion() {
         .await
         .unwrap();
     let done = h.services.pending_delete_test_gate.completion(&h.ws.0);
-    let (pause, resume) = h
+    let pause = h
         .services
         .pending_delete_test_gate
         .arm("background", &h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     assert!(h
         .services
         .store
@@ -464,7 +447,7 @@ async fn cascade_transfers_agent_claim_until_background_completion() {
         .await
         .unwrap());
     assert!(h.request(true).is_err());
-    resume.notify_one();
+    pause.release();
     reached(&done).await;
     assert!(
         h.request(true).is_ok(),
@@ -483,12 +466,12 @@ async fn immediate_takes_original_timer_claim_and_responds_before_filesystem() {
         .await
         .unwrap();
     let done = h.services.pending_delete_test_gate.completion(&h.ws.0);
-    let (pause, resume) = h
+    let pause = h
         .services
         .pending_delete_test_gate
         .arm("background", &h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     assert!(dir.exists());
     assert!(h.request(false).is_err());
     assert!(!h
@@ -496,7 +479,7 @@ async fn immediate_takes_original_timer_claim_and_responds_before_filesystem() {
         .cancel_workspace_delete(h.ws.clone())
         .await
         .unwrap());
-    resume.notify_one();
+    pause.release();
     reached(&done).await;
     assert!(!dir.exists());
     assert!(h.request(false).is_ok());
@@ -546,12 +529,12 @@ async fn canceled_background_with_late_real_filesystem_worker_never_confirms() {
     let dir = h.root.path().join(&h.ws.0);
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("late"), "bytes").unwrap();
-    let (pause, resume, worker_done) = h.services.pending_delete_test_gate.arm_worker(&h.ws.0);
+    let (pause, worker_done) = h.services.pending_delete_test_gate.arm_worker(&h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     h.services.pending_delete_test_gate.abort(&h.ws.0).await;
     assert!(h.request(false).is_err());
-    resume.send(()).unwrap();
+    pause.release();
     reached(&worker_done).await;
     assert!(!dir.exists());
     assert!(h.request(false).is_err());
@@ -689,15 +672,15 @@ async fn real_git_worktree_cleanup_keeps_claim_until_detach_and_removal_complete
     ws.branch = "owned-topic".into();
     h.services.store.update_workspace(&ws).await.unwrap();
     let done = h.services.pending_delete_test_gate.completion(&h.ws.0);
-    let (pause, resume) = h
+    let pause = h
         .services
         .pending_delete_test_gate
         .arm("background", &h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     assert!(checkout.exists());
     assert!(h.request(false).is_err());
-    resume.notify_one();
+    pause.release();
     reached(&done).await;
     assert!(!checkout.exists());
     assert!(repo.find_worktree("owned-topic").is_err());
@@ -802,11 +785,11 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
     let services = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
-    let (pause, resume) = services.pending_delete_test_gate.arm("background", &ws.0);
+    let pause = services.pending_delete_test_gate.arm("background", &ws.0);
     services.delete_workspace(ws.clone()).await.unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     services.pending_delete_test_gate.abort(&ws.0).await;
-    resume.notify_one();
+    pause.release();
     drop(services);
     let reopened = Store::open(&db.path).await.unwrap();
     let registry = Arc::new(RepositoryLifecycleRegistry::default());
@@ -822,7 +805,7 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
 #[intent_test_macros::daemon_test]
 async fn secret_request_racing_agent_delete_does_not_survive() {
     let h = Harness::new().await;
-    let (pause, resume) = h
+    let pause = h
         .services
         .pending_delete_test_gate
         .arm("agent-secret-window", &h.agent.0);
@@ -831,14 +814,14 @@ async fn secret_request_racing_agent_delete_does_not_survive() {
         .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
         .await
         .unwrap();
-    reached(&pause).await;
+    pause.wait_reached().await;
     let ticket = h
         .services
         .secret_request_op(h.ws.clone(), h.agent.clone(), "KEY".into(), "race".into())
         .await
         .expect("the row still exists while deletion is paused");
     let request_id = ticket["requestId"].as_str().unwrap().to_string();
-    resume.notify_one();
+    pause.release();
     reached(&finished).await;
     assert!(h
         .services

@@ -5619,8 +5619,7 @@ mod tests {
     struct ParkedDeleteSecretStore {
         inner: InMemorySecretStore,
         park_delete_for: &'static str,
-        parked: std::sync::mpsc::Sender<()>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        pause: Arc<intentd_test_support::PausePoint>,
         done: std::sync::mpsc::Sender<()>,
     }
     impl SecretStore for ParkedDeleteSecretStore {
@@ -5632,8 +5631,7 @@ mod tests {
         }
         fn delete(&self, account: &str) -> Result<()> {
             if account == self.park_delete_for {
-                self.parked.send(()).unwrap();
-                self.release.lock().unwrap().recv().unwrap();
+                self.pause.pause_blocking();
                 self.inner.delete(account)?;
                 self.done.send(()).unwrap();
                 return Ok(());
@@ -5656,15 +5654,13 @@ mod tests {
         let raw = InMemorySecretStore::default();
         raw.store(SECRET_ACCOUNT, "glo_device").unwrap();
         raw.store(REFRESH_SECRET_ACCOUNT, "glr_device").unwrap();
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pause = intentd_test_support::PausePoint::new("sibling secret delete");
         let (done_tx, _done_rx) = std::sync::mpsc::channel();
         let secrets = Arc::new(AsyncSecretStore::with_timings(
             Arc::new(ParkedDeleteSecretStore {
                 inner: raw.clone(),
                 park_delete_for: REFRESH_SECRET_ACCOUNT,
-                parked: parked_tx,
-                release: Mutex::new(release_rx),
+                pause: pause.clone(),
                 done: done_tx,
             }),
             Duration::from_secs(1),
@@ -5675,7 +5671,7 @@ mod tests {
         let mut services = crate::Services::new_isolated(store).with_settings_registry(registry);
         services.secrets = secrets.clone();
         let writer = services.clone();
-        let update = intent_core::spawn_daemon(async move {
+        let mut update = intent_core::spawn_daemon(async move {
             writer
                 .settings_update(json!([
                     { "path": SECRET_ACCOUNT, "value": "glpat-new" },
@@ -5683,12 +5679,7 @@ mod tests {
                 ]))
                 .await
         });
-        tokio::task::spawn_blocking(move || {
-            parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
-        })
-        .await
-        .unwrap()
-        .expect("sibling delete parked");
+        pause.reached(&mut update).await;
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             async {
@@ -5717,7 +5708,7 @@ mod tests {
         )
         .await;
         // Release before asserting, so RED never strands a blocking worker.
-        release_tx.send(()).unwrap();
+        pause.release();
         let failure = update.await.unwrap().expect_err("sibling delete timed out");
         assert!(matches!(failure, Error::Internal(_)));
         let read = read
@@ -5753,13 +5744,13 @@ mod tests {
         );
     }
 
-    struct ReleaseWrite(Option<std::sync::mpsc::Sender<()>>);
+    /// Opens a held secret write's pause point for good, at the latest on
+    /// drop, so a failing assertion never strands the blocking worker.
+    struct ReleaseWrite(Arc<intentd_test_support::PausePoint>);
 
     impl ReleaseWrite {
         fn release(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
+            self.0.open();
         }
     }
 
@@ -5772,8 +5763,7 @@ mod tests {
     struct ParkedSettingsWrite {
         inner: InMemorySecretStore,
         delete: bool,
-        entered: Arc<tokio::sync::Notify>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        pause: Arc<intentd_test_support::PausePoint>,
         once: std::sync::atomic::AtomicBool,
     }
 
@@ -5783,10 +5773,7 @@ mod tests {
                 && self.delete == delete
                 && self.once.swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                self.entered.notify_one();
-                // Drop of the test's sender also releases the blocking worker
-                // on an assertion failure, so runtime shutdown cannot hang.
-                let _ = self.release.lock().unwrap().recv();
+                self.pause.pause_blocking();
             }
         }
     }
@@ -5813,7 +5800,7 @@ mod tests {
         tempfile::TempDir,
         crate::Services,
         InMemorySecretStore,
-        Arc<tokio::sync::Notify>,
+        Arc<intentd_test_support::PausePoint>,
         ReleaseWrite,
         crate::events::Subscription,
     ) {
@@ -5828,20 +5815,25 @@ mod tests {
             "old-token",
         )
         .unwrap();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = std::sync::mpsc::channel();
+        let entered = intentd_test_support::PausePoint::new("staged settings secret write");
         let secrets = Arc::new(ParkedSettingsWrite {
             inner: raw.clone(),
             delete,
-            entered: entered.clone(),
-            release: Mutex::new(rx),
+            pause: entered.clone(),
             once: std::sync::atomic::AtomicBool::new(true),
         });
         let services = crate::Services::new_isolated(store)
             .with_secret_store(secrets)
             .with_settings_registry(registry)
             .with_event_bus(bus);
-        (dir, services, raw, entered, ReleaseWrite(Some(tx)), sub)
+        (
+            dir,
+            services,
+            raw,
+            entered.clone(),
+            ReleaseWrite(entered),
+            sub,
+        )
     }
 
     async fn shutdown_cancelled_settings_write(delete: bool, during_settle: bool) {
@@ -5877,7 +5869,7 @@ mod tests {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
+            entered.wait_reached(),
         )
         .await
         .expect("actual secret write entered");
@@ -5992,7 +5984,7 @@ mod tests {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
+            entered.wait_reached(),
         )
         .await
         .expect("write parked");
@@ -6134,7 +6126,7 @@ mod tests {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
+            entered.wait_reached(),
         )
         .await
         .unwrap();
@@ -6190,8 +6182,7 @@ mod tests {
         struct RejectThenParkRollback {
             inner: InMemorySecretStore,
             registry: Arc<SettingsRegistry>,
-            entered: Arc<tokio::sync::Notify>,
-            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            pause: Arc<intentd_test_support::PausePoint>,
         }
         impl SecretStore for RejectThenParkRollback {
             fn load(&self, path: &str) -> Result<Option<String>> {
@@ -6207,8 +6198,7 @@ mod tests {
                     self.registry
                         .pin("notifications.volume", json!(0.5), "TEST_PIN")?;
                 } else if path == SECRET_ACCOUNT && value == "old-token" {
-                    self.entered.notify_one();
-                    let _ = self.release.lock().unwrap().recv();
+                    self.pause.pause_blocking();
                 }
                 self.inner.store(path, value)
             }
@@ -6218,16 +6208,14 @@ mod tests {
         let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
         let raw = InMemorySecretStore::default();
         raw.store(SECRET_ACCOUNT, "old-token").unwrap();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut release = ReleaseWrite(Some(tx));
+        let entered = intentd_test_support::PausePoint::new("compensating rollback write");
+        let mut release = ReleaseWrite(entered.clone());
         let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_secret_store(Arc::new(RejectThenParkRollback {
                 inner: raw.clone(),
                 registry,
-                entered: entered.clone(),
-                release: Mutex::new(rx),
+                pause: entered.clone(),
             }));
         let writer = services.clone();
         let first = intent_core::spawn_daemon(async move {
@@ -6240,7 +6228,7 @@ mod tests {
         });
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
+            entered.wait_reached(),
         )
         .await
         .expect("rollback parked");
@@ -6348,14 +6336,12 @@ mod tests {
             .store(REFRESH_SECRET_ACCOUNT, "glr_device")
             .unwrap();
         raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pause = intentd_test_support::PausePoint::new("sibling secret delete");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let parked: Arc<dyn SecretStore> = Arc::new(ParkedDeleteSecretStore {
             inner: raw_secrets.clone(),
             park_delete_for: REFRESH_SECRET_ACCOUNT,
-            parked: parked_tx,
-            release: Mutex::new(release_rx),
+            pause: pause.clone(),
             done: done_tx,
         });
         let secrets = AsyncSecretStore::with_timings(
@@ -6375,12 +6361,7 @@ mod tests {
             result
         };
         let driver = async {
-            tokio::task::spawn_blocking(move || {
-                parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
-            })
-            .await
-            .unwrap()
-            .expect("the sibling delete must park");
+            pause.wait_reached().await;
             let rollback_claimed_delete = || {
                 secrets.timed_out(REFRESH_SECRET_ACCOUNT)
                     && secrets.detached_len(REFRESH_SECRET_ACCOUNT) == 0
@@ -6393,7 +6374,7 @@ mod tests {
                 Some("glr_device"),
                 "the parked delete must not have landed yet"
             );
-            release_tx.send(()).unwrap();
+            pause.release();
         };
         let (result, ()) = tokio::join!(update, driver);
         let err = result.expect_err("the timed-out sibling clear must surface");
@@ -6454,14 +6435,12 @@ mod tests {
             .store(REFRESH_SECRET_ACCOUNT, "glr_device")
             .unwrap();
         raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
-        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pause = intentd_test_support::PausePoint::new("sibling secret delete");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let parked: Arc<dyn SecretStore> = Arc::new(ParkedDeleteSecretStore {
             inner: raw_secrets.clone(),
             park_delete_for: REFRESH_SECRET_ACCOUNT,
-            parked: parked_tx,
-            release: Mutex::new(release_rx),
+            pause: pause.clone(),
             done: done_tx,
         });
         let secrets = AsyncSecretStore::with_timings(
@@ -6491,9 +6470,7 @@ mod tests {
             ),
             other => panic!("expected Error::Internal, got {other:?}"),
         }
-        parked_rx
-            .try_recv()
-            .expect("the sibling delete must have parked");
+        assert_eq!(pause.arrivals(), 1, "the sibling delete must have parked");
         assert_eq!(
             secrets.detached_len(REFRESH_SECRET_ACCOUNT),
             1,
@@ -6518,7 +6495,7 @@ mod tests {
             "the sibling clear stops at the first failure, so later siblings are untouched"
         );
 
-        release_tx.send(()).unwrap();
+        pause.release();
         tokio::task::spawn_blocking(move || {
             done_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         })
@@ -10592,8 +10569,7 @@ mod rollback_order_tests {
     async fn github_mutation_during_failed_batch(action: &str) {
         struct ParkFailure {
             raw: intent_core::FileSecretStore,
-            entered: Arc<tokio::sync::Notify>,
-            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            pause: Arc<intentd_test_support::PausePoint>,
         }
         impl SecretStore for ParkFailure {
             fn load(&self, account: &str) -> Result<Option<String>> {
@@ -10604,8 +10580,7 @@ mod rollback_order_tests {
             }
             fn store(&self, account: &str, value: &str) -> Result<()> {
                 if account == "accounts.sentry.token" {
-                    self.entered.notify_one();
-                    let _ = self.release.lock().unwrap().recv();
+                    self.pause.pause_blocking();
                     return Err(Error::Internal("injected later secret failure".into()));
                 }
                 self.raw.store(account, value)
@@ -10630,18 +10605,16 @@ mod rollback_order_tests {
             "device",
         )
         .unwrap();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pause = intentd_test_support::PausePoint::new("later secret write");
         let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(ParkFailure {
                 raw: raw.clone(),
-                entered: entered.clone(),
-                release: Mutex::new(release_rx),
+                pause: pause.clone(),
             }))
             .with_event_bus(bus)
             .with_github_login_base_uri("http://127.0.0.1:1");
         let writer = services.clone();
-        let failed = intent_core::spawn_daemon(async move {
+        let mut failed = intent_core::spawn_daemon(async move {
             writer
                 .settings_update(json!([
                     {"path":crate::github_auth_ops::SECRET_ACCOUNT, "value":"temporary-pat"},
@@ -10649,12 +10622,7 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            entered.notified(),
-        )
-        .await
-        .unwrap();
+        pause.reached(&mut failed).await;
         assert_eq!(
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
                 .unwrap()
@@ -10697,7 +10665,7 @@ mod rollback_order_tests {
             }
             _ => unreachable!(),
         }
-        release_tx.send(()).unwrap();
+        pause.release();
         let error = failed
             .await
             .unwrap()
@@ -10765,7 +10733,7 @@ mod rollback_order_tests {
     async fn unsettled_secret_batch_case(repeated: bool) {
         struct ParkWrite {
             raw: InMemorySecretStore,
-            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            pause: intentd_test_support::PausePoint,
             attempts: Mutex<Vec<String>>,
         }
         impl SecretStore for ParkWrite {
@@ -10776,7 +10744,7 @@ mod rollback_order_tests {
                 if account == "accounts.sentry.token" {
                     self.attempts.lock().unwrap().push(value.into());
                     if value == "late-write" {
-                        let _ = self.release.lock().unwrap().recv();
+                        self.pause.pause_blocking();
                     }
                 }
                 self.raw.store(account, value)
@@ -10791,10 +10759,9 @@ mod rollback_order_tests {
         raw.store("linear.token", "original-linear").unwrap();
         raw.store("accounts.sentry.token", "original-sentry")
             .unwrap();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let parked = Arc::new(ParkWrite {
             raw: raw.clone(),
-            release: Mutex::new(release_rx),
+            pause: intentd_test_support::PausePoint::unshared("late sentry write"),
             attempts: Mutex::new(Vec::new()),
         });
         let secrets = AsyncSecretStore::with_timings(
@@ -10838,7 +10805,7 @@ mod rollback_order_tests {
             "never blindly restore the unsettled credential"
         );
         assert_eq!(secrets.detached_len("accounts.sentry.token"), 1);
-        release_tx.send(()).unwrap();
+        parked.pause.release();
         assert!(secrets
             .settle_detached("accounts.sentry.token")
             .await
@@ -10898,8 +10865,7 @@ mod rollback_order_tests {
     }
 
     struct ParkCompensatingHook {
-        parked: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
+        pause: Arc<intentd_test_support::PausePoint>,
     }
     impl ServerControl for ParkCompensatingHook {
         fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
@@ -10911,8 +10877,7 @@ mod rollback_order_tests {
         }
         fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async move {
-                self.parked.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
             })
         }
         fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
@@ -10943,14 +10908,12 @@ mod rollback_order_tests {
                 .with_event_bus(bus)
                 .with_github_login_base_uri("http://127.0.0.1:1"),
         );
-        let parked = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        let parked = intentd_test_support::PausePoint::new("compensating listener stop");
         services.attach_server_control(Arc::new(ParkCompensatingHook {
-            parked: parked.clone(),
-            release: release.clone(),
+            pause: parked.clone(),
         }));
         let writer = services.clone();
-        let update = intent_core::spawn_daemon(async move {
+        let mut update = intent_core::spawn_daemon(async move {
             writer
                 .settings_update(json!([
                     {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
@@ -10958,12 +10921,7 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            parked.notified(),
-        )
-        .await
-        .unwrap();
+        parked.reached(&mut update).await;
         eprintln!(
             "at compensating hook: token={:?}; method={:?}",
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
@@ -10988,7 +10946,7 @@ mod rollback_order_tests {
             )
             .unwrap();
         }
-        release.notify_one();
+        parked.release();
         let error = timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             update,
@@ -11030,8 +10988,7 @@ mod rollback_order_tests {
 
     pub(super) struct PausedRollbackStore {
         pub(super) raw: InMemorySecretStore,
-        pub(super) parked: Arc<tokio::sync::Notify>,
-        pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
+        pub(super) pause: Arc<intentd_test_support::PausePoint>,
     }
     impl SecretStore for PausedRollbackStore {
         fn load(&self, account: &str) -> Result<Option<String>> {
@@ -11040,8 +10997,7 @@ mod rollback_order_tests {
         fn store(&self, account: &str, value: &str) -> Result<()> {
             self.raw.store(account, value)?;
             if account == crate::github_auth_ops::SECRET_ACCOUNT && value == "original-device" {
-                self.parked.notify_one();
-                let _ = self.release.lock().unwrap().recv();
+                self.pause.pause_blocking();
             }
             Ok(())
         }
@@ -11099,15 +11055,13 @@ mod rollback_order_tests {
         let raw = InMemorySecretStore::default();
         raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
             .unwrap();
-        let parked = Arc::new(tokio::sync::Notify::new());
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let parked = intentd_test_support::PausePoint::new("secret rollback restore");
         let services = Arc::new(
             crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(PausedRollbackStore {
                     raw,
-                    parked: parked.clone(),
-                    release: Mutex::new(release_rx),
+                    pause: parked.clone(),
                 }))
                 .with_event_bus(bus),
         );
@@ -11122,12 +11076,7 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            parked.notified(),
-        )
-        .await
-        .unwrap();
+        parked.wait_reached().await;
         let newer = timeout(
             intentd_test_support::test_timeout(Duration::from_secs(3)),
             services.settings_update(json!([
@@ -11138,7 +11087,7 @@ mod rollback_order_tests {
         .expect("secret compensation must not hold the revision gate")
         .unwrap();
         assert_eq!(newer["revision"], json!(1));
-        release_tx.send(()).unwrap();
+        parked.release();
         failed.await.unwrap().expect_err("first start failed");
         let current = services
             .settings_get("server.wsApi.enabled".into())
@@ -11354,16 +11303,14 @@ mod port_assignment_publication_tests {
         let raw = InMemorySecretStore::default();
         raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
             .unwrap();
-        let parked = Arc::new(tokio::sync::Notify::new());
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let parked = intentd_test_support::PausePoint::new("secret rollback restore");
         let services = Arc::new(
             crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus)
                 .with_secret_store(Arc::new(PausedRollbackStore {
                     raw,
-                    parked: parked.clone(),
-                    release: Mutex::new(release_rx),
+                    pause: parked.clone(),
                 })),
         );
         let control = Arc::new(AssignPort {
@@ -11383,12 +11330,7 @@ mod port_assignment_publication_tests {
                 ]))
                 .await
         });
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            parked.notified(),
-        )
-        .await
-        .unwrap();
+        parked.wait_reached().await;
         let assigned = services
             .settings_get("server.wsApi.port".into())
             .await
@@ -11415,7 +11357,7 @@ mod port_assignment_publication_tests {
             .await
             .unwrap();
         assert_eq!(newer["revision"], 2);
-        release_tx.send(()).unwrap();
+        parked.release();
         let error = failed.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("injected tunnel failure"));
         let final_port = services

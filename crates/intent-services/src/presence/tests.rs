@@ -538,10 +538,8 @@ async fn profile_persisted_after_first_sight_refreshes_rosters_without_a_reconne
 #[tokio::test]
 async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile() {
     use crate::events::SubscriptionFilter;
-    use crate::presence::ProfileFetchPause;
     use intent_core::events::PRESENCE_CHANGED;
     use intent_core::with_caller;
-    use std::sync::Arc;
     let tmp = crate::tests::TempDb::new();
     let root = crate::tests::WorkspacesRoot::new();
     let (store, services, ws, caller) = member_services(&tmp, &root).await;
@@ -559,7 +557,7 @@ async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile()
             workspace_id: Some(ws.to_string()),
             ..Default::default()
         });
-    let pause = Arc::new(ProfileFetchPause::default());
+    let pause = intentd_test_support::PausePoint::new("profile fetch");
     *services.presence.profile_fetch_pause.lock().unwrap() = Some(pause.clone());
     let identity = intent_sourcecontrol::UserIdentity {
         login: "octocat".to_string(),
@@ -574,7 +572,7 @@ async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile()
         services.presence_connect_op("conn-1".into()),
     );
     let interleave = async {
-        pause.fetched.notified().await;
+        pause.wait_reached().await;
         assert!(
             services.presence.lock().profiles.is_empty(),
             "the stale row is fetched but not yet installed"
@@ -583,7 +581,7 @@ async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile()
             .apply_primary_identity(row.clone(), &identity)
             .await
             .expect("identity applied mid-read");
-        pause.resume.notify_one();
+        pause.release();
     };
     let (connected, ()) = tokio::join!(connect, interleave);
     connected.expect("hello");
@@ -923,21 +921,21 @@ async fn focus_move_during_async_projection_never_restores_old_target() {
             .unwrap();
     })
     .await;
-    let pause = std::sync::Arc::new(super::ProfileFetchPause::default());
+    let pause = intentd_test_support::PausePoint::new("profile fetch");
     *services.presence.focus_fetch_pause.lock().unwrap() = Some(pause.clone());
     let read = with_caller(
         caller.clone(),
         services.presence_focus_snapshot_op(ws, principal),
     );
     let mutation = async {
-        pause.fetched.notified().await;
+        pause.wait_reached().await;
         with_caller(
             caller,
             services.presence_update_op("person".into(), json!({"focus":[]})),
         )
         .await
         .unwrap();
-        pause.resume.notify_one();
+        pause.release();
     };
     let (result, ()) = tokio::time::timeout(scaled_timeout(Duration::from_secs(5)), async {
         tokio::join!(read, mutation)

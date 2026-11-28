@@ -376,17 +376,6 @@ impl Drop for RetireFrame {
         self.0.retire();
     }
 }
-#[derive(Default)]
-pub(super) struct WorkerGate {
-    entered: Notify,
-    release: Notify,
-}
-impl WorkerGate {
-    pub(super) async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
-}
 async fn until(mut ready: impl FnMut() -> bool) {
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -544,7 +533,7 @@ async fn native_selection_observed_commit_survives_waiter_cancel_before_retentio
     let edit = s.capture(&f).await.unwrap();
     let c = s.original(f.query()).await;
     let op = record(&c, &edit.selection_id);
-    let gate = Arc::new(WorkerGate::default());
+    let gate = intentd_test_support::PausePoint::new("selection worker after store");
     *c.selection.after_store.lock().unwrap() = Some(gate.clone());
     let worker_f = f.clone();
     let worker_s = s.clone();
@@ -556,7 +545,7 @@ async fn native_selection_observed_commit_survives_waiter_cancel_before_retentio
     });
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        gate.entered.notified(),
+        gate.wait_reached(),
     )
     .await
     .unwrap();
@@ -582,7 +571,7 @@ async fn native_selection_observed_commit_survives_waiter_cancel_before_retentio
             .available_permits(),
         WORKER_LIMIT - 1
     );
-    gate.release.notify_one();
+    gate.release();
     until(|| op.progress.lock().unwrap().receipt.is_some()).await;
     until(|| {
         f.services
@@ -847,7 +836,7 @@ async fn native_selection_record_and_worker_limits_charge_original_completion() 
     .await;
     let s = Arc::new(f.socket().await);
     let c = s.original(f.query()).await;
-    let gate = Arc::new(WorkerGate::default());
+    let gate = intentd_test_support::PausePoint::new("selection worker after store");
     *c.selection.after_store.lock().unwrap() = Some(gate.clone());
     let mut tasks = Vec::new();
     let mut ops = Vec::new();
@@ -861,7 +850,7 @@ async fn native_selection_record_and_worker_limits_charge_original_completion() 
         }));
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
-            gate.entered.notified(),
+            gate.wait_reached(),
         )
         .await
         .unwrap();
@@ -890,7 +879,9 @@ async fn native_selection_record_and_worker_limits_charge_original_completion() 
             .available_permits(),
         0
     );
-    gate.release.notify_waiters();
+    for _ in 0..WORKER_LIMIT {
+        gate.release();
+    }
     until(|| {
         f.services
             .repository_selection_capacity
@@ -1128,7 +1119,7 @@ async fn native_selection_expired_worker_retains_capacity_and_observed_commit() 
     let edit = s.capture(&f).await.unwrap();
     let c = s.original(f.query()).await;
     let op = record(&c, &edit.selection_id);
-    let gate = Arc::new(WorkerGate::default());
+    let gate = intentd_test_support::PausePoint::new("selection worker after store");
     *c.selection.after_store.lock().unwrap() = Some(gate.clone());
     let worker_f = f.clone();
     let worker_s = s.clone();
@@ -1138,7 +1129,7 @@ async fn native_selection_expired_worker_retains_capacity_and_observed_commit() 
             .save(&worker_f, &worker_edit, Choice::Automatic {})
             .await
     });
-    gate.entered.notified().await;
+    gate.wait_reached().await;
     tokio::time::pause();
     tokio::time::advance(LEASE_TTL + Duration::from_secs(1)).await;
     for _ in 0..8 {
@@ -1166,7 +1157,7 @@ async fn native_selection_expired_worker_retains_capacity_and_observed_commit() 
     tokio::time::resume();
     waiter.abort();
     let _ = waiter.await;
-    gate.release.notify_one();
+    gate.release();
     until(|| op.progress.lock().unwrap().receipt.is_some()).await;
     until(|| {
         f.services

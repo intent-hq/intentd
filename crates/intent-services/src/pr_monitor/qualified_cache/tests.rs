@@ -1224,7 +1224,6 @@ mod managed {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::Notify;
     use tokio::time::timeout;
     const BUDGET: Duration = Duration::from_secs(5);
     const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
@@ -1260,13 +1259,21 @@ mod managed {
         }
     }
 
-    #[derive(Default)]
     struct Replies {
         statuses: Mutex<HashMap<String, u16>>,
         pause: Mutex<Option<String>>,
-        entered: Notify,
-        release: Notify,
+        hold: intentd_test_support::PausePoint,
         calls: Mutex<Vec<String>>,
+    }
+    impl Default for Replies {
+        fn default() -> Self {
+            Self {
+                statuses: Mutex::default(),
+                pause: Mutex::default(),
+                hold: intentd_test_support::PausePoint::unshared("held provider reply"),
+                calls: Mutex::default(),
+            }
+        }
     }
     struct ReadServer {
         fixture: Server,
@@ -1275,7 +1282,7 @@ mod managed {
     }
     impl Drop for ReadServer {
         fn drop(&mut self) {
-            self.replies.release.notify_waiters();
+            self.replies.hold.release();
             self.task.abort();
         }
     }
@@ -1370,8 +1377,7 @@ mod managed {
                             }
                         };
                         if pause {
-                            control.entered.notify_one();
-                            control.release.notified().await;
+                            control.hold.pause().await;
                         }
                         let body=if endpoint.ends_with("/merge_requests") {
                         json!([{"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/merge_requests/4",
@@ -1424,13 +1430,13 @@ mod managed {
         async fn entered(&self) {
             timeout(
                 intentd_test_support::test_timeout(BUDGET),
-                self.replies.entered.notified(),
+                self.replies.hold.wait_reached(),
             )
             .await
             .unwrap();
         }
         fn resume(&self) {
-            self.replies.release.notify_one();
+            self.replies.hold.release();
         }
         fn count(&self) -> usize {
             self.replies.calls.lock().unwrap().len()

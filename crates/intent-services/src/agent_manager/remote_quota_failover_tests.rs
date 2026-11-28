@@ -1797,10 +1797,10 @@ async fn paused_retry(
     id: &AgentId,
     ws: &WorkspaceId,
 ) -> (
-    Arc<crate::agent_manager::TurnStartPause>,
+    Arc<intentd_test_support::PausePoint>,
     tokio::task::JoinHandle<Value>,
 ) {
-    let pause = Arc::new(crate::agent_manager::TurnStartPause::default());
+    let pause = intentd_test_support::PausePoint::new("turn step");
     mgr.turn_schedule.arm(
         crate::agent_manager::turn_schedule::TurnStep::RetryChecked,
         pause.clone(),
@@ -1811,7 +1811,7 @@ async fn paused_retry(
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("the retry reaches its pause");
@@ -1829,7 +1829,7 @@ async fn a_retry_racing_a_new_message_does_not_cancel_its_turn() {
     let (pause, retry) = paused_retry(&mgr, &id, &ws).await;
     send(&mgr, &id, &ws, "message alpha").await;
     next.wait_prompts(1).await;
-    pause.resume.notify_one();
+    pause.release();
     retry.await.unwrap();
     next.finish.add_permits(8);
     wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE, "message alpha"]).await;
@@ -1853,7 +1853,7 @@ async fn a_second_retry_does_not_cancel_the_first_ones_turn() {
     let (pause, second) = paused_retry(&mgr, &id, &ws).await;
     mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
     next.wait_prompts(1).await;
-    pause.resume.notify_one();
+    pause.release();
     second.await.unwrap();
     next.finish.add_permits(8);
     wait_delivered(&mgr, &id, &next, &[FIRST_MESSAGE]).await;

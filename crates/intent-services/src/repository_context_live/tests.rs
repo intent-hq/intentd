@@ -313,44 +313,22 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
 }
 
 /// Blocking fixture barrier retains the actual reader worker and worktree lock.
-pub(crate) struct BlockingHold {
-    entered: tokio::sync::Notify,
-    released: Mutex<bool>,
-    ready: std::sync::Condvar,
-}
+/// Once released it stays open: later probes pass without stopping.
+pub(crate) struct BlockingHold(intentd_test_support::PausePoint);
 impl BlockingHold {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: tokio::sync::Notify::new(),
-            released: Mutex::new(false),
-            ready: std::sync::Condvar::new(),
-        })
+        Arc::new(Self(intentd_test_support::PausePoint::unshared(
+            "blocking fixture barrier",
+        )))
     }
     pub(crate) fn wait(&self) {
-        self.entered.notify_one();
-        let guard = self.released.lock().unwrap();
-        let (guard, timed) = self
-            .ready
-            .wait_timeout_while(
-                guard,
-                intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
-                |done| !*done,
-            )
-            .unwrap();
-        drop(guard);
-        assert!(!timed.timed_out(), "blocking fixture release deadline");
+        self.0.pause_blocking();
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
-            self.entered.notified(),
-        )
-        .await
-        .unwrap();
+        self.0.wait_reached().await;
     }
     pub(crate) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.ready.notify_all();
+        self.0.open();
     }
 }
 

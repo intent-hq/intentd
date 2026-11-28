@@ -19141,7 +19141,7 @@ pub(crate) mod pr {
         let (_t, svc, ws_id, park) = parked_refresh_setup(None).await;
         let refresh = svc.refresh_workspace_pr(&ws_id);
         let fold = async {
-            park.entered.notified().await;
+            park.pause.wait_reached().await;
             svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
                 .await
                 .expect("fold");
@@ -19151,7 +19151,7 @@ pub(crate) mod pr {
                 Some(true),
                 "the fold landed while the REST read was held"
             );
-            park.release.notify_one();
+            park.pause.release();
         };
         let (outcome, ()) = tokio::join!(refresh, fold);
         assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
@@ -19178,7 +19178,7 @@ pub(crate) mod pr {
         let (_t, svc, ws_id, park) = parked_refresh_setup(Some(true)).await;
         let refresh = svc.refresh_workspace_pr(&ws_id);
         let fold = async {
-            park.entered.notified().await;
+            park.pause.wait_reached().await;
             svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
                 .await
                 .expect("fold");
@@ -19188,7 +19188,7 @@ pub(crate) mod pr {
                 None,
                 "the fold cleared the signal while the REST read was held"
             );
-            park.release.notify_one();
+            park.pause.release();
         };
         let (outcome, ()) = tokio::join!(refresh, fold);
         assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
@@ -21180,11 +21180,11 @@ pub(crate) mod pr {
         });
         let refresh = svc.refresh_git_root_pr(root, &sc);
         let fold = async {
-            park.entered.notified().await;
+            park.pause.wait_reached().await;
             svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
                 .await
                 .expect("fold");
-            park.release.notify_one();
+            park.pause.release();
         };
         let (outcome, ()) = tokio::join!(refresh, fold);
         assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
@@ -21207,11 +21207,11 @@ pub(crate) mod pr {
         });
         let refresh = svc.refresh_git_root_pr(root, &sc);
         let fold = async {
-            park.entered.notified().await;
+            park.pause.wait_reached().await;
             svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
                 .await
                 .expect("fold");
-            park.release.notify_one();
+            park.pause.release();
         };
         let (outcome, ()) = tokio::join!(refresh, fold);
         assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
@@ -24177,7 +24177,7 @@ mod file_tracking {
         let index_before = std::fs::read(git.path().join("index")).unwrap();
         std::fs::write(git.path().join("index.lock"), "held by test\n").unwrap();
 
-        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "git");
+        let commit = crate::periodic_shutdown_tests::hold(&svc, "git");
         let committing = svc.clone();
         let workspace_id = ws.clone();
         let operation = tokio::spawn(intent_core::with_caller(
@@ -24196,7 +24196,7 @@ mod file_tracking {
                     .await
             },
         ));
-        crate::periodic_shutdown_tests::entered(entered).await;
+        crate::periodic_shutdown_tests::entered(&commit).await;
         let committed = git.head().unwrap().peel_to_commit().unwrap();
         assert_ne!(committed.id(), parent);
         assert_eq!(committed.parent_id(0).unwrap(), parent);
@@ -24222,7 +24222,7 @@ mod file_tracking {
                 &[&committed],
             )
             .unwrap();
-        release.send(()).unwrap();
+        commit.release();
         let outcome = operation.await.unwrap().unwrap();
         assert_eq!(outcome.hash, committed.id().to_string());
         assert_ne!(outcome.hash, later.to_string());
@@ -45930,50 +45930,39 @@ mod idempotency_serialization {
 
     use super::TempDb;
     use crate::{with_idempotency, IdempotencyInflight};
+    use intentd_test_support::PausePoint;
 
-    /// A racing caller's observable checkpoints: `entered` fires
-    /// synchronously right before `with_idempotency` is called, `started`
-    /// fires from inside `op`, and `op` then parks until `release` opens.
+    /// A racing caller's observable checkpoints: it arrives at `entered`
+    /// (always open, so it only counts) right before `with_idempotency` is
+    /// called, and at `op` from inside `op`, which holds until the test
+    /// opens it.
     struct Race {
         store: Store,
         inflight: Arc<IdempotencyInflight>,
         calls: Arc<AtomicUsize>,
-        entered: tokio::sync::mpsc::UnboundedSender<()>,
-        started: tokio::sync::mpsc::UnboundedSender<()>,
-        release: tokio::sync::watch::Receiver<bool>,
+        entered: Arc<PausePoint>,
+        op: Arc<PausePoint>,
     }
 
     struct Checkpoints {
-        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
-        started: tokio::sync::mpsc::UnboundedReceiver<()>,
-        release: tokio::sync::watch::Sender<bool>,
+        entered: Arc<PausePoint>,
+        op: Arc<PausePoint>,
     }
 
     fn race(store: Store) -> (Arc<Race>, Checkpoints) {
-        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let entered = PausePoint::new("idempotency caller entered");
+        entered.open();
+        let op = PausePoint::new("idempotent op");
         (
             Arc::new(Race {
                 store,
                 inflight: Arc::new(IdempotencyInflight::default()),
                 calls: Arc::new(AtomicUsize::new(0)),
-                entered: entered_tx,
-                started: started_tx,
-                release: release_rx,
+                entered: entered.clone(),
+                op: op.clone(),
             }),
-            Checkpoints {
-                entered: entered_rx,
-                started: started_rx,
-                release: release_tx,
-            },
+            Checkpoints { entered, op },
         )
-    }
-
-    async fn wait_open(mut release: tokio::sync::watch::Receiver<bool>) {
-        while !*release.borrow_and_update() {
-            release.changed().await.expect("release gate dropped");
-        }
     }
 
     impl Race {
@@ -45988,7 +45977,7 @@ mod idempotency_serialization {
             let key = key.to_string();
             tokio::spawn(async move {
                 let op_race = race.clone();
-                race.entered.send(()).expect("entered checkpoint");
+                race.entered.pause().await;
                 with_idempotency(
                     &race.inflight,
                     &race.store,
@@ -45997,8 +45986,7 @@ mod idempotency_serialization {
                     "test.op",
                     move || async move {
                         let n = op_race.calls.fetch_add(1, Ordering::SeqCst) + 1;
-                        op_race.started.send(()).expect("started checkpoint");
-                        wait_open(op_race.release.clone()).await;
+                        op_race.op.pause().await;
                         outcome(n)
                     },
                 )
@@ -46034,18 +46022,15 @@ mod idempotency_serialization {
     async fn concurrent_same_key_first_use_runs_op_once() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let (race, mut cp) = race(store.clone());
+        let (race, cp) = race(store.clone());
 
         let first = race.spawn("race-key", winner);
-        cp.entered.recv().await.expect("first entered");
-        cp.started.recv().await.expect("first op in flight");
+        cp.entered.wait_reached().await;
+        cp.op.wait_reached().await;
         let second = race.spawn("race-key", winner);
-        cp.entered
-            .recv()
-            .await
-            .expect("second caller entered while the first op is parked");
+        cp.entered.wait_reached().await;
         race.wait_holders("race-key", 2).await;
-        cp.release.send(true).expect("open gate");
+        cp.op.open();
 
         let first = first.await.expect("join").expect("first result");
         let second = second.await.expect("join").expect("second result");
@@ -46081,15 +46066,15 @@ mod idempotency_serialization {
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let (race, mut cp) = race(store.clone());
+        let (race, cp) = race(store.clone());
 
         let first = race.spawn("fail-key", fail_first);
-        cp.entered.recv().await.expect("first entered");
-        cp.started.recv().await.expect("first op in flight");
+        cp.entered.wait_reached().await;
+        cp.op.wait_reached().await;
         let second = race.spawn("fail-key", fail_first);
-        cp.entered.recv().await.expect("second entered");
+        cp.entered.wait_reached().await;
         race.wait_holders("fail-key", 2).await;
-        cp.release.send(true).expect("open gate");
+        cp.op.open();
 
         let first = first.await.expect("join");
         let second = second.await.expect("join");
@@ -46114,11 +46099,11 @@ mod idempotency_serialization {
     async fn unrelated_keys_do_not_serialize() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let (race, mut cp) = race(store.clone());
+        let (race, cp) = race(store.clone());
 
         let held = race.spawn("held-key", winner);
-        cp.entered.recv().await.expect("held entered");
-        cp.started.recv().await.expect("held op in flight");
+        cp.entered.wait_reached().await;
+        cp.op.wait_reached().await;
 
         let other = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(30)),
@@ -46142,7 +46127,7 @@ mod idempotency_serialization {
             "the unrelated call never touched the held key"
         );
 
-        cp.release.send(true).expect("open gate");
+        cp.op.open();
         let held = held.await.expect("join").expect("held result");
         assert_eq!(held["call"], 1);
         assert!(race.inflight.is_empty());
@@ -46155,14 +46140,14 @@ mod idempotency_serialization {
     async fn cancelled_waiter_releases_hold_and_entry_is_pruned() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let (race, mut cp) = race(store);
+        let (race, cp) = race(store);
 
         let holder = race.spawn("k", winner);
-        cp.entered.recv().await.expect("holder entered");
-        cp.started.recv().await.expect("holder op in flight");
+        cp.entered.wait_reached().await;
+        cp.op.wait_reached().await;
 
         let waiter = race.spawn("k", winner);
-        cp.entered.recv().await.expect("waiter entered");
+        cp.entered.wait_reached().await;
         race.wait_holders("k", 2).await;
 
         waiter.abort();
@@ -46176,7 +46161,7 @@ mod idempotency_serialization {
             "the cancelled waiter no longer holds the key"
         );
 
-        cp.release.send(true).expect("open gate");
+        cp.op.open();
         let held = holder.await.expect("join").expect("holder result");
         assert_eq!(held["call"], 1);
         assert_eq!(race.calls.load(Ordering::SeqCst), 1, "op ran once");

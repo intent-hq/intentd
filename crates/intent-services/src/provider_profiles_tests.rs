@@ -1130,26 +1130,17 @@ struct GatedSecrets {
 
 struct Gate {
     op: &'static str,
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: std::sync::mpsc::Receiver<()>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 
 impl GatedSecrets {
-    fn arm(
-        &self,
-        op: &'static str,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
-        let (entered, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release) = std::sync::mpsc::channel();
+    fn arm(&self, op: &'static str) -> Arc<intentd_test_support::PausePoint> {
+        let pause = intentd_test_support::PausePoint::new(format!("profile secret {op}"));
         *self.gate.lock().unwrap() = Some(Gate {
             op,
-            entered,
-            release,
+            pause: pause.clone(),
         });
-        (entered_rx, release_tx)
+        pause
     }
 
     fn pause(&self, op: &str, account: &str) {
@@ -1165,8 +1156,7 @@ impl GatedSecrets {
             }
         };
         if let Some(gate) = gate {
-            let _ = gate.entered.send(());
-            let _ = gate.release.recv();
+            gate.pause.pause_blocking();
         }
     }
 }
@@ -1197,11 +1187,11 @@ fn install_gated(fx: &mut Fixture, gated: &Arc<GatedSecrets>, write_timeout: Dur
 }
 
 /// Release the parked write only after the caller's write budget expired.
-fn release_after_budget(release: std::sync::mpsc::Sender<()>) {
+fn release_after_budget(pause: Arc<intentd_test_support::PausePoint>) {
     std::thread::spawn(move || {
         // timing-guard: the regression needs the write to outlive its 50ms budget
         std::thread::sleep(Duration::from_millis(300));
-        let _ = release.send(());
+        pause.release();
     });
 }
 
@@ -1210,14 +1200,14 @@ async fn create_waits_for_a_slow_secret_write_instead_of_orphaning_it() {
     let mut fx = Fixture::new().await;
     let gated = Arc::new(GatedSecrets::default());
     install_gated(&mut fx, &gated, Duration::from_millis(50));
-    let (entered, release) = gated.arm("store");
+    let pause = gated.arm("store");
     let svc = fx.svc.clone();
-    let create = intent_core::spawn_daemon(async move {
+    let mut create = intent_core::spawn_daemon(async move {
         svc.provider_profiles_create_impl(json!({ "baseProviderId": "codex", "name": "Slow" }))
             .await
     });
-    entered.await.unwrap();
-    release_after_budget(release);
+    pause.reached(&mut create).await;
+    release_after_budget(pause);
     let created = create
         .await
         .unwrap()
@@ -1245,18 +1235,18 @@ async fn update_reports_a_slow_but_successful_env_write_honestly() {
         .await;
     let id = created["profile"]["id"].as_str().unwrap().to_string();
     let mut sub = fx.subscribe();
-    let (entered, release) = gated.arm("store");
+    let pause = gated.arm("store");
     let svc = fx.svc.clone();
     let update_id = id.clone();
-    let update = intent_core::spawn_daemon(async move {
+    let mut update = intent_core::spawn_daemon(async move {
         svc.provider_profiles_update_impl(
             update_id,
             json!({ "env": [{ "key": "B", "kind": "unset" }] }),
         )
         .await
     });
-    entered.await.unwrap();
-    release_after_budget(release);
+    pause.reached(&mut update).await;
+    release_after_budget(pause);
     let updated = update
         .await
         .unwrap()
@@ -1288,21 +1278,21 @@ async fn delete_prune_does_not_revert_a_concurrent_provider_defaults_write() {
 
     // Park the delete between its settings read and the prune, then let
     // another writer replace the map (dropping the profile key).
-    let (entered, release) = gated.arm("delete");
+    let pause = gated.arm("delete");
     let svc = fx.svc.clone();
     let delete_id = id.clone();
-    let delete =
+    let mut delete =
         intent_core::spawn_daemon(
             async move { svc.provider_profiles_delete_impl(delete_id).await },
         );
-    entered.await.unwrap();
+    pause.reached(&mut delete).await;
     fx.svc
         .settings_update_checking_profiles(json!([
             { "path": "model.providerDefaults", "value": { "claude-code": "s1" } },
         ]))
         .await
         .unwrap();
-    release.send(()).unwrap();
+    pause.release();
     delete.await.unwrap().unwrap();
     assert_eq!(
         fx.svc.effective_settings().model.provider_defaults,

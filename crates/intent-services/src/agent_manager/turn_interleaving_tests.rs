@@ -242,7 +242,7 @@ async fn run_case(case: &Case, n: usize) {
     let mut parked = None;
     if let Some(pause) = pause {
         tokio::select! {
-            () = pause.reached.notified() => parked = Some(pause),
+            () = pause.wait_reached() => parked = Some(pause),
             done = &mut first => {
                 record_sent(&mut sent, case.first, &done.unwrap());
                 actor.mgr.turn_schedule.disarm(case.at.unwrap());
@@ -261,7 +261,7 @@ async fn run_case(case: &Case, n: usize) {
             // The parked action holds what this one waits for (the
             // turn-start gate): resume it first.
             if let Some(pause) = parked.take() {
-                pause.resume.notify_one();
+                pause.release();
                 record_sent(&mut sent, case.first, &(&mut first).await.unwrap());
             }
             next.await.unwrap()
@@ -271,7 +271,7 @@ async fn run_case(case: &Case, n: usize) {
     }
 
     if let Some(pause) = parked {
-        pause.resume.notify_one();
+        pause.release();
         record_sent(&mut sent, case.first, &first.await.unwrap());
         actor.settle(&label).await;
     }
@@ -479,7 +479,7 @@ async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
     let interrupt = tokio::spawn(actor.clone().act(Action::Interrupt));
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
-        pause.reached.notified(),
+        pause.wait_reached(),
     )
     .await
     .expect("the stop reaches its pause");
@@ -504,7 +504,7 @@ async fn a_stop_across_a_turn_boundary_stops_the_next_turn() {
         .expect("turn B holds the slot");
     assert_ne!(turn_a, turn_b, "a new admission holds the slot");
 
-    pause.resume.notify_one();
+    pause.release();
     interrupt.await.unwrap().unwrap();
     actor.settle("stop across a turn boundary").await;
 

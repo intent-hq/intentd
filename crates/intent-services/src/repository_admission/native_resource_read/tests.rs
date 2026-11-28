@@ -15,16 +15,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const INSTANCE: &str = "https://forge.test:8443/install";
 const PROJECT: &str = "Team/Sub/Project";
-#[derive(Default)]
 struct Provider {
     routes: Mutex<Vec<(String, String)>>,
     replies: Mutex<HashMap<String, (u16, Value)>>,
     headers: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
-    entered: Notify,
-    release: Notify,
+    hold: intentd_test_support::PausePoint,
     active: AtomicUsize,
     completed: AtomicUsize,
+}
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            routes: Mutex::default(),
+            replies: Mutex::default(),
+            headers: Mutex::default(),
+            pause: Mutex::default(),
+            hold: intentd_test_support::PausePoint::unshared("held provider response"),
+            active: AtomicUsize::default(),
+            completed: AtomicUsize::default(),
+        }
+    }
 }
 struct Server {
     host: GitlabHost,
@@ -80,7 +91,7 @@ impl Server {
                             let reply=state.replies.lock().unwrap().get(route).cloned().unwrap_or_else(||default_reply(route));
                             let extra=state.headers.lock().unwrap().get(route).cloned().unwrap_or_default();
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
-                            if pause {state.entered.notify_one();state.release.notified().await;}
+                            if pause {state.hold.pause().await;}
                             let body=reply.1.to_string();
                             let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\n{extra}Connection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
@@ -123,12 +134,10 @@ impl Server {
             .insert(route.into(), headers.into());
     }
     async fn entered(&self) {
-        tokio::time::timeout(acquire_wait(), self.state.entered.notified())
-            .await
-            .unwrap();
+        self.state.hold.wait_reached().await;
     }
     async fn finish(mut self) {
-        self.state.release.notify_waiters();
+        self.state.hold.release();
         self.stop.take().unwrap().send(()).unwrap();
         tokio::time::timeout(acquire_wait(), self.task.take().unwrap())
             .await
@@ -146,7 +155,7 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        self.state.release.notify_waiters();
+        self.state.hold.release();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -816,7 +825,7 @@ async fn scoped_page_reads_fresh_denial_wins_over_held_older_success() {
             .await
             .unwrap();
         assert_eq!(rejected["outcome"]["code"], "resource-denied");
-        server.state.release.notify_one();
+        server.state.hold.release();
     });
     assert!(
         old_result.is_err(),
@@ -1604,7 +1613,7 @@ async fn resource_pre_denial_inflight_success_cannot_restore_eligibility() {
             .await
             .unwrap();
         assert_eq!(denied["outcome"]["code"], "resource-denied");
-        server.state.release.notify_one();
+        server.state.hold.release();
         let (scope, late) = first.await;
         eprintln!("late original body {late:?}");
         assert!(late.is_err());
@@ -1911,7 +1920,7 @@ async fn resource_release_cancels_original_provider_future_and_joins() {
         assert!(body.is_err());
         scope.retire();
         drop(scope);
-        server.state.release.notify_one();
+        server.state.hold.release();
     }
     drop(s);
     server.finish().await;

@@ -4,37 +4,12 @@ use crate::repository_read_source::tests::{run, ActualRead, ReadServer};
 use intent_acp::mcp_server::private_results::McpPrivateBoundaryKind as Boundary;
 use intent_acp::mcp_server::request_context::{McpRequestContext, McpRequestScope};
 use intent_acp::mcp_server::WorkspaceMcpServer;
+use intentd_test_support::PausePoint;
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
-
-struct Hold {
-    entered: Notify,
-    release: Semaphore,
-}
-impl Hold {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: Notify::new(),
-            release: Semaphore::new(0),
-        })
-    }
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-    }
-    async fn reached(&self) {
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(10)),
-            self.entered.notified(),
-        )
-        .await
-        .unwrap();
-    }
-}
 
 #[derive(Default)]
 struct Control {
-    hold: Mutex<Option<(Boundary, bool, Arc<Hold>)>>,
+    hold: Mutex<Option<(Boundary, bool, Arc<PausePoint>)>>,
     events: Mutex<Vec<(Boundary, usize)>>,
     records: Mutex<Vec<Arc<ReadRecord>>>,
     foreign: Mutex<Vec<Arc<ReadRecord>>>,
@@ -110,11 +85,11 @@ impl McpPrivatePolicy for ControlledPolicy {
                 }
             };
             if let Some((_, false, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             let admitted = self.original.admit(boundary, records, packet).await;
             if let Some((_, true, gate)) = &hold {
-                gate.wait().await;
+                gate.pause().await;
             }
             admitted
         })
@@ -141,14 +116,14 @@ async fn real_host_transfer_and_later_output_each_require_original_live_authorit
         let http = ReadServer::new().await;
         let f = ActualRead::new(&http).await;
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((boundary, after, gate.clone()));
         let endpoint = controlled(&f, control.clone());
         let task =
             tokio::spawn(async move { run(&endpoint, "return await ws.pr.snapshot(4);").await });
-        gate.reached().await;
+        gate.wait_reached().await;
         f.owner.interrupt_requests();
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert_eq!(
             reply.to_string().contains("actual review"),
@@ -171,13 +146,13 @@ async fn caught_discarded_and_transformed_results_keep_all_original_records() {
         let http = ReadServer::new().await;
         let f = ActualRead::new(&http).await;
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
         let endpoint = controlled(&f, control.clone());
         let task = tokio::spawn(async move { run(&endpoint, code).await });
-        gate.reached().await;
+        gate.wait_reached().await;
         f.owner.interrupt_requests();
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert!(
             reply
@@ -199,7 +174,7 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
     let http = ReadServer::new().await;
     let f = ActualRead::new(&http).await;
     let control = Arc::new(Control::default());
-    let gate = Hold::new();
+    let gate = PausePoint::new("policy admission");
     *control.hold.lock().unwrap() = Some((Boundary::TcpResponse, false, gate.clone()));
     let bridge =
         intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(controlled(&f, control.clone())))
@@ -211,9 +186,9 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
         .write_all(format!("{request}\n").as_bytes())
         .await
         .unwrap();
-    gate.reached().await;
+    gate.wait_reached().await;
     f.owner.interrupt_requests();
-    gate.release.add_permits(1);
+    gate.release();
     let mut reply = String::new();
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -245,7 +220,7 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
             )])
             .unwrap();
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::ArtifactStart, after, gate.clone()));
         let endpoint = controlled(&f, control.clone());
         let task = tokio::spawn(async move {
@@ -255,7 +230,7 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
             )
             .await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         let folder = f.git.dir.path().join("tool-outputs");
         assert!(!folder.exists(), "no private I/O inside admission");
         tokio::time::timeout(
@@ -268,7 +243,7 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
         .await
         .unwrap();
         f.owner.interrupt_requests();
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert!(
             reply
@@ -354,13 +329,13 @@ async fn source_changes_after_host_disclosure_reject_constant_output_without_reb
         let http = ReadServer::new().await;
         let f = ActualRead::new(&http).await;
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
         let endpoint = controlled(&f, control);
         let task = tokio::spawn(async move {
             run(&endpoint, "await ws.pr.snapshot(4); return 'constant';").await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         let mut pending = None;
         match change {
             "head" => {
@@ -408,7 +383,7 @@ async fn source_changes_after_host_disclosure_reject_constant_output_without_reb
         if let Some(pending) = pending {
             pending.settle_confirmed().await.unwrap();
         }
-        gate.release.add_permits(1);
+        gate.release();
         let reply = task.await.unwrap();
         assert!(
             reply
@@ -426,13 +401,13 @@ async fn original_public_scheduling_cancellation_retires_old_output_but_allows_f
         let http = ReadServer::new().await;
         let f = ActualRead::new(&http).await;
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
         let endpoint = controlled(&f, control);
         let task = tokio::spawn(async move {
             run(&endpoint, "await ws.pr.snapshot(4); return 'constant';").await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         intent_core::with_caller(Caller::Daemon, async {
             if agent {
                 f.auth
@@ -465,7 +440,7 @@ async fn original_public_scheduling_cancellation_retires_old_output_but_allows_f
             }
         })
         .await;
-        gate.release.add_permits(1);
+        gate.release();
         assert!(task
             .await
             .unwrap()
@@ -483,14 +458,14 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
     let http = ReadServer::new().await;
     let f = ActualRead::new(&http).await;
     let control = Arc::new(Control::default());
-    let gate = Hold::new();
+    let gate = PausePoint::new("policy admission");
     *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
     let endpoint = controlled(&f, control);
     let task =
         tokio::spawn(
             async move { run(&endpoint, "await ws.pr.snapshot(4); return 'constant';").await },
         );
-    gate.reached().await;
+    gate.wait_reached().await;
     intent_core::with_caller(Caller::Daemon, async {
         f.auth
             .service
@@ -522,7 +497,7 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
             .unwrap());
     })
     .await;
-    gate.release.add_permits(1);
+    gate.release();
     assert!(task
         .await
         .unwrap()
@@ -555,13 +530,13 @@ async fn original_settings_and_secret_replacement_cannot_repair_final_output() {
         let http = ReadServer::new().await;
         let f = ActualRead::new(&http).await;
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
         let endpoint = controlled(&f, control);
         let task = tokio::spawn(async move {
             run(&endpoint, "await ws.pr.snapshot(4); return 'constant';").await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         let path = if secret {
             SECRET_ACCOUNT
         } else {
@@ -570,7 +545,7 @@ async fn original_settings_and_secret_replacement_cannot_repair_final_output() {
         intent_core::with_caller(intent_core::Caller::Daemon,
             f.auth.service.settings_update(serde_json::json!([{"path":path,"value":if secret {"pat-second"} else {"replacement"}}]))
         ).await.unwrap();
-        gate.release.add_permits(1);
+        gate.release();
         assert!(task
             .await
             .unwrap()
@@ -584,16 +559,16 @@ async fn mixed_live_original_requests_are_refused_without_releasing_shared_autho
     let http = ReadServer::new().await;
     let f = ActualRead::new(&http).await;
     let first = Arc::new(Control::default());
-    let gate = Hold::new();
+    let gate = PausePoint::new("policy admission");
     *first.hold.lock().unwrap() = Some((Boundary::DirectResponse, false, gate.clone()));
     let endpoint = controlled(&f, first.clone());
     let task = tokio::spawn(async move { run(&endpoint, "return await ws.pr.snapshot(4);").await });
-    gate.reached().await;
+    gate.wait_reached().await;
     let second = Arc::new(Control::default());
     *second.foreign.lock().unwrap() = first.records.lock().unwrap().clone();
     let reply = run(&controlled(&f, second), "return await ws.pr.snapshot(4);").await;
     assert!(reply.to_string().contains("actual review"), "{reply}");
-    gate.release.add_permits(1);
+    gate.release();
     assert!(task.await.unwrap().to_string().contains("actual review"));
 }
 
@@ -610,7 +585,7 @@ async fn original_artifact_cancellation_and_failed_io_do_not_become_replacement_
             )])
             .unwrap();
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() =
             Some((Boundary::ArtifactStart, mode != "before", gate.clone()));
         let folder = f.git.dir.path().join("tool-outputs");
@@ -622,10 +597,10 @@ async fn original_artifact_cancellation_and_failed_io_do_not_become_replacement_
             )
             .await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         if mode == "failed-io" {
             std::fs::write(&folder, "original obstruction").unwrap();
-            gate.release.add_permits(1);
+            gate.release();
             let reply = task.await.unwrap();
             assert_eq!(
                 std::fs::read_to_string(&folder).unwrap(),
@@ -638,7 +613,7 @@ async fn original_artifact_cancellation_and_failed_io_do_not_become_replacement_
         } else {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
-            gate.release.add_permits(1);
+            gate.release();
             assert!(!folder.exists());
         }
         tokio::time::timeout(
@@ -660,19 +635,19 @@ async fn real_attachment_admission_keeps_already_admitted_effect_distinct_from_r
         let f = ActualRead::new(&http).await;
         let registry = Arc::new(intent_core::TurnAttachmentRegistry::new());
         let control = Arc::new(Control::default());
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         *control.hold.lock().unwrap() = Some((Boundary::Attachments, after, gate.clone()));
         let endpoint = controlled(&f, control).with_turn_attachments(Some(registry.clone()));
         let task = tokio::spawn(async move {
             run(&endpoint,"const p=await ws.pr.snapshot(4); return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://original',mimeType:'application/json',text:JSON.stringify({title:p.title})}}]};").await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert_eq!(
             registry.pending_count_by_mime(&f.agent, "application/json"),
             0
         );
         f.owner.interrupt_requests();
-        gate.release.add_permits(1);
+        gate.release();
         assert!(task
             .await
             .unwrap()
@@ -688,7 +663,7 @@ async fn real_attachment_admission_keeps_already_admitted_effect_distinct_from_r
 /// Scheduling/restoration around the actual service future; no admission path.
 struct DeliveryControlApi {
     inner: Arc<dyn intent_core::WorkspaceApi>,
-    settings: Mutex<Option<Arc<Hold>>>,
+    settings: Mutex<Option<Arc<PausePoint>>>,
     restore: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
 }
 impl intent_core::WorkspaceApi for DeliveryControlApi {
@@ -708,7 +683,7 @@ impl intent_core::WorkspaceApi for DeliveryControlApi {
         Box::pin(async move {
             let gate = self.settings.lock().unwrap().take();
             if let Some(gate) = gate {
-                gate.wait().await;
+                gate.pause().await;
             }
             self.inner.settings_get(path).await
         })
@@ -746,7 +721,7 @@ async fn post_eval_settings_wait_preserves_retirement_and_cancellation_before_an
                 serde_json::json!(1000),
             )])
             .unwrap();
-        let gate = Hold::new();
+        let gate = PausePoint::new("policy admission");
         let api = Arc::new(DeliveryControlApi {
             inner: f.api(),
             settings: Mutex::new(Some(gate.clone())),
@@ -762,14 +737,14 @@ async fn post_eval_settings_wait_preserves_retirement_and_cancellation_before_an
             )
             .await
         });
-        gate.reached().await;
+        gate.wait_reached().await;
         assert!(http.count() > 0);
         f.owner.interrupt_requests();
         if cancel {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         } else {
-            gate.release.add_permits(1);
+            gate.release();
             assert!(task
                 .await
                 .unwrap()

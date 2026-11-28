@@ -143,13 +143,7 @@ impl RunningFlagGate {
 /// a test can interleave a newer script start (one-shot).
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-#[derive(Default)]
-pub struct ScriptsRunningPark {
-    /// Signaled by the parked recompute on entering the window.
-    pub entered: tokio::sync::Notify,
-    /// Held by the parked recompute until the test releases it.
-    pub release: tokio::sync::Notify,
-}
+pub type ScriptsRunningPark = intentd_test_support::PausePoint;
 
 struct CacheInner<T> {
     map: HashMap<WorkspaceId, T>,
@@ -803,7 +797,7 @@ impl Services {
     /// Arm [`ScriptsRunningPark`]: the next transitioning recompute parks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
-        let park = Arc::new(ScriptsRunningPark::default());
+        let park = ScriptsRunningPark::new("scriptsRunning recompute");
         *self
             .scripts_running_state
             .park
@@ -821,8 +815,7 @@ impl Services {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(park) = park {
-            park.entered.notify_one();
-            park.release.notified().await;
+            park.pause().await;
         }
     }
 

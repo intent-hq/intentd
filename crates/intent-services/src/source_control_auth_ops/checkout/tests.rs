@@ -262,7 +262,7 @@ async fn checkout_current_401_disconnects_but_late_old_401_cannot_reject_replace
         .gitlab_connect_pat(server.host.clone(), "pat-second".into())
         .await
         .unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(call.await.is_err());
     let replacement = fixture
         .service
@@ -294,7 +294,7 @@ async fn checkout_admitted_success_is_preserved_but_retired_caller_cannot_delive
     tokio::pin!(call);
     tokio::select! { result = &mut call => panic!("expected held HTTP: {result:?}"), () = server.entered() => {} }
     caller.retire();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(
         call.await.is_ok(),
         "actual admitted response stays truthful"
@@ -389,7 +389,7 @@ async fn checkout_late_project_denial_does_not_quarantine_a_new_verified_account
         .gitlab_connect_pat(server.host.clone(), "pat-second".into())
         .await
         .unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(call.await.is_err());
     let replacement = fixture
         .service
@@ -515,7 +515,7 @@ async fn checkout_pending_pat_cancel_is_original_prefix_scoped_and_has_no_write(
             .unwrap()["cancelled"],
         true
     );
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(connect.await.is_err());
     assert_eq!(
         std::fs::read(fixture.service.gitlab_secret_store.path()).unwrap(),
@@ -613,8 +613,7 @@ async fn checkout_known_project_denial_blocks_follow_up_before_http() {
 async fn checkout_project_denial_during_original_read_refuses_final_http_admission() {
     struct HeldRead {
         original: Arc<dyn RepositorySecretReader>,
-        entered: tokio::sync::Notify,
-        release: tokio::sync::Notify,
+        pause: intentd_test_support::PausePoint,
     }
     impl RepositorySecretReader for HeldRead {
         fn load<'a>(
@@ -624,8 +623,7 @@ async fn checkout_project_denial_during_original_read_refuses_final_http_admissi
         {
             Box::pin(async move {
                 let snapshot = self.original.load(expected).await?;
-                self.entered.notify_one();
-                self.release.notified().await;
+                self.pause.pause().await;
                 Ok(snapshot)
             })
         }
@@ -639,8 +637,7 @@ async fn checkout_project_denial_during_original_read_refuses_final_http_admissi
         .unwrap();
     let reader = Arc::new(HeldRead {
         original: original.reader.clone(),
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
+        pause: intentd_test_support::PausePoint::unshared("source secret read"),
     });
     // Scheduling wrapper only: it delegates to the actual paired file reader.
     let pending = Arc::new(GitlabCheckoutConnection {
@@ -652,7 +649,7 @@ async fn checkout_project_denial_during_original_read_refuses_final_http_admissi
     let provider = pending.provider().unwrap();
     let call = provider.get_repo("group", "project");
     tokio::pin!(call);
-    tokio::select! { result = &mut call => panic!("expected held source read: {result:?}"), () = reader.entered.notified() => {} }
+    reader.pause.reached(&mut call).await;
     *server.control.project_status.lock().unwrap() = Some(403);
     assert!(original
         .provider()
@@ -662,7 +659,7 @@ async fn checkout_project_denial_during_original_read_refuses_final_http_admissi
         .is_err());
     let requests = server.control.requests.lock().unwrap().len();
     *server.control.project_status.lock().unwrap() = None;
-    reader.release.notify_one();
+    reader.pause.release();
     assert!(matches!(
         call.await,
         Err(intent_sourcecontrol::Error::AdmissionUnavailable(

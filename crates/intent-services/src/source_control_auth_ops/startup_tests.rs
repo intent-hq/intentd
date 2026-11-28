@@ -1,21 +1,19 @@
 use super::*;
 use intent_core::WorkspaceApi;
+use intentd_test_support::PausePoint;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 struct HeldCommitResult {
-    entered: Arc<Notify>,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    pause: Arc<PausePoint>,
 }
 
 impl Drop for HeldCommitResult {
     fn drop(&mut self) {
-        self.entered.notify_one();
-        let _ = self.release.lock().unwrap().recv();
+        self.pause.pause_blocking();
     }
 }
 
@@ -25,19 +23,12 @@ async fn gitlab_poll_retains_late_commit_result_and_binding() {
     use std::task::Poll;
     let (_dir, svc) = services().await;
     let (host, server) = authorized_host().await;
-    let entered = Arc::new(Notify::new());
-    let (release, held) = std::sync::mpsc::channel();
+    let pause = PausePoint::new("commit result lease drop");
     svc.gitlab_auth.lock().await.persistence_test_lease = Some(Arc::new(HeldCommitResult {
-        entered: entered.clone(),
-        release: std::sync::Mutex::new(held),
+        pause: pause.clone(),
     }));
     svc.gitlab_connect_device(host).await.unwrap();
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        entered.notified(),
-    )
-    .await
-    .unwrap();
+    pause.wait_reached().await;
     assert_eq!(
         svc.gitlab_secret_store
             .load(GITLAB_SECRET_ACCOUNT)
@@ -51,7 +42,7 @@ async fn gitlab_poll_retains_late_commit_result_and_binding() {
     let drain = svc.shutdown_store_writers();
     tokio::pin!(drain);
     let pending = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await;
-    release.send(()).unwrap();
+    pause.release();
     if pending {
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -236,8 +227,7 @@ const SAVED_PAT: &str = "glpat-startup-saved-canary";
 
 struct DeferredStart {
     host: GitlabHost,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
+    pause: Arc<PausePoint>,
     task: JoinHandle<()>,
 }
 
@@ -251,10 +241,8 @@ impl DeferredStart {
     async fn new(host: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let hit = entered.clone();
-        let resume = release.clone();
+        let pause = PausePoint::new("private device authorization");
+        let parked = pause.clone();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -281,8 +269,7 @@ impl DeferredStart {
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("POST /oauth/authorize_device "));
             assert!(!request.contains(SAVED_PAT));
-            hit.notify_one();
-            resume.notified().await;
+            parked.pause().await;
             let body = json!({
                 "device_code": "private-startup-device-code",
                 "user_code": "TEST-CODE",
@@ -299,8 +286,7 @@ impl DeferredStart {
                 .unwrap()
                 .with_api_origin(&origin)
                 .unwrap(),
-            entered,
-            release,
+            pause,
             task,
         }
     }
@@ -308,18 +294,13 @@ impl DeferredStart {
     async fn start(&self, svc: &Arc<crate::Services>) -> JoinHandle<Result<Value>> {
         let svc = svc.clone();
         let host = self.host.clone();
-        let task = tokio::spawn(async move { svc.gitlab_connect_device(host).await });
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            self.entered.notified(),
-        )
-        .await
-        .expect("startup reached private upstream");
+        let mut task = tokio::spawn(async move { svc.gitlab_connect_device(host).await });
+        self.pause.reached(&mut task).await;
         task
     }
 
     async fn finish(&self, task: JoinHandle<Result<Value>>) -> Result<Value> {
-        self.release.notify_one();
+        self.pause.release();
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),
             task,

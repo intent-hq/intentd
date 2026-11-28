@@ -34,7 +34,7 @@ struct Server {
     seen: Arc<Mutex<Vec<(String, String)>>>,
     handler: Arc<Mutex<Handler>>,
     headers: Arc<Mutex<Vec<(String, String)>>>,
-    response_pause: Arc<Mutex<Option<Arc<Pause>>>>,
+    response_pause: Arc<Mutex<Option<Arc<PausePoint>>>>,
     response_completed: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -59,7 +59,7 @@ impl Server {
         let respond = handler.clone();
         let headers = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
         let response_headers = headers.clone();
-        let response_pause = Arc::new(Mutex::new(None::<Arc<Pause>>));
+        let response_pause = Arc::new(Mutex::new(None::<Arc<PausePoint>>));
         let paused = response_pause.clone();
         let response_completed = Arc::new(tokio::sync::Notify::new());
         let completed = response_completed.clone();
@@ -113,8 +113,7 @@ impl Server {
                         .push((line.clone(), head.to_string()));
                     let reply = respond.lock().unwrap()(method, path);
                     if let Some(pause) = pause {
-                        pause.entered.notify_one();
-                        pause.release.acquire().await.unwrap().forget();
+                        pause.pause().await;
                     }
                     let body = reply.body.to_string();
                     let next = reply
@@ -929,7 +928,7 @@ async fn bound_target_pipeline_keeps_optional_restrictions_separate_from_denial(
 struct AdmissionSchedule {
     test: Arc<Test>,
     calls: std::sync::atomic::AtomicUsize,
-    pause: Option<Arc<Pause>>,
+    pause: Option<Arc<PausePoint>>,
     after: Option<AfterRelease>,
 }
 impl RepositoryAuthority for AdmissionSchedule {
@@ -943,8 +942,7 @@ impl RepositoryAuthority for AdmissionSchedule {
             let final_check = self.calls.fetch_add(1, Ordering::SeqCst) == 1;
             if final_check {
                 if let Some(pause) = &self.pause {
-                    pause.entered.notify_one();
-                    pause.release.acquire().await.unwrap().forget();
+                    pause.pause().await;
                 }
             }
             Ok(Box::new(ReleaseFence {
@@ -958,7 +956,7 @@ impl RepositoryAuthority for AdmissionSchedule {
 }
 fn scheduled_provider(
     server: &Server,
-    pause: Option<Arc<Pause>>,
+    pause: Option<Arc<PausePoint>>,
     after: Option<AfterRelease>,
     budget: Duration,
 ) -> intent_sourcecontrol::GitLabSourceControl {
@@ -989,20 +987,15 @@ fn scheduled_provider(
     .into_provider()
     .unwrap()
 }
-async fn reached(pause: &Pause) {
-    tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(2)),
-        pause.entered.notified(),
-    )
-    .await
-    .unwrap();
+async fn reached(pause: &PausePoint) {
+    pause.wait_reached().await;
 }
 
 #[tokio::test]
 async fn http_admission_final_fence_rechecks_directory_and_original_authority() {
     for change in 0..4 {
         let server = Server::new().await;
-        let pause = Pause::new();
+        let pause = PausePoint::new("repository secret read");
         let provider =
             scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
         let task = tokio::spawn(async move { provider.list_comments(&repo(), 4).await });
@@ -1015,7 +1008,7 @@ async fn http_admission_final_fence_rechecks_directory_and_original_authority() 
             }
             _ => *server.test.authority.revision.lock().unwrap() += 1,
         }
-        pause.release.add_permits(1);
+        pause.release();
         let error = task.await.unwrap().unwrap_err();
         if change == 1 {
             assert!(matches!(
@@ -1054,13 +1047,13 @@ async fn http_admission_winning_transfer_preserves_known_success_after_retiremen
 #[tokio::test]
 async fn http_admission_cancellation_at_prepared_fence_sends_nothing() {
     let server = Server::new().await;
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     let provider = scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
     let task = tokio::spawn(async move { provider.list_comments(&repo(), 4).await });
     reached(&pause).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    pause.release.add_permits(1);
+    pause.release();
     assert!(server.seen.lock().unwrap().is_empty());
     server
         .provider(RepositoryCredentialUse::NativeReviewCreate)
@@ -1073,7 +1066,7 @@ async fn http_admission_cancellation_at_prepared_fence_sends_nothing() {
 #[tokio::test]
 async fn http_admission_detached_preparation_still_refuses_original_retirement() {
     let server = Server::new().await;
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     let provider = scheduled_provider(&server, Some(pause.clone()), None, Duration::from_secs(2));
     let (send, receive) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
@@ -1082,7 +1075,7 @@ async fn http_admission_detached_preparation_still_refuses_original_retirement()
     reached(&pause).await;
     drop(task); // Detaching is not cancellation or authority.
     server.test.directory.retire().unwrap();
-    pause.release.add_permits(1);
+    pause.release();
     assert!(matches!(
         receive.await.unwrap(),
         Err(Error::AdmissionRetired)
@@ -1093,7 +1086,7 @@ async fn http_admission_detached_preparation_still_refuses_original_retirement()
 #[tokio::test]
 async fn http_admission_timeout_after_preparation_is_local_and_unsent() {
     let server = Server::new().await;
-    let pause = Pause::new();
+    let pause = PausePoint::new("repository secret read");
     let provider = scheduled_provider(
         &server,
         Some(pause.clone()),
@@ -1344,7 +1337,7 @@ async fn http_admission_optional_quota_is_observed_before_partial_result() {
 async fn http_admission_detach_or_cancel_cannot_recall_a_request_already_seen() {
     for cancel in [false, true] {
         let server = Server::new().await;
-        let pause = Pause::new();
+        let pause = PausePoint::new("repository secret read");
         *server.response_pause.lock().unwrap() = Some(pause.clone());
         let provider = server.provider(RepositoryCredentialUse::NativeReviewCreate);
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -1360,7 +1353,7 @@ async fn http_admission_detach_or_cancel_cannot_recall_a_request_already_seen() 
             drop(task);
         }
         server.test.directory.retire().unwrap();
-        pause.release.add_permits(1);
+        pause.release();
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(2)),
             server.response_completed.notified(),

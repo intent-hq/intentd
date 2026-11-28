@@ -7,16 +7,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
 use tokio::time::timeout;
 
-#[derive(Default)]
 pub(crate) struct Control {
     pub(crate) pause: Mutex<Option<&'static str>>,
     pub(crate) pause_skip: AtomicUsize,
     pub(crate) paused_user_status: Mutex<Option<u16>>,
-    pub(super) entered: Notify,
-    pub(crate) release: Notify,
+    pub(crate) hold: intentd_test_support::PausePoint,
     pub(crate) token_reply: Mutex<Option<(u16, Value)>>,
     pub(crate) denied_user: Mutex<Option<&'static str>>,
     pub(crate) requests: Mutex<Vec<String>>,
@@ -24,6 +21,23 @@ pub(crate) struct Control {
     pub(crate) expected_project_token: Mutex<Option<&'static str>>,
     pub(crate) project_status: Mutex<Option<u16>>,
     pub(super) directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
+}
+impl Default for Control {
+    fn default() -> Self {
+        Self {
+            pause: Mutex::default(),
+            pause_skip: AtomicUsize::default(),
+            paused_user_status: Mutex::default(),
+            hold: intentd_test_support::PausePoint::unshared("held GitLab request"),
+            token_reply: Mutex::default(),
+            denied_user: Mutex::default(),
+            requests: Mutex::default(),
+            exchanges: AtomicUsize::default(),
+            expected_project_token: Mutex::default(),
+            project_status: Mutex::default(),
+            directory: Mutex::default(),
+        }
+    }
 }
 pub(crate) struct Server {
     pub(crate) host: GitlabHost,
@@ -109,8 +123,7 @@ impl Server {
                         None
                     };
                     if pause {
-                        control.entered.notify_one();
-                        control.release.notified().await;
+                        control.hold.pause().await;
                     }
                     let (status, body) = if let Some(status) = held_status {
                         (
@@ -201,12 +214,7 @@ impl Server {
         }
     }
     pub(crate) async fn entered(&self) {
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            self.control.entered.notified(),
-        )
-        .await
-        .unwrap();
+        self.control.hold.wait_reached().await;
     }
 }
 struct Fixture {
@@ -349,7 +357,7 @@ async fn pending_owner_cannot_be_rebound_to_a_replacement_directory_attachment()
             .attach_repository(replacement.clone(), None),
         Err(RepositoryCredentialError::StaleMutation)
     );
-    server.control.release.notify_one();
+    server.control.hold.release();
     pending.await.unwrap().unwrap();
     let binding = f.directory.binding().unwrap();
     assert_eq!(binding.daemon_id, f.svc.daemon_boot_id);
@@ -379,7 +387,7 @@ async fn late_pat_validation_cannot_overwrite_a_newer_original_writer() {
     server.entered().await;
     f.pat(&server, "pat-second").await;
     let binding = f.directory.binding().unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(old.await.unwrap().is_err());
     assert_eq!(f.token().as_deref(), Some("pat-second"));
     assert_eq!(f.directory.binding().unwrap(), binding);
@@ -566,7 +574,7 @@ async fn late_device_grant_after_cancel_keeps_the_prior_connection() {
         .unwrap();
     server.entered().await;
     f.svc.gitlab_auth.lock().await.flow = None;
-    server.control.release.notify_one();
+    server.control.hold.release();
     let _gate = f.svc.gitlab_credential_gate.lock().await;
     assert_eq!(f.directory.binding().unwrap(), binding);
     assert_eq!(f.token().as_deref(), Some("pat-first"));
@@ -586,7 +594,7 @@ async fn device_completion_uses_actual_grant_verification_and_persistence() {
         f.directory.binding(),
         Err(RepositoryCredentialError::Unverified)
     );
-    server.control.release.notify_one();
+    server.control.hold.release();
     let _gate = f.svc.gitlab_credential_gate.lock().await;
     assert_eq!(f.directory.binding().unwrap().account.account_id, "42");
     assert_eq!(f.token().as_deref(), Some("rotated"));
@@ -610,7 +618,7 @@ async fn unrelated_revoke_does_not_steal_a_pending_pat_reservation() {
         .gitlab_revoke_owned(GitlabHost::parse("other.test").unwrap())
         .await
         .unwrap();
-    server.control.release.notify_one();
+    server.control.hold.release();
     pending.await.unwrap().unwrap();
     assert_eq!(f.token().as_deref(), Some("pat-slow"));
 }
@@ -771,7 +779,7 @@ async fn real_refresh_retains_in_flight_quota_and_ignores_old_token_rejection() 
         .directory
         .reject_current_credential(ticket.dispatch_stamp())
         .unwrap());
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert_eq!(refresh.await.unwrap().unwrap(), "rotated");
     assert_eq!(f.directory.binding().unwrap(), binding);
     assert!(!f
@@ -802,15 +810,12 @@ async fn real_refresh_retains_in_flight_quota_and_ignores_old_token_rejection() 
 }
 
 struct EffectPause {
-    entered: Arc<Notify>,
-    state: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    pause: Arc<intentd_test_support::PausePoint>,
 }
 impl EffectPause {
     fn install(f: &Fixture, call: usize) -> Self {
-        let entered = Arc::new(Notify::new());
-        let state = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let hit = entered.clone();
-        let held = state.clone();
+        let pause = intentd_test_support::PausePoint::new(format!("GitLab write effect {call}"));
+        let held = pause.clone();
         let count = AtomicUsize::new(0);
         let directory = f.directory.clone();
         let store = f.svc.gitlab_secret_store.clone();
@@ -828,18 +833,12 @@ impl EffectPause {
                     store.load(GITLAB_SECRET_ACCOUNT).unwrap().as_deref(),
                     Some("pat-first")
                 );
-                hit.notify_one();
-                let (lock, ready) = &*held;
-                let mut release = lock.lock().unwrap();
-                while !*release {
-                    release = ready.wait(release).unwrap();
-                }
+                held.pause_blocking();
             }));
-        Self { entered, state }
+        Self { pause }
     }
     fn release(&self) {
-        *self.state.0.lock().unwrap() = true;
-        self.state.1.notify_all();
+        self.pause.open();
     }
 }
 impl Drop for EffectPause {
@@ -862,7 +861,7 @@ async fn cancelled_pat_persistence_retains_gate_and_publishes_from_original_owne
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        paused.entered.notified(),
+        paused.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -917,7 +916,7 @@ async fn abandoned_refresh_settles_only_from_the_actual_persistence_owner() {
         );
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        paused.entered.notified(),
+        paused.pause.wait_reached(),
     )
     .await
     .unwrap();
@@ -1015,7 +1014,7 @@ async fn retired_directory_during_refresh_cannot_persist_the_late_exchange() {
     // This test intentionally retires after exchange dispatch. A late response
     // must not mutate the local pair, even though the upstream effect was sent.
     *server.control.directory.lock().unwrap() = None;
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(
         matches!(task.await.unwrap(), Err(Error::Internal(_))),
         "local writer retirement must not return a fallback proof token"
@@ -1049,7 +1048,7 @@ async fn retired_rejection_refresh_stays_local_without_clearing_the_pair() {
     server.entered().await;
     f.directory.retire().unwrap();
     *server.control.directory.lock().unwrap() = None;
-    server.control.release.notify_one();
+    server.control.hold.release();
     assert!(matches!(task.await.unwrap(), Err(Error::Internal(_))));
     assert_eq!(f.token().as_deref(), Some("pat-first"));
     assert_eq!(
@@ -1142,7 +1141,7 @@ async fn transient_after_await(retry: bool, retired: bool) {
         f.directory.retire().unwrap();
         *server.control.directory.lock().unwrap() = None;
     }
-    server.control.release.notify_one();
+    server.control.hold.release();
     let result = task.await.unwrap();
     if retired {
         assert!(
@@ -1290,7 +1289,7 @@ async fn retirement_after_write_admission_cannot_recall_the_effect_or_publish_re
     });
     timeout(
         intentd_test_support::test_timeout(Duration::from_secs(5)),
-        paused.entered.notified(),
+        paused.pause.wait_reached(),
     )
     .await
     .unwrap();
