@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.321] - 2026-11-28
+
+### 🐛 Bug Fixes
+
+- *(store)* Check read-modify-write gates in the write's own transaction ([#3867](https://github.com/intent-hq/intentd/pull/3867))
+
+
 ## [0.11.320] - 2026-11-28
 
 ### 🚀 Features
