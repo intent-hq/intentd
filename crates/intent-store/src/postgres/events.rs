@@ -152,35 +152,47 @@ fn decode_subscription_row(row: &PgRow) -> Result<PersistedEventSubscription> {
     })
 }
 
+/// Insert one event of `tenant` in the writer transaction `tx`, minting its
+/// id; returns the persisted event and its seq (the row's `row_seq`, taken
+/// under the writer lock `tx` holds).
+pub(super) async fn insert_event_on(
+    tx: &mut super::WriteTx,
+    tenant: &str,
+    ev: &NewEvent,
+) -> Result<(Event, EventSeq)> {
+    let enc = encode(ev)?;
+    let sql = format!(
+        "INSERT INTO event (tenant_id, {EVENT_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING row_seq"
+    );
+    let row_seq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(tenant)
+        .bind(&enc.id)
+        .bind(&ev.workspace_id.0)
+        .bind(&ev.timestamp)
+        .bind(&ev.event_type)
+        .bind(&enc.actor)
+        .bind(&ev.session_id)
+        .bind(&ev.correlation_id)
+        .bind(&ev.parent_event_id)
+        .bind(&enc.metadata)
+        .bind(&enc.data)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
+    Ok((persisted_event(ev, enc.id), seq_from_db(row_seq)?))
+}
+
 impl PgStore {
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
         Ok(self.insert_event_seq(ev).await?.0)
     }
 
     pub async fn insert_event_seq(&self, ev: &NewEvent) -> Result<(Event, EventSeq)> {
-        let enc = encode(ev)?;
-        let sql = format!(
-            "INSERT INTO event (tenant_id, {EVENT_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING row_seq"
-        );
         let mut tx = self.begin_write().await?;
-        let row_seq: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
-            .bind(self.tenant())
-            .bind(&enc.id)
-            .bind(&ev.workspace_id.0)
-            .bind(&ev.timestamp)
-            .bind(&ev.event_type)
-            .bind(&enc.actor)
-            .bind(&ev.session_id)
-            .bind(&ev.correlation_id)
-            .bind(&ev.parent_event_id)
-            .bind(&enc.metadata)
-            .bind(&enc.data)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
+        let inserted = insert_event_on(&mut tx, self.tenant(), ev).await?;
         tx.commit().await.map_err(db)?;
-        Ok((persisted_event(ev, enc.id), seq_from_db(row_seq)?))
+        Ok(inserted)
     }
 
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {

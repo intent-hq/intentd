@@ -548,3 +548,73 @@ async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
         "the rejected set leaves the existing pin untouched"
     );
 }
+
+/// The pin's delta commits with the pin and reaches subscribers once, after
+/// the commit: while the setter is still held right after its write, the
+/// delta has already arrived and a subscriber reading the pin then sees it.
+/// Each set publishes exactly one delta, stored once.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_delta_arrives_once_after_its_pin_commits() {
+    let reg = FakeRegistry::new(&[
+        ("desktop-a", Some("Desktop A"), true),
+        ("desktop-b", Some("Desktop B"), true),
+    ]);
+    let (_t, _r, svc, bus, ws) = setup(reg).await;
+    let park = Arc::new(intent_services::CompletionClassifyPark::default());
+    let svc = svc.with_browser_pin_park_for_test(park.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    });
+    let wait = || intentd_test_support::test_timeout(Duration::from_secs(5));
+
+    let mut setter = tokio::spawn(intent_core::with_caller(intent_core::Caller::Daemon, {
+        let (svc, ws) = (svc.clone(), ws.clone());
+        async move {
+            svc.set_workspace_browser_client(ws, Some(ClientId::from_string("desktop-b")))
+                .await
+        }
+    }));
+    tokio::time::timeout(wait(), async {
+        tokio::select! {
+            () = park.entered.notified() => {}
+            done = &mut setter => panic!("the setter ended before its pin was written: {done:?}"),
+        }
+    })
+    .await
+    .expect("the setter writes its pin");
+    let batch = tokio::time::timeout(wait(), sub.recv())
+        .await
+        .expect("the delta arrives while the setter is held after its commit")
+        .expect("subscription open");
+    let delta =
+        serde_json::to_value(&batch[0]).unwrap()["data"]["changes"]["browserClientId"].clone();
+    assert_eq!(delta, "desktop-b");
+    assert_eq!(
+        bus.store().workspace_browser_client(&ws).await.unwrap(),
+        Some(ClientId::from_string("desktop-b")),
+        "the delta's pin is committed when it arrives"
+    );
+    park.release.notify_one();
+    tokio::time::timeout(wait(), setter)
+        .await
+        .expect("the setter finishes once released")
+        .unwrap()
+        .expect("set");
+
+    let mut seen = vec![delta];
+    for ev in &batch[1..] {
+        seen.push(serde_json::to_value(ev).unwrap()["data"]["changes"]["browserClientId"].clone());
+    }
+    assert_eq!(
+        seen,
+        vec![json!("desktop-b")],
+        "one delta per set: {seen:?}"
+    );
+    let durable = bus
+        .store()
+        .events_by_type(&ws, intent_core::events::WORKSPACE_UPDATED, 10)
+        .await
+        .unwrap();
+    assert_eq!(durable.len(), 1, "the delta is stored once");
+}

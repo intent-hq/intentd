@@ -241,7 +241,7 @@ pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
 pub use discussion_activity_repo::DiscussionActivityReceipt;
 pub use discussion_agent_repo::DiscussionDelivery;
-pub use event_repo::{EventQuery, EventSeq, NewEvent};
+pub use event_repo::{CommittedEvents, EventQuery, EventSeq, NewEvent, NoHandOff};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use executor_repo::ExecutorRevocation;
 pub use hook_repo::ActiveHookMetadata;
@@ -487,6 +487,9 @@ pub(crate) async fn commit_with_rollback_guard<T>(
     body_result: Result<T>,
     context: &str,
 ) -> Result<T> {
+    // Not a wrapper over `commit_with_rollback_guard_holding`: every SQLite
+    // write awaits this, and a nested future would grow every write's poll
+    // frame (the workspace.create stack budget, `tests/workspace_create_stack.rs`).
     match body_result {
         Ok(v) => {
             if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
@@ -494,6 +497,30 @@ pub(crate) async fn commit_with_rollback_guard<T>(
                 return Err(Error::Internal(format!("{context}: {e}")));
             }
             Ok(v)
+        }
+        Err(e) => {
+            rollback_or_poison(conn).await;
+            Err(e)
+        }
+    }
+}
+
+/// [`commit_with_rollback_guard`], returning the connection after a
+/// successful COMMIT so the caller still holds the write connection (and so
+/// the next writer waits) while it finishes the commit's follow-up, as
+/// [`event_repo::SqliteEventTx`] does to hand its events off in seq order.
+pub(crate) async fn commit_with_rollback_guard_holding<T>(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    body_result: Result<T>,
+    context: &str,
+) -> Result<(T, sqlx::pool::PoolConnection<sqlx::Sqlite>)> {
+    match body_result {
+        Ok(v) => {
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                rollback_or_poison(conn).await;
+                return Err(Error::Internal(format!("{context}: {e}")));
+            }
+            Ok((v, conn))
         }
         Err(e) => {
             rollback_or_poison(conn).await;

@@ -13,7 +13,9 @@ use crate::agent_repo::{
     delete_in_bounded_batches, fetch_agent_usage_rows, DELETE_CASCADE_BATCH,
     UNREAD_TOP_LEVEL_SESSION_INDEX, UNREAD_TOP_LEVEL_SESSION_PREDICATE,
 };
+use crate::event_repo::{CommittedEvents, EventSeq, NewEvent, SqliteEventTx};
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
+use intent_core::Event;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -650,6 +652,30 @@ impl Store {
         client_id: Option<&ClientId>,
     ) -> Result<()> {
         dispatch!(self, backend => backend.set_workspace_browser_client(id, client_id).await)
+    }
+
+    /// [`Store::set_workspace_browser_client`], appending `event` (the
+    /// pin's `workspace:updated` delta) in the same transaction: the delta
+    /// commits with the pin or not at all, so the event log's seq order is
+    /// the pin's commit order across every writer of the tenant. Once
+    /// committed, the event goes to `after_commit` ([`CommittedEvents`]).
+    /// Returns the appended event and its seq.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist (nothing
+    /// is written or handed off); `Error::Internal` if the database
+    /// operation fails.
+    pub async fn set_workspace_browser_client_with_event(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+        event: &NewEvent,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
+    ) -> Result<(Event, EventSeq)> {
+        dispatch!(self, backend => backend
+            .set_workspace_browser_client_with_event(id, client_id, event, after_commit)
+            .await)
     }
 
     /// The persisted per-workspace browser-client pin; `Ok(None)` when
@@ -2023,6 +2049,34 @@ impl crate::SqliteStore {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
         Ok(())
+    }
+
+    pub async fn set_workspace_browser_client_with_event(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+        event: &NewEvent,
+        after_commit: std::sync::Arc<dyn CommittedEvents>,
+    ) -> Result<(Event, EventSeq)> {
+        let mut tx = SqliteEventTx::begin(self).await?;
+        let body = async {
+            let res = sqlx::query("UPDATE workspace SET browser_client_id = ? WHERE id = ?")
+                .bind(client_id.map(|c| c.0.as_str()))
+                .bind(&id.0)
+                .execute(tx.conn())
+                .await
+                .map_err(|e| Error::Internal(format!("set browser_client_id failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            tx.append_event(event).await
+        }
+        .await;
+        let (_, appended) = tx.finish(body, after_commit).await?;
+        appended
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal("browser pin: no appended event".into()))
     }
 
     pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {

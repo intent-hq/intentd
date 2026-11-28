@@ -705,9 +705,11 @@ pub struct Services {
     /// published — no pre-enqueue snapshot omitting a newer draining entry,
     /// no old overlay copy arriving after the settled shrink.
     agent_queue_publish_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
-    /// publish so concurrent setters never emit deltas out of order relative
-    /// to the durable pin; the delta is read back from the committed row.
+    /// Serializes this process's `workspace.setBrowserClient` calls, so each
+    /// reply and claimed-tab migration follows its own pin in commit order.
+    /// The pin's `workspace:updated` delta commits with the pin
+    /// (`Store::set_workspace_browser_client_with_event`), which orders the
+    /// deltas across processes too.
     browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
     desktop: Arc<desktop::Runtime>,
     /// Serializes each browser tab registry mutation (`browser.upsertTab` /
@@ -1052,6 +1054,11 @@ pub struct Services {
     hook_wake_park: Option<Arc<CompletionClassifyPark>>,
     #[cfg(any(test, feature = "test-hooks"))]
     hook_eval_park: Option<Arc<CompletionClassifyPark>>,
+    /// Test seam: parks `workspace.setBrowserClient` once its pin and delta
+    /// are written, before the rest of the call, so a test can run another
+    /// process's setter inside that window. `None` in production wiring.
+    #[cfg(any(test, feature = "test-hooks"))]
+    browser_pin_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
     /// it claims the watch and before the durable send, so a concurrent
@@ -2000,6 +2007,8 @@ impl Services {
             hook_wake_park: None,
             #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            browser_pin_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
@@ -3377,6 +3386,12 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_guarded_enqueue_park(self, park: Arc<CompletionClassifyPark>) -> Self {
         let _ = self.delivery_guards.enqueue_park.set(park);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_browser_pin_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.browser_pin_park = Some(park);
         self
     }
 
@@ -16197,6 +16212,22 @@ fn search_done_event(
     }
 }
 
+/// The after-commit hand-off of `workspace.setBrowserClient`: bumps the
+/// workspace's desktop assignment generation, then puts the pin's delta on
+/// the bus, so a subscriber reacting to the delta reads the new assignment.
+struct PinHandOff {
+    bus: EventBus,
+    desktop: Arc<desktop::Runtime>,
+    workspace: WorkspaceId,
+}
+
+impl intent_store::CommittedEvents for PinHandOff {
+    fn committed(&self, events: &[(Event, intent_store::EventSeq)]) {
+        self.desktop.assignment_changed(&self.workspace);
+        intent_store::CommittedEvents::committed(&self.bus, events);
+    }
+}
+
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
 ///
@@ -25896,27 +25927,53 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            // Write, announce and read back under one gate: two racing
-            // setters would otherwise publish deltas in the opposite order of
-            // their commits, or echo the other's pin in their own reply. The
-            // delta carries the read-back committed value, not the requested
-            // one, and the reply is built from the same committed state.
+            // The pin and its self-sufficient `workspace:updated` delta
+            // (§6.5; `null` spells a cleared pin so clients can drop their
+            // copy) commit in one transaction, and the store hands the delta
+            // to the bus after the commit, in seq order. So the event log's
+            // order is the pins' commit order across every process of the
+            // tenant, and a subscriber that reads the pin on the delta sees
+            // it. The gate keeps this process's setters' replies and tab
+            // migrations in commit order.
             let _gate = self.browser_client_pin_gate.lock().await;
-            store
-                .set_workspace_browser_client(&id, client_id.as_ref())
-                .await?;
-            self.desktop.assignment_changed(&id);
-            let committed = store.workspace_browser_client(&id).await?;
-            // Self-sufficient `workspace:updated` delta (§6.5); `null`
-            // spells a cleared pin so clients can drop their copy.
-            let change = committed
+            let change = client_id
                 .as_ref()
                 .map_or(serde_json::Value::Null, |c| c.as_str().into());
-            publish_event(
-                bus.as_ref(),
-                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
-            )
-            .await;
+            let delta =
+                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change }));
+            if let Some(bus) = bus.as_ref().filter(|_| !id.is_home_record()) {
+                let delta = bus.prepare_append(&delta).await?;
+                let hand_off = Arc::new(PinHandOff {
+                    bus: bus.clone(),
+                    desktop: self.desktop.clone(),
+                    workspace: id.clone(),
+                });
+                store
+                    .set_workspace_browser_client_with_event(
+                        &id,
+                        client_id.as_ref(),
+                        &delta,
+                        hand_off,
+                    )
+                    .await?;
+            } else {
+                // No bus to hand off to, or a machine's home record, whose
+                // events are never stored: write the pin alone and publish
+                // as before.
+                store
+                    .set_workspace_browser_client(&id, client_id.as_ref())
+                    .await?;
+                self.desktop.assignment_changed(&id);
+                publish_event(bus.as_ref(), delta).await;
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(park) = &self.browser_pin_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+            // Migrate to the pin in effect now: another process's setter may
+            // have replaced this one since it committed.
+            let committed = store.workspace_browser_client(&id).await?;
             // Driving-client switch (REV-2 Model 10): every claimed tab of the
             // workspace follows the new pin; one `browser:tab-updated` per
             // moved tab. Clearing the pin moves nothing — the driving client
