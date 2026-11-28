@@ -576,26 +576,26 @@ async fn send_now_from_another_process_claims_the_entry() {
     seed_agent(&store_a, &agent).await;
     let a = Services::new_isolated(store_a.clone());
     let b = Services::new_isolated(open(&pool, &tenant, "process-b").await);
-    let x = enqueue(&a, &agent, "x", None).await;
-    let y = enqueue(&a, &agent, "y", None).await;
+    let first = enqueue(&a, &agent, "x", None).await;
+    let second = enqueue(&a, &agent, "y", None).await;
 
-    b.agent_send_queued_message_now_op_for_test(agent.clone(), x)
+    b.agent_send_queued_message_now_op_for_test(agent.clone(), first)
         .await
         .expect("B sends A's entry");
     assert_eq!(user_rows(&store_a, &agent).await, 1);
     assert_eq!(
         a.claim_next_queued_message_for_test(&agent).await,
-        Some((y, Vec::new())),
+        Some((second, Vec::new())),
         "A's drain skips the sent entry"
     );
 
-    let z = enqueue(&a, &agent, "z", None).await;
+    let busy = enqueue(&a, &agent, "z", None).await;
     let (_, _, draining) = a
         .claim_next_queued_message_held_for_test(&agent)
         .await
         .expect("A claims z");
     let refused = b
-        .agent_send_queued_message_now_op_for_test(agent.clone(), z)
+        .agent_send_queued_message_now_op_for_test(agent.clone(), busy)
         .await;
     assert!(
         matches!(refused, Err(intent_core::Error::InvalidParams(_))),
@@ -644,4 +644,38 @@ async fn a_failed_claim_write_retries_the_drain() {
         1,
         "the retried drain delivered the entry"
     );
+}
+
+/// A pop that is claimed only later (the recovery-send redrive, the
+/// worker's raced pop) keeps its entry stored across a write-through of the
+/// same queue in between: another process still sees it, and of the two
+/// exactly one delivers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_between_a_pop_and_its_claim_keeps_the_entry_stored() {
+    let Some(pool) = pool().await else { return };
+    let tenant = tenant_name("late-claim");
+    let agent = AgentId("agent-late-claim".into());
+    let store_a = open(&pool, &tenant, "process-a").await;
+    seed_agent(&store_a, &agent).await;
+    let a = Services::new_isolated(store_a);
+    let b = Services::new_isolated(open(&pool, &tenant, "process-b").await);
+    let x = enqueue(&a, &agent, "x", None).await;
+
+    let mut from_b = None;
+    let from_a = a
+        .pop_then_claim_for_test(&agent, async {
+            // A writes the queue while x is popped but not yet claimed.
+            enqueue(&a, &agent, "y", None).await;
+            assert_eq!(
+                queue_contents(&b, &agent).await,
+                ["x", "y"],
+                "x is still stored"
+            );
+            from_b = b.claim_next_queued_message_for_test(&agent).await;
+        })
+        .await
+        .expect("A pops x");
+    assert_eq!(from_b, Some((x.clone(), Vec::new())), "B claims x first");
+    assert_eq!(from_a, (x.clone(), vec![x]), "so A's late claim is lost");
+    assert_eq!(queue_contents(&a, &agent).await, ["y"]);
 }

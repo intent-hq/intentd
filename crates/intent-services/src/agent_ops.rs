@@ -2487,6 +2487,9 @@ pub(crate) struct DrainingGuard {
     ids: Vec<String>,
     /// The claim to end on drop, once a claim write kept these entries.
     claim: Option<QueueClaim>,
+    /// On a shared store: where these entries are listed as popped but
+    /// not yet claimed ([`DrainingGuard::mark_claimed`] or drop retires them).
+    unclaimed: Option<Arc<crate::DeliveryGuards>>,
 }
 
 /// This process's store claim on drained entries (see [`DrainingGuard`]).
@@ -2526,6 +2529,28 @@ impl DrainingGuard {
         self.ids.retain(|id| !ids.contains(id));
         if let Some(claim) = self.claim.as_mut() {
             claim.ids.retain(|id| !ids.contains(id));
+        }
+        drop(overlay);
+        self.mark_claimed(ids);
+    }
+
+    /// Stop listing `ids` as popped and not yet claimed: a claim write is
+    /// about to name them (or the drain gave them up).
+    fn mark_claimed(&self, ids: &[String]) {
+        let Some(guards) = self.unclaimed.as_ref() else {
+            return;
+        };
+        let mut unclaimed = guards
+            .unclaimed_pops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(set) = unclaimed.get_mut(&self.agent_id) {
+            for id in ids {
+                set.remove(id);
+            }
+            if set.is_empty() {
+                unclaimed.remove(&self.agent_id);
+            }
         }
     }
 
@@ -2569,6 +2594,7 @@ impl Drop for DrainingGuard {
             }
         }
         drop(overlay);
+        self.mark_claimed(&self.ids);
         let Some(claim) = self.claim.take() else {
             return;
         };
@@ -21033,12 +21059,26 @@ impl Services {
                 entry.provisional = !entry.persisted;
                 entry
             }));
+        let ids: Vec<String> = entries.iter().map(|m| m.id.clone()).collect();
+        // On a shared store the pop's claim comes after it (another await):
+        // until then its entries stay in this process's queue writes.
+        let unclaimed = self.store.agent_queues_shared().then(|| {
+            self.delivery_guards
+                .unclaimed_pops
+                .lock()
+                .unwrap()
+                .entry(agent_id.clone())
+                .or_default()
+                .extend(ids.iter().cloned());
+            Arc::clone(&self.delivery_guards)
+        });
         DrainingGuard {
             overlay: Arc::clone(&self.draining_queue_entries),
             shutdown: Arc::clone(&self.draining_shutdown),
             agent_id: agent_id.clone(),
-            ids: entries.iter().map(|m| m.id.clone()).collect(),
+            ids,
             claim: None,
+            unclaimed,
         }
     }
 
@@ -21257,6 +21297,8 @@ impl Services {
             return QueuePop::Empty;
         };
         let taken = popped.drained_entries();
+        let taken_ids: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
+        popped.draining_guard().mark_claimed(&taken_ids);
         match self.claim_taken_locked(agent_id, &taken).await {
             Ok(lost) => {
                 let kept = taken
@@ -21322,6 +21364,10 @@ impl Services {
         let taken = popped.drained_entries();
         let claimed = {
             let _gate = self.agent_queue_persist_gate.lock().await;
+            // From here the claim write names them; until now this
+            // process's writes kept their rows.
+            let ids: Vec<String> = taken.iter().map(|m| m.id.clone()).collect();
+            popped.draining_guard().mark_claimed(&ids);
             self.claim_taken_locked(agent_id, &taken).await
         };
         match claimed {
@@ -21356,6 +21402,22 @@ impl Services {
         let _ = self.delivery_guards.queue_claim_retry_base.set(base);
         let _ = self.delivery_guards.queue_claim_retry_park.set(park);
         self
+    }
+
+    /// The raced pop's order (tests): pop the queue head first, run
+    /// `between` (another writer's window), then claim it
+    /// ([`Services::claim_drained`]). Returns the popped id and the lost ids,
+    /// or `None` when nothing was queued or the claim write failed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) async fn pop_then_claim(
+        &self,
+        agent_id: &AgentId,
+        between: impl std::future::Future<Output = ()>,
+    ) -> Option<(String, Vec<String>)> {
+        let mut popped = self.dequeue_message_draining_provisional(agent_id)?;
+        between.await;
+        let lost = self.claim_drained(agent_id, &mut popped).await.ok()?;
+        Some((popped.0.id.clone(), lost))
     }
 
     /// Resolves once a queue claim retry ran its drain (tests).
@@ -21479,7 +21541,18 @@ impl Services {
         let draining = self.draining_queue_entries.lock().unwrap();
         let mut queues = self.agent_queues.lock().unwrap();
         let live = queues.get(agent_id).cloned().unwrap_or_default();
-        let now = Self::rows_of(&draining, &live, false, agent_id);
+        let now = {
+            let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
+            Self::rows_of(&draining, &live, false, unclaimed.get(agent_id), agent_id)
+        };
+        // Entries being drained stay out of the live queue even when the
+        // stored queue still lists them (their claim is still to come).
+        let drained: HashSet<&str> = draining
+            .get(agent_id)
+            .into_iter()
+            .flatten()
+            .map(|m| m.id.as_str())
+            .collect();
         let merged = if same_queue_rows(from, &now) {
             merged
         } else {
@@ -21492,6 +21565,9 @@ impl Services {
         };
         let mut next: Vec<QueuedMessage> = Vec::with_capacity(merged.len());
         for row in merged {
+            if drained.contains(row.id.as_str()) {
+                continue;
+            }
             let same = live.iter().find(|m| {
                 m.id == row.id && serde_json::to_value(m).is_ok_and(|v| v == row.payload)
             });
@@ -21531,21 +21607,27 @@ impl Services {
         let frozen = self
             .draining_shutdown
             .load(std::sync::atomic::Ordering::Relaxed);
-        Self::rows_of(&draining, live, frozen, agent_id)
+        let unclaimed = self.delivery_guards.unclaimed_pops.lock().unwrap();
+        Self::rows_of(&draining, live, frozen, unclaimed.get(agent_id), agent_id)
     }
 
     /// [`Services::queue_rows`] over already-locked maps.
+    ///
+    /// `unclaimed` are popped entries whose store claim is still to come
+    /// (on a shared store): they stay in the written queue, so a write in
+    /// between keeps their rows for the claim to take.
     fn rows_of(
         draining: &HashMap<AgentId, Vec<QueuedMessage>>,
         live: &[QueuedMessage],
         frozen: bool,
+        unclaimed: Option<&HashSet<String>>,
         agent_id: &AgentId,
     ) -> Vec<intent_store::AgentQueueRow> {
         let retained: Vec<_> = draining
             .get(agent_id)
             .into_iter()
             .flatten()
-            .filter(|_| frozen)
+            .filter(|d| frozen || unclaimed.is_some_and(|ids| ids.contains(&d.id)))
             .collect();
         let mut seen_ids = HashSet::new();
         // Frozen order is authoritative even when a partially persisted batch

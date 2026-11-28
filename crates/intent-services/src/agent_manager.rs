@@ -16712,7 +16712,7 @@ fn auggie_explicit_path_setting(
         .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
-fn dequeue_worker_raced_tail(
+async fn dequeue_worker_raced_tail(
     services: &Services,
     agent_id: &AgentId,
     next: &QueuedMessage,
@@ -16725,7 +16725,24 @@ fn dequeue_worker_raced_tail(
     {
         return None;
     }
-    services.dequeue_ready_batch_draining(agent_id, false, 1)
+    // On a shared store the tail is a claimed pop like every drain's: an
+    // entry another process took first is not folded in, and a failed claim
+    // leaves the tail queued (a drain retry is scheduled).
+    match services
+        .claim_queue_pop_outcome(agent_id, || {
+            services.dequeue_ready_batch_draining(agent_id, false, 1)
+        })
+        .await
+    {
+        QueuePop::Claimed((mut batch, mut draining), lost) => {
+            if !lost.is_empty() {
+                draining.release(&lost);
+                batch.retain(|m| !lost.contains(&m.id));
+            }
+            (!batch.is_empty()).then_some((batch, draining))
+        }
+        QueuePop::Empty | QueuePop::ClaimFailed => None,
+    }
 }
 
 /// Background turn worker: drive the current message to completion, then drain
@@ -18112,7 +18129,8 @@ async fn run_message_worker(
             let mut next = raced.pop().expect("raced batch non-empty");
             // The first entry was popped before re-claiming the slot.
             // Fold any further ready entries into the same provider turn.
-            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next);
+            let extra_batch =
+                boxed_await(|| dequeue_worker_raced_tail(&mgr.services, &agent_id, &next)).await;
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -26638,7 +26656,9 @@ mod agent_retry_tests {
                     intent_core::MessageOrigin::Automatic,
                 );
                 assert!(
-                    dequeue_worker_raced_tail(&mgr.services, &agent, &next).is_none(),
+                    dequeue_worker_raced_tail(&mgr.services, &agent, &next)
+                        .await
+                        .is_none(),
                     "popped monitor must not absorb ordinary entries"
                 );
                 assert!(mgr.services.is_message_queued(&agent, &tail.id));

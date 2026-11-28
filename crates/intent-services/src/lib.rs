@@ -518,6 +518,12 @@ pub(crate) struct DeliveryGuards {
     /// Test seam: parks a queue claim retry after its backoff, right before
     /// its drain. Unset in production.
     pub(crate) queue_claim_retry_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// On a shared store: entries popped to drain whose store claim is
+    /// still to come (the recovery-send redrive and the worker's raced pop
+    /// claim after the in-flight slot). This process's queue writes keep
+    /// them meanwhile, so the claim finds their rows. Lock order: after
+    /// `draining_queue_entries` and `agent_queues`.
+    pub(crate) unclaimed_pops: Mutex<HashMap<AgentId, HashSet<String>>>,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.
