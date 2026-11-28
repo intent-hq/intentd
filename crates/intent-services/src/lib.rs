@@ -469,6 +469,18 @@ pub struct CompletionClassifyPark {
     pub release: tokio::sync::Notify,
 }
 
+/// Test seams inside the identity transition: each parks the step right
+/// before its store write, after the service's own checks, so a test can
+/// commit another process's change in that window. Unset in production.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub(crate) struct IdentityParks {
+    /// An invite mint, before its insert.
+    pub(crate) mint: OnceLock<Arc<intentd_test_support::PausePoint>>,
+    /// A primary identity apply, before its principal write.
+    pub(crate) write: OnceLock<Arc<intentd_test_support::PausePoint>>,
+}
+
 /// Shared state of lease-guarded delivery (`Services::delivery_guards`).
 #[derive(Default)]
 pub(crate) struct DeliveryGuards {
@@ -488,6 +500,12 @@ pub(crate) struct DeliveryGuards {
     /// Test seam: parks a poisoned-queue migration right before it takes
     /// the persist gate. Unset in production.
     pub(crate) migration_park: OnceLock<Arc<CompletionClassifyPark>>,
+    /// Test seams inside the identity transition (see [`IdentityParks`]).
+    /// Kept in this shared `Arc` rather than a `Services` field: every
+    /// future holding a `Services` clone grows with it, and the create
+    /// path's reduced-stack guard has no room for that.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) identity: IdentityParks,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.
@@ -3371,6 +3389,23 @@ impl Services {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_watch_registration_park(self, park: Arc<CompletionClassifyPark>) -> Self {
         let _ = self.delivery_guards.registration_park.set(park);
+        self
+    }
+
+    /// Test seam: park an invite mint right before its insert.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_invite_mint_park(self, park: Arc<intentd_test_support::PausePoint>) -> Self {
+        let _ = self.delivery_guards.identity.mint.set(park);
+        self
+    }
+
+    /// Test seam: park a primary identity apply right before its write.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_identity_write_park(
+        self,
+        park: Arc<intentd_test_support::PausePoint>,
+    ) -> Self {
+        let _ = self.delivery_guards.identity.write.set(park);
         self
     }
 

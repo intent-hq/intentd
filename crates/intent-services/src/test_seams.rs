@@ -10,7 +10,10 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use intent_core::{AgentId, BoxFuture, Event, MessageOrigin, Result, Workspace, WorkspaceId};
+use intent_core::{
+    AgentId, BoxFuture, Event, MessageOrigin, Principal, Result, Workspace, WorkspaceId,
+};
+use intent_sourcecontrol::UserIdentity;
 use serde_json::Value;
 
 use crate::agent_manager::AgentManager;
@@ -135,6 +138,33 @@ impl Services {
     #[must_use]
     pub fn has_ready_to_send_for_test(&self, agent_id: &AgentId) -> bool {
         self.has_ready_to_send(agent_id)
+    }
+
+    /// Test seam: `with_invite_mint_park`.
+    #[must_use]
+    pub fn with_invite_mint_park_for_test(
+        self,
+        park: Arc<intentd_test_support::PausePoint>,
+    ) -> Self {
+        self.with_invite_mint_park(park)
+    }
+
+    /// Test seam: `with_identity_write_park`.
+    #[must_use]
+    pub fn with_identity_write_park_for_test(
+        self,
+        park: Arc<intentd_test_support::PausePoint>,
+    ) -> Self {
+        self.with_identity_write_park(park)
+    }
+
+    /// Test seam: `apply_primary_identity` (the locking variant).
+    pub async fn apply_primary_identity_for_test(
+        &self,
+        principal: Principal,
+        user: &UserIdentity,
+    ) -> Result<Principal> {
+        self.apply_primary_identity(principal, user).await
     }
 
     /// Test seam: `persist_queue_snapshot`.

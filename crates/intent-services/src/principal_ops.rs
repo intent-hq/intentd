@@ -31,7 +31,7 @@ use intent_core::{
 };
 use intent_sourcecontrol::gitlab_auth::{GitlabHost, GitlabUser};
 use intent_sourcecontrol::UserIdentity;
-use intent_store::Store;
+use intent_store::{IdentityWriteCheck, Store};
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
@@ -1267,13 +1267,19 @@ impl Services {
         {
             return Err(Error::IdentityInUse);
         }
-        let previous = primary.identity_key();
+        // The identity the row holds now; the write lands only while it
+        // still does (another process may switch it before the write).
+        let previous = self.store.get_principal(&primary.id).await?.identity_key();
         primary.set_identity(identity.clone());
         primary.login = Some(user.login.clone());
         primary.display_name = user.display_name.clone();
         primary.avatar_url = user.avatar_url.clone();
         primary.updated_at = now_iso();
-        if let Err(e) = self.store.upsert_principal(&primary).await {
+        let check = IdentityWriteCheck {
+            expected: previous.clone(),
+            refuse_if_locked: false,
+        };
+        if let Err(e) = self.store.upsert_principal_checked(&primary, &check).await {
             // Invite redemption can bind this account while the provider
             // probe is in flight. The unique index prevents any merge; keep
             // the same typed refusal if it wins after our initial lookup.
@@ -1317,7 +1323,13 @@ impl Services {
         updated.display_name = None;
         updated.avatar_url = None;
         updated.updated_at = now_iso();
-        self.store.upsert_principal(&updated).await?;
+        let check = IdentityWriteCheck {
+            expected: principal.identity_key(),
+            refuse_if_locked: false,
+        };
+        self.store
+            .upsert_principal_checked(&updated, &check)
+            .await?;
         self.presence_profile_changed(&updated).await;
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -1439,7 +1451,7 @@ impl Services {
     /// A persisted change is pushed into the presence profile cache
     /// ([`Self::presence_profile_changed`]) so a roster that already lists
     /// the principal is renamed without a reconnect.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) async fn apply_primary_identity(
         &self,
         principal: Principal,
@@ -1465,7 +1477,7 @@ impl Services {
     }
 
     /// [`Self::apply_primary_identity`] for an account on any forge.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) async fn apply_primary_forge_identity(
         &self,
         principal: Principal,
@@ -1504,13 +1516,14 @@ impl Services {
         let principal = self.store.get_principal(&principal.id).await?;
         let current = principal.identity_key();
         let same_account = current.is_some() && current == user.identity;
-        if !same_account
-            && self.primary_identity_locked().await?
+        // Applied only while the identity is unlocked, unless it keeps the
+        // account or is the explicit re-key the setting authorises.
+        let needs_unlocked = !same_account
             && !user
                 .identity
                 .as_ref()
-                .is_some_and(|fetched| self.is_explicit_rekey(current.as_ref(), fetched))
-        {
+                .is_some_and(|fetched| self.is_explicit_rekey(current.as_ref(), fetched));
+        if needs_unlocked && self.primary_identity_locked().await? {
             tracing::warn!(
                 cached_identity = ?current,
                 fetched_identity = ?user.identity,
@@ -1541,7 +1554,20 @@ impl Services {
             return Ok(principal);
         }
         updated.updated_at = now_iso();
-        self.store.upsert_principal(&updated).await?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(park) = self.delivery_guards.identity.write.get() {
+            park.pause().await;
+        }
+        // The lock state and the row are checked again in the write's own
+        // transaction: the identity lock orders this process only, and
+        // another process may mint an invite or switch the row meanwhile.
+        let check = IdentityWriteCheck {
+            expected: current.clone(),
+            refuse_if_locked: needs_unlocked,
+        };
+        self.store
+            .upsert_principal_checked(&updated, &check)
+            .await?;
         self.presence_profile_changed(&updated).await;
         // A replaced triple publishes; so does the first link when the
         // `identity.provider` setting selected it (re-linking an unlinked

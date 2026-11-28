@@ -46,6 +46,8 @@ nix = { workspace = true }
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 intent-services = { workspace = true, features = ["test-hooks"] }
+# The identity transition test hands an account to `apply_primary_identity`.
+intent-sourcecontrol = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = "1"
 tokio-rustls = { workspace = true }

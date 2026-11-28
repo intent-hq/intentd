@@ -84,6 +84,8 @@ mod quotas;
 mod read_snapshots;
 #[path = "postgres_backend/repositories.rs"]
 mod repositories;
+#[path = "postgres_backend/request_gates.rs"]
+mod request_gates;
 #[path = "postgres_backend/retention.rs"]
 mod retention;
 #[path = "postgres_backend/row_seq.rs"]

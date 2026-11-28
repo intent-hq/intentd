@@ -180,7 +180,10 @@ impl Services {
                     "the inviting identity changed while minting; retry".into(),
                 ));
             }
-            self.store.insert_host_invite(&invite).await?;
+            self.store
+                .insert_host_invite_as(&invite, creator.identity_key().as_ref())
+                .await
+                .map_err(super::inviting_identity_changed)?;
         }
         self.host_invite_event(&invite.id, "created").await;
         Ok(json!({"invite":host_invite_to_wire(&invite, None), "secret":secret}))
