@@ -663,8 +663,13 @@ jobs:
       # (listing of the vanished object's dir, live cargo/rustc processes);
       # every other failure — a genuine lint above all — propagates
       # unchanged, so it never hides a real red.
+      # The second pass lints intentd tests behind repository-test-fixtures,
+      # which the workspace pass never compiles: five lint errors reached main
+      # in e2e_repository_context_wire unseen (intentd#3846).
       - name: Clippy
-        run: ./scripts/ci-lld-retry.sh cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          ./scripts/ci-lld-retry.sh cargo clippy --workspace --all-targets -- -D warnings
+          ./scripts/ci-lld-retry.sh cargo clippy -p intentd --tests --features repository-test-fixtures -- -D warnings
       # Source lints: every `crates/*/tests/*_lint.rs` integration test is a
       # source-scanning lint and is selected by the `--test` glob, so a new
       # lint needs no wiring here. Each lint's rationale lives in its module
