@@ -415,6 +415,19 @@ class BaselineTests(unittest.TestCase):
         self.prepare()
         self.assertEqual(self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip(), repaired)
 
+    def test_repair_ignores_commit_signing_config(self):
+        # A signed repaired commit would change SHA per run and break the retry path.
+        broken, fix = self.unpackageable_release()
+        self.record_repair("v0.9.115", broken, fix)
+        self.env.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "commit.gpgSign",
+                         "GIT_CONFIG_VALUE_0": "true", "GIT_CONFIG_KEY_1": "gpg.program",
+                         "GIT_CONFIG_VALUE_1": "false"})
+        self.prepare()
+        repaired = self.run_ok("git", "rev-parse", "v0.9.115^{commit}").strip()
+        self.assertNotIn("gpgsig", self.run_ok("git", "cat-file", "commit", repaired))
+        self.output.unlink()
+        self.prepare()
+
     def test_repair_retires_once_a_newer_tag_exists(self):
         broken, fix = self.unpackageable_release()
         self.record_repair("v0.9.115", broken, fix)

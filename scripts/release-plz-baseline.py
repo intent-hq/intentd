@@ -103,7 +103,7 @@ def repaired_commit(repo, record):
             raise ValueError(f"fix {record['fix']} does not apply to {record['tag']}: {applied.stderr.strip()}")
         tree = git(repo, "write-tree", env=env).stdout.strip()
         message = f"Local release-plz baseline: {record['tag']} + {record['fix']}\n\n{record['reason']}\n"
-        made = git(repo, "commit-tree", tree, "-p", record["commit"], env=env, stdin=message)
+        made = git(repo, "commit-tree", "--no-gpg-sign", tree, "-p", record["commit"], env=env, stdin=message)
         if made.returncode or not SHA.fullmatch(made.stdout.strip()):
             raise ValueError(f"cannot create the repaired {record['tag']} commit: {made.stderr.strip()}")
         return made.stdout.strip()
