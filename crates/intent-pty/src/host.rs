@@ -44,6 +44,14 @@ const DRAIN_POLL: Duration = Duration::from_millis(5);
 /// finite and normally empties within a few reads — the bound only guards
 /// against a wedged reader keeping the held slave fd open forever.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Default bound on [`PtyHost::wait_exit`]'s wait for output EOF after the
+/// reap: a copy of the terminal that outlives the child (a background job)
+/// keeps the reader open, and must not hold the exit back for long.
+pub const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
+/// Cap on the chunks [`PtyHost::wait_exit`] collects from a live receiver,
+/// so a straggler that keeps writing cannot hold the exit or grow the tail
+/// without bound.
+const EXIT_TAIL_MAX_CHUNKS: usize = 4096;
 /// Attempt budget for `openpty`: transient pty/fd-pool exhaustion (e.g.
 /// EMFILE/ENFILE-class errors under heavy parallel load — monorepo#653)
 /// usually clears within milliseconds as other PTYs close, so a short
@@ -138,6 +146,58 @@ impl PtyExit {
             memory_limit: false,
         }
     }
+}
+
+/// How [`PtyHost::wait_exit`] ends a run once the child is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitWait {
+    /// Longest wait for the output to reach EOF after the reap; `None` waits
+    /// until EOF, which a kill always brings.
+    pub output_eof: Option<Duration>,
+    /// End process-group members that outlived the child before the EOF
+    /// wait (monorepo#1300), so their copy of the terminal cannot hold the
+    /// output open and no process outlives the run.
+    pub reap_group: bool,
+}
+
+impl ExitWait {
+    /// A script or setup run: end the group's stragglers, then wait up to
+    /// [`OUTPUT_EOF_WAIT`] for EOF.
+    pub const SCRIPT: Self = Self {
+        output_eof: Some(OUTPUT_EOF_WAIT),
+        reap_group: true,
+    };
+
+    /// An interactive terminal: a background job the user started keeps
+    /// running. Unix only waits for EOF: a `ConPTY` reader reaches EOF only
+    /// at teardown, so on Windows the wait would always run to its bound.
+    pub const TERMINAL: Self = Self {
+        output_eof: Some(if cfg!(unix) {
+            OUTPUT_EOF_WAIT
+        } else {
+            Duration::ZERO
+        }),
+        reap_group: false,
+    };
+}
+
+/// A finished run from [`PtyHost::wait_exit`]: the exit, with the output
+/// that was still on the caller's live receiver.
+#[derive(Debug)]
+pub struct ExitTail {
+    /// The latched exit; `None` when the host no longer tracks the PTY.
+    pub exit: Option<PtyExit>,
+    /// Live output not yet consumed, in order.
+    pub output: Vec<TailOutput>,
+}
+
+/// One item of [`ExitTail::output`].
+#[derive(Debug)]
+pub enum TailOutput {
+    /// An output chunk.
+    Chunk(Arc<OutputChunk>),
+    /// The receiver lagged here and skipped chunks.
+    Lagged,
 }
 
 /// A signal to deliver to a PTY's process group.
@@ -338,7 +398,9 @@ struct PtySession {
 /// A `try_wait` failure other than `EINTR` (e.g. `ECHILD`: the child was
 /// already reaped out of band, so its status is gone for good) is latched as
 /// [`PtyExit::unobservable`] — terminal, so `wait()` and every exit-polling
-/// consumer settle instead of reporting "still running" forever.
+/// consumer settle instead of reporting "still running" forever. So is a
+/// child whose pid no longer exists while `try_wait` still reports it
+/// running (`kill(pid, 0)` → `ESRCH`; a zombie still answers).
 fn observe_exit(session: &PtySession) -> Option<PtyExit> {
     let mut cached = session.exit.lock().unwrap();
     if let Some(exit) = cached.as_ref() {
@@ -355,7 +417,11 @@ fn observe_exit(session: &PtySession) -> Option<PtyExit> {
                     .as_ref()
                     .is_some_and(|leaf| leaf.oom_kills() > 0),
         },
-        Ok(None) => return None,
+        Ok(None) if !session.pid.is_some_and(pid_gone) => return None,
+        Ok(None) => {
+            tracing::warn!(pid = ?session.pid, "pty child gone without a status; latching exit");
+            PtyExit::unobservable()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return None,
         Err(e) => {
             tracing::warn!(pid = ?session.pid, error = %e, "pty child status unobservable; latching exit");
@@ -658,20 +724,10 @@ impl PtyHost {
         Ok(self.get(id)?.fanout.lock().unwrap().eof)
     }
 
-    /// Wait for the output reader to finish; callers decide their teardown deadline.
-    /// # Errors
-    /// Returns `NotFound` for a removed attempt.
-    /// # Panics
-    /// Panics if the output lock is poisoned.
-    pub async fn wait_output_eof(&self, id: PtyId) -> Result<()> {
-        let session = self.get(id)?;
-        let notify = session.fanout.lock().unwrap().eof_notify.clone();
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !session.fanout.lock().unwrap().eof {
-            notified.await;
-        }
+    /// Wait for the output reader to finish.
+    #[cfg(test)]
+    pub(crate) async fn wait_output_eof(&self, id: PtyId) -> Result<()> {
+        output_ended(&self.get(id)?.fanout).await;
         Ok(())
     }
 
@@ -797,29 +853,76 @@ impl PtyHost {
         Ok(observe_exit(&session))
     }
 
-    /// Wait until the PTY's child exits and return its status (ACP
-    /// `terminal/wait_for_exit`). Polls the child rather than blocking a thread.
-    ///
-    /// Note: exit becomes observable as soon as the child is reaped, which can
-    /// be slightly before the reader has drained the last of its output into
-    /// scrollback (monorepo#587 makes that output eventually-complete rather
-    /// than lost). Callers reading scrollback right after `wait()` should poll
-    /// briefly rather than assume it is final.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::NotFound` if no session exists for `id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
-    pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
+    /// Wait until the child is reaped. The exit comes before the reader has
+    /// drained the last output, so only tests that read no output use it;
+    /// everything else uses [`PtyHost::wait_exit`].
+    #[cfg(test)]
+    pub(crate) async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
             if let Some(exit) = observe_exit(&session) {
                 return Ok(exit);
             }
             tokio::time::sleep(REAP_POLL).await;
+        }
+    }
+
+    /// Wait until the child is reaped **and** its output has ended, then
+    /// return the exit with the rest of `live`. The one way to observe an
+    /// exit together with the output that came before it: the child is
+    /// reaped before the reader has published its final chunks, so an exit
+    /// taken at the reap can be reported ahead of that output.
+    ///
+    /// 1. Poll until the child is reaped. A kill meanwhile reaps it too.
+    /// 2. With [`ExitWait::reap_group`], end the group's stragglers.
+    /// 3. Wait for the reader to reach EOF, bounded by
+    ///    [`ExitWait::output_eof`]. At EOF an output sink has every byte.
+    /// 4. Take what is left on `live` without blocking.
+    ///
+    /// Chunks on `live` are collected through every step, at most
+    /// `EXIT_TAIL_MAX_CHUNKS` in all; past the cap the rest stays unread.
+    /// Call it with `live` once the child has exited (see
+    /// [`PtyHost::try_exit`]), or output during the run is collected too.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
+    pub async fn wait_exit(
+        &self,
+        id: PtyId,
+        wait: ExitWait,
+        live: Option<&mut broadcast::Receiver<Arc<OutputChunk>>>,
+    ) -> ExitTail {
+        let mut tail = TailCollector {
+            live,
+            output: Vec::new(),
+        };
+        let Ok(session) = self.get(id) else {
+            tail.drain();
+            return ExitTail {
+                exit: None,
+                output: tail.output,
+            };
+        };
+        let exit = loop {
+            if let Some(exit) = observe_exit(&session) {
+                break exit;
+            }
+            tail.collect_until(tokio::time::sleep(REAP_POLL), None)
+                .await;
+        };
+        if wait.reap_group {
+            reap_stragglers(&session).await;
+        }
+        let deadline = wait
+            .output_eof
+            .and_then(|bound| tokio::time::Instant::now().checked_add(bound));
+        tail.collect_until(output_ended(&session.fanout), deadline)
+            .await;
+        tail.drain();
+        ExitTail {
+            exit: Some(exit),
+            output: tail.output,
         }
     }
 
@@ -998,31 +1101,13 @@ impl PtyHost {
     /// empty (monorepo#1300). The session stays registered so its scrollback
     /// and latched exit status remain readable. No-op when the session is
     /// unknown, the child is still running (the group is legitimately
-    /// alive), or the group is already empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
-    #[cfg_attr(
-        not(unix),
-        expect(
-            clippy::unused_async,
-            reason = "async on every platform; the group escalation awaits only on unix"
-        )
-    )]
-    pub async fn reap_group_stragglers(&self, id: PtyId) {
-        let Ok(session) = self.get(id) else { return };
-        #[cfg(unix)]
-        {
-            if observe_exit(&session).is_none() {
-                return;
-            }
-            if let Some(pid) = session.pid {
-                escalate_group_kill(pid, &session).await;
-            }
+    /// alive), or the group is already empty. Callers get this through
+    /// [`ExitWait::reap_group`].
+    #[cfg(all(test, unix))]
+    pub(crate) async fn reap_group_stragglers(&self, id: PtyId) {
+        if let Ok(session) = self.get(id) {
+            reap_stragglers(&session).await;
         }
-        #[cfg(not(unix))]
-        drop(session);
     }
 
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
@@ -1223,6 +1308,123 @@ fn process_name(_pid: u32) -> Option<String> {
     None
 }
 
+/// See [`PtyHost::reap_group_stragglers`].
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unused_async,
+        reason = "async on every platform; the group escalation awaits only on unix"
+    )
+)]
+async fn reap_stragglers(session: &PtySession) {
+    #[cfg(unix)]
+    {
+        if observe_exit(session).is_none() {
+            return;
+        }
+        if let Some(pid) = session.pid {
+            escalate_group_kill(pid, session).await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = session;
+}
+
+/// Resolve once the reader has reached EOF.
+async fn output_ended(fanout: &Mutex<Fanout>) {
+    let notify = fanout.lock().unwrap().eof_notify.clone();
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if !fanout.lock().unwrap().eof {
+        notified.await;
+    }
+}
+
+/// [`PtyHost::wait_exit`]'s collection of a caller's live receiver.
+struct TailCollector<'a> {
+    live: Option<&'a mut broadcast::Receiver<Arc<OutputChunk>>>,
+    output: Vec<TailOutput>,
+}
+
+impl TailCollector<'_> {
+    /// The receiver, while it is open and the cap is not reached.
+    fn open(&mut self) -> Option<&mut broadcast::Receiver<Arc<OutputChunk>>> {
+        if self.output.len() >= EXIT_TAIL_MAX_CHUNKS {
+            return None;
+        }
+        self.live.as_deref_mut()
+    }
+
+    /// Collect until `until` resolves or `deadline` passes. The deadline is
+    /// also checked after each chunk: a channel that never empties keeps
+    /// `recv` ready, and the coop budget can then starve the timer.
+    async fn collect_until(
+        &mut self,
+        until: impl std::future::Future<Output = ()>,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        use broadcast::error::RecvError;
+        tokio::pin!(until);
+        let expired = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(expired);
+        loop {
+            let Some(live) = self.open() else {
+                tokio::select! {
+                    () = &mut until => return,
+                    () = &mut expired => return,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = &mut until => return,
+                () = &mut expired => return,
+                recv = live.recv() => {
+                    match recv {
+                        Ok(chunk) => self.output.push(TailOutput::Chunk(chunk)),
+                        Err(RecvError::Lagged(_)) => self.output.push(TailOutput::Lagged),
+                        Err(RecvError::Closed) => self.live = None,
+                    }
+                    if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take what is already on the receiver, without blocking.
+    fn drain(&mut self) {
+        use broadcast::error::TryRecvError;
+        while let Some(live) = self.open() {
+            match live.try_recv() {
+                Ok(chunk) => self.output.push(TailOutput::Chunk(chunk)),
+                Err(TryRecvError::Lagged(_)) => self.output.push(TailOutput::Lagged),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+            }
+        }
+    }
+}
+
+/// Whether `pid` no longer exists (`ESRCH`); a zombie still exists.
+#[cfg(unix)]
+fn pid_gone(pid: u32) -> bool {
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+#[cfg(not(unix))]
+fn pid_gone(_pid: u32) -> bool {
+    false
+}
+
 /// Per-PTY exit watcher (own thread): poll until the child is reaped (latching
 /// its exit status), then wait — bounded — for the reader to drain any output
 /// still queued on the master, and release the held slave fd so the reader
@@ -1262,6 +1464,10 @@ fn read_loop(
     sink: Option<OutputSink>,
     #[cfg(windows)] writer: &Arc<Mutex<Box<dyn Write + Send>>>,
 ) {
+    // Declared before `sink` so it drops after it: EOF is signalled once
+    // the sink is released, on a panic too.
+    let _eof = SignalEof(fanout);
+    let sink = sink;
     let publish = |bytes: &[u8]| {
         if let Some(sink) = &sink {
             sink.write(bytes);
@@ -1299,10 +1505,20 @@ fn read_loop(
     }
     #[cfg(windows)]
     publish(&handshake.finish());
-    drop(sink);
-    let mut fanout = fanout.lock().unwrap();
-    fanout.eof = true;
-    fanout.eof_notify.notify_waiters();
+}
+
+/// Marks the reader's output ended when dropped.
+struct SignalEof<'a>(&'a Arc<Mutex<Fanout>>);
+
+impl Drop for SignalEof<'_> {
+    fn drop(&mut self) {
+        let mut fanout = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fanout.eof = true;
+        fanout.eof_notify.notify_waiters();
+    }
 }
 
 fn publish_output(fanout: &Arc<Mutex<Fanout>>, bytes: &[u8]) {
@@ -1979,6 +2195,64 @@ mod tests {
         assert_eq!(host.count(), 0);
     }
 
+    /// Stand-in for a child that `try_wait` always reports running.
+    #[derive(Debug)]
+    struct NeverExits;
+
+    impl ChildKiller for NeverExits {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NeverExits)
+        }
+    }
+
+    impl Child for NeverExits {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A child whose pid no longer exists while `try_wait` still reports it
+    /// running is latched as an unobservable exit, so no wait hangs on it.
+    #[tokio::test]
+    async fn try_exit_latches_unobservable_exit_when_the_pid_is_gone() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "sleep");
+        spec.args = vec!["30".into()];
+        let id = host.spawn(spec).unwrap();
+        let session = host.get(id).unwrap();
+        let mut real = std::mem::replace(
+            &mut *session.child.lock().unwrap(),
+            Box::new(NeverExits) as Box<dyn Child + Send + Sync>,
+        );
+        assert_eq!(host.try_exit(id).unwrap(), None, "pid still exists");
+        real.kill().unwrap();
+        real.wait().unwrap();
+
+        let exit = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            host.wait(id),
+        )
+        .await
+        .expect("wait() settles once the pid is gone")
+        .unwrap();
+        assert_eq!(exit, PtyExit::unobservable());
+
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
     /// A long-running child keeps the held slave and its reader thread until
     /// teardown; `kill()` releases both and joins the reader and watcher
     /// threads promptly (no leak on the kill path either).
@@ -2468,6 +2742,8 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod exit_wait_tests;
 #[cfg(test)]
 #[path = "replay_tests.rs"]
 mod replay_tests;

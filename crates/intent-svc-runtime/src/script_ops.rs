@@ -24,13 +24,15 @@ use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
     ScriptStartedBy, ScriptStatus, WorkspaceId,
 };
-use intent_pty::{OutputChunk, OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
+use intent_pty::{
+    ExitWait, OutputChunk, OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec, TailOutput,
+};
 use intent_services::feature_api::pagination::{
     tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
 };
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 
@@ -65,10 +67,6 @@ const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 pub(crate) const AUTO_START_MONITOR_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
-/// Cap on output chunks drained after the exit poll has ended a run: the
-/// queue holds at most the fan-out capacity of already-produced chunks, so
-/// anything past this is a straggler still writing to the held slave.
-const EXIT_DRAIN_MAX_CHUNKS: usize = 4096;
 /// `exitCode` sentinel written whenever a run ends without an observable
 /// status: the terminal state is total — `exited` always carries a code — and
 /// `-1` (impossible for a real process) marks the code as unknown; `error`
@@ -3035,12 +3033,9 @@ impl ScriptManager {
                 mgr.run_one(&ws_task, &sid, generation, pty_id, false).await;
                 false
             };
-            // Group-keyed liveness (monorepo#1300): before the
-            // exit is recorded, reap group members that outlived the shell
-            // (a descendant trapping TERM+HUP) so `exited` means the whole
-            // group is gone. No-op after the timeout kill (session gone) or
-            // when the group is already empty.
-            mgr.pty.reap_group_stragglers(pty_id).await;
+            // Group-keyed liveness (monorepo#1300): `run_one`'s
+            // `wait_exit` (or the timeout kill) has ended every group member
+            // that outlived the shell, so `exited` means the whole group is gone.
             let exit = mgr.pty.try_exit(pty_id).ok().flatten();
             mgr.mark_exited(&ws_task, &sid, generation, exit.clone(), timed_out)
                 .await;
@@ -3151,12 +3146,11 @@ impl ScriptManager {
             // run_one captures leader exit before output/straggler teardown;
             // TERM grace must not inflate a quick exit past the floor.
             let ran_for = ended_at.saturating_duration_since(started);
-            // Group-keyed liveness (monorepo#1300): reap group
-            // members that outlived the shell (a descendant trapping
-            // TERM+HUP) before the exit is recorded, so `exited` means the
-            // whole group is gone — the script can never sit `running` (or
-            // flip to `exited`) while trapped survivors linger.
-            self.pty.reap_group_stragglers(pty_id).await;
+            // Group-keyed liveness (monorepo#1300): `run_one`'s `wait_exit`
+            // has ended every group member that outlived the shell (a
+            // descendant trapping TERM+HUP), so `exited` means the whole
+            // group is gone — the script can never sit `running` (or flip to
+            // `exited`) while trapped survivors linger.
             let Some((stopped_by_user, restart_count)) = self
                 .mark_exited(&ws, &script_id, generation, exit, false)
                 .await
@@ -3233,19 +3227,17 @@ impl ScriptManager {
     /// exit status once the child ends (polling like `terminal_ops`).
     ///
     /// Liveness backstop: each `EXIT_POLL` tick also ends the run when the
-    /// child is provably gone without an observable status — the host has
-    /// dropped the session, or the recorded pid no longer exists (`kill(pid,
-    /// 0)` → `ESRCH`; a zombie still answers, so an exited-but-unreaped child
-    /// never trips this). The caller then records the run with the
+    /// child is gone without an observable status — the host has dropped the
+    /// session, or latched an unobservable exit for a pid that no longer
+    /// exists. The caller then records the run with the
     /// [`EXIT_CODE_UNOBSERVABLE`] sentinel instead of sitting `running`
     /// until the daemon dies.
     ///
     /// The poll is a persistent interval, not a sleep re-armed per output
     /// chunk: a descendant that keeps the slave open and prints faster than
-    /// `EXIT_POLL` must not postpone the exit check (and the caller's group
-    /// reap) indefinitely. For the same reason the post-exit drain is bounded
-    /// by [`EXIT_DRAIN_MAX_CHUNKS`] — anything beyond it is a straggler still
-    /// producing, which the caller's `reap_group_stragglers` ends.
+    /// `EXIT_POLL` must not postpone the exit check indefinitely. Once it
+    /// ends, [`PtyHost::wait_exit`] ends the group's stragglers and hands
+    /// back the output still to come, bounded.
     async fn run_one(
         &self,
         ws: &WorkspaceId,
@@ -3257,7 +3249,6 @@ impl ScriptManager {
         let Ok(attachment) = self.pty.attach(pty_id) else {
             return (self.pty.try_exit(pty_id).ok().flatten(), Instant::now());
         };
-        let pid = self.pty.pid(pty_id);
         let mut live = attachment.live;
         let mut url_done = !detect_url;
         if !attachment.backlog.is_empty() {
@@ -3276,35 +3267,14 @@ impl ScriptManager {
             tokio::select! {
                 biased;
                 _ = poll.tick() => {
-                    let ended = match self.pty.try_exit(pty_id) {
-                        Ok(Some(_)) | Err(_) => true,
-                        Ok(None) => pid.is_some_and(pid_gone),
-                    };
-                    if ended {
-                        let ended_at = Instant::now();
-                        self.pty.reap_group_stragglers(pty_id).await;
-                        let _=tokio::time::timeout(Duration::from_secs(2),self.pty.wait_output_eof(pty_id)).await;
-                        for _ in 0..EXIT_DRAIN_MAX_CHUNKS {
-                            match live.try_recv() {
-                                Ok(chunk) => {
-                                    self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
-                                    self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
-                                    if !url_done {
-                                        url_done =
-                                            self.try_detect_url(ws, script_id, generation, &chunk).await;
-                                    }
-                                }
-                                Err(TryRecvError::Lagged(_)) => {self.monitor_gap(ws,script_id,pty_id).await;},
-                                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                            }
-                        }
-                        break ended_at;
+                    if !matches!(self.pty.try_exit(pty_id), Ok(None)) {
+                        break Instant::now();
                     }
                 }
                 recv = live.recv() => match recv {
                     Ok(chunk) => {
                         self.observe_monitor_chunk(ws,script_id,pty_id,&chunk).await;
-                                    self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
+                        self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
                         if !url_done {
                             url_done = self.try_detect_url(ws, script_id, generation, &chunk).await;
                         }
@@ -3314,6 +3284,23 @@ impl ScriptManager {
                 },
             }
         };
+        let tail = self
+            .pty
+            .wait_exit(pty_id, ExitWait::SCRIPT, Some(&mut live))
+            .await;
+        for item in tail.output {
+            match item {
+                TailOutput::Chunk(chunk) => {
+                    self.observe_monitor_chunk(ws, script_id, pty_id, &chunk)
+                        .await;
+                    self.emit_output_for(ws, script_id, generation, pty_id, &chunk);
+                    if !url_done {
+                        url_done = self.try_detect_url(ws, script_id, generation, &chunk).await;
+                    }
+                }
+                TailOutput::Lagged => self.monitor_gap(ws, script_id, pty_id).await,
+            }
+        }
         if !live.is_empty() {
             self.monitor_gap(ws, script_id, pty_id).await;
         }
@@ -3329,7 +3316,7 @@ impl ScriptManager {
         {
             tracing::warn!(%error,"monitor EOF failed");
         }
-        (self.pty.try_exit(pty_id).ok().flatten(), ended_at)
+        (tail.exit, ended_at)
     }
 
     /// Scan a chunk for the first local dev-server URL; on a first hit, latch it
@@ -3977,7 +3964,7 @@ fn last_n_lines(text: &str, n: usize) -> String {
 /// Whether no process with `pid` exists any more: `kill(pid, 0)` → `ESRCH`.
 /// A zombie (exited, not yet reaped) still answers the probe, so only a fully
 /// gone pid counts; `EPERM` means the pid exists (possibly reused).
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn pid_gone(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -3987,7 +3974,7 @@ fn pid_gone(pid: u32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn pid_gone(_pid: u32) -> bool {
     false
 }

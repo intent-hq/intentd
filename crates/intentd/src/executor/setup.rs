@@ -20,7 +20,7 @@ use intent_core::node_link::{
     CheckoutOwner, SetupCommand, SetupState, SubmodulePin, HOMES_PROTOCOL, MAX_SCRIPT_OUTPUT_BYTES,
     PREPARED_CHECKOUT_PROTOCOL,
 };
-use intent_pty::{OutputSink, PtyHost, SpawnSpec};
+use intent_pty::{ExitWait, OutputSink, PtyHost, SpawnSpec};
 use intent_services::feature_api::shell::{saved_script_env_overlay, scrubbed_env_vars_except};
 use intent_transport::node_link::NodeLink;
 
@@ -45,10 +45,6 @@ const OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 /// The output a failure notice and a retry's result quote.
 pub(super) const NOTICE_TAIL_BYTES: usize = 4 * 1024;
-
-/// How long the run waits for the terminal's output to end after the
-/// script's process group is reaped.
-const OUTPUT_EOF_WAIT: Duration = Duration::from_secs(2);
 
 /// The PTY's own scrollback; the output itself is kept by [`SetupOutput`].
 const SCROLLBACK_BYTES: usize = 64 * 1024;
@@ -683,23 +679,17 @@ async fn spawn_and_wait(
         .command
         .timeout_secs
         .map_or(DEFAULT_TIMEOUT, Duration::from_secs);
+    // The run ends once nothing the script started is left and its output
+    // has reached the sink. A script that exited before the timeout keeps
+    // its result: the kill below ends what it left and drains the output.
     let exit = tokio::select! {
-        exit = pty.wait(pty_id) => Some(exit),
-        () = tokio::time::sleep(timeout) => None,
+        tail = pty.wait_exit(pty_id, ExitWait::SCRIPT, None) => Some(tail.exit),
+        () = tokio::time::sleep(timeout) => pty.try_exit(pty_id).ok().flatten().map(Some),
         _ = &mut *stop => {
             pty.kill(pty_id).await;
             return Ran::Stopped;
         }
     };
-    // Reap the group first so the output can reach EOF and nothing the
-    // script started outlives the run.
-    match exit {
-        Some(_) => pty.reap_group_stragglers(pty_id).await,
-        None => {
-            pty.kill(pty_id).await;
-        }
-    }
-    let _ = tokio::time::timeout(OUTPUT_EOF_WAIT, pty.wait_output_eof(pty_id)).await;
     pty.kill(pty_id).await;
     let finished_at = Some(intent_core::now_iso());
     Ran::Finished(match exit {
@@ -711,7 +701,7 @@ async fn spawn_and_wait(
                 timeout.as_secs()
             ),
         ),
-        Some(Ok(exit)) if exit.observed => {
+        Some(Some(exit)) if exit.observed => {
             let code = i32::try_from(exit.exit_code).unwrap_or(-1);
             SetupStatus {
                 state: if code == 0 {
@@ -1071,6 +1061,49 @@ mod tests {
         assert!(body.lines().any(|line| line == "/second-run"), "{body}");
         assert!(!body.lines().any(|line| line == "/agent-file"), "{body}");
         assert_eq!(body.matches("# Created by").count(), 1, "{body}");
+    }
+
+    /// A script that exits before its timeout keeps its own result, even
+    /// when ending a straggler it left carries the run past the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exit_before_the_timeout_is_not_a_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let work = repo(root.path());
+        let tmp = root.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let command = SetupCommand {
+            script: "(trap '' TERM HUP; sleep 30) &\nexit 0\n".to_owned(),
+            branch_name: "b".to_owned(),
+            source_branch: "main".to_owned(),
+            timeout_secs: Some(2),
+        };
+        let pty = PtyHost::new();
+        let output = SetupOutput::new(intent_core::AgentId::from("a1"), HeadLink::default());
+        let (_stop_tx, mut stop) = oneshot::channel();
+        let ran = run(
+            &pty,
+            SetupRun {
+                command: &command,
+                worktree: &work,
+                tmp: &tmp,
+                main_checkout: &work,
+                pins: &[],
+                retry: false,
+            },
+            &output,
+            intent_core::now_iso(),
+            &mut stop,
+        )
+        .await;
+        let Ran::Finished(status) = ran else {
+            panic!("the run was not stopped");
+        };
+        assert_eq!(
+            (status.state, status.exit_code),
+            (Recorded::Completed, Some(0)),
+            "{status:?}"
+        );
     }
 
     #[test]

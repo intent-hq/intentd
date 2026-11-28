@@ -19,7 +19,7 @@ use intent_core::node_link::{
     PtyStream, MAX_PTY_OUTPUT_BYTES, NODE_HOME_UNKNOWN, PTY_UNACKED_BYTES,
 };
 use intent_core::nodes::NodeCounter;
-use intent_pty::{OutputSink, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{ExitWait, OutputSink, PtyHost, PtyId, PtySize, SpawnSpec};
 use intent_services::feature_api::shell::{default_shell, scrubbed_env_vars_except, shell_args};
 use intent_transport::node_link::NodeLink;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -115,15 +115,6 @@ enum Process {
     Pty(PtyId),
     Exec(Option<oneshot::Sender<()>>),
     Gone,
-}
-
-/// Turns its channel true when dropped: with the PTY's output sink.
-struct ReaderDone(watch::Sender<bool>);
-
-impl Drop for ReaderDone {
-    fn drop(&mut self) {
-        self.0.send_replace(true);
-    }
 }
 
 /// A terminal `ptyOpen` reserved: [`HomeTerminals::start`] starts it.
@@ -577,12 +568,7 @@ impl HomeTerminals {
             spec.size = PtySize { rows, cols };
         }
         let sink_term = Arc::downgrade(term);
-        // The PTY host drops the sink when the terminal's reader thread
-        // ends, so this turns true once every byte has been read.
-        let (read_all, mut reader_done) = watch::channel(false);
-        let read_all = ReaderDone(read_all);
         spec.output_sink = Some(OutputSink::new(move |bytes| {
-            let _ = &read_all;
             if let Some(term) = sink_term.upgrade() {
                 if term.push(bytes, None) {
                     term.wait_room_blocking();
@@ -606,16 +592,18 @@ impl HomeTerminals {
         let reaped = term.clone();
         // caller-binding: allow — node-local home terminal process supervision
         tokio::spawn(async move {
-            let exit = pty.wait(pty_id).await;
-            pty.reap_group_stragglers(pty_id).await;
             // Every byte before the exit, however long the output waits
             // for acknowledgements: the exit is reported only once the
             // reader has ended. A kill (or an end from here) releases a
             // paused reader and stops it, so this wait always ends with it.
-            let _ = reader_done.wait_for(|done| *done).await;
+            let until_eof = ExitWait {
+                output_eof: None,
+                reap_group: true,
+            };
+            let exit = pty.wait_exit(pty_id, until_eof, None).await.exit;
             pty.kill(pty_id).await;
             let (exit_code, memory_limit) = match exit {
-                Ok(exit) if exit.observed => (
+                Some(exit) if exit.observed => (
                     i32::try_from(exit.exit_code).unwrap_or(-1),
                     exit.memory_limit,
                 ),
