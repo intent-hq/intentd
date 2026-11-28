@@ -73,17 +73,22 @@ async fn terminal_wait_is_bounded_by_a_job_holding_the_terminal() {
     let mut spec = SpawnSpec::new("s", "sh");
     spec.args = vec![
         "-c".into(),
-        "trap '' HUP; sleep 30 & echo $!; echo done".into(),
+        "trap '' HUP; sleep 120 & echo $!; echo done".into(),
     ];
     let id = host.spawn(spec).unwrap();
     let Attachment { backlog, mut live } = host.attach(id).unwrap();
 
-    let started = Instant::now();
-    let tail = host
-        .wait_exit(id, ExitWait::TERMINAL, Some(&mut live))
-        .await;
+    let tail = tokio::time::timeout(
+        scaled(Duration::from_secs(20)),
+        host.wait_exit(id, ExitWait::TERMINAL, Some(&mut live)),
+    )
+    .await
+    .expect("the wait does not last as long as the job");
 
-    assert!(started.elapsed() < OUTPUT_EOF_WAIT + scaled(Duration::from_secs(5)));
+    assert!(
+        !host.output_eof(id).unwrap(),
+        "returned at the bound, not at EOF"
+    );
     assert!(tail.exit.as_ref().expect("exit status").success);
     let text = String::from_utf8(tail_bytes(&backlog, &tail)).unwrap();
     assert!(text.contains("done"), "{text:?}");
