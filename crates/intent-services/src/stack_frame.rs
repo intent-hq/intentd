@@ -31,6 +31,13 @@
 //! (a reduced-stack run of the create cases that overflowed
 //! `wss_workspace_create_context_links_round_trip_and_validation`).
 //!
+//! The event bus is on that path too (the spec seed publishes
+//! `note:created`): `publish_event`, `EventBus::publish` and the note/task
+//! projection (`events/bus/task_push.rs`) build their store and publish
+//! futures through `boxed_await` themselves, so shallow callers can await
+//! them inline (the create path's `ensure_spec_note` still boxes its
+//! `publish_event` awaits: inline, they cost it ~4 KiB).
+//!
 //! Every `Store` future sits under these frames too, so the store keeps
 //! them the same size with its `postgres` feature on (`intent_store`'s
 //! `dispatch!` boxes Postgres futures; holding them inline overflowed 30

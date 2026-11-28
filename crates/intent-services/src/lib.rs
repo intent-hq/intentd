@@ -12302,6 +12302,9 @@ impl Services {
 ///
 /// `workspace.create` runs this under its deep poll frames, so every await
 /// here is built off-frame with [`boxed_await`] (see `crate::stack_frame`).
+/// That includes [`publish_event`], although it boxes the bus publish
+/// itself: its three inline sites still cost ~4 KiB of this poll frame
+/// (measured with the create-path stack guard).
 async fn ensure_spec_note(
     store: &Store,
     bus: Option<&EventBus>,
@@ -16207,6 +16210,10 @@ fn search_done_event(
 
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
+///
+/// The bus publish is built off-frame with `boxed_await`: this helper is
+/// awaited under deep poll frames (`workspace.create`'s spec seed, agent
+/// delivery), and boxing here keeps every caller's await small.
 pub async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
