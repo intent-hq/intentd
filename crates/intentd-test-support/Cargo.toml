@@ -6,9 +6,12 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 description = "Workspace-internal test support for the intentd e2e suites (process-group child guard, release-file barrier, bounded pause points); never published"
-# Reachable only as a dev-dependency of the e2e suites; never a runtime dep
-# and never on crates.io.
-publish = false
+# A dev-dependency, or an optional dependency behind a crate's `test-hooks`
+# feature (never in intentd's production graph). Not `publish = false`:
+# release-plz packages the whole workspace to compute versions, and Cargo
+# cannot package a crate whose normal dependency is unpublishable. It is
+# still never published or tagged: release-plz publishes nothing
+# (`publish = false` in release-plz.toml) and does not opt this crate in.
 
 [dependencies]
 # PausePoint: async waits and the tokio::test fixtures that use it.
