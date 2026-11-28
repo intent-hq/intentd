@@ -1103,7 +1103,7 @@ impl PtyHost {
     /// unknown, the child is still running (the group is legitimately
     /// alive), or the group is already empty. Callers get this through
     /// [`ExitWait::reap_group`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn reap_group_stragglers(&self, id: PtyId) {
         if let Ok(session) = self.get(id) {
             reap_stragglers(&session).await;
