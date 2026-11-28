@@ -412,10 +412,12 @@ exec '__NODE__' '__NPM__' '__SCRIPT__' "$@"
 /// `--yes`, the project root, `--allow-scripts` and, overriding a value the
 /// user set, `--ignore-scripts=false` — plus its run variables, then runs the
 /// adapter through `sh` as the `npx` lifecycle event with an explicit env,
-/// as `libnpmexec` / `@npmcli/run-script` do.
+/// as `libnpmexec` / `@npmcli/run-script` do. `__ALLOW_SCRIPTS__` is
+/// substituted with [`intent_providers::NPM_ALLOW_SCRIPTS_ARG`].
 const FAKE_NPM_SCRIPT: &str = r#"const { spawn } = require('node:child_process');
 const [script, ...npxArgs] = process.argv.slice(2);
-const allow = npxArgs.find((a) => a.startsWith('--allow-scripts='));
+const allowFlag = '__ALLOW_SCRIPTS__=';
+const allow = npxArgs.find((a) => a.startsWith(allowFlag));
 Object.assign(process.env, {
   npm_config_yes: 'true',
   npm_config_local_prefix: process.cwd(),
@@ -426,7 +428,7 @@ Object.assign(process.env, {
   npm_node_execpath: process.execPath,
   NODE: process.execPath,
   INIT_CWD: process.cwd(),
-  ...(allow ? { npm_config_allow_scripts: allow.slice('--allow-scripts='.length) } : {}),
+  ...(allow ? { npm_config_allow_scripts: allow.slice(allowFlag.length) } : {}),
 });
 const env = {
   ...process.env,
@@ -468,7 +470,11 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755))
         .expect("chmod node");
     let npm = bin_dir.join("fake-npm.cjs");
-    std::fs::write(&npm, FAKE_NPM_SCRIPT).expect("write fake npm");
+    std::fs::write(
+        &npm,
+        FAKE_NPM_SCRIPT.replace("__ALLOW_SCRIPTS__", intent_providers::NPM_ALLOW_SCRIPTS_ARG),
+    )
+    .expect("write fake npm");
     let npx = bin_dir.join("npx");
     intent_acp::fake_npx::FakeNpx::new(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         .version("10.9.2")
